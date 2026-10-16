@@ -85,7 +85,7 @@ end
 # the filter (`_tw_valid_under_filter`): its native code calls the callee's
 # compiled code directly, and only trait-world values reach it, to which no
 # outside, owned method applies.
-const _tw_load_filter = Ref{Int8}(-1)
+const _tw_load_filter = Ref{Int8}(Int8(-1))   # no conversion during the Compiler bootstrap
 _tw_filter_on() = (v = _tw_load_filter[]; v == Int8(-1) && (v = _tw_load_filter[] = get(ENV, "JULIA_TW_FILTER", "1") == "0" ? Int8(0) : Int8(1)); v == Int8(1))
 const _tw_modules = Ref{Vector{Any}}(Any[])       # registered modules (TraitWorld itself)
 const _tw_julia_names = Ref{Vector{Any}}(Any[])   # names of Julia's standard libraries
