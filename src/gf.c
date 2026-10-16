@@ -2165,8 +2165,115 @@ JL_DLLEXPORT jl_value_t *jl_debug_method_invalidation(int state)
 static void _invalidate_backedges(jl_method_instance_t *replaced_mi, jl_code_instance_t *replaced_ci, size_t max_world, int depth);
 
 // recursively invalidate cached methods that had an edge to a replaced method
+
+// --- trait-world invalidation filter (trait-bound PoC, design note rev 1110) ---
+// A method insertion never invalidates code of a trait module (or TraitWorld)
+// when the new method is defined outside the trait world and outside Julia
+// (Base, Core, the standard libraries: one owner, in every view) and its
+// definer owns a type or the function of its signature: a definition
+// elsewhere, for the definer's own types, can never apply to trait-world code
+// (layering: no value of an outside type reaches it). Pirates (definer owns
+// nothing in the signature) invalidate as before, so trait-world code never
+// silently disagrees with plain Julia; in doubt (Union arguments, extensions,
+// which C cannot attribute to their parents) the filter invalidates. Only
+// trait modules are protected, not wrapped packages: their code is also
+// ordinary code. The arrays are rooted by the caller (TraitWorld).
+static _Atomic(jl_array_t*) jl_tw_modules;       // Modules: trait modules and TraitWorld
+static _Atomic(jl_array_t*) jl_tw_julia_names;   // Symbols: names of Julia's standard libraries
+static _Atomic(jl_method_t*) jl_tw_trigger;      // the method being inserted (jl_method_table_activate)
+JL_DLLEXPORT _Atomic(size_t) jl_tw_skipped;      // invalidations the filter skipped (for measurements)
+
+JL_DLLEXPORT void jl_set_trait_world_filter(jl_array_t *mods, jl_array_t *julia_names)
+{
+    jl_atomic_store_release(&jl_tw_julia_names, julia_names);
+    jl_atomic_store_release(&jl_tw_modules, mods);
+}
+
+static jl_module_t *tw_root(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    // a package root is its own parent; a module of a script counts as its own package
+    while (m->parent != NULL && m->parent != m && m->parent != jl_main_module)
+        m = m->parent;
+    return m;
+}
+
+static int tw_in_chain(jl_array_t *mods, jl_module_t *m) JL_NOTSAFEPOINT
+{
+    while (1) {
+        for (size_t i = 0; i < jl_array_nrows(mods); i++)
+            if (jl_array_ptr_ref(mods, i) == (jl_value_t*)m)
+                return 1;
+        if (m->parent == NULL || m->parent == m)
+            return 0;
+        m = m->parent;
+    }
+}
+
+static int tw_is_julia(jl_module_t *root) JL_NOTSAFEPOINT
+{
+    if (root == jl_base_module || root == jl_core_module)
+        return 1;
+    jl_array_t *names = jl_atomic_load_relaxed(&jl_tw_julia_names);
+    if (names == NULL)
+        return 0;
+    for (size_t i = 0; i < jl_array_nrows(names); i++)
+        if (jl_array_ptr_ref(names, i) == (jl_value_t*)root->name)
+            return 1;
+    return 0;
+}
+
+static int tw_type_owned_by(jl_value_t *t, jl_module_t *root, int depth) JL_NOTSAFEPOINT
+{
+    if (depth > 2)
+        return 0;
+    t = jl_unwrap_unionall(t);
+    if (jl_is_typevar(t))
+        t = ((jl_tvar_t*)t)->ub;
+    if (!jl_is_datatype(t))
+        return 0;                                   // a Union proves no ownership
+    jl_datatype_t *dt = (jl_datatype_t*)t;
+    if (dt->name == jl_type_typename && jl_nparams(dt) == 1)
+        return tw_type_owned_by(jl_tparam0(dt), root, depth + 1);    // Type{T}: a constructor of T
+    return tw_root(dt->name->module) == root;
+}
+
+static int tw_method_owned(jl_method_t *m) JL_NOTSAFEPOINT
+{
+    jl_module_t *root = tw_root(m->module);
+    jl_value_t *sig = jl_unwrap_unionall(m->sig);
+    if (!jl_is_datatype(sig))
+        return 0;
+    size_t np = jl_nparams(sig);
+    for (size_t i = 0; i < np; i++) {
+        jl_value_t *p = jl_tparam(sig, i);
+        if (jl_is_vararg(p))
+            continue;
+        if (tw_type_owned_by(p, root, 0))
+            return 1;
+    }
+    return 0;
+}
+
+static int tw_protected(jl_code_instance_t *ci) JL_NOTSAFEPOINT
+{
+    jl_method_t *trig = jl_atomic_load_relaxed(&jl_tw_trigger);
+    jl_array_t *mods = jl_atomic_load_relaxed(&jl_tw_modules);
+    if (trig == NULL || mods == NULL)
+        return 0;
+    jl_method_instance_t *mi = jl_get_ci_mi(ci);
+    if (!jl_is_method(mi->def.method) || !tw_in_chain(mods, mi->def.method->module))
+        return 0;                                   // not trait-world code: plain Julia
+    if (tw_in_chain(mods, trig->module) || tw_is_julia(tw_root(trig->module)))
+        return 0;                                   // a trait-world or Julia definition: in the view
+    return tw_method_owned(trig);
+}
+
 static void invalidate_code_instance(jl_code_instance_t *replaced, size_t max_world, int depth)
 {
+    if (tw_protected(replaced)) {
+        jl_atomic_fetch_add_relaxed(&jl_tw_skipped, 1);
+        return;
+    }
     jl_timing_counter_inc(JL_TIMING_COUNTER_Invalidations, 1);
     if (_jl_debug_method_invalidation) {
         jl_value_t *boxeddepth = NULL;
@@ -2976,6 +3083,7 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     jl_genericmemory_t *interferences = NULL;
     JL_GC_PUSH6(&oldvalue, &oldmi, &loctag, &isect, &isect2, &interferences);
     jl_typemap_entry_t *replaced = NULL;
+    jl_atomic_store_relaxed(&jl_tw_trigger, method);   // trait-world invalidation filter
     // Check what entries this intersects with in the prior world.
     oldvalue = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), newentry, &replaced, max_world);
     jl_method_t *const *d;
@@ -3198,6 +3306,7 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     jl_atomic_store_relaxed(&method->dispatch_status, dispatch_bits); // TODO: this should be sequenced fully after the world counter store
     jl_atomic_store_release(&method->interferences, interferences);
     jl_gc_wb(method, interferences);
+    jl_atomic_store_relaxed(&jl_tw_trigger, NULL);   // trait-world invalidation filter
     JL_GC_POP();
 }
 
