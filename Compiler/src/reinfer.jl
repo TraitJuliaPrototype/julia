@@ -66,6 +66,157 @@ function VerifyMethodResultState()
 end
 
 
+# --- trait-world load filter (trait-bound PoC, design note rev 1110) ---
+# The load-time half of src/gf.c's invalidation filter: when a package image
+# is validated, an edge of trait-world code (a trait module, or a module
+# TraitWorld registers) is not failed by methods that match it now but did not
+# when the image was built, if each such method is defined outside the trait
+# world and outside Julia and its definer owns a type or the function of its
+# signature: such a method can never apply to trait-world code (layering).
+# Pirates fail the edge as before. Trait modules are recognized by their
+# `__trait_module__` binding, so a library's own image is covered while it
+# loads, before TraitWorld sees it; TraitWorld's own modules carry
+# `__trait_world_machinery__`. On unless JULIA_TW_FILTER=0, so that images
+# loaded before TraitWorld are covered too; TraitWorld adds its registrations.
+#
+# A Base method compiled for trait-world code (a callee CodeInstance in the
+# image, shared with ordinary code) fails as before when a newcomer intersects
+# its edges; the trait-world caller keeps its code if the callee is valid under
+# the filter (`_tw_valid_under_filter`): its native code calls the callee's
+# compiled code directly, and only trait-world values reach it, to which no
+# outside, owned method applies.
+const _tw_load_filter = Ref{Int8}(-1)
+_tw_filter_on() = (v = _tw_load_filter[]; v == Int8(-1) && (v = _tw_load_filter[] = get(ENV, "JULIA_TW_FILTER", "1") == "0" ? Int8(0) : Int8(1)); v == Int8(1))
+const _tw_modules = Ref{Vector{Any}}(Any[])       # registered modules (TraitWorld itself)
+const _tw_julia_names = Ref{Vector{Any}}(Any[])   # names of Julia's standard libraries
+const _tw_current = Ref(false)                    # the CodeInstance being verified is trait-world code
+const _tw_skipped = Ref(0)                        # edges kept by the filter (for measurements)
+
+function _tw_root(m::Module)
+    while true
+        p = parentmodule(m)
+        (p === m || p === Main) && return m
+        m = p
+    end
+end
+# measurements only (x13): JULIA_TW_PROTECT=<package names> treats those packages as trait-world code
+const _tw_protect = Ref{Union{Nothing,Vector{Symbol}}}(nothing)
+function _tw_protected_name(r::Module)
+    ns = _tw_protect[]
+    ns === nothing && (ns = _tw_protect[] = Symbol[Symbol(x) for x in split(get(ENV, "JULIA_TW_PROTECT", ""), ',') if !isempty(x)])
+    isempty(ns) && return false
+    n = nameof(r)
+    for x in ns
+        x === n && return true
+    end
+    return false
+end
+function _tw_in_trait_world(m::Module)
+    _tw_protected_name(_tw_root(m)) && return true
+    while true
+        (isdefined(m, :__trait_module__) || isdefined(m, :__trait_world_machinery__)) && return true
+        for x in _tw_modules[]
+            x === m && return true
+        end
+        p = parentmodule(m)
+        p === m && return false
+        m = p
+    end
+end
+function _tw_is_julia(r::Module)
+    (r === Base || r === Core || r === Base.Compiler) && return true
+    n = nameof(r)
+    for x in _tw_julia_names[]
+        x === n && return true
+    end
+    p = Base.pathof(r)                            # a standard library: under Sys.STDLIB
+    return p isa String && startswith(p, Base.Sys.STDLIB)
+end
+function _tw_owned_by(@nospecialize(t), r::Module, depth::Int)
+    depth > 2 && return false
+    t = Base.unwrap_unionall(t)
+    t isa TypeVar && (t = t.ub)
+    t isa DataType || return false                # a Union proves no ownership
+    t.name === Type.body.name && length(t.parameters) == 1 && return _tw_owned_by(t.parameters[1], r, depth + 1)
+    return _tw_root(t.name.module) === r
+end
+"A method that can never apply to trait-world code: defined outside it and Julia, for its definer's own type or function."
+function _tw_outside_owned(m::Method)
+    r = _tw_root(m.module)
+    (_tw_in_trait_world(m.module) || _tw_is_julia(r)) && return false
+    sig = Base.unwrap_unionall(m.sig)
+    sig isa DataType || return false
+    for p in sig.parameters
+        p isa Core.TypeofVararg && continue
+        _tw_owned_by(p, r, 0) && return true
+    end
+    return false
+end
+function _tw_protected(codeinst::CodeInstance)
+    _tw_filter_on() || return false
+    def = get_ci_mi(codeinst).def
+    return def isa Method && _tw_in_trait_world(def.module)
+end
+
+"""
+Whether `ci`'s edges hold under the filter, recursively, without changing any
+CodeInstance's validity: for a callee of trait-world code that failed the
+ordinary verification. A deleted method, a binding change, a changed `invoke`
+target or a pirate still fails it.
+"""
+function _tw_valid_under_filter(ci::CodeInstance, seen::Base.IdSet{CodeInstance}, depth::Int = 0)
+    ci in seen && return true
+    depth > 64 && return false
+    push!(seen, ci)
+    callees = ci.edges
+    world = ci.min_world
+    matches = []
+    saved = _tw_current[]
+    _tw_current[] = true
+    try
+        j = 1
+        while j ≤ length(callees)
+            edge = callees[j]
+            edge isa Method && return false
+            if edge isa CodeInstance
+                edge = get_ci_mi(edge)
+            end
+            if edge isa MethodInstance
+                _, mx = verify_call(edge.specTypes, callees, j, 1, world, true, matches)
+                j += 1
+            elseif edge isa Int
+                _, mx = verify_call(callees[j+1], callees, j+2, abs(edge), world, edge > 0, matches)
+                j += 2 + abs(edge)
+            elseif edge isa Core.Binding
+                binding_was_invalidated(edge) && return false
+                j += 1
+                continue
+            else
+                callee = callees[j+1]
+                if callee isa Core.MethodTable
+                    j += 2
+                    continue
+                end
+                callee isa CodeInstance && (callee = get_ci_mi(callee))
+                meth = callee isa MethodInstance ? callee.def::Method : callee::Method
+                _, mx = verify_invokesig(edge, meth, world, matches)
+                j += 2
+            end
+            mx == 0 && return false
+        end
+    finally
+        _tw_current[] = saved
+    end
+    for edge in callees
+        edge isa CodeInstance || continue
+        mw = edge.max_world
+        (mw == WORLD_AGE_REVALIDATION_SENTINEL || mw < get_world_counter()) || continue
+        _tw_valid_under_filter(edge, seen, depth + 1) || return false
+    end
+    return true
+end
+
+
 # Restore backedges to external targets
 # `edges` = [caller1, ...], the list of worklist-owned code instances internally
 function insert_backedges(internal_methods::Vector{Any})
@@ -214,6 +365,7 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
                 end
             end
 
+            _tw_current[] = _tw_protected(initial.codeinst)   # trait-world load filter
             # Process all non-CodeInstance edges
             if !isempty(initial.callees) && maxworld != get_require_world()
                 matches = []
@@ -366,6 +518,12 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
             parent_maxworld = parent_result.result_maxworld
             parent_cause = parent_work.cause
             parent_stage = parent_work.stage
+            if max_valid2 == 0 && _tw_protected(workspace.initial_states[current_depth].codeinst) && !_tw_protected(callee) &&
+                    _tw_valid_under_filter(callee, Base.IdSet{CodeInstance}())
+                _tw_skipped[] += 1                     # trait-world load filter: the callee fails for ordinary code only
+                max_valid2 = validation_world
+                child_cycle = 0
+            end
             if parent_minworld < min_valid2
                 parent_minworld = min_valid2
             end
@@ -569,7 +727,8 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
         end
    end
     # next, compare the current result of ml_matches to the old result
-    lim = _jl_debug_method_invalidation[] !== nothing ? Int(typemax(Int32)) : n
+    tw = _tw_current[]
+    lim = _jl_debug_method_invalidation[] !== nothing || tw ? Int(typemax(Int32)) : n
     minworld = RefValue{UInt}(1)
     maxworld = RefValue{UInt}(typemax(UInt))
     has_ambig = RefValue{Int32}(0)
@@ -579,7 +738,18 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
         maxworld[] = 0
     else
         # setdiff!(result, expected)
-        if length(result) ≠ n
+        nskip = 0
+        if tw
+            for k = 1:length(result)
+                mk = (result[k]::Core.MethodMatch).method
+                isexp = false
+                for j = 1:n
+                    get_method_from_edge(expecteds[i+j-1]) === mk && (isexp = true; break)
+                end
+                (!isexp && _tw_outside_owned(mk)) && (nskip += 1)
+            end
+        end
+        if length(result) - nskip ≠ n
             maxworld[] = 0
         end
         ins = 0
@@ -592,6 +762,10 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
                     found = true
                     break
                 end
+            end
+            if !found && tw && _tw_outside_owned(match.method)
+                _tw_skipped[] += 1                     # trait-world load filter: a newcomer that cannot apply to trait-world code
+                found = true
             end
             if !found
                 # intersection has a new method or a method was
