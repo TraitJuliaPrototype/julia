@@ -891,7 +891,18 @@ static void jl_add_methods(jl_array_t *external)
 }
 
 extern _Atomic(int) allow_new_worlds;
-static void jl_activate_methods(jl_array_t *external, jl_array_t *internal, size_t world, const char *pkgname)
+static int jl_method_refused(jl_array_t *refused, jl_value_t *m) JL_NOTSAFEPOINT
+{
+    if (refused == NULL)
+        return 0;
+    for (size_t k = 0; k < jl_array_nrows(refused); k++)
+        if (jl_array_ptr_ref(refused, k) == m)
+            return 1;
+    return 0;
+}
+
+// `refused`: methods an image hook asked to leave inactive (they never become visible)
+static void jl_activate_methods(jl_array_t *external, jl_array_t *internal, size_t world, const char *pkgname, jl_array_t *refused)
 {
     size_t i, l = jl_array_nrows(internal);
     for (i = 0; i < l; i++) {
@@ -899,6 +910,8 @@ static void jl_activate_methods(jl_array_t *external, jl_array_t *internal, size
         jl_value_t *obj = jl_array_ptr_ref(internal, i);
         if (jl_typetagis(obj, jl_typemap_entry_type)) {
             jl_typemap_entry_t *entry = (jl_typemap_entry_t*)obj;
+            if (jl_method_refused(refused, (jl_value_t*)entry->func.method))
+                continue;
             assert(jl_atomic_load_relaxed(&entry->min_world) == ~(size_t)0);
             assert(jl_atomic_load_relaxed(&entry->max_world) == WORLD_AGE_REVALIDATION_SENTINEL);
             jl_atomic_store_release(&entry->min_world, world);
@@ -928,6 +941,8 @@ static void jl_activate_methods(jl_array_t *external, jl_array_t *internal, size
         }
         for (i = 0; i < l; i++) {
             jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_array_ptr_ref(external, i);
+            if (jl_method_refused(refused, (jl_value_t*)entry->func.method))
+                continue;                               // refused by the image hook: stays inactive
             //uint64_t t0 = uv_hrtime();
             jl_method_table_activate(entry);
             //jl_printf(JL_STDERR, "%f ", (double)(uv_hrtime() - t0) / 1e6);

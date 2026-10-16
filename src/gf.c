@@ -2183,6 +2183,94 @@ static _Atomic(jl_array_t*) jl_tw_julia_names;   // Symbols: names of Julia's st
 static _Atomic(jl_method_t*) jl_tw_trigger;      // the method being inserted (jl_method_table_activate)
 JL_DLLEXPORT _Atomic(size_t) jl_tw_skipped;      // invalidations the filter skipped (for measurements)
 
+// --- method-definition hooks (trait-bound PoC, julia-support.md piece 1) ---
+// `jl_method_def_hook`: a Julia callable `hook(m::Method, after::Bool)`, called with `after = false`
+// before a method enters the method table (it may throw to refuse the definition: the method then
+// never becomes visible and no world is allocated), and with `after = true` once it is visible.
+// `jl_image_methods_hook`: a Julia callable `hook(ms::Vector{Any}, pkg::String)`, called with the
+// new methods of a package image before they are activated; it returns a vector of methods to
+// leave inactive (or `nothing`). Both run in the latest world, outside the world-counter lock, and
+// not for definitions made by a hook itself. Set to `nothing` to remove. The callables are rooted
+// by the caller (as the filter's arrays are).
+static _Atomic(jl_value_t*) jl_method_def_hook;
+static _Atomic(jl_value_t*) jl_image_methods_hook;
+static _Thread_local int jl_in_method_hook = 0;  // a definition made by a hook itself is not hooked
+
+JL_DLLEXPORT void jl_set_method_definition_hook(jl_value_t *f)
+{
+    jl_atomic_store_release(&jl_method_def_hook, f == jl_nothing ? NULL : f);
+}
+JL_DLLEXPORT void jl_set_image_methods_hook(jl_value_t *f)
+{
+    jl_atomic_store_release(&jl_image_methods_hook, f == jl_nothing ? NULL : f);
+}
+
+// call `hook(args...)` in the latest world; rethrows after restoring the state
+static jl_value_t *jl_call_method_hook(jl_value_t **args, uint32_t nargs)
+{
+    jl_task_t *ct = jl_current_task;
+    size_t last_age = ct->world_age;
+    jl_value_t *res = NULL;
+    jl_in_method_hook = 1;
+    JL_TRY {
+        ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
+        res = jl_apply(args, nargs);
+        ct->world_age = last_age;
+        jl_in_method_hook = 0;
+    }
+    JL_CATCH {
+        ct->world_age = last_age;
+        jl_in_method_hook = 0;
+        jl_rethrow();
+    }
+    return res;
+}
+
+static void jl_run_method_def_hook(jl_method_t *m, int after)
+{
+    jl_value_t *hook = jl_atomic_load_acquire(&jl_method_def_hook);
+    if (hook == NULL || jl_in_method_hook || jl_generating_output() && !jl_options.incremental)
+        return;
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 3);
+    args[0] = hook;
+    args[1] = (jl_value_t*)m;
+    args[2] = after ? jl_true : jl_false;
+    jl_call_method_hook(args, 3);
+    JL_GC_POP();
+}
+
+// the image's new methods, before activation: returns an array of methods to leave inactive, or NULL
+jl_array_t *jl_run_image_methods_hook(jl_array_t *external, const char *pkgname)
+{
+    jl_value_t *hook = jl_atomic_load_acquire(&jl_image_methods_hook);
+    if (hook == NULL || jl_in_method_hook)
+        return NULL;
+    size_t l = jl_array_nrows(external);
+    if (l == 0)
+        return NULL;
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 3);
+    args[0] = hook;
+    jl_array_t *ms = jl_alloc_vec_any(l);
+    args[1] = (jl_value_t*)ms;
+    for (size_t i = 0; i < l; i++) {
+        jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_array_ptr_ref(external, i);
+        jl_array_ptr_set(ms, i, (jl_value_t*)entry->func.method);
+    }
+    args[2] = jl_cstr_to_string(pkgname ? pkgname : "");
+    jl_value_t *res = NULL;
+    JL_TRY {
+        res = jl_call_method_hook(args, 3);
+    }
+    JL_CATCH {
+        jl_printf((JL_STREAM*)STDERR_FILENO, "WARNING: the image methods hook failed for %s; activating all methods\n", pkgname);
+        res = NULL;
+    }
+    JL_GC_POP();
+    return (res != NULL && jl_is_array(res) && jl_array_nrows((jl_array_t*)res) > 0) ? (jl_array_t*)res : NULL;
+}
+
 JL_DLLEXPORT void jl_set_trait_world_filter(jl_array_t *mods, jl_array_t *julia_names)
 {
     jl_atomic_store_release(&jl_tw_julia_names, julia_names);
@@ -3349,6 +3437,7 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
 
 JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method, jl_tupletype_t *simpletype)
 {
+    jl_run_method_def_hook(method, 0);              // may throw: the method is refused before it enters the table
     jl_typemap_entry_t *newentry = jl_method_table_add(mt, method, simpletype);
     JL_GC_PUSH1(&newentry);
     JL_LOCK(&world_counter_lock);
@@ -3359,6 +3448,7 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
     jl_method_table_activate(newentry);
     jl_atomic_store_release(&jl_world_counter, world);
     JL_UNLOCK(&world_counter_lock);
+    jl_run_method_def_hook(method, 1);              // the method is visible now
     JL_GC_POP();
 }
 

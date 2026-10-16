@@ -4453,18 +4453,22 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
                     }
                 }
             }
+            // the image methods hook (trait-bound PoC): methods to leave inactive, decided before activation
+            jl_array_t *refused = jl_run_image_methods_hook(extext_methods, pkgname);
+            JL_GC_PUSH1(&refused);
             JL_LOCK(&world_counter_lock);
             // allocate a world for the new methods, and insert them there, invalidating content as needed
             size_t world = jl_atomic_load_relaxed(&jl_world_counter);
             if (new_methods)
                 world += 1;
-            jl_activate_methods(extext_methods, internal_methods, world, pkgname);
+            jl_activate_methods(extext_methods, internal_methods, world, pkgname, refused);
             // TODO: inject internal_methods into caches here, so the system can see them immediately as potential candidates (before validation)
             // allow users to start running in this updated world
             if (new_methods)
                 jl_atomic_store_release(&jl_world_counter, world);
             // now permit more methods to be added again
             JL_UNLOCK(&world_counter_lock);
+            JL_GC_POP();
 
             if (completeinfo) {
                 cachesizes_sv = jl_alloc_svec(7);

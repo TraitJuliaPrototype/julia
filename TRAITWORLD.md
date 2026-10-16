@@ -11,6 +11,13 @@ Trait-world code is recognized by the module markers `__trait_module__` and `__t
 
 The earlier branch `trait-universe` holds the same patches on 1.12 (commit 0bf9125), with which the measurements of sessions 20–21 were made.
 
+## Hooks (branch `trait-world-1.13-hooks`)
+
+1. **Method-definition hooks** (`src/gf.c`, `src/staticdata.c`, `src/staticdata_utils.c`):
+   - `jl_set_method_definition_hook(f)`: `f(m::Method, after::Bool)` is called before a method enters the method table (`after = false`; throwing refuses it, the method never becomes visible and no world is allocated) and once it is visible (`after = true`).
+   - `jl_set_image_methods_hook(f)`: `f(ms::Vector{Any}, pkg::String)` is called with a package image's new methods before `jl_activate_methods`; it returns the methods to leave inactive (they never become visible), or `nothing`. An exception is reported and ignored.
+   - Both run in the latest world, outside the world-counter lock, not for definitions a hook makes itself, and not while the system image is built. `nothing` removes a hook. The callables are rooted by the caller.
+
 ## Build
 
 Built in session 23 (2026-10-16) at `julia-1.13/`, a worktree of `julia/` on this branch: `julia-1.13/julia`. `tw-build.sh` runs `make -j4` niced under a memory watchdog (it kills the build below 4 GB available). The build downloads from cache.julialang.org, github.com, api.github.com, codeload.github.com, objects.githubusercontent.com, release-assets.githubusercontent.com, raw.githubusercontent.com and curl.haxx.se/curl.se.
