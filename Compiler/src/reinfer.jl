@@ -85,12 +85,12 @@ end
 # the filter (`_tw_valid_under_filter`): its native code calls the callee's
 # compiled code directly, and only trait-world values reach it, to which no
 # outside, owned method applies.
-const _tw_load_filter = Ref{Int8}(Int8(-1))   # no conversion during the Compiler bootstrap
+const _tw_load_filter = RefValue{Int8}(Int8(-1))   # RefValue: `Ref` has no constructors yet during the Compiler bootstrap
 _tw_filter_on() = (v = _tw_load_filter[]; v == Int8(-1) && (v = _tw_load_filter[] = get(ENV, "JULIA_TW_FILTER", "1") == "0" ? Int8(0) : Int8(1)); v == Int8(1))
-const _tw_modules = Ref{Vector{Any}}(Any[])       # registered modules (TraitWorld itself)
-const _tw_julia_names = Ref{Vector{Any}}(Any[])   # names of Julia's standard libraries
-const _tw_current = Ref(false)                    # the CodeInstance being verified is trait-world code
-const _tw_skipped = Ref(0)                        # edges kept by the filter (for measurements)
+const _tw_modules = RefValue{Vector{Any}}(Any[])       # registered modules (TraitWorld itself)
+const _tw_julia_names = RefValue{Vector{Any}}(Any[])   # names of Julia's standard libraries
+const _tw_current = RefValue{Bool}(false)                    # the CodeInstance being verified is trait-world code
+const _tw_skipped = RefValue{Int}(0)                        # edges kept by the filter (for measurements)
 
 function _tw_root(m::Module)
     while true
@@ -100,7 +100,7 @@ function _tw_root(m::Module)
     end
 end
 # measurements only (x13): JULIA_TW_PROTECT=<package names> treats those packages as trait-world code
-const _tw_protect = Ref{Union{Nothing,Vector{Symbol}}}(nothing)
+const _tw_protect = RefValue{Union{Nothing,Vector{Symbol}}}(nothing)
 function _tw_protected_name(r::Module)
     ns = _tw_protect[]
     ns === nothing && (ns = _tw_protect[] = Symbol[Symbol(x) for x in split(get(ENV, "JULIA_TW_PROTECT", ""), ',') if !isempty(x)])
