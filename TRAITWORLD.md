@@ -13,6 +13,10 @@ The earlier branch `trait-universe` holds the same patches on 1.12 (commit 0bf91
 
 ## Build
 
+Built in session 23 (2026-10-16) at `julia-1.13/`, a worktree of `julia/` on this branch: `julia-1.13/julia`. `tw-build.sh` runs `make -j4` niced under a memory watchdog (it kills the build below 4 GB available). The build downloads from cache.julialang.org, github.com, api.github.com, codeload.github.com, objects.githubusercontent.com, release-assets.githubusercontent.com, raw.githubusercontent.com and curl.haxx.se/curl.se.
+
+The load half had to change for the build (it had been tested only by injection): image validation runs in the compiler's world, fixed early in the bootstrap, before Base's `ENV`, `split` and `pathof` exist. Its globals are `RefValue`s, the environment is read with `getenv`, and the standard libraries are a literal list. TraitWorld registers trait modules with the insertion half when they start and protects its own machinery (its registries hold no edges).
+
 A cold build of this checkout needs the network for its dependencies (`make` downloads LLVM and other binaries) and takes 40–60 minutes; run it alone on the machine.
 
     make -j4                       # cold build
