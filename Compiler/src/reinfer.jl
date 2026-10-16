@@ -164,10 +164,34 @@ function _tw_owned_by(@nospecialize(t), r::Module, depth::Int)
     t.name === Type.body.name && length(t.parameters) == 1 && return _tw_owned_by(t.parameters[1], r, depth + 1)
     return _tw_root(t.name.module) === r
 end
-"A method that can never apply to trait-world code: defined outside it and Julia, for its definer's own type or function."
+"Whether package `r` owns a type anywhere in `t` (a signature: arguments, parameters, a trait object's views and keys)."
+function _tw_mentions_owned(@nospecialize(t), r::Module, depth::Int)
+    depth > 8 && return false
+    if t isa Union
+        return _tw_mentions_owned(t.a, r, depth + 1) || _tw_mentions_owned(t.b, r, depth + 1)
+    elseif t isa UnionAll
+        return _tw_mentions_owned(t.var.lb, r, depth + 1) || _tw_mentions_owned(t.var.ub, r, depth + 1) ||
+               _tw_mentions_owned(t.body, r, depth + 1)
+    elseif t isa TypeVar
+        return _tw_mentions_owned(t.lb, r, depth + 1) || _tw_mentions_owned(t.ub, r, depth + 1)
+    elseif t isa Core.TypeofVararg
+        return isdefined(t, :T) && _tw_mentions_owned(t.T, r, depth + 1)
+    elseif t isa DataType
+        _tw_root(t.name.module) === r && return true
+        for p in t.parameters
+            _tw_mentions_owned(p, r, depth + 1) && return true
+        end
+    end
+    return false
+end
+"The signature of the trait-world CodeInstance being verified (rule 4: the owners of its types are in its view)."
+const _tw_current_sig = RefValue{Any}(nothing)
+"A method that can never apply to trait-world code: defined outside it and Julia, for its definer's own type or function, and owning no type the code being verified was compiled for."
 function _tw_outside_owned(m::Method)
     r = _tw_root(m.module)
     (_tw_in_trait_world(m.module) || _tw_is_julia(r)) && return false
+    sig0 = _tw_current_sig[]
+    sig0 === nothing || (_tw_mentions_owned(sig0, r, 0) && return false)
     sig = Base.unwrap_unionall(m.sig)
     sig isa DataType || return false
     for p in sig.parameters
@@ -196,7 +220,9 @@ function _tw_valid_under_filter(ci::CodeInstance, seen::Base.IdSet{CodeInstance}
     world = ci.min_world
     matches = []
     saved = _tw_current[]
+    savedsig = _tw_current_sig[]
     _tw_current[] = true
+    _tw_current_sig[] = get_ci_mi(ci).specTypes
     try
         j = 1
         while j ≤ length(callees)
@@ -230,6 +256,7 @@ function _tw_valid_under_filter(ci::CodeInstance, seen::Base.IdSet{CodeInstance}
         end
     finally
         _tw_current[] = saved
+        _tw_current_sig[] = savedsig
     end
     for edge in callees
         edge isa CodeInstance || continue
@@ -390,6 +417,7 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
             end
 
             _tw_current[] = _tw_protected(initial.codeinst)   # trait-world load filter
+            _tw_current_sig[] = get_ci_mi(initial.codeinst).specTypes
             # Process all non-CodeInstance edges
             if !isempty(initial.callees) && maxworld != get_require_world()
                 matches = []

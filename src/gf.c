@@ -2254,6 +2254,41 @@ static int tw_method_owned(jl_method_t *m) JL_NOTSAFEPOINT
     return 0;
 }
 
+// Whether the package `root` owns a type anywhere in `t`, the signature a CodeInstance was compiled
+// for: its arguments, their parameters, a trait object's views and keys. Under keys a worker is
+// compiled for the user's implementing type, so that type's owner is in the worker's view (rule 4),
+// and its definitions must invalidate as in plain Julia.
+static int tw_mentions_owned(jl_value_t *t, jl_module_t *root, int depth) JL_NOTSAFEPOINT
+{
+    if (depth > 8 || t == NULL)
+        return 0;
+    if (jl_is_uniontype(t))
+        return tw_mentions_owned(((jl_uniontype_t*)t)->a, root, depth + 1) ||
+               tw_mentions_owned(((jl_uniontype_t*)t)->b, root, depth + 1);
+    if (jl_is_unionall(t)) {
+        jl_tvar_t *v = ((jl_unionall_t*)t)->var;
+        return tw_mentions_owned(v->lb, root, depth + 1) || tw_mentions_owned(v->ub, root, depth + 1) ||
+               tw_mentions_owned(((jl_unionall_t*)t)->body, root, depth + 1);
+    }
+    if (jl_is_typevar(t))
+        return tw_mentions_owned(((jl_tvar_t*)t)->lb, root, depth + 1) ||
+               tw_mentions_owned(((jl_tvar_t*)t)->ub, root, depth + 1);
+    if (jl_is_vararg(t)) {
+        jl_vararg_t *va = (jl_vararg_t*)t;
+        return va->T != NULL && tw_mentions_owned(va->T, root, depth + 1);
+    }
+    if (!jl_is_datatype(t))
+        return 0;
+    jl_datatype_t *dt = (jl_datatype_t*)t;
+    if (tw_root(dt->name->module) == root)
+        return 1;
+    size_t np = jl_nparams(dt);
+    for (size_t i = 0; i < np; i++)
+        if (tw_mentions_owned(jl_tparam(dt, i), root, depth + 1))
+            return 1;
+    return 0;
+}
+
 static int tw_protected(jl_code_instance_t *ci) JL_NOTSAFEPOINT
 {
     jl_method_t *trig = jl_atomic_load_relaxed(&jl_tw_trigger);
@@ -2265,6 +2300,8 @@ static int tw_protected(jl_code_instance_t *ci) JL_NOTSAFEPOINT
         return 0;                                   // not trait-world code: plain Julia
     if (tw_in_chain(mods, trig->module) || tw_is_julia(tw_root(trig->module)))
         return 0;                                   // a trait-world or Julia definition: in the view
+    if (tw_mentions_owned(mi->specTypes, tw_root(trig->module), 0))
+        return 0;                                   // the definer owns a type the code was compiled for: in its view
     return tw_method_owned(trig);
 }
 
