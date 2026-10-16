@@ -18,6 +18,12 @@ The earlier branch `trait-universe` holds the same patches on 1.12 (commit 0bf91
    - `jl_set_image_methods_hook(f)`: `f(ms::Vector{Any}, pkg::String)` is called with a package image's new methods before `jl_activate_methods`; it returns the methods to leave inactive (they never become visible), or `nothing`. An exception is reported and ignored.
    - Both run in the latest world, outside the world-counter lock, not for definitions a hook makes itself, and not while the system image is built. `nothing` removes a hook. The callables are rooted by the caller.
 
+2. **Invalidation policy hook** (`src/gf.c`, `src/staticdata*.c`, `Compiler/src/reinfer.jl`):
+   - `jl_set_invalidation_policy(f)`: `f(m::Method)::Union{Module,Nothing}` is called per new method, before the world-counter lock (and for an image's methods before activation): the package whose definition it is when it cannot change protected code that does not mention that package's types, `nothing` when it invalidates as usual. Inside the lock the test per CodeInstance is structural: its module is registered (`jl_set_trait_world_filter`) and its signature mentions no type of that package. The load half calls the same callable through `Core.invokelatest` (`ReinferUtils._tw_policy`), because validation runs in the compiler's early world.
+   - The hard-coded policy (trigger owners, Julia's library names) is gone: TraitWorld's `_invalidation_policy` decides (rule 4).
+   - **A fix to the filter itself:** a skipped CodeInstance keeps its backedge. Before, the backedge was removed although the code was kept, so a later pirate could not find and invalidate it (stale code).
+   - The callee rule at insertion needs nothing new: a protected caller is never invalidated through a callee's invalidation, and keeps calling the callee's compiled code.
+
 ## Build
 
 Built in session 23 (2026-10-16) at `julia-1.13/`, a worktree of `julia/` on this branch: `julia-1.13/julia`. `tw-build.sh` runs `make -j4` niced under a memory watchdog (it kills the build below 4 GB available). The build downloads from cache.julialang.org, github.com, api.github.com, codeload.github.com, objects.githubusercontent.com, release-assets.githubusercontent.com, raw.githubusercontent.com and curl.haxx.se/curl.se.

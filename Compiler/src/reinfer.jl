@@ -186,19 +186,28 @@ function _tw_mentions_owned(@nospecialize(t), r::Module, depth::Int)
 end
 "The signature of the trait-world CodeInstance being verified (rule 4: the owners of its types are in its view)."
 const _tw_current_sig = RefValue{Any}(nothing)
-"A method that can never apply to trait-world code: defined outside it and Julia, for its definer's own type or function, and owning no type the code being verified was compiled for."
-function _tw_outside_owned(m::Method)
-    r = _tw_root(m.module)
-    (_tw_in_trait_world(m.module) || _tw_is_julia(r)) && return false
-    sig0 = _tw_current_sig[]
-    sig0 === nothing || (_tw_mentions_owned(sig0, r, 0) && return false)
-    sig = Base.unwrap_unionall(m.sig)
-    sig isa DataType || return false
-    for p in sig.parameters
-        p isa Core.TypeofVararg && continue
-        _tw_owned_by(p, r, 0) && return true
+"""
+The invalidation policy (julia-support.md piece 2), registered by TraitWorld: a callable
+`policy(m::Method)::Union{Module,Nothing}`, the package whose definition `m` is when it cannot
+change protected code that does not mention that package's types, `nothing` when it invalidates as
+usual. Validation runs in the compiler's world, fixed early in the bootstrap, so the policy (defined
+later) is called with `Core.invokelatest`. The same callable is registered for method insertion
+(`jl_set_invalidation_policy`).
+"""
+const _tw_policy = RefValue{Any}(nothing)
+"Whether newcomer `m` cannot change the protected code being verified: the policy names its package, and the code's signature mentions none of its types."
+function _tw_policy_skip(m::Method)
+    p = _tw_policy[]
+    p === nothing && return false
+    r = try
+        Core.invokelatest(p, m)
+    catch
+        nothing                                       # in doubt: fail the edge as usual
     end
-    return false
+    r isa Module || return false
+    sig0 = _tw_current_sig[]
+    sig0 === nothing && return true
+    return !_tw_mentions_owned(sig0, r, 0)
 end
 function _tw_protected(codeinst::CodeInstance)
     _tw_filter_on() || return false
@@ -798,7 +807,7 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
                 for j = 1:n
                     get_method_from_edge(expecteds[i+j-1]) === mk && (isexp = true; break)
                 end
-                (!isexp && _tw_outside_owned(mk)) && (nskip += 1)
+                (!isexp && _tw_policy_skip(mk)) && (nskip += 1)
             end
         end
         if length(result) - nskip ≠ n
@@ -815,7 +824,7 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
                     break
                 end
             end
-            if !found && tw && _tw_outside_owned(match.method)
+            if !found && tw && _tw_policy_skip(match.method)
                 _tw_skipped[] += 1                     # trait-world load filter: a newcomer that cannot apply to trait-world code
                 found = true
             end
