@@ -148,6 +148,18 @@ JL_DLLEXPORT void jl_finalize_precompile_inferred(int8_t cleanup_keep_ir)
 
 static jl_array_t *queue_external_cis(jl_array_t *list, jl_query_cache *query_cache);
 
+// trait-bound PoC (julia-support.md piece 5): native code a package's workload made for upstream code.
+// A CodeInstance inferred while the package is precompiled, for a method instance of an upstream
+// method that no call in the package reaches statically (a dynamic call, `invokelatest`, a call from
+// upstream code the workload ran), has no backedge to the worklist and is dropped, with the machine
+// code made for it. With `jl_set_image_keep_compiled(1)` it is kept if it was compiled in this
+// session: the image then holds that code, and a new session does not compile it again.
+static int jl_image_keep_compiled = 0;
+JL_DLLEXPORT void jl_set_image_keep_compiled(int on)
+{
+    jl_image_keep_compiled = on;
+}
+
 JL_DLLEXPORT jl_array_t* jl_compute_new_ext_cis(void)
 {
     if (newly_inferred == NULL)
@@ -545,6 +557,9 @@ static jl_array_t *queue_external_cis(jl_array_t *list, jl_query_cache *query_ca
             assert(stack.len == 0);
             if (found == 1) {
                 jl_array_ptr_1d_push(new_ext_cis, (jl_value_t*)ci);
+            }
+            else if (found == 0 && jl_image_keep_compiled && jl_atomic_load_relaxed(&ci->invoke) != NULL) {
+                jl_array_ptr_1d_push(new_ext_cis, (jl_value_t*)ci);   // compiled by the workload (piece 5)
             }
         }
     }

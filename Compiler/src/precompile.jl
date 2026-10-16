@@ -370,6 +370,7 @@ function compile_and_emit_native(worlds::Vector{UInt},
 
     # Step 3: Collect set of method instances that seem worth compiling
     specialization_worklist = []
+    foreign_internal = Any[]          # other owners' CodeInstances of the package's own methods (serialized with them)
     if trim_mode == 0x00
         if newmodules === nothing
             infer_all_method_defs!(all, newmethods, latestworld, specialization_worklist)
@@ -390,6 +391,9 @@ function compile_and_emit_native(worlds::Vector{UInt},
             end
         end
         enqueue_specializations!(all, newmethods, specialization_worklist)
+        # CodeInstances of other owners (an AbstractInterpreter's own cache) in the package's own
+        # methods: collected here, compiled below from their cached IR (trait-bound PoC, piece 5)
+        collect_foreign_cis!(foreign_internal, newmethods)
 
         # Process the specialization worklist and prepare final tocompile worklist
         tocompile = []
@@ -430,9 +434,52 @@ function compile_and_emit_native(worlds::Vector{UInt},
         # been printed, so give up here and exit (w/o a stack trace).
         invokelatest(invokelatest(getglobal, Base, :exit), 1)
     end
+    if trim_mode == 0x00
+        add_foreign_codeinfos!(codeinfos, ext_foreign_cis)
+        add_foreign_codeinfos!(codeinfos, foreign_internal)
+    end
 
     return codeinfos
 
+end
+
+# Machine code for CodeInstances of other owners (trait-bound PoC, piece 5). Julia saved only their
+# inferred code: an AbstractInterpreter's own cache (`cache_owner`) was compiled again in every
+# session. Their cached IR is the optimized IR its interpreter compiled them from, so codegen takes
+# it as it is; calls between them are `:invoke`s of their CodeInstances.
+function collect_foreign_cis!(out::Vector{Any}, newmethods)
+    for method in newmethods
+        specs = (method::Method).specializations
+        mis = isa(specs, Core.SimpleVector) ? specs : Core.svec(specs)
+        for mi in mis
+            mi isa MethodInstance || continue
+            ci = isdefined(mi, :cache) ? mi.cache : nothing
+            while ci !== nothing
+                ci.owner !== nothing && ci.max_world == typemax(UInt) && push!(out, ci)
+                ci = isdefined(ci, :next) ? ci.next : nothing
+            end
+        end
+    end
+    return out
+end
+function add_foreign_codeinfos!(codeinfos::Vector{Any}, cis::Vector{Any})
+    seen = Base.IdSet{CodeInstance}()
+    for ci in cis
+        ci = ci::CodeInstance
+        ci in seen && continue
+        push!(seen, ci)
+        use_const_api(ci) && continue
+        inferred = ci.inferred
+        mi = get_ci_mi(ci)
+        def = mi.def
+        def isa Method || continue
+        src = inferred isa CodeInfo ? inferred :
+              inferred isa String ? ccall(:jl_uncompress_ir, Any, (Any, Any, Any), def, ci, inferred) : nothing
+        src isa CodeInfo || continue
+        push!(codeinfos, ci)
+        push!(codeinfos, src)
+    end
+    return codeinfos
 end
 
 # Helper function to process method instances for compilation

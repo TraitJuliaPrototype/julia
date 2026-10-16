@@ -38,6 +38,11 @@ The earlier branch `trait-universe` holds the same patches on 1.12 (commit 0bf91
    - Measured with TraitDifferentialEquations and CSV, DataFrames and CairoMakie loaded after it (session note 23, row 7): no ODECore, ordinary-layer or machinery code invalidated, first solve 96 ms (0.7–1.05 s before). Loaded before it: first solve still 0.7 s, from Base callees of TraitWorld's own image that fail at validation (the default policy above does not yet take the intersection of a `Union`'s required packages).
    - The image hook's checks cost 0.38 s over the 63,000 methods of those loads (4.8 s before owners were memoized per image).
 
+5. **Native code for upstream and foreign CodeInstances in package images** (`src/staticdata_utils.c`, `Compiler/src/precompile.jl`):
+   - `jl_set_image_keep_compiled(1)` (TraitWorld calls it when a package using it is precompiled): a CodeInstance inferred during the precompilation for an upstream method, which no call of the package reaches statically (a dynamic call, `invokelatest`, an entry's worker at upstream types), is kept in the image if it was compiled, with its machine code. Before, it was dropped.
+   - CodeInstances of another owner (an `AbstractInterpreter`'s own cache, `cache_owner`) get machine code in the image, compiled from their cached IR (the interpreter must keep it: `may_discard_trees(interp) = false`). Before, only their inferred code was saved, and a session compiled them again.
+   - Measured (`$TMPDIR/p5`, a package whose workload calls an upstream function dynamically and through the upstream package's own interpreter): the upstream function's first call 0.33 ms instead of 21.5 ms; the interpreter's code 0.39 ms instead of 11.1 s (the compiler's specializations for the interpreter are kept too).
+
 ## Build
 
 Built in session 23 (2026-10-16) at `julia-1.13/`, a worktree of `julia/` on this branch: `julia-1.13/julia`. `tw-build.sh` runs `make -j4` niced under a memory watchdog (it kills the build below 4 GB available). The build downloads from cache.julialang.org, github.com, api.github.com, codeload.github.com, objects.githubusercontent.com, release-assets.githubusercontent.com, raw.githubusercontent.com and curl.haxx.se/curl.se.
