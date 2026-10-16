@@ -86,9 +86,20 @@ end
 # compiled code directly, and only trait-world values reach it, to which no
 # outside, owned method applies.
 const _tw_load_filter = RefValue{Int8}(Int8(-1))   # RefValue: `Ref` has no constructors yet during the Compiler bootstrap
-_tw_filter_on() = (v = _tw_load_filter[]; v == Int8(-1) && (v = _tw_load_filter[] = get(ENV, "JULIA_TW_FILTER", "1") == "0" ? Int8(0) : Int8(1)); v == Int8(1))
+# Validation runs in the compiler's world, which is fixed early in the bootstrap, before Base's
+# ENV, split, pathof and friends exist: these helpers use only what the bootstrap has (ccall,
+# pointers, symbols), and the names of Julia's standard libraries are a literal list.
+function _tw_filter_on()
+    v = _tw_load_filter[]
+    if v == Int8(-1)
+        p = ccall(:getenv, Ptr{UInt8}, (Ptr{UInt8},), "JULIA_TW_FILTER")
+        v = (p != C_NULL && unsafe_load(p) == 0x30 && unsafe_load(p + 1) == 0x00) ? Int8(0) : Int8(1)
+        _tw_load_filter[] = v
+    end
+    return v == Int8(1)
+end
 const _tw_modules = RefValue{Vector{Any}}(Any[])       # registered modules (TraitWorld itself)
-const _tw_julia_names = RefValue{Vector{Any}}(Any[])   # names of Julia's standard libraries
+const _tw_julia_names = RefValue{Vector{Any}}(Any[:ArgTools,:Artifacts,:Base64,:CompilerSupportLibraries_jll,:CRC32c,:Dates,:DelimitedFiles,:Distributed,:Downloads,:dSFMT_jll,:FileWatching,:Future,:GMP_jll,:InteractiveUtils,:JuliaSyntaxHighlighting,:LazyArtifacts,:libblastrampoline_jll,:LibCURL,:LibCURL_jll,:Libdl,:LibGit2,:LibGit2_jll,:libLLVM_jll,:LibSSH2_jll,:LibUnwind_jll,:LibUV_jll,:LinearAlgebra,:LLD_jll,:LLVMLibUnwind_jll,:Logging,:Markdown,:Mmap,:MozillaCACerts_jll,:MPFR_jll,:NetworkOptions,:nghttp2_jll,:OpenBLAS_jll,:OpenLibm_jll,:OpenSSL_jll,:p7zip_jll,:PCRE2_jll,:Pkg,:Printf,:Profile,:Random,:REPL,:Serialization,:SHA,:SharedArrays,:Sockets,:SparseArrays,:Statistics,:StyledStrings,:SuiteSparse,:SuiteSparse_jll,:Tar,:Test,:TOML,:Unicode,:UUIDs,:Zlib_jll,:Zstd_jll])   # names of Julia's standard libraries (TraitWorld may extend it)
 const _tw_current = RefValue{Bool}(false)                    # the CodeInstance being verified is trait-world code
 const _tw_skipped = RefValue{Int}(0)                        # edges kept by the filter (for measurements)
 
@@ -100,16 +111,30 @@ function _tw_root(m::Module)
     end
 end
 # measurements only (x13): JULIA_TW_PROTECT=<package names> treats those packages as trait-world code
-const _tw_protect = RefValue{Union{Nothing,Vector{Symbol}}}(nothing)
 function _tw_protected_name(r::Module)
-    ns = _tw_protect[]
-    ns === nothing && (ns = _tw_protect[] = Symbol[Symbol(x) for x in split(get(ENV, "JULIA_TW_PROTECT", ""), ',') if !isempty(x)])
-    isempty(ns) && return false
-    n = nameof(r)
-    for x in ns
-        x === n && return true
+    p = ccall(:getenv, Ptr{UInt8}, (Ptr{UInt8},), "JULIA_TW_PROTECT")
+    p == C_NULL && return false
+    n = ccall(:jl_symbol_name, Ptr{UInt8}, (Any,), nameof(r))
+    i = 0
+    while true                                    # each comma-separated name
+        j = 0
+        while true
+            a = unsafe_load(p + i + j)
+            b = unsafe_load(n + j)
+            if a == 0x2c || a == 0x00
+                b == 0x00 && return true
+                break
+            end
+            a == b || break
+            j += 1
+        end
+        while true                                # on to the next name
+            a = unsafe_load(p + i)
+            i += 1
+            a == 0x00 && return false
+            a == 0x2c && break
+        end
     end
-    return false
 end
 function _tw_in_trait_world(m::Module)
     _tw_protected_name(_tw_root(m)) && return true
@@ -129,8 +154,7 @@ function _tw_is_julia(r::Module)
     for x in _tw_julia_names[]
         x === n && return true
     end
-    p = Base.pathof(r)                            # a standard library: under Sys.STDLIB
-    return p isa String && startswith(p, Base.Sys.STDLIB)
+    return false
 end
 function _tw_owned_by(@nospecialize(t), r::Module, depth::Int)
     depth > 2 && return false
