@@ -416,6 +416,47 @@ JL_DLLEXPORT jl_value_t *jl_bitcast(jl_value_t *ty, jl_value_t *v)
 }
 
 // run time version of pointerref intrinsic (warning: i is not rooted)
+// getfield_at_offset(obj, T, off): the value of type T stored at byte offset `off` of the object
+// `obj` (an isbits value inline, or a reference). setfield_at_offset(obj, T, off, x) stores it,
+// with the write barrier for a reference. For the trait-bound PoC's views: a field read through a
+// user's object at an offset known only at run time, with Julia's alias metadata in codegen.
+static int jl_offset_isbits(jl_value_t *ty) JL_NOTSAFEPOINT
+{
+    return jl_is_datatype(ty) && jl_datatype_isinlinealloc((jl_datatype_t*)ty, 0) &&
+           ((jl_datatype_t*)ty)->layout->npointers == 0;
+}
+JL_DLLEXPORT jl_value_t *jl_getfield_at_offset(jl_value_t *obj, jl_value_t *ty, jl_value_t *off)
+{
+    JL_TYPECHK(getfield_at_offset, type, ty);
+    JL_TYPECHK(getfield_at_offset, long, off);
+    char *p = (char*)obj + jl_unbox_long(off);
+    if (jl_offset_isbits(ty))
+        return jl_new_bits(ty, p);
+    if (jl_is_datatype(ty) && jl_datatype_isinlinealloc((jl_datatype_t*)ty, 0))
+        jl_error("getfield_at_offset: an inline field with references is not supported");
+    jl_value_t *v = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)p);
+    if (v == NULL)
+        jl_throw(jl_undefref_exception);
+    return v;
+}
+JL_DLLEXPORT jl_value_t *jl_setfield_at_offset(jl_value_t *obj, jl_value_t *ty, jl_value_t *off, jl_value_t *x)
+{
+    JL_TYPECHK(setfield_at_offset, type, ty);
+    JL_TYPECHK(setfield_at_offset, long, off);
+    if (!jl_isa(x, ty))
+        jl_type_error("setfield_at_offset", ty, x);
+    char *p = (char*)obj + jl_unbox_long(off);
+    if (jl_offset_isbits(ty)) {
+        memcpy(p, x, jl_datatype_size(ty));
+        return jl_nothing;
+    }
+    if (jl_is_datatype(ty) && jl_datatype_isinlinealloc((jl_datatype_t*)ty, 0))
+        jl_error("setfield_at_offset: an inline field with references is not supported");
+    jl_atomic_store_release((_Atomic(jl_value_t*)*)p, x);
+    jl_gc_wb(obj, x);
+    return jl_nothing;
+}
+
 JL_DLLEXPORT jl_value_t *jl_pointerref(jl_value_t *p, jl_value_t *i, jl_value_t *align)
 {
     JL_TYPECHK(pointerref, pointer, p);

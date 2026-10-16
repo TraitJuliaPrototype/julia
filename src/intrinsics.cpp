@@ -872,6 +872,68 @@ static jl_cgval_t emit_pointerref(jl_codectx_t &ctx, ArrayRef<jl_cgval_t> argv)
     }
 }
 
+// getfield_at_offset(obj, T, off): a load at a byte offset of a boxed object, with the alias
+// metadata of a mutable field (tbaa_mutab), so that loops reading it while storing into an array
+// still vectorize; a reference is loaded as a tracked pointer and checked for null.
+static jl_cgval_t emit_getfield_at_offset(jl_codectx_t &ctx, ArrayRef<jl_cgval_t> argv)
+{
+    const jl_cgval_t &obj = argv[0];
+    const jl_cgval_t &ty = argv[1];
+    const jl_cgval_t &off = argv[2];
+    if (ty.constant == NULL || !jl_is_type(ty.constant) || off.typ != (jl_value_t*)jl_long_type ||
+        jl_is_concrete_immutable(obj.typ) || !obj.ispointer())
+        return emit_runtime_call(ctx, getfield_at_offset, argv, 3);
+    jl_value_t *ety = ty.constant;
+    bool isbits = jl_is_datatype(ety) && jl_datatype_isinlinealloc((jl_datatype_t*)ety, 0) &&
+                  ((jl_datatype_t*)ety)->layout->npointers == 0;
+    if (!isbits && jl_is_datatype(ety) && jl_datatype_isinlinealloc((jl_datatype_t*)ety, 0))
+        return emit_runtime_call(ctx, getfield_at_offset, argv, 3);
+    const jl_cgval_t &sobj = obj;                  // a boxed (mutable or abstractly typed) object
+    Value *base = data_pointer(ctx, sobj);
+    Value *offv = emit_unbox(ctx, ctx.types().T_size, off, (jl_value_t*)jl_long_type);
+    Value *addr = emit_ptrgep(ctx, base, offv);
+    if (isbits)
+        return typed_load(ctx, addr, nullptr, ety, ctx.tbaa().tbaa_mutab, nullptr, false,
+                          AtomicOrdering::NotAtomic, false, julia_alignment(ety));
+    LoadInst *load = ctx.builder.CreateAlignedLoad(ctx.types().T_prjlvalue, addr, Align(sizeof(void*)));
+    load->setOrdering(AtomicOrdering::Unordered);
+    jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_mutab);
+    Value *fldv = ai.decorateInst(load);
+    null_pointer_check(ctx, fldv, nullptr);
+    return mark_julia_type(ctx, fldv, true, ety);
+}
+
+// setfield_at_offset(obj, T, off, x): the store, with the write barrier for a reference
+static jl_cgval_t emit_setfield_at_offset(jl_codectx_t &ctx, ArrayRef<jl_cgval_t> argv)
+{
+    const jl_cgval_t &obj = argv[0];
+    const jl_cgval_t &ty = argv[1];
+    const jl_cgval_t &off = argv[2];
+    jl_cgval_t x = argv[3];
+    if (ty.constant == NULL || !jl_is_type(ty.constant) || off.typ != (jl_value_t*)jl_long_type ||
+        jl_is_concrete_immutable(obj.typ) || !obj.ispointer())
+        return emit_runtime_call(ctx, setfield_at_offset, argv, 4);
+    jl_value_t *ety = ty.constant;
+    bool isbits = jl_is_datatype(ety) && jl_datatype_isinlinealloc((jl_datatype_t*)ety, 0) &&
+                  ((jl_datatype_t*)ety)->layout->npointers == 0;
+    if (!isbits && jl_is_datatype(ety) && jl_datatype_isinlinealloc((jl_datatype_t*)ety, 0))
+        return emit_runtime_call(ctx, setfield_at_offset, argv, 4);
+    emit_typecheck(ctx, x, ety, "setfield_at_offset");
+    x = update_julia_type(ctx, x, ety);
+    if (x.typ == jl_bottom_type)
+        return jl_cgval_t();
+    const jl_cgval_t &sobj = obj;                  // a boxed (mutable or abstractly typed) object
+    Value *base = data_pointer(ctx, sobj);
+    Value *offv = emit_unbox(ctx, ctx.types().T_size, off, (jl_value_t*)jl_long_type);
+    Value *addr = emit_ptrgep(ctx, base, offv);
+    typed_store(ctx, addr, x, jl_cgval_t(), ety, ctx.tbaa().tbaa_mutab, nullptr,
+                isbits ? nullptr : boxed(ctx, sobj),
+                !isbits, AtomicOrdering::NotAtomic, AtomicOrdering::NotAtomic,
+                isbits ? julia_alignment(ety) : sizeof(void*),
+                nullptr, true, false, false, false, false, false, nullptr, "setfield_at_offset", nullptr, nullptr);
+    return ghostValue(ctx, jl_nothing_type);
+}
+
 static jl_cgval_t emit_runtime_pointerset(jl_codectx_t &ctx, ArrayRef<jl_cgval_t> argv)
 {
     return emit_runtime_call(ctx, pointerset, argv, 4);
@@ -1395,6 +1457,12 @@ static jl_cgval_t emit_intrinsic(jl_codectx_t &ctx, intrinsic f, jl_value_t **ar
         ++Emitted_pointerset;
         assert(nargs == 4);
         return emit_pointerset(ctx, argv);
+    case getfield_at_offset:
+        assert(nargs == 3);
+        return emit_getfield_at_offset(ctx, argv);
+    case setfield_at_offset:
+        assert(nargs == 4);
+        return emit_setfield_at_offset(ctx, argv);
 
     case add_ptr:
     case sub_ptr:

@@ -24,6 +24,12 @@ The earlier branch `trait-universe` holds the same patches on 1.12 (commit 0bf91
    - **A fix to the filter itself:** a skipped CodeInstance keeps its backedge. Before, the backedge was removed although the code was kept, so a later pirate could not find and invalidate it (stale code).
    - The callee rule at insertion needs nothing new: a protected caller is never invalidated through a callee's invalidation, and keeps calling the callee's compiled code.
 
+3. **Field-offset intrinsics** (`src/intrinsics.h`, `src/intrinsics.cpp`, `src/runtime_intrinsics.c`, `Compiler/src/tfuncs.jl`):
+   - `Core.Intrinsics.getfield_at_offset(obj, T, off)` loads the value of type `T` at byte offset `off` of a boxed (mutable or abstractly typed) object, with the alias metadata of a mutable field (`jtbaa_mutab`) and, for a reference, a null check.
+   - `setfield_at_offset(obj, T, off, x)` stores it, with the write barrier for a reference.
+   - Inline fields holding references, and non-constant `T`, go to the runtime functions `jl_getfield_at_offset` and `jl_setfield_at_offset`.
+   - TraitWorld uses them instead of `llvmcall` with hand-written TBAA. A loop that reads a field through the object while storing into another array vectorizes: 0.121 ns per element against 0.120 plain.
+
 ## Build
 
 Built in session 23 (2026-10-16) at `julia-1.13/`, a worktree of `julia/` on this branch: `julia-1.13/julia`. `tw-build.sh` runs `make -j4` niced under a memory watchdog (it kills the build below 4 GB available). The build downloads from cache.julialang.org, github.com, api.github.com, codeload.github.com, objects.githubusercontent.com, release-assets.githubusercontent.com, raw.githubusercontent.com and curl.haxx.se/curl.se.

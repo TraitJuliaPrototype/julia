@@ -756,6 +756,15 @@ end
 add_tfunc(add_ptr, 2, 2, pointerarith_tfunc, 1)
 add_tfunc(sub_ptr, 2, 2, pointerarith_tfunc, 1)
 add_tfunc(pointerref, 3, 3, pointerref_tfunc, 4)
+@nospecs function getfield_at_offset_tfunc(𝕃::AbstractLattice, obj, ty, off)
+    T, exact = instanceof_tfunc(ty)
+    return exact ? T : Any
+end
+@nospecs function setfield_at_offset_tfunc(𝕃::AbstractLattice, obj, ty, off, x)
+    return Nothing
+end
+add_tfunc(Intrinsics.getfield_at_offset, 3, 3, getfield_at_offset_tfunc, 2)
+add_tfunc(Intrinsics.setfield_at_offset, 4, 4, setfield_at_offset_tfunc, 4)
 add_tfunc(pointerset, 4, 4, pointerset_tfunc, 5)
 add_tfunc(atomic_fence, 1, 1, atomic_fence_tfunc, 4)
 add_tfunc(atomic_pointerref, 2, 2, atomic_pointerref_tfunc, 4)
@@ -3064,6 +3073,7 @@ end
 
 function _is_effect_free_infer(f::IntrinsicFunction)
      return !(f === Intrinsics.pointerset ||
+              f === Intrinsics.setfield_at_offset ||
               f === Intrinsics.atomic_pointerref ||
               f === Intrinsics.atomic_pointerset ||
               f === Intrinsics.atomic_pointerswap ||
@@ -3081,6 +3091,7 @@ function is_pure_intrinsic_infer(f::IntrinsicFunction, is_effect_free::Union{Not
             f === Intrinsics.llvmcall ||              # can do arbitrary things
             f === Intrinsics.atomic_pointermodify ||  # can do arbitrary things
             f === Intrinsics.pointerref ||            # this one is volatile
+            f === Intrinsics.getfield_at_offset ||    # reads mutable memory
             f === Intrinsics.sqrt_llvm_fast ||        # this one may differ at runtime (by a few ulps)
             f === Intrinsics.have_fma ||              # this one depends on the runtime environment
             f === Intrinsics.cglobal)                 # cglobal lookup answer changes at runtime
@@ -3103,7 +3114,7 @@ function intrinsic_effects(f::IntrinsicFunction, argtypes::Vector{Any})
         consistent = ALWAYS_FALSE
     end
     nothrow = intrinsic_nothrow(f, argtypes)
-    inaccessiblememonly = is_effect_free && !(f === Intrinsics.pointerref) ? ALWAYS_TRUE : ALWAYS_FALSE
+    inaccessiblememonly = is_effect_free && !(f === Intrinsics.pointerref || f === Intrinsics.getfield_at_offset) ? ALWAYS_TRUE : ALWAYS_FALSE
     return Effects(EFFECTS_TOTAL; consistent, effect_free, nothrow, inaccessiblememonly)
 end
 

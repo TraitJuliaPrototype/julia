@@ -94,6 +94,9 @@
     /*  pointer access */ \
     ADD_I(pointerref, 3) \
     ADD_I(pointerset, 4) \
+    /*  field access at a byte offset in a mutable object (trait-bound PoC) */ \
+    ADD_I(getfield_at_offset, 3) \
+    ADD_I(setfield_at_offset, 4) \
     /*  pointer atomics */ \
     ADD_I(atomic_fence, 1) \
     ADD_I(atomic_pointerref, 2) \
