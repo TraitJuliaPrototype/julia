@@ -139,7 +139,10 @@ end
 function _tw_in_trait_world(m::Module)
     _tw_protected_name(_tw_root(m)) && return true
     while true
-        (isdefined(m, :__trait_module__) || isdefined(m, :__trait_world_machinery__)) && return true
+        # in the latest world: validation runs in the compiler's world, where the bindings of a
+        # module being loaded (TraitWorld's own image) are not yet defined
+        (Core.invokelatest(isdefined, m, :__trait_module__)::Bool ||
+         Core.invokelatest(isdefined, m, :__trait_world_machinery__)::Bool) && return true
         for x in _tw_modules[]
             x === m && return true
         end
@@ -156,13 +159,39 @@ function _tw_is_julia(r::Module)
     end
     return false
 end
-function _tw_owned_by(@nospecialize(t), r::Module, depth::Int)
-    depth > 2 && return false
-    t = Base.unwrap_unionall(t)
-    t isa TypeVar && (t = t.ub)
-    t isa DataType || return false                # a Union proves no ownership
-    t.name === Type.body.name && length(t.parameters) == 1 && return _tw_owned_by(t.parameters[1], r, depth + 1)
-    return _tw_root(t.name.module) === r
+# The package (outside Base, Core and the trait world) that every value matching `t` mentions in
+# its type, or `nothing`: as TraitWorld's policy (`_required_root`). `Type{T}` counts as `T` (a type
+# value reaches protected code, like any value, only where the code was compiled for it).
+function _tw_required_root(@nospecialize(t), depth::Int)
+    depth > 4 && return nothing
+    t isa UnionAll && return _tw_required_root(Base.unwrap_unionall(t), depth)
+    t isa TypeVar && return _tw_required_root(t.ub, depth + 1)
+    t isa Core.TypeofVararg && return isdefined(t, :T) ? _tw_required_root(t.T, depth + 1) : nothing
+    if t isa Union
+        a = _tw_required_root(t.a, depth + 1)
+        return a !== nothing && a === _tw_required_root(t.b, depth + 1) ? a : nothing
+    end
+    t isa DataType || return nothing
+    r = _tw_root(t.name.module)
+    # a standard library's types are its own (SparseArrays, LibGit2): only Base's and Core's are everyone's
+    (r === Base || r === Core || r === Base.Compiler || _tw_in_trait_world(t.name.module)) || return r
+    for p in t.parameters
+        x = _tw_required_root(p, depth + 1)
+        x === nothing || return x
+    end
+    return nothing
+end
+# The default policy, the same rule as TraitWorld's: in force until TraitWorld registers its own,
+# since TraitWorld's image (and the images loaded with it) are validated before its `__init__` runs.
+function _tw_default_policy(m::Method)
+    _tw_in_trait_world(m.module) && return nothing
+    sig = Base.unwrap_unionall(m.sig)
+    sig isa DataType || return nothing
+    for i in 2:length(sig.parameters)
+        r = _tw_required_root(sig.parameters[i], 0)
+        r === nothing || return r
+    end
+    return nothing
 end
 "Whether package `r` owns a type anywhere in `t` (a signature: arguments, parameters, a trait object's views and keys)."
 function _tw_mentions_owned(@nospecialize(t), r::Module, depth::Int)
@@ -198,8 +227,7 @@ const _tw_policy = RefValue{Any}(nothing)
 "Whether newcomer `m` cannot change the protected code being verified: the policy names its package, and the code's signature mentions none of its types."
 function _tw_policy_skip(m::Method)
     p = _tw_policy[]
-    p === nothing && return false
-    r = try
+    r = p === nothing ? _tw_default_policy(m) : try
         Core.invokelatest(p, m)
     catch
         nothing                                       # in doubt: fail the edge as usual

@@ -1620,9 +1620,32 @@ function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UIn
     return ci
 end
 
+"""
+The inference hook (trait-bound PoC, julia-support.md piece 4): a callable `hook(ci::CodeInstance)`,
+called after a top-level inference request finishes, for code of a protected (trait-world) module,
+so that checks of compiled code run where it is compiled. Set by TraitWorld; `nothing` costs one
+test. It runs in the latest world (`Core.invokelatest`) and must not itself request inference of
+the code being compiled; an exception is ignored.
+"""
+const _tw_infer_hook = RefValue{Any}(nothing)
+function _tw_run_infer_hook(@nospecialize(ci))
+    hook = _tw_infer_hook[]
+    hook === nothing && return nothing
+    ci isa CodeInstance || return nothing
+    def = get_ci_mi(ci).def
+    def isa Method || return nothing
+    ReinferUtils._tw_in_trait_world(def.module) || return nothing
+    try
+        Core.invokelatest(hook, ci)
+    catch
+    end
+    return nothing
+end
+
 function typeinf_ext_toplevel(interp::AbstractInterpreter, mi::MethodInstance, source_mode::UInt8)
     ci = typeinf_ext(interp, mi, source_mode)
     ci = add_codeinsts_to_jit!(interp, ci, source_mode)
+    _tw_run_infer_hook(ci)
     return ci
 end
 
