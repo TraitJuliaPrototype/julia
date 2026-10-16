@@ -76,8 +76,9 @@ end
 # Pirates fail the edge as before. Trait modules are recognized by their
 # `__trait_module__` binding, so a library's own image is covered while it
 # loads, before TraitWorld sees it; TraitWorld's own modules carry
-# `__trait_world_machinery__`. On unless JULIA_TW_FILTER=0, so that images
-# loaded before TraitWorld are covered too; TraitWorld adds its registrations.
+# `__trait_world_machinery__`. Off unless JULIA_TW_FILTER=1 (rule P of wrapping by facts: nothing
+# is skipped; the filter stays for comparisons). When on, it covers images loaded
+# before TraitWorld too; TraitWorld adds its registrations.
 #
 # A Base method compiled for trait-world code (a callee CodeInstance in the
 # image, shared with ordinary code) fails as before when a newcomer intersects
@@ -93,7 +94,7 @@ function _tw_filter_on()
     v = _tw_load_filter[]
     if v == Int8(-1)
         p = ccall(:getenv, Ptr{UInt8}, (Ptr{UInt8},), "JULIA_TW_FILTER")
-        v = (p != C_NULL && unsafe_load(p) == 0x30 && unsafe_load(p + 1) == 0x00) ? Int8(0) : Int8(1)
+        v = (p != C_NULL && unsafe_load(p) == 0x31 && unsafe_load(p + 1) == 0x00) ? Int8(1) : Int8(0)
         _tw_load_filter[] = v
     end
     return v == Int8(1)

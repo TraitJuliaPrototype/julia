@@ -2502,10 +2502,17 @@ static void _invalidate_backedges(jl_method_instance_t *replaced_mi, jl_code_ins
         if (replaced_ci) {
             // If we're invalidating a particular codeinstance, only invalidate
             // this backedge it actually has an edge for our codeinstance.
+            // A bare MethodInstance edge stands for the caller's dependence on its own
+            // interpreter's result for that instance (a cycle partner, or a result not cached):
+            // an interpreter consults only its own cache, so only a CodeInstance of the caller's
+            // owner can break it. Replacing the method reaches every owner (`replaced_ci == NULL`).
+            // A generator's cached output (owner `:uninferred`) may have read any owner's result.
+            int same_owner = jl_egal(replaced->owner, replaced_ci->owner) ||
+                             replaced->owner == (jl_value_t*)jl_uninferred_sym;
             jl_svec_t *edges = jl_atomic_load_relaxed(&replaced->edges);
             for (size_t j = 0; j < jl_svec_len(edges); ++j) {
                 jl_value_t *edge = jl_svecref(edges, j);
-                if (edge == (jl_value_t*)replaced_mi || edge == (jl_value_t*)replaced_ci)
+                if ((same_owner && edge == (jl_value_t*)replaced_mi) || edge == (jl_value_t*)replaced_ci)
                     goto found;
             }
             ins = set_next_edge(backedges, ins, invokesig, replaced);
