@@ -388,9 +388,9 @@ function add_inlining_edge!(edges::Vector{Any}, edge::CodeInstance)
             edges[i] = edge
             return
         end
-        if edgeᵢ isa CodeInstance && edgeᵢ.def === edge.def
-            # found existing edge
-            # XXX compare `CodeInstance` identify?
+        if edgeᵢ isa CodeInstance && edgeᵢ.def === edge.def && edgeᵢ.owner === edge.owner
+            # found existing edge (code of another owner for the same instance is a different
+            # dependency: it is invalidated separately)
             return
         end
         i += 1

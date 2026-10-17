@@ -1615,10 +1615,38 @@ end
 function handle_invoke_expr!(todo::Vector{Pair{Int,Any}}, ir::IRCode,
     idx::Int, stmt::Expr, @nospecialize(info::CallInfo), flag::UInt32, sig::Signature, state::InliningState)
     edge = stmt.args[1]
-    mi = isa(edge, MethodInstance) ? edge : get_ci_mi(edge::CodeInstance)
-    case = resolve_todo(mi, info, flag, state)
+    if isa(edge, CodeInstance) && edge.owner !== cache_owner(state.interp)
+        # `invoke(f, ci, args...)` of another owner's code (an external interpreter's cache):
+        # inline exactly that code. The caller's own cache may hold different code for the same
+        # method instance, and inlining it would make the call run code it never asked for.
+        case = resolve_todo(edge, info, flag, state)
+    else
+        mi = isa(edge, MethodInstance) ? edge : get_ci_mi(edge::CodeInstance)
+        case = resolve_todo(mi, info, flag, state)
+    end
     handle_single_case!(todo, ir, idx, stmt, case, false)
     return nothing
+end
+
+# the resolver for an `:invoke` of a given CodeInstance of another owner
+function resolve_todo(ci::CodeInstance, @nospecialize(info::CallInfo), flag::UInt32,
+                      state::InliningState)
+    if !OptimizationParams(state.interp).inlining || is_stmt_noinline(flag)
+        return nothing
+    end
+    et = InliningEdgeTracker(state)
+    if use_const_api(ci)
+        add_inlining_edge!(et, ci)
+        return ConstantCase(quoted(ci.rettype_const), ci)
+    end
+    src = @atomic :monotonic ci.inferred
+    src === nothing && return nothing
+    effects = decode_effects(ci.ipo_purity_bits)
+    mi = get_ci_mi(ci)
+    src_inlining_policy(state.interp, mi, src, info, flag) || return nothing
+    ir, spec_info, debuginfo = retrieve_ir_for_inlining(ci, src)
+    add_inlining_edge!(et, ci)
+    return InliningTodo(mi, ir, spec_info, debuginfo, effects)
 end
 
 function inline_const_if_inlineable!(inst::Instruction)
