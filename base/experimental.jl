@@ -525,6 +525,40 @@ usage, by eliminating the tracking of those possible invalidation.
 """
 disable_new_worlds() = ccall(:jl_disable_new_worlds, Cvoid, ())
 
+"""
+    Base.Experimental.register_type_printer(name::Core.TypeName, printer)
+
+Print every type whose name is `name` by calling `printer(io, T)`, wherever Julia prints a
+type: by `show`, nested in other types, in method signatures and stack traces. `printer`
+may fall back to Julia's own printing with [`Base.Experimental.show_type_plain`](@ref).
+`printer === nothing` removes the printer.
+
+This is a registry rather than methods of `show`. A method `show(::IO, ::Type{<:X})`
+invalidates every caller compiled for `show(::IO, ::Type)`, which is most code that prints
+a type. Registering a printer invalidates no compiled code.
+"""
+function register_type_printer(name::Core.TypeName, @nospecialize(printer))
+    @lock Base._type_printers_lock begin
+        d = copy(@atomic :acquire Base._type_printers.d)
+        if printer === nothing
+            delete!(d, name)
+        else
+            d[name] = printer
+        end
+        @atomic :release Base._type_printers.d = d
+    end
+    return nothing
+end
+
+"""
+    Base.Experimental.show_type_plain(io::IO, T::Type)
+
+Print `T` as Julia does when no printer is registered for its name (see
+[`Base.Experimental.register_type_printer`](@ref)). Parameters of `T` still print through
+their own printers.
+"""
+show_type_plain(io::IO, @nospecialize(T::Type)) = Base._show_type_plain(io, T)
+
 ### Task metrics
 
 """

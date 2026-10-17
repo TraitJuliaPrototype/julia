@@ -976,7 +976,35 @@ function show(io::IO, ::MIME"text/plain", @nospecialize(x::Type))
 end
 
 show(io::IO, @nospecialize(x::Type)) = _show_type(io, inferencebarrier(x))
+
+# Printers registered for type names (`Experimental.register_type_printer`). A registry rather
+# than methods of `show`: a package's method of `show(::IO, ::Type{<:X})` invalidates every
+# caller compiled for `show(::IO, ::Type)`, which is most code that prints a type, while
+# registering a printer invalidates nothing. Copy on write, so that readers take no lock.
+mutable struct TypePrinters
+    @atomic d::IdDict{Core.TypeName,Any}
+end
+const _type_printers = TypePrinters(IdDict{Core.TypeName,Any}())
+const _type_printers_lock = ReentrantLock()
+
+function _type_printer(x::DataType)
+    d = @atomic :acquire _type_printers.d
+    isempty(d) && return nothing
+    return get(d, x.name, nothing)
+end
+
 function _show_type(io::IO, @nospecialize(x::Type))
+    if x isa DataType
+        p = _type_printer(x)
+        if p !== nothing
+            invokelatest(p, io, x)
+            return
+        end
+    end
+    _show_type_plain(io, x)
+end
+
+function _show_type_plain(io::IO, @nospecialize(x::Type))
     if print_without_params(x)
         show_type_name(io, (unwrap_unionall(x)::DataType).name)
         return
