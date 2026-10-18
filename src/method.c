@@ -1006,6 +1006,14 @@ JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src)
                 m->facts = jl_unbox_long(jl_exprarg(st, 1)) != 0 ? 2 : 1;   // `Expr(:meta, :facts, 0)`: a boundary
                 st = jl_nothing;
             }
+            else if (nargs > 2) {
+                // `facts n` merged into another meta (`pushmeta!`, as `@inline` does)
+                size_t k;
+                for (k = 0; k + 1 < nargs; k++) {
+                    if (jl_exprarg(st, k) == (jl_value_t*)jl_facts_sym && jl_is_long(jl_exprarg(st, k + 1)))
+                        m->facts = jl_unbox_long(jl_exprarg(st, k + 1)) != 0 ? 2 : 1;
+                }
+            }
             else if (nargs == 2 && jl_exprarg(st, 0) == (jl_value_t*)jl_generated_sym) {
                 if (m->generator != NULL)
                     jl_error("duplicate @generated function body");

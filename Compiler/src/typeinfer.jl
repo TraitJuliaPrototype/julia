@@ -1250,6 +1250,8 @@ typeinf_frame(interp::AbstractInterpreter, method::Method, @nospecialize(atype),
               run_optimizer::Bool) =
     typeinf_frame(interp, specialize_method(method, atype, sparams), run_optimizer)
 function typeinf_frame(interp::AbstractInterpreter, mi::MethodInstance, run_optimizer::Bool)
+    # reflection shows the code that runs: a facts method by facts (facts.jl)
+    leaves_to_facts(interp, mi.def) && return typeinf_frame(facts_interp(interp::NativeInterpreter), mi, run_optimizer)
     result = InferenceResult(mi, typeinf_lattice(interp))
     frame = InferenceState(result, #=cache_mode=#:no, interp)
     frame === nothing && return nothing
@@ -1323,7 +1325,7 @@ function ci_has_source(interp::AbstractInterpreter, code::CodeInstance)
     if isa(inf, String)
         inf = _uncompressed_ir(code, inf)
     end
-    if code.owner === nothing
+    if code.owner === nothing || code.owner === FACTS_OWNER     # code compiled by facts is native code too
         if isa(inf, CodeInfo)
             codegen[code] = inf
             return true

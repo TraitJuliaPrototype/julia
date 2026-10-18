@@ -535,6 +535,14 @@
                          (and (pair? x) (eq? (car x) 'purity))))
                    (cdr e))))
 
+;; `facts n` in a meta (alone, or merged with others by `pushmeta!`): a method compiled by facts (1)
+;; or in its caller's mode (0, a boundary); every method a definition lowers to carries it
+;; (Compiler/src/facts.jl)
+(define (facts-meta? e)
+  (and (pair? e) (eq? (car e) 'meta) (pair? (memq 'facts (cdr e))) (pair? (cdr (memq 'facts (cdr e))))))
+(define (facts-meta-only e)
+  `(meta facts ,(cadr (memq 'facts (cdr e)))))
+
 (define (argwide-nospecialize-meta? e)
   (and (length= e 2) (eq? (car e) 'meta) (memq (cadr e) '(nospecialize specialize))))
 

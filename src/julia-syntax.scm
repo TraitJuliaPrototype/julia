@@ -559,6 +559,7 @@
           name positional-sparams pargl-all
           `(block
             ,@(keep-first linenum? (without-generated prologue))
+            ,@(map facts-meta-only (filter facts-meta? prologue))
             ,(let (;; call mangled(vals..., [rest_kw,] pargs..., [vararg]...)
                    (ret `(return (call ,mangled
                                        ,@(if ordered-defaults keynames vals)
@@ -579,6 +580,7 @@
           `(block
             ;; propagate method metadata to keyword sorter
             ,@(map propagate-method-meta (filter meta? prologue))
+            ,@(map facts-meta-only (filter facts-meta? prologue))
             ,@(filter argwide-nospecialize-meta? prologue)
             ,@(let ((lnns (filter linenum? prologue)))
                 (if (pair? lnns)
