@@ -1035,6 +1035,7 @@ end
 # compute (and cache) an inferred AST and return the current best estimate of the result type
 function typeinf_edge(interp::AbstractInterpreter, method::Method, @nospecialize(atype), sparams::SimpleVector, caller::AbsIntState, edgecycle::Bool, edgelimited::Bool)
     mi = specialize_method(method, atype, sparams)
+    leaves_to_facts(interp, method) && return facts_edge(interp::NativeInterpreter, method, mi, caller, edgecycle, edgelimited)
     cache_mode = CACHE_MODE_GLOBAL # cache edge targets globally by default
     force_inline = is_stmt_inline(get_curr_ssaflag(caller))
     edge_ci = nothing
@@ -1351,6 +1352,8 @@ end
 
 # compute (and cache) an inferred AST and return type
 function typeinf_ext(interp::AbstractInterpreter, mi::MethodInstance, source_mode::UInt8)
+    # a facts method is inferred by facts, whoever asks (reflection, compile queues; facts.jl)
+    leaves_to_facts(interp, mi.def) && return typeinf_ext(facts_interp(interp::NativeInterpreter), mi, source_mode)
     start_time = ccall(:jl_typeinf_timing_begin, UInt64, ())
     let code = get(code_cache(interp), mi, nothing)
         if code isa CodeInstance
@@ -1589,7 +1592,7 @@ function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UIn
                 src = _uncompressed_ir(callee, src)
             end
             if !isa(src, CodeInfo)
-                newcallee = typeinf_ext(workqueue.interp, callee.def, source_mode) # always SOURCE_MODE_ABI
+                newcallee = typeinf_ext(interp_for_owner(workqueue.interp, callee.owner), callee.def, source_mode) # always SOURCE_MODE_ABI
                 if newcallee isa CodeInstance
                     callee === ci && (ci = newcallee) # ci stopped meeting the requirements after typeinf_ext last checked, try again with newcallee
                     push!(workqueue, newcallee)
@@ -1608,7 +1611,7 @@ function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UIn
             cached = ccall(:jl_get_ci_equiv, Any, (Any, UInt), callee, get_inference_world(workqueue.interp))::CodeInstance
             if cached === callee
                 # make sure callee is gc-rooted and cached, as required by jl_add_codeinst_to_jit
-                code_cache(workqueue.interp)[mi] = callee
+                code_cache(interp_for_owner(workqueue.interp, callee.owner))[mi] = callee
             else
                 # use an existing CI from the cache, if there is available one that is compatible
                 callee === ci && (ci = cached)
@@ -1649,12 +1652,16 @@ function typeinf_ext_toplevel(interp::AbstractInterpreter, mi::MethodInstance, s
     return ci
 end
 
-# This is a bridge for the C code calling `jl_typeinf_func()` on a single Method match
-function typeinf_ext_toplevel(mi::MethodInstance, world::UInt, source_mode::UInt8, trim_mode::UInt8)
+# This is a bridge for the C code calling `jl_typeinf_func()` on a single Method match, for the
+# code of cache owner `owner` (`nothing`, or `FACTS_OWNER` for code compiled by facts beside it)
+function typeinf_ext_toplevel(mi::MethodInstance, world::UInt, source_mode::UInt8, trim_mode::UInt8, @nospecialize(owner))
     inf_params = InferenceParams(; force_enable_inference = trim_mode != TRIM_NO)
-    interp = NativeInterpreter(world; inf_params, facts = facts_default() && !is_compiler_code(mi))
+    interp = owner === FACTS_OWNER ? NativeInterpreter(world; inf_params, facts = true, owner = FACTS_OWNER) :
+        NativeInterpreter(world; inf_params, facts = facts_default() && !is_compiler_code(mi))
     return typeinf_ext_toplevel(interp, mi, source_mode)
 end
+typeinf_ext_toplevel(mi::MethodInstance, world::UInt, source_mode::UInt8, trim_mode::UInt8) =
+    typeinf_ext_toplevel(mi, world, source_mode, trim_mode, default_owner(mi))
 
 function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
     invokelatest_queue::Union{CompilationQueue,Nothing} = nothing,
@@ -1672,7 +1679,7 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             # and this is either the primary world, or not applicable in the primary world
             # then we want to compile and emit this
             if item.def.primary_world <= world
-                ci = typeinf_ext(interp, item, SOURCE_MODE_GET_SOURCE)
+                ci = typeinf_ext(interp_for_owner(interp, default_owner(item)), item, SOURCE_MODE_GET_SOURCE)
                 ci isa CodeInstance && push!(workqueue, ci)
             end
             markinspected!(workqueue, item)
@@ -1701,7 +1708,7 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             else
                 src = get(interp.codegen, callee, nothing)
                 if src === nothing
-                    newcallee = typeinf_ext(interp, mi, SOURCE_MODE_GET_SOURCE)
+                    newcallee = typeinf_ext(interp_for_owner(interp, callee.owner), mi, SOURCE_MODE_GET_SOURCE)
                     if newcallee isa CodeInstance
                         @assert use_const_api(newcallee) || haskey(interp.codegen, newcallee)
                         push!(workqueue, newcallee)
@@ -1720,7 +1727,7 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
                 if iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), mi, callee))
                     cached = ccall(:jl_get_ci_equiv, Any, (Any, UInt), callee, world)::CodeInstance
                     if cached === callee
-                        code_cache(interp)[mi] = callee
+                        code_cache(interp_for_owner(interp, callee.owner))[mi] = callee
                     else
                         # Use an existing CI from the cache, if there is available one that is compatible
                         callee = cached

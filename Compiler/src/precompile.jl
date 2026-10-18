@@ -408,6 +408,11 @@ function compile_and_emit_native(worlds::Vector{UInt},
                 push!(tocompile, item::Core.SimpleVector)
             end
         end
+        # code compiled by facts (facts.jl, part (B)) is compiled as plain code is: through the
+        # compile queue, which infers it again by facts where its source was discarded
+        for cis in (ext_foreign_cis, foreign_internal), ci in cis
+            (ci::CodeInstance).owner === FACTS_OWNER && push!(tocompile, ci)
+        end
     else # trimming mode
         # array of MethodInstances and ccallable aliases to include in the output
         tocompile = []
@@ -466,6 +471,7 @@ function add_foreign_codeinfos!(codeinfos::Vector{Any}, cis::Vector{Any})
     seen = Base.IdSet{CodeInstance}()
     for ci in cis
         ci = ci::CodeInstance
+        ci.owner === FACTS_OWNER && continue    # in the compile queue (above)
         ci in seen && continue
         push!(seen, ci)
         use_const_api(ci) && continue

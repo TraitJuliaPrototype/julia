@@ -892,6 +892,7 @@ function abstract_call_method_with_const_args(interp::AbstractInterpreter,
     if bail_out_const_call(interp, result, si, match, sv)
         return nothing
     end
+    leaves_to_facts(interp, match.method) && return nothing   # plain code never re-infers a facts method (facts.jl)
     eligibility = concrete_eval_eligible(interp, f, result, arginfo, sv)
     concrete_eval_result = nothing
     if eligibility === :concrete_eval

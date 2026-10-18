@@ -419,10 +419,27 @@ jl_mutex_t jl_typeinf_lock;
 // returns the inferred source, and may cache the result in mi
 // if successful, also updates the mi argument to describe the validity of this src
 // if inference doesn't occur (or can't finish), returns NULL instead
+// The cache owner whose code dispatch runs for `mi` (Compiler/src/facts.jl, part (B)): `:facts` for a
+// method of a module compiled by facts, else plain Julia's (`nothing`).
+JL_DLLEXPORT jl_value_t *jl_default_owner(jl_method_instance_t *mi) JL_NOTSAFEPOINT
+{
+    jl_method_t *def = mi->def.method;
+    if (jl_is_method(def) && jl_method_is_facts(def))
+        return (jl_value_t*)jl_facts_sym;
+    return jl_nothing;
+}
+
+static jl_code_instance_t *jl_type_infer_owner(jl_method_instance_t *mi, size_t world, uint8_t source_mode, uint8_t trim_mode, jl_value_t *owner);
+
 jl_code_instance_t *jl_type_infer(jl_method_instance_t *mi, size_t world, uint8_t source_mode, uint8_t trim_mode)
 {
+    return jl_type_infer_owner(mi, world, source_mode, trim_mode, jl_default_owner(mi));
+}
+
+static jl_code_instance_t *jl_type_infer_owner(jl_method_instance_t *mi, size_t world, uint8_t source_mode, uint8_t trim_mode, jl_value_t *owner)
+{
     if (jl_typeinf_func == NULL) {
-        if (source_mode == SOURCE_MODE_ABI)
+        if (source_mode == SOURCE_MODE_ABI && owner == jl_nothing)
             return jl_method_inferred_with_abi(mi, world);
         else
             return NULL;
@@ -439,17 +456,18 @@ jl_code_instance_t *jl_type_infer(jl_method_instance_t *mi, size_t world, uint8_
 
     jl_code_instance_t *ci = NULL;
 #ifdef ENABLE_INFERENCE
-    if (jl_engine_hasreserved(mi, jl_nothing)) // don't recur on a thread on the same MethodInstance--force it to interpret it until the inference has finished
+    if (jl_engine_hasreserved(mi, owner)) // don't recur on a thread on the same MethodInstance--force it to interpret it until the inference has finished
         return NULL;
     JL_TIMING(INFERENCE, INFERENCE);
     jl_value_t **fargs;
     JL_GC_PUSH1(&ci);
-    JL_GC_PUSHARGS(fargs, 5);
+    JL_GC_PUSHARGS(fargs, 6);
     fargs[0] = (jl_value_t*)jl_typeinf_func;
     fargs[1] = (jl_value_t*)mi;
     fargs[2] = jl_box_ulong(world);
     fargs[3] = jl_box_uint8(source_mode);
     fargs[4] = jl_box_uint8(trim_mode);
+    fargs[5] = owner;
     int last_errno = errno;
 #ifdef _OS_WINDOWS_
     DWORD last_error = GetLastError();
@@ -477,7 +495,7 @@ jl_code_instance_t *jl_type_infer(jl_method_instance_t *mi, size_t world, uint8_
     ct->reentrant_timing += 0b10;
     JL_LOCK(&jl_typeinf_lock);
     JL_TRY {
-        ci = (jl_code_instance_t*)jl_apply(fargs, 5);
+        ci = (jl_code_instance_t*)jl_apply(fargs, 6);
     }
     JL_CATCH {
         jl_value_t *e = jl_current_exception(ct);
@@ -3658,11 +3676,11 @@ JL_DLLEXPORT jl_value_t *jl_rettype_inferred_native(jl_method_instance_t *mi, si
 
 JL_DLLEXPORT jl_value_t *(*const jl_rettype_inferred_addr)(jl_method_instance_t *mi, size_t min_world, size_t max_world) JL_NOTSAFEPOINT = jl_rettype_inferred_native;
 
-STATIC_INLINE jl_callptr_t jl_method_compiled_callptr(jl_method_instance_t *mi, size_t world, jl_code_instance_t **codeinst_out) JL_NOTSAFEPOINT
+STATIC_INLINE jl_callptr_t jl_method_compiled_callptr_owner(jl_method_instance_t *mi, size_t world, jl_value_t *owner, jl_code_instance_t **codeinst_out) JL_NOTSAFEPOINT
 {
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     for (; codeinst; codeinst = jl_atomic_load_relaxed(&codeinst->next)) {
-        if (codeinst->owner != jl_nothing)
+        if (codeinst->owner != owner)
             continue;
         if (jl_atomic_load_relaxed(&codeinst->min_world) <= world && world <= jl_atomic_load_relaxed(&codeinst->max_world)) {
             jl_callptr_t invoke = jl_atomic_load_acquire(&codeinst->invoke);
@@ -3673,6 +3691,11 @@ STATIC_INLINE jl_callptr_t jl_method_compiled_callptr(jl_method_instance_t *mi, 
         }
     }
     return NULL;
+}
+
+STATIC_INLINE jl_callptr_t jl_method_compiled_callptr(jl_method_instance_t *mi, size_t world, jl_code_instance_t **codeinst_out) JL_NOTSAFEPOINT
+{
+    return jl_method_compiled_callptr_owner(mi, world, jl_default_owner(mi), codeinst_out);
 }
 
 jl_code_instance_t *jl_method_compiled(jl_method_instance_t *mi, size_t world) JL_NOTSAFEPOINT
@@ -3868,10 +3891,18 @@ JL_DLLEXPORT int jl_method_is_macro(jl_method_t *m)
     return jl_symbol_name(m->name)[0] == '@';
 }
 
+static jl_code_instance_t *jl_compile_method_internal_owner(jl_method_instance_t *mi, size_t world, jl_value_t *owner);
+
 jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t world)
 {
+    return jl_compile_method_internal_owner(mi, world, jl_default_owner(mi));
+}
+
+static jl_code_instance_t *jl_compile_method_internal_owner(jl_method_instance_t *mi, size_t world, jl_value_t *owner)
+{
     // quick check if we already have a compiled result
-    jl_code_instance_t *codeinst = jl_method_compiled(mi, world);
+    jl_code_instance_t *codeinst = NULL;
+    jl_method_compiled_callptr_owner(mi, world, owner, &codeinst);
     if (codeinst)
         return codeinst;
 
@@ -3879,7 +3910,9 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
     // instead and just copy it here for caching
     jl_method_instance_t *mi2 = jl_normalize_to_compilable_mi(mi);
     if (mi2 != mi) {
-        jl_code_instance_t *codeinst2 = jl_compile_method_internal(mi2, world);
+        jl_code_instance_t *codeinst2 = jl_compile_method_internal_owner(mi2, world, owner);
+        if (owner != jl_nothing)
+            return codeinst2; // code compiled by facts: the wider instance's code serves
         jl_code_instance_t *codeinst = jl_get_method_inferred(
                 mi, codeinst2->rettype,
                 jl_atomic_load_relaxed(&codeinst2->min_world),
@@ -3921,7 +3954,7 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
     int compile_option = jl_options.compile_enabled;
     jl_method_t *def = mi->def.method;
     // disabling compilation per-module can override global setting
-    if (jl_is_method(def)) {
+    if (jl_is_method(def) && owner == jl_nothing) {
         int mod_setting = jl_get_module_compile(((jl_method_t*)def)->module);
         if (mod_setting == JL_OPTIONS_COMPILE_OFF ||
             mod_setting == JL_OPTIONS_COMPILE_MIN)
@@ -4007,7 +4040,7 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
         int should_skip_inference = !jl_is_method(mi->def.method) || jl_method_is_macro(mi->def.method);
 
         if (!should_skip_inference) {
-            codeinst = jl_type_infer(mi, world, SOURCE_MODE_ABI, jl_options.trim);
+            codeinst = jl_type_infer_owner(mi, world, SOURCE_MODE_ABI, jl_options.trim, owner);
         }
     }
 
@@ -4468,10 +4501,10 @@ STATIC_INLINE jl_value_t *verify_type(jl_value_t *v) JL_NOTSAFEPOINT
     return v;
 }
 
-STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc, size_t world)
+STATIC_INLINE jl_value_t *_jl_invoke_owner(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc, size_t world, jl_value_t *owner)
 {
     jl_code_instance_t *codeinst = NULL;
-    jl_callptr_t invoke = jl_method_compiled_callptr(mfunc, world, &codeinst);
+    jl_callptr_t invoke = jl_method_compiled_callptr_owner(mfunc, world, owner, &codeinst);
     if (invoke) {
         jl_value_t *res = invoke(F, args, nargs, codeinst);
         return verify_type(res);
@@ -4481,7 +4514,7 @@ STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t 
 #ifdef _OS_WINDOWS_
     DWORD last_error = GetLastError();
 #endif
-    codeinst = jl_compile_method_internal(mfunc, world);
+    codeinst = jl_compile_method_internal_owner(mfunc, world, owner);
 #ifdef _OS_WINDOWS_
     SetLastError(last_error);
 #endif
@@ -4491,6 +4524,11 @@ STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t 
     invoke = jl_atomic_load_acquire(&codeinst->invoke);
     jl_value_t *res = invoke(F, args, nargs, codeinst);
     return verify_type(res);
+}
+
+STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc, size_t world)
+{
+    return _jl_invoke_owner(F, args, nargs, mfunc, world, jl_default_owner(mfunc));
 }
 
 JL_DLLEXPORT jl_value_t *jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc)
@@ -4691,6 +4729,24 @@ JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t *F, jl_value_t **args, uint
                                                      world);
     JL_GC_PROMISE_ROOTED(mfunc);
     return _jl_invoke(F, args, nargs, mfunc, world);
+}
+
+// Dispatch at run time from code compiled by facts (part (C)): the same method lookup, then the
+// code compiled by facts for the method found, compiled on a miss.
+JL_DLLEXPORT jl_value_t *jl_apply_generic_facts(jl_value_t *F, jl_value_t **args, uint32_t nargs)
+{
+    size_t world = jl_current_task->world_age;
+    jl_method_instance_t *mfunc = jl_lookup_generic_(F, args, nargs,
+                                                     jl_int32hash_fast(jl_return_address()),
+                                                     world);
+    JL_GC_PROMISE_ROOTED(mfunc);
+    return _jl_invoke_owner(F, args, nargs, mfunc, world, (jl_value_t*)jl_facts_sym);
+}
+
+JL_DLLEXPORT jl_value_t *jl_invoke_facts(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc)
+{
+    size_t world = jl_current_task->world_age;
+    return _jl_invoke_owner(F, args, nargs, mfunc, world, (jl_value_t*)jl_facts_sym);
 }
 
 static jl_method_match_t *_gf_invoke_lookup(jl_value_t *types JL_PROPAGATES_ROOT, jl_methtable_t *mt, size_t world, int cache_result, size_t *min_valid, size_t *max_valid)

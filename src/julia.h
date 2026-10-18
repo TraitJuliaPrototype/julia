@@ -387,6 +387,10 @@ typedef struct _jl_method_t {
     // forcing the conclusion to always true.
     _jl_purity_overrides_t purity;
 
+    // compiled by facts (Compiler/src/facts.jl): 0 as its module says, 1 in its caller's mode
+    // (a boundary, `Expr(:meta, :facts, 0)`), 2 always (`Expr(:meta, :facts, 1)`)
+    uint8_t facts;
+
 // hidden fields:
     jl_mutex_t writelock;
 } jl_method_t;
@@ -858,6 +862,7 @@ typedef struct _jl_module_t {
     int8_t infer;
     uint8_t istopmod;
     int8_t max_methods;
+    int8_t facts; // compiled by facts (Compiler/src/facts.jl): 1 yes, 0 no; a new submodule inherits it
     // If cleared no binding partition in this module has PARTITION_FLAG_EXPORTED and min_world > jl_require_world.
     _Atomic(int8_t) export_set_changed_since_require_world;
     jl_mutex_t lock;
@@ -2053,6 +2058,9 @@ JL_DLLEXPORT void jl_set_module_infer(jl_module_t *self, int value);
 JL_DLLEXPORT int jl_get_module_infer(jl_module_t *m);
 JL_DLLEXPORT void jl_set_module_max_methods(jl_module_t *self, int value);
 JL_DLLEXPORT int jl_get_module_max_methods(jl_module_t *m);
+JL_DLLEXPORT void jl_set_module_facts(jl_module_t *self, int value);
+JL_DLLEXPORT int jl_get_module_facts(jl_module_t *m);
+JL_DLLEXPORT int jl_method_is_facts(jl_method_t *m) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_get_module_usings_backedges(jl_module_t *m);
 JL_DLLEXPORT jl_value_t *jl_get_module_scanned_methods(jl_module_t *m);
 JL_DLLEXPORT jl_value_t *jl_get_module_binding_or_nothing(jl_module_t *m, jl_sym_t *s);
@@ -2311,6 +2319,9 @@ STATIC_INLINE int jl_vinfo_usedundef(uint8_t vi)
 
 JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t *F, jl_value_t **args, uint32_t nargs);
 JL_DLLEXPORT jl_value_t *jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *meth);
+// the same, called from code compiled by facts: they run code compiled by facts (part (C))
+JL_DLLEXPORT jl_value_t *jl_apply_generic_facts(jl_value_t *F, jl_value_t **args, uint32_t nargs);
+JL_DLLEXPORT jl_value_t *jl_invoke_facts(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *meth);
 JL_DLLEXPORT jl_value_t *jl_invoke_oc(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *meth);
 JL_DLLEXPORT int32_t jl_invoke_api(jl_code_instance_t *linfo);
 

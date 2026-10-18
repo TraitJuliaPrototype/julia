@@ -962,6 +962,17 @@ static const auto jlinvoke_func = new JuliaFunction<>{
     get_func2_sig,
     get_func_attrs,
 };
+// the same entry points for code compiled by facts (part (C)): dispatch runs code compiled by facts
+static const auto jlapplygeneric_facts_func = new JuliaFunction<>{
+    XSTR(jl_apply_generic_facts),
+    get_func_sig,
+    get_func_attrs,
+};
+static const auto jlinvoke_facts_func = new JuliaFunction<>{
+    XSTR(jl_invoke_facts),
+    get_func2_sig,
+    get_func_attrs,
+};
 static const auto jlinvokeoc_func = new JuliaFunction<>{
     XSTR(jl_invoke_oc),
     get_func2_sig,
@@ -2113,6 +2124,20 @@ static Value *emit_f_is(jl_codectx_t &ctx, const jl_cgval_t &arg1, const jl_cgva
                         Value *nullcheck1 = nullptr, Value *nullcheck2 = nullptr);
 static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t nargs, ArrayRef<jl_cgval_t> argv, bool is_promotable=false);
 static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayRef<jl_cgval_t> argv, size_t nargs, jl_value_t *rt, bool always_inline);
+
+// Code compiled by facts dispatches at run time to code compiled by facts (part (C)).
+static bool in_facts_code(jl_codectx_t &ctx)
+{
+    return ctx.codeinst && ctx.codeinst->owner == (jl_value_t*)jl_facts_sym;
+}
+static JuliaFunction<> *applygeneric_for(jl_codectx_t &ctx)
+{
+    return in_facts_code(ctx) ? jlapplygeneric_facts_func : jlapplygeneric_func;
+}
+static JuliaFunction<> *invoke_for(jl_codectx_t &ctx)
+{
+    return in_facts_code(ctx) ? jlinvoke_facts_func : jlinvoke_func;
+}
 
 static Value *literal_pointer_val(jl_codectx_t &ctx, jl_value_t *p);
 static unsigned julia_alignment(jl_value_t *jt);
@@ -4246,7 +4271,7 @@ static bool emit_builtin_call(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
                     nva = ctx.builder.CreateTrunc(nva, getInt32Ty(ctx.builder.getContext()));
 #endif
                     Value *theArgs = emit_ptrgep(ctx, ctx.argArray, ctx.nReqArgs * sizeof(jl_value_t*));
-                    Value *r = ctx.builder.CreateCall(prepare_call(jlapplygeneric_func), { theF, theArgs, nva });
+                    Value *r = ctx.builder.CreateCall(prepare_call(applygeneric_for(ctx)), { theF, theArgs, nva });
                     *ret = mark_julia_type(ctx, r, true, jl_any_type);
                     return true;
                 }
@@ -4263,7 +4288,7 @@ static bool emit_builtin_call(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
 #endif
             Value *svec_data = emit_ptrgep(ctx, emit_pointer_from_objref(ctx, svec_val), ctx.types().sizeof_ptr);
             OperandBundleDef OpBundle("jl_roots", svec_val);
-            Value *r = ctx.builder.CreateCall(prepare_call(jlapplygeneric_func), { theF, svec_data, svec_len }, OpBundle);
+            Value *r = ctx.builder.CreateCall(prepare_call(applygeneric_for(ctx)), { theF, svec_data, svec_len }, OpBundle);
             *ret = mark_julia_type(ctx, r, true, jl_any_type);
             return true;
         }
@@ -4300,7 +4325,7 @@ static bool emit_builtin_call(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
         }
         Value *new_age = ctx.builder.CreateSelect(not_pure, target_world, last_age);
         emit_tls_world_age_store(ctx, new_age);
-        Value *r = emit_jlcall(ctx, jlapplygeneric_func, nullptr, argv.drop_front(fidx), nargs - fidx + 1, julia_call);
+        Value *r = emit_jlcall(ctx, applygeneric_for(ctx), nullptr, argv.drop_front(fidx), nargs - fidx + 1, julia_call);
         emit_tls_world_age_store(ctx, last_age);
         *ret = mark_julia_type(ctx, r, true, rt);
         return true;
@@ -5489,7 +5514,7 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayR
                     bool specsig, needsparams;
                     std::tie(specsig, needsparams) = uses_specsig(get_ci_abi(codeinst), mi, codeinst->rettype, ctx.params->prefer_specsig);
                     if (needsparams) {
-                        Value *r = emit_jlcall(ctx, jlinvoke_func, track_pjlvalue(ctx, literal_pointer_val(ctx, (jl_value_t*)mi)), argv, nargs, julia_call2);
+                        Value *r = emit_jlcall(ctx, invoke_for(ctx), track_pjlvalue(ctx, literal_pointer_val(ctx, (jl_value_t*)mi)), argv, nargs, julia_call2);
                         result = mark_julia_type(ctx, r, true, rt);
                     }
                     else {
@@ -5559,7 +5584,7 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayR
         }
     }
     if (!handled) {
-        Value *r = emit_jlcall(ctx, jlinvoke_func, boxed(ctx, lival), argv, nargs, julia_call2);
+        Value *r = emit_jlcall(ctx, invoke_for(ctx), boxed(ctx, lival), argv, nargs, julia_call2);
         result = mark_julia_type(ctx, r, true, rt);
     }
     if (result.typ == jl_bottom_type) {
@@ -5619,7 +5644,7 @@ static jl_cgval_t emit_invoke_modify(jl_codectx_t &ctx, jl_expr_t *ex, jl_value_
         }
     }
     // emit function and arguments
-    Value *callval = emit_jlcall(ctx, jlapplygeneric_func, nullptr, argv, nargs, julia_call);
+    Value *callval = emit_jlcall(ctx, applygeneric_for(ctx), nullptr, argv, nargs, julia_call);
     return mark_julia_type(ctx, callval, true, rt);
 }
 
@@ -5714,7 +5739,7 @@ static jl_cgval_t emit_call(jl_codectx_t &ctx, jl_expr_t *ex, jl_value_t *rt, bo
         }
     }
     // emit function and arguments
-    Value *callval = emit_jlcall(ctx, jlapplygeneric_func, nullptr, argv, n_generic_args, julia_call);
+    Value *callval = emit_jlcall(ctx, applygeneric_for(ctx), nullptr, argv, n_generic_args, julia_call);
     return mark_julia_type(ctx, callval, true, rt);
 }
 
@@ -10338,6 +10363,8 @@ static void init_jit_functions(void)
         add_named_global(jl_builtin_f_names[i], jl_builtin_f_addrs[i]);
     add_named_global(jlapplygeneric_func, &jl_apply_generic);
     add_named_global(jlinvoke_func, &jl_invoke);
+    add_named_global(jlapplygeneric_facts_func, &jl_apply_generic_facts);
+    add_named_global(jlinvoke_facts_func, &jl_invoke_facts);
     add_named_global(jltopeval_func, &jl_toplevel_eval);
     add_named_global(jlcopyast_func, &jl_copy_ast);
     //add_named_global(jlnsvec_func, &jl_svec);

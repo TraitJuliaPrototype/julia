@@ -22,6 +22,54 @@ function facts_default()
 end
 facts_mode(interp::AbstractInterpreter) = interp isa NativeInterpreter && interp.facts
 
+# --- (B): code compiled by facts beside plain code ------------------------------------------------
+# A module compiled by facts (`@compiler_options facts=true`, as `@trait_module` declares) has its
+# methods compiled by facts under their own cache owner, whoever calls them; everything a facts frame
+# calls is compiled by facts under that owner too. Plain code calling a facts method names the
+# facts CodeInstance. At run time, code of that owner dispatches to code of that owner (part (C),
+# `jl_apply_generic_facts` in the runtime).
+
+"The cache owner of code compiled by facts beside plain code."
+const FACTS_OWNER = :facts
+"""
+Whether `m` is compiled by facts: a method of a module compiled by facts, unless it is a boundary
+(`Expr(:meta, :facts, 0)` in its body: compiled in its caller's mode, as a trait entry is).
+"""
+is_facts_method(@nospecialize(m)) = m isa Method && ccall(:jl_method_is_facts, Cint, (Any,), m) != 0
+"A facts interpreter beside `interp`: its world, parameters and codegen cache, the facts owner."
+facts_interp(interp::NativeInterpreter) =
+    NativeInterpreter(interp.world, interp.method_table, InferenceResult[], interp.codegen,
+                      interp.inf_params, interp.opt_params, true, FACTS_OWNER)
+"""
+The interpreter that infers code of cache owner `owner` beside `interp` (for compile queues, whose
+items may be CodeInstances of either owner).
+"""
+function interp_for_owner(interp::AbstractInterpreter, @nospecialize(owner))
+    cache_owner(interp) === owner && return interp
+    interp isa NativeInterpreter || return interp
+    owner === FACTS_OWNER && return facts_interp(interp)
+    owner === nothing || return interp
+    return NativeInterpreter(interp.world, interp.method_table, InferenceResult[], interp.codegen,
+                             interp.inf_params, interp.opt_params, facts_default(), nothing)
+end
+"The owner whose code dispatch runs for `mi`: the facts owner for a method of a facts module."
+default_owner(mi::MethodInstance) = is_facts_method(mi.def) ? FACTS_OWNER : nothing
+"Whether plain inference in `interp` must leave `method` to an inference by facts."
+leaves_to_facts(interp::AbstractInterpreter, @nospecialize(method)) =
+    interp isa NativeInterpreter && interp.owner !== FACTS_OWNER && is_facts_method(method)
+
+"""
+A call from plain code to a facts method: the callee is inferred by facts, in an inference of its own
+(its own stack, as a request from the runtime would be), and the call names that CodeInstance, with
+the edge to it. Plain code never infers a facts method itself.
+"""
+function facts_edge(interp::NativeInterpreter, method::Method, mi::MethodInstance, caller::AbsIntState,
+                    edgecycle::Bool, edgelimited::Bool)
+    ci = typeinf_ext(facts_interp(interp), mi, SOURCE_MODE_NOT_REQUIRED)
+    ci isa CodeInstance && return return_cached_result(interp, method, ci, caller, edgecycle, edgelimited)
+    return Future(MethodCallResult(interp, caller, method, Any, Any, Effects(), nothing, edgecycle, edgelimited))
+end
+
 "Whether `mi` is the compiler's own code (a method of `Compiler` or a module inside it)."
 function is_compiler_code(mi::MethodInstance)
     m = mi.def
@@ -42,8 +90,26 @@ Whether `T` (a call's argument types) is a fact signature: a dispatch tuple; a t
 tuple-typed arguments have unions of concrete element types (it admits exactly the values of its
 splits, as top-level union splitting); or a closure's call at kinds (only its owner adds methods).
 """
-is_fact_sig(@nospecialize(T)) = T isa DataType && (isdispatchtuple(T) || fact_splits_ok(T) ||
+is_fact_sig(@nospecialize(T)) = T isa DataType && (isdispatchtuple(T) || fact_splits_ok(T) || vararg_fact(T) ||
     (T <: Tuple && length(T.parameters) >= 1 && is_closure_type(T.parameters[1]) && kinds_ok(T.parameters)))
+
+"""
+A tuple of concrete types ending in `Vararg{E}` with `E` concrete and not a kind: every tuple it admits
+is a dispatch tuple with the same owners in it, so only their stakeholders or a pirate can change
+dispatch at any of them (the user, session 29: "Anything that satisfies 'can only be changed by
+stakeholders or pirates' is fine"). Julia's core test of issue #10981 splats 2·10^6 arguments.
+"""
+function vararg_fact(@nospecialize(T))
+    (T isa DataType && T <: Tuple) || return false
+    ps = T.parameters
+    (isempty(ps) || !isvarargtype(ps[end])) && return false
+    va = unwrapva(ps[end])
+    (isdispatchelem(va) && !iskindtype(va)) || return false
+    for i in 1:length(ps)-1
+        isdispatchelem(ps[i]) || return false
+    end
+    return true
+end
 
 function fact_splits_ok(@nospecialize(T))
     (T isa DataType && T <: Tuple) || return false

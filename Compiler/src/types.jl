@@ -392,14 +392,17 @@ struct NativeInterpreter <: AbstractInterpreter
     inf_params::InferenceParams
     opt_params::OptimizationParams
 
-    # Whether calls are inferred only at fact signatures (facts.jl)
+    # Whether calls are inferred only at fact signatures, and the owner of the code it caches
+    # (`nothing`: plain Julia's; `FACTS_OWNER`: code compiled by facts beside plain code; facts.jl)
     facts::Bool
+    owner::Any
 end
 
 function NativeInterpreter(world::UInt = get_world_counter();
                            inf_params::InferenceParams = InferenceParams(),
                            opt_params::OptimizationParams = OptimizationParams(),
-                           facts::Bool = facts_default())
+                           facts::Bool = facts_default(),
+                           owner = nothing)
     curr_max_world = get_world_counter()
     # Sometimes the caller is lazy and passes typemax(UInt).
     # we cap it to the current world age for correctness
@@ -412,7 +415,7 @@ function NativeInterpreter(world::UInt = get_world_counter();
     method_table = CachedMethodTable(InternalMethodTable(world))
     inf_cache = Vector{InferenceResult}() # Initially empty cache
     codegen = IdDict{CodeInstance,CodeInfo}()
-    return NativeInterpreter(world, method_table, inf_cache, codegen, inf_params, opt_params, facts)
+    return NativeInterpreter(world, method_table, inf_cache, codegen, inf_params, opt_params, facts, owner)
 end
 
 # Quickly and easily satisfy the AbstractInterpreter API contract
@@ -420,7 +423,7 @@ InferenceParams(interp::NativeInterpreter) = interp.inf_params
 OptimizationParams(interp::NativeInterpreter) = interp.opt_params
 get_inference_world(interp::NativeInterpreter) = interp.world
 get_inference_cache(interp::NativeInterpreter) = interp.inf_cache
-cache_owner(::NativeInterpreter) = nothing
+cache_owner(interp::NativeInterpreter) = interp.owner
 
 engine_reserve(interp::AbstractInterpreter, mi::MethodInstance) = engine_reserve(mi, cache_owner(interp))
 engine_reserve(mi::MethodInstance, @nospecialize owner) = ccall(:jl_engine_reserve, Any, (Any, Any), mi, owner)::CodeInstance

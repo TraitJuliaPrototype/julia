@@ -521,6 +521,7 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
     m->compile = -1;
     m->infer = -1;
     m->max_methods = -1;
+    m->facts = parent != NULL && parent != m ? parent->facts == 1 : 0;
     m->file = jl_empty_sym;
     m->line = 0;
     m->hash = parent == NULL ? bitmix(name->hash, jl_module_type->hash) :
@@ -723,6 +724,21 @@ JL_DLLEXPORT int jl_get_module_infer(jl_module_t *m)
         value = m->infer;
     }
     return value;
+}
+
+JL_DLLEXPORT void jl_set_module_facts(jl_module_t *self, int value)
+{
+    self->facts = value != 0;
+}
+
+JL_DLLEXPORT int jl_get_module_facts(jl_module_t *m)
+{
+    return m->facts == 1;
+}
+
+JL_DLLEXPORT int jl_method_is_facts(jl_method_t *m) JL_NOTSAFEPOINT
+{
+    return m->facts == 0 ? m->module->facts == 1 : m->facts == 2;
 }
 
 JL_DLLEXPORT void jl_set_module_max_methods(jl_module_t *self, int value)

@@ -1002,6 +1002,10 @@ JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src)
                 }
                 st = jl_nothing;
             }
+            else if (nargs == 2 && jl_exprarg(st, 0) == (jl_value_t*)jl_facts_sym && jl_is_long(jl_exprarg(st, 1))) {
+                m->facts = jl_unbox_long(jl_exprarg(st, 1)) != 0 ? 2 : 1;   // `Expr(:meta, :facts, 0)`: a boundary
+                st = jl_nothing;
+            }
             else if (nargs == 2 && jl_exprarg(st, 0) == (jl_value_t*)jl_generated_sym) {
                 if (m->generator != NULL)
                     jl_error("duplicate @generated function body");
@@ -1087,6 +1091,7 @@ JL_DLLEXPORT jl_method_t *jl_new_method_uninit(jl_module_t *module)
     m->constprop = 0;
     m->purity.bits = 0;
     m->max_varargs = UINT8_MAX;
+    m->facts = 0;
     JL_MUTEX_INIT(&m->writelock, "method->writelock");
     return m;
 }

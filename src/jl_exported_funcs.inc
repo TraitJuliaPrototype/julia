@@ -15,6 +15,7 @@
     XX(jl_apply_array_type) \
     XX(jl_apply_cmpswap_type) \
     XX(jl_apply_generic) \
+    XX(jl_apply_generic_facts) \
     XX(jl_apply_tuple_type) \
     XX(jl_apply_tuple_type_v) \
     XX(jl_apply_type) \
@@ -205,6 +206,9 @@
     XX(jl_get_libjulia_internal_path) \
     XX(jl_get_module_compile) \
     XX(jl_get_module_infer) \
+    XX(jl_get_module_facts) \
+    XX(jl_method_is_facts) \
+    XX(jl_set_module_facts) \
     XX(jl_get_module_of_binding) \
     XX(jl_get_module_optlevel) \
     XX(jl_get_module_usings_backedges) \
@@ -249,6 +253,7 @@
     XX(jl_intersect_types) \
     XX(jl_intrinsic_name) \
     XX(jl_invoke) \
+    XX(jl_invoke_facts) \
     XX(jl_invoke_api) \
     XX(jl_in_threaded_region) \
     XX(jl_iolock_begin) \
