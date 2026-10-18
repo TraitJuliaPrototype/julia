@@ -391,11 +391,15 @@ struct NativeInterpreter <: AbstractInterpreter
     # Parameters for inference and optimization
     inf_params::InferenceParams
     opt_params::OptimizationParams
+
+    # Whether calls are inferred only at fact signatures (facts.jl)
+    facts::Bool
 end
 
 function NativeInterpreter(world::UInt = get_world_counter();
                            inf_params::InferenceParams = InferenceParams(),
-                           opt_params::OptimizationParams = OptimizationParams())
+                           opt_params::OptimizationParams = OptimizationParams(),
+                           facts::Bool = facts_default())
     curr_max_world = get_world_counter()
     # Sometimes the caller is lazy and passes typemax(UInt).
     # we cap it to the current world age for correctness
@@ -408,7 +412,7 @@ function NativeInterpreter(world::UInt = get_world_counter();
     method_table = CachedMethodTable(InternalMethodTable(world))
     inf_cache = Vector{InferenceResult}() # Initially empty cache
     codegen = IdDict{CodeInstance,CodeInfo}()
-    return NativeInterpreter(world, method_table, inf_cache, codegen, inf_params, opt_params)
+    return NativeInterpreter(world, method_table, inf_cache, codegen, inf_params, opt_params, facts)
 end
 
 # Quickly and easily satisfy the AbstractInterpreter API contract

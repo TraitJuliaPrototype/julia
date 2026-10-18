@@ -365,6 +365,7 @@ end
 function find_method_matches(interp::AbstractInterpreter, argtypes::Vector{Any}, @nospecialize(atype);
                              max_union_splitting::Int = InferenceParams(interp).max_union_splitting,
                              max_methods::Int = InferenceParams(interp).max_methods)
+    facts_mode(interp) && return facts_find_method_matches(interp, argtypes, atype, max_union_splitting, max_methods)
     if is_union_split_eligible(typeinf_lattice(interp), argtypes, max_union_splitting)
         return find_union_split_method_matches(interp, argtypes, max_methods)
     end
@@ -958,6 +959,7 @@ end
 function concrete_eval_eligible(interp::AbstractInterpreter,
     @nospecialize(f), result::MethodCallResult, arginfo::ArgInfo, sv::AbsIntState)
     (;effects) = result
+    facts_mode(interp) && facts_eval_refused(result) && return :none
     if inbounds_option() === :off
         if !is_nothrow(effects)
             # Disable concrete evaluation in `--check-bounds=no` mode,

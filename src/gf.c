@@ -1087,6 +1087,20 @@ JL_DLLEXPORT void jl_set_compile_and_emit_func(jl_value_t *f)
     jl_compile_and_emit_func = (jl_value_t*)f;
 }
 
+// The process switch of the compiler's facts mode (Compiler/src/facts.jl): JULIA_COMPILE_BY_FACTS,
+// read once. 1 on, 0 off, 2 unset (the system image decides).
+JL_DLLEXPORT int jl_compile_by_facts(void)
+{
+    static _Atomic(int) mode = -1;
+    int m = jl_atomic_load_relaxed(&mode);
+    if (m < 0) {
+        const char *e = getenv("JULIA_COMPILE_BY_FACTS");
+        m = (e == NULL || *e == '\0') ? 2 : (strcmp(e, "0") == 0 ? 0 : 1);
+        jl_atomic_store_relaxed(&mode, m);
+    }
+    return m;
+}
+
 static int very_general_type(jl_value_t *t)
 {
     return (t == (jl_value_t*)jl_any_type || jl_types_equal(t, (jl_value_t*)jl_type_type));

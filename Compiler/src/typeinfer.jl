@@ -1652,7 +1652,7 @@ end
 # This is a bridge for the C code calling `jl_typeinf_func()` on a single Method match
 function typeinf_ext_toplevel(mi::MethodInstance, world::UInt, source_mode::UInt8, trim_mode::UInt8)
     inf_params = InferenceParams(; force_enable_inference = trim_mode != TRIM_NO)
-    interp = NativeInterpreter(world; inf_params)
+    interp = NativeInterpreter(world; inf_params, facts = facts_default() && !is_compiler_code(mi))
     return typeinf_ext_toplevel(interp, mi, source_mode)
 end
 
@@ -1777,7 +1777,7 @@ verify_typeinf_trim(codeinfos::Vector{Any}, onlywarn::Bool) = Core._call_in_worl
 
 function return_type(@nospecialize(f), t::DataType) # this method has a special tfunc
     world = tls_world_age()
-    args = Any[_return_type, NativeInterpreter(world), Tuple{Core.Typeof(f), t.parameters...}]
+    args = Any[_return_type, return_type_interp(world), Tuple{Core.Typeof(f), t.parameters...}]
     return ccall(:jl_call_in_typeinf_world, Any, (Ptr{Any}, Cint), args, length(args))
 end
 
@@ -1791,7 +1791,7 @@ function return_type(t::DataType)
 end
 
 function return_type(t::DataType, world::UInt)
-    args = Any[_return_type, NativeInterpreter(world), t]
+    args = Any[_return_type, return_type_interp(world), t]
     return ccall(:jl_call_in_typeinf_world, Any, (Ptr{Any}, Cint), args, length(args))
 end
 

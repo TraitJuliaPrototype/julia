@@ -3175,6 +3175,13 @@ function return_type_tfunc(interp::AbstractInterpreter, argtypes::Vector{Any}, s
         end
         info = MethodResultPure(ReturnTypeCallInfo(call.info))
         rt = widenslotwrapper(call.rt)
+        # facts mode: the answer may be wider than plain inference's; fold only an answer that
+        # cannot be wider (a constant, a concrete type, Union{}), else plain Julia's at run time
+        if facts_mode(interp) && !(isa(rt, Const) || (w = widenconst(rt); w === Bottom || (isconcretetype(w) && !iskindtype(w))))
+            sig = length(argtypes) == 3 ? Tuple{widenconst(aft), af_argtype.parameters...} : af_argtype
+            r = facts_plain_return_type(interp, sig, sv)
+            return r === nothing ? UNKNOWN : r
+        end
         if isa(rt, Const)
             # output was computed to be constant
             return CallMeta(Const(typeof(rt.val)), Union{}, RT_CALL_EFFECTS, info)
