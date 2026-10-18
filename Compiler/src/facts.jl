@@ -349,3 +349,82 @@ function facts_plain_return_type(interp::AbstractInterpreter, @nospecialize(sig)
     update_valid_age!(sv, valid)
     return CallMeta(Const(rt), Union{}, Effects(EFFECTS_TOTAL; nortcall = false), MethodResultPure(PlainRTInfo(sigs, cis)))
 end
+
+# --- (D): a call on a dynamic value, split at the call site ---------------------------------------
+# `dynamic_call(K, f, x, args...)` is `f(x, args...)` where `x` is a value of an open set of types
+# (a trait's dynamic value, `K` the trait). Inference splits it over the candidate types registered
+# for `K` (at most `MAX_FACT_SPLITS`): `f` at their union, each split a fact with its edge, plus a
+# fallback for any other type; the inliner emits `isa` branches with direct calls and the dynamic
+# call in the last branch, as for union splitting. The candidates are read without an edge: a type
+# registered later reaches the fallback, which is correct, and invalidates nothing.
+
+"`f(x, args...)` for a value `x` of the open set of types registered for `K` (split at the call site)."
+dynamic_call(@nospecialize(K), f, x, args...) = f(x, args...)
+
+mutable struct DynamicCandidates
+    @atomic table::Any          # an IdDict{Any,Vector{Any}}, replaced on each registration, never mutated
+end
+const DYNAMIC_CANDIDATES = DynamicCandidates(nothing)
+
+"Register type `C` as a candidate of `K` (TraitWorld does, for each trait-object type a dynamic value of `K` holds)."
+function register_dynamic_candidate!(@nospecialize(K), @nospecialize(C))
+    while true
+        old = @atomic DYNAMIC_CANDIDATES.table
+        if old !== nothing
+            v = get(old::IdDict{Any,Vector{Any}}, K, nothing)
+            if v !== nothing
+                for c in v::Vector{Any}
+                    c === C && return nothing
+                end
+            end
+        end
+        new = old === nothing ? IdDict{Any,Vector{Any}}() : copy(old::IdDict{Any,Vector{Any}})
+        v = Any[get(new, K, Any[])::Vector{Any}..., C]
+        new[K] = v
+        (@atomicreplace DYNAMIC_CANDIDATES.table old => new).success && return nothing
+    end
+end
+"The candidate types of `K` now: the first `MAX_FACT_SPLITS` registered."
+function dynamic_candidates(@nospecialize(K))
+    t = @atomic DYNAMIC_CANDIDATES.table
+    t === nothing && return Any[]
+    v = get(t::IdDict{Any,Vector{Any}}, K, nothing)
+    v === nothing && return Any[]
+    v = v::Vector{Any}
+    return length(v) <= MAX_FACT_SPLITS ? v : v[1:MAX_FACT_SPLITS]
+end
+
+"The call info of a `dynamic_call`: the call of `f` at the candidates' union; the inliner rewrites the statement."
+struct DynamicSplitInfo <: CallInfo
+    info::CallInfo
+end
+add_edges_impl(edges::Vector{Any}, info::DynamicSplitInfo) = add_edges!(edges, info.info)
+nsplit_impl(info::DynamicSplitInfo) = nsplit(info.info)
+getsplit_impl(info::DynamicSplitInfo, idx::Int) = getsplit(info.info, idx)
+getresult_impl(info::DynamicSplitInfo, idx::Int) = getresult(info.info, idx)
+
+"Inference of `dynamic_call(K, f, x, args...)`: `f` at the union of `K`'s candidates (a narrower known type of `x` kept), and a fallback."
+function abstract_dynamic_call(interp::AbstractInterpreter, argtypes::Vector{Any}, si::StmtInfo, sv::AbsIntState)
+    K = argtypes[2]
+    newargs = Any[argtypes[3:end]...]
+    cands = K isa Const ? dynamic_candidates(K.val) : Any[]
+    X = widenconst(argtypes[4])
+    narrowed = false
+    if !isempty(cands) && !isdispatchelem(X)
+        U = Union{}
+        for C in cands
+            U = Union{U, C}
+        end
+        U = typeintersect(X, U)
+        if U !== Union{}
+            newargs[2] = U
+            narrowed = true
+        end
+    end
+    call = abstract_call(interp, ArgInfo(nothing, newargs), si, sv)::Future
+    narrowed || return call
+    return Future{CallMeta}(call, interp, sv) do call, _, _
+        # a value of another type reaches the fallback: its result and effects are unknown
+        return CallMeta(Any, Any, merge_effects(call.effects, Effects()), DynamicSplitInfo(call.info))
+    end
+end

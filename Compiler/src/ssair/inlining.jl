@@ -1281,6 +1281,15 @@ function process_simple!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::Int, flag
     sig = inline_apply!(todo, ir, idx, stmt, sig, state)
     sig === nothing && return nothing
 
+    # a call on a dynamic value (`dynamic_call(K, f, x, args...)`, facts.jl): the call of `f`,
+    # split by inference over the candidates (after `inline_apply!`, which makes a splat a call)
+    if inst[:info] isa DynamicSplitInfo && isexpr(stmt, :call) && length(stmt.args) >= 4
+        stmt = Expr(:call, stmt.args[3:end]...)
+        inst[:stmt] = stmt              # the info stays a `DynamicSplitInfo`: never fully covered
+        sig = call_sig(ir, stmt)
+        sig === nothing && return nothing
+    end
+
     # Check if we match any of the early inliners
     earlyres = early_inline_special_case(ir, stmt, flag, rt, sig, state)
     if isa(earlyres, SomeCase)
@@ -1398,6 +1407,10 @@ function compute_inlining_cases(@nospecialize(info::CallInfo), flag::UInt32, sig
             end
         end
         fully_covered &= split_fully_covered
+    end
+    if info isa DynamicSplitInfo
+        # a value of a type not among the candidates reaches the call itself (facts.jl, part D)
+        handled_all_cases = fully_covered = false
     end
 
     (handled_all_cases & fully_covered) || (joint_effects = Effects(joint_effects; nothrow=false))
