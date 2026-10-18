@@ -738,6 +738,8 @@ JL_DLLEXPORT int jl_get_module_facts(jl_module_t *m)
 
 JL_DLLEXPORT int jl_method_is_facts(jl_method_t *m) JL_NOTSAFEPOINT
 {
+    if (jl_options.trim != JL_TRIM_NO)
+        return 0;   // a trimmed build compiles plain code: its world is closed (design.md §6)
     return m->facts == 0 ? m->module->facts == 1 : m->facts == 2;
 }
 

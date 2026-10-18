@@ -3635,7 +3635,11 @@ function merge_override_effects!(interp::AbstractInterpreter, effects::Effects, 
     # It is possible for arguments (GlobalRef/:static_parameter) to throw,
     # but these will be recomputed during SSA construction later.
     override = decode_statement_effects_override(sv)
-    effects = override_effects(effects, override)
+    # under the facts mode, assertions are trusted only in Julia's own methods (facts.jl)
+    def = frame_instance(sv).def
+    if !(facts_mode(interp) && def isa Method && !facts_trusts_assertions(def))
+        effects = override_effects(effects, override)
+    end
     set_curr_ssaflag!(sv, flags_for_effects(effects), IR_FLAGS_EFFECTS)
     merge_effects!(interp, sv, effects)
     return effects

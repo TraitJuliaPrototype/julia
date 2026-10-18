@@ -181,6 +181,12 @@ function facts_find_method_matches(interp::AbstractInterpreter, argtypes::Vector
     return find_simple_method_matches(interp, atype, max_methods)
 end
 
+"Whether the facts mode trusts `m`'s asserted effects: methods of Base and Core only."
+function facts_trusts_assertions(m::Method)
+    r = Base.moduleroot(m.module)
+    return r === Base || r === Core
+end
+
 """
 Compile-time evaluation under the facts mode: a dynamic call already taints the caller's effects,
 so only asserted effects (`@assume_effects`) can make code over a run-time site foldable; folding it

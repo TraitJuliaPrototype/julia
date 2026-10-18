@@ -1114,6 +1114,8 @@ JL_DLLEXPORT int jl_compile_by_facts(void)
     if (m < 0) {
         const char *e = getenv("JULIA_COMPILE_BY_FACTS");
         m = (e == NULL || *e == '\0') ? 2 : (strcmp(e, "0") == 0 ? 0 : 1);
+        if (jl_options.trim != JL_TRIM_NO)
+            m = 0;   // a trimmed build compiles plain code (design.md §6)
         jl_atomic_store_relaxed(&mode, m);
     }
     return m;
