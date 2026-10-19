@@ -35,6 +35,10 @@ else
 
 @eval baremodule Compiler
 
+# the compiler's own code is compiled plainly whoever calls it, code compiled by facts included
+# (Compiler/src/facts.jl): set before its submodules exist, which inherit it
+ccall(:jl_set_module_facts, Nothing, (Any, Int32), Compiler, 2)
+
 using Core.Intrinsics, Core.IR
 
 using Core: ABIOverride, Builtin, CodeInstance, IntrinsicFunction, MethodInstance, MethodMatch,

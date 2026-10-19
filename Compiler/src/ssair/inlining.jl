@@ -806,10 +806,10 @@ function compileable_specialization(code::Union{MethodInstance,CodeInstance}, ef
     end
     # prefer using a CodeInstance gotten from the cache, since that is where the invoke target should get compiled to normally
     # TODO: can this code be gotten directly from inference sometimes?
-    # (a facts method's code is in the facts cache, whoever calls it: facts.jl)
-    code = leaves_to_facts(state.interp, method) ?
-        get(code_cache(facts_interp(state.interp::NativeInterpreter)), mi_invoke, nothing) :
-        get(code_cache(state), mi_invoke, nothing)
+    # (a facts method's code is in the facts cache, whoever calls it, and the compiler's in the plain one: facts.jl)
+    other = leaves_to(state.interp, method)
+    code = other === nothing ? get(code_cache(state), mi_invoke, nothing) :
+        get(code_cache(other), mi_invoke, nothing)
     if !isa(code, CodeInstance)
         #println("missing code for ", mi_invoke, " for ", mi)
         code = mi_invoke

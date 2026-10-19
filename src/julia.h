@@ -862,7 +862,8 @@ typedef struct _jl_module_t {
     int8_t infer;
     uint8_t istopmod;
     int8_t max_methods;
-    int8_t facts; // compiled by facts (Compiler/src/facts.jl): 1 yes, 0 no; a new submodule inherits it
+    int8_t facts; // compiled by facts (Compiler/src/facts.jl): 1 yes, 0 no, 2 never (plain whoever calls: the
+                  // compiler's own code); a new submodule inherits it
     // If cleared no binding partition in this module has PARTITION_FLAG_EXPORTED and min_world > jl_require_world.
     _Atomic(int8_t) export_set_changed_since_require_world;
     jl_mutex_t lock;
@@ -2061,6 +2062,7 @@ JL_DLLEXPORT int jl_get_module_max_methods(jl_module_t *m);
 JL_DLLEXPORT void jl_set_module_facts(jl_module_t *self, int value);
 JL_DLLEXPORT int jl_get_module_facts(jl_module_t *m);
 JL_DLLEXPORT int jl_method_is_facts(jl_method_t *m) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_method_is_plain(jl_method_t *m) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_get_module_usings_backedges(jl_module_t *m);
 JL_DLLEXPORT jl_value_t *jl_get_module_scanned_methods(jl_module_t *m);
 JL_DLLEXPORT jl_value_t *jl_get_module_binding_or_nothing(jl_module_t *m, jl_sym_t *s);

@@ -917,7 +917,7 @@ static int jl_method_refused(jl_array_t *refused, jl_value_t *m) JL_NOTSAFEPOINT
 }
 
 // `refused`: methods an image hook asked to leave inactive (they never become visible)
-static void jl_activate_methods(jl_array_t *external, jl_array_t *internal, size_t world, const char *pkgname, jl_array_t *refused, jl_array_t *roots)
+static void jl_activate_methods(jl_array_t *external, jl_array_t *internal, size_t world, const char *pkgname, jl_array_t *refused)
 {
     size_t i, l = jl_array_nrows(internal);
     for (i = 0; i < l; i++) {
@@ -959,9 +959,7 @@ static void jl_activate_methods(jl_array_t *external, jl_array_t *internal, size
             if (jl_method_refused(refused, (jl_value_t*)entry->func.method))
                 continue;                               // refused by the image hook: stays inactive
             //uint64_t t0 = uv_hrtime();
-            jl_tw_set_trigger_root(roots ? jl_array_ptr_ref(roots, i) : NULL);   // the invalidation policy's answer
             jl_method_table_activate(entry);
-            jl_tw_set_trigger_root(NULL);
             //jl_printf(JL_STDERR, "%f ", (double)(uv_hrtime() - t0) / 1e6);
             //jl_static_show(JL_STDERR, entry->func.value);
             //jl_printf(JL_STDERR, "\n");

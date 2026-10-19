@@ -2198,25 +2198,6 @@ JL_DLLEXPORT jl_value_t *jl_debug_method_invalidation(int state)
 
 static void _invalidate_backedges(jl_method_instance_t *replaced_mi, jl_code_instance_t *replaced_ci, size_t max_world, int depth);
 
-// recursively invalidate cached methods that had an edge to a replaced method
-
-// --- trait-world invalidation filter (trait-bound PoC, design note rev 1110) ---
-// A method insertion never invalidates code of a trait module (or TraitWorld)
-// when the new method is defined outside the trait world and outside Julia
-// (Base, Core, the standard libraries: one owner, in every view) and its
-// definer owns a type or the function of its signature: a definition
-// elsewhere, for the definer's own types, can never apply to trait-world code
-// (layering: no value of an outside type reaches it). Pirates (definer owns
-// nothing in the signature) invalidate as before, so trait-world code never
-// silently disagrees with plain Julia; in doubt (Union arguments, extensions,
-// which C cannot attribute to their parents) the filter invalidates. Only
-// trait modules are protected, not wrapped packages: their code is also
-// ordinary code. The arrays are rooted by the caller (TraitWorld).
-static _Atomic(jl_array_t*) jl_tw_modules;       // Modules: trait modules and TraitWorld
-static _Atomic(jl_array_t*) jl_tw_julia_names;   // Symbols: names of Julia's standard libraries
-static _Atomic(jl_method_t*) jl_tw_trigger;      // the method being inserted (jl_method_table_activate)
-JL_DLLEXPORT _Atomic(size_t) jl_tw_skipped;      // invalidations the filter skipped (for measurements)
-
 // --- method-definition hooks (trait-bound PoC, julia-support.md piece 1) ---
 // `jl_method_def_hook`: a Julia callable `hook(m::Method, after::Bool)`, called with `after = false`
 // before a method enters the method table (it may throw to refuse the definition: the method then
@@ -2225,7 +2206,7 @@ JL_DLLEXPORT _Atomic(size_t) jl_tw_skipped;      // invalidations the filter ski
 // new methods of a package image before they are activated; it returns a vector of methods to
 // leave inactive (or `nothing`). Both run in the latest world, outside the world-counter lock, and
 // not for definitions made by a hook itself. Set to `nothing` to remove. The callables are rooted
-// by the caller (as the filter's arrays are).
+// by the caller.
 static _Atomic(jl_value_t*) jl_method_def_hook;
 static _Atomic(jl_value_t*) jl_image_methods_hook;
 static _Thread_local int jl_in_method_hook = 0;  // a definition made by a hook itself is not hooked
@@ -2305,156 +2286,9 @@ jl_array_t *jl_run_image_methods_hook(jl_array_t *external, const char *pkgname)
     return (res != NULL && jl_is_array(res) && jl_array_nrows((jl_array_t*)res) > 0) ? (jl_array_t*)res : NULL;
 }
 
-JL_DLLEXPORT void jl_set_trait_world_filter(jl_array_t *mods, jl_array_t *julia_names)
-{
-    jl_atomic_store_release(&jl_tw_julia_names, julia_names);   // kept for the API; the policy decides
-    jl_atomic_store_release(&jl_tw_modules, mods);
-}
-
-static jl_module_t *tw_root(jl_module_t *m) JL_NOTSAFEPOINT
-{
-    // a package root is its own parent; a module of a script counts as its own package
-    while (m->parent != NULL && m->parent != m && m->parent != jl_main_module)
-        m = m->parent;
-    return m;
-}
-
-static int tw_in_chain(jl_array_t *mods, jl_module_t *m) JL_NOTSAFEPOINT
-{
-    while (1) {
-        for (size_t i = 0; i < jl_array_nrows(mods); i++)
-            if (jl_array_ptr_ref(mods, i) == (jl_value_t*)m)
-                return 1;
-        if (m->parent == NULL || m->parent == m)
-            return 0;
-        m = m->parent;
-    }
-}
-
-// Whether the package `root` owns a type anywhere in `t`, the signature a CodeInstance was compiled
-// for: its arguments, their parameters, a trait object's views and keys. Under keys a worker is
-// compiled for the user's implementing type, so that type's owner is in the worker's view (rule 4),
-// and its definitions must invalidate as in plain Julia.
-static int tw_mentions_owned(jl_value_t *t, jl_module_t *root, int depth) JL_NOTSAFEPOINT
-{
-    if (depth > 8 || t == NULL)
-        return 0;
-    if (jl_is_uniontype(t))
-        return tw_mentions_owned(((jl_uniontype_t*)t)->a, root, depth + 1) ||
-               tw_mentions_owned(((jl_uniontype_t*)t)->b, root, depth + 1);
-    if (jl_is_unionall(t)) {
-        jl_tvar_t *v = ((jl_unionall_t*)t)->var;
-        return tw_mentions_owned(v->lb, root, depth + 1) || tw_mentions_owned(v->ub, root, depth + 1) ||
-               tw_mentions_owned(((jl_unionall_t*)t)->body, root, depth + 1);
-    }
-    if (jl_is_typevar(t))
-        return tw_mentions_owned(((jl_tvar_t*)t)->lb, root, depth + 1) ||
-               tw_mentions_owned(((jl_tvar_t*)t)->ub, root, depth + 1);
-    if (jl_is_vararg(t)) {
-        jl_vararg_t *va = (jl_vararg_t*)t;
-        return va->T != NULL && tw_mentions_owned(va->T, root, depth + 1);
-    }
-    if (!jl_is_datatype(t))
-        return 0;
-    jl_datatype_t *dt = (jl_datatype_t*)t;
-    if (tw_root(dt->name->module) == root)
-        return 1;
-    size_t np = jl_nparams(dt);
-    for (size_t i = 0; i < np; i++)
-        if (tw_mentions_owned(jl_tparam(dt, i), root, depth + 1))
-            return 1;
-    return 0;
-}
-
-// The invalidation policy (julia-support.md piece 2). A Julia callable registered with
-// `jl_set_invalidation_policy(f)` decides, per new method and before any lock is taken,
-// `f(m::Method)::Union{Module,Nothing}`: the package whose definition it is, when that definition
-// cannot change protected code that does not mention the package's types; `nothing` when it
-// invalidates as usual (a definition in the trait world or Julia, a pirate). Inside the lock the
-// test per CodeInstance is structural and allocation-free: the code is protected (its module is
-// registered) and its signature mentions no type of that package (rule 4: the owners of the types a
-// call is compiled for are in its view).
-static _Atomic(jl_value_t*) jl_tw_policy;
-static _Atomic(jl_value_t*) jl_tw_trigger_root;   // the policy's answer for the method being activated
-
-JL_DLLEXPORT void jl_set_invalidation_policy(jl_value_t *f)
-{
-    jl_atomic_store_release(&jl_tw_policy, f == jl_nothing ? NULL : f);
-}
-
-// the policy's answer for `m`, or NULL; called outside the world-counter lock
-jl_value_t *jl_tw_policy_root(jl_method_t *m)
-{
-    jl_value_t *policy = jl_atomic_load_acquire(&jl_tw_policy);
-    if (policy == NULL || jl_in_method_hook)
-        return NULL;
-    jl_value_t **args;
-    JL_GC_PUSHARGS(args, 2);
-    args[0] = policy;
-    args[1] = (jl_value_t*)m;
-    jl_value_t *res = NULL;
-    JL_TRY {
-        res = jl_call_method_hook(args, 2);
-    }
-    JL_CATCH {
-        res = NULL;                                 // in doubt: invalidate as usual
-    }
-    JL_GC_POP();
-    return (res != NULL && jl_is_module(res)) ? res : NULL;
-}
-
-// the policy's answers for a package image's new methods (typemap entries), or NULL
-jl_array_t *jl_tw_policy_roots(jl_array_t *external)
-{
-    if (jl_atomic_load_acquire(&jl_tw_policy) == NULL)
-        return NULL;
-    size_t l = jl_array_nrows(external);
-    jl_array_t *roots = jl_alloc_vec_any(l);
-    JL_GC_PUSH1(&roots);
-    for (size_t i = 0; i < l; i++) {
-        jl_typemap_entry_t *entry = (jl_typemap_entry_t*)jl_array_ptr_ref(external, i);
-        jl_value_t *r = jl_tw_policy_root(entry->func.method);
-        jl_array_ptr_set(roots, i, r ? r : jl_nothing);
-    }
-    JL_GC_POP();
-    return roots;
-}
-
-void jl_tw_set_trigger_root(jl_value_t *root) JL_NOTSAFEPOINT
-{
-    jl_atomic_store_relaxed(&jl_tw_trigger_root, (root == NULL || root == jl_nothing) ? NULL : root);
-}
-
-static int tw_protected(jl_code_instance_t *ci) JL_NOTSAFEPOINT
-{
-    jl_value_t *root = jl_atomic_load_relaxed(&jl_tw_trigger_root);
-    jl_array_t *mods = jl_atomic_load_relaxed(&jl_tw_modules);
-    if (root == NULL || mods == NULL)
-        return 0;
-    jl_method_instance_t *mi = jl_get_ci_mi(ci);
-    if (!jl_is_method(mi->def.method) || !tw_in_chain(mods, mi->def.method->module))
-        return 0;                                   // not protected code: plain Julia
-    if (tw_mentions_owned(mi->specTypes, (jl_module_t*)root, 0))
-        return 0;                                   // the definer owns a type the code was compiled for: in its view
-    return 1;
-}
-
-// Whether the filter keeps `ci` (counting it): its caller must then keep the backedge too, so that a
-// later definition the filter does not skip (a pirate, an owner of one of its types) still finds it.
-static int tw_skip(jl_code_instance_t *ci) JL_NOTSAFEPOINT
-{
-    if (!tw_protected(ci))
-        return 0;
-    jl_atomic_fetch_add_relaxed(&jl_tw_skipped, 1);
-    return 1;
-}
-
+// recursively invalidate cached methods that had an edge to a replaced method
 static void invalidate_code_instance(jl_code_instance_t *replaced, size_t max_world, int depth)
 {
-    if (tw_protected(replaced)) {
-        jl_atomic_fetch_add_relaxed(&jl_tw_skipped, 1);
-        return;
-    }
     jl_timing_counter_inc(JL_TIMING_COUNTER_Invalidations, 1);
     if (_jl_debug_method_invalidation) {
         jl_value_t *boxeddepth = NULL;
@@ -2525,14 +2359,6 @@ static void _invalidate_backedges(jl_method_instance_t *replaced_mi, jl_code_ins
             continue;
         }
         JL_GC_PROMISE_ROOTED(replaced); // propagated by get_next_edge from backedges
-        if (tw_skip(replaced)) {
-            // the trait-world filter keeps this caller: keep its backedge
-            if (replaced_ci)
-                ins = set_next_edge(backedges, ins, invokesig, replaced);
-            else
-                jl_method_instance_add_backedge(replaced_mi, invokesig, replaced);
-            continue;
-        }
         if (replaced_ci) {
             // If we're invalidating a particular codeinstance, only invalidate
             // this backedge it actually has an edge for our codeinstance.
@@ -2651,10 +2477,7 @@ static int _invalidate_dispatch_backedges(jl_method_instance_t *mi, jl_value_t *
         else {
             replaced_edge = replaced_dispatch;
         }
-        if (replaced_edge && tw_skip(caller)) {
-            insb = set_next_edge(backedges, insb, invokeTypes, caller);   // kept by the filter: keep its backedge
-        }
-        else if (replaced_edge) {
+        if (replaced_edge) {
             invalidate_code_instance(caller, max_world, 1);
             insb = clear_next_edge(backedges, insb, invokeTypes, caller);
             jl_atomic_fetch_or(&mi->flags, MI_FLAG_BACKEDGES_DIRTY);
@@ -2833,8 +2656,6 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
             }
         }
         *env->isect = *env->isect2 = NULL;
-        if (missing && tw_skip((jl_code_instance_t*)d[i]))
-            missing = 0;                                // kept by the filter: keep its backedge (below)
         if (missing) {
             jl_code_instance_t *backedge = (jl_code_instance_t*)d[i];
             JL_GC_PROMISE_ROOTED(backedge);
@@ -3284,7 +3105,6 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     jl_genericmemory_t *interferences = NULL;
     JL_GC_PUSH6(&oldvalue, &oldmi, &loctag, &isect, &isect2, &interferences);
     jl_typemap_entry_t *replaced = NULL;
-    jl_atomic_store_relaxed(&jl_tw_trigger, method);   // trait-world invalidation filter
     // Check what entries this intersects with in the prior world.
     oldvalue = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), newentry, &replaced, max_world);
     jl_method_t *const *d;
@@ -3507,24 +3327,20 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     jl_atomic_store_relaxed(&method->dispatch_status, dispatch_bits); // TODO: this should be sequenced fully after the world counter store
     jl_atomic_store_release(&method->interferences, interferences);
     jl_gc_wb(method, interferences);
-    jl_atomic_store_relaxed(&jl_tw_trigger, NULL);   // trait-world invalidation filter
     JL_GC_POP();
 }
 
 JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method, jl_tupletype_t *simpletype)
 {
     jl_run_method_def_hook(method, 0);              // may throw: the method is refused before it enters the table
-    jl_value_t *root = jl_tw_policy_root(method);   // the invalidation policy, decided before the lock
     jl_typemap_entry_t *newentry = jl_method_table_add(mt, method, simpletype);
-    JL_GC_PUSH2(&newentry, &root);
+    JL_GC_PUSH1(&newentry);
     JL_LOCK(&world_counter_lock);
     if (!jl_atomic_load_relaxed(&allow_new_worlds))
         jl_error("Method changes have been disabled via a call to disable_new_worlds.");
     size_t world = jl_atomic_load_relaxed(&jl_world_counter) + 1;
     jl_atomic_store_relaxed(&method->primary_world, world);
-    jl_tw_set_trigger_root(root);
     jl_method_table_activate(newentry);
-    jl_tw_set_trigger_root(NULL);
     jl_atomic_store_release(&jl_world_counter, world);
     JL_UNLOCK(&world_counter_lock);
     jl_run_method_def_hook(method, 1);              // the method is visible now
@@ -4733,6 +4549,14 @@ JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t *F, jl_value_t **args, uint
     return _jl_invoke(F, args, nargs, mfunc, world);
 }
 
+// The owner whose code a call from code compiled by facts runs: code compiled by facts, except for
+// a method compiled plainly whoever calls it (the compiler's own code, `jl_method_is_plain`).
+STATIC_INLINE jl_value_t *facts_callee_owner(jl_method_instance_t *mfunc) JL_NOTSAFEPOINT
+{
+    jl_method_t *def = mfunc->def.method;
+    return jl_is_method(def) && jl_method_is_plain(def) ? jl_nothing : (jl_value_t*)jl_facts_sym;
+}
+
 // Dispatch at run time from code compiled by facts (part (C)): the same method lookup, then the
 // code compiled by facts for the method found, compiled on a miss.
 JL_DLLEXPORT jl_value_t *jl_apply_generic_facts(jl_value_t *F, jl_value_t **args, uint32_t nargs)
@@ -4742,13 +4566,13 @@ JL_DLLEXPORT jl_value_t *jl_apply_generic_facts(jl_value_t *F, jl_value_t **args
                                                      jl_int32hash_fast(jl_return_address()),
                                                      world);
     JL_GC_PROMISE_ROOTED(mfunc);
-    return _jl_invoke_owner(F, args, nargs, mfunc, world, (jl_value_t*)jl_facts_sym);
+    return _jl_invoke_owner(F, args, nargs, mfunc, world, facts_callee_owner(mfunc));
 }
 
 JL_DLLEXPORT jl_value_t *jl_invoke_facts(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc)
 {
     size_t world = jl_current_task->world_age;
-    return _jl_invoke_owner(F, args, nargs, mfunc, world, (jl_value_t*)jl_facts_sym);
+    return _jl_invoke_owner(F, args, nargs, mfunc, world, facts_callee_owner(mfunc));
 }
 
 static jl_method_match_t *_gf_invoke_lookup(jl_value_t *types JL_PROPAGATES_ROOT, jl_methtable_t *mt, size_t world, int cache_result, size_t *min_valid, size_t *max_valid)

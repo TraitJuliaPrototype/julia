@@ -54,18 +54,37 @@ function interp_for_owner(interp::AbstractInterpreter, @nospecialize(owner))
 end
 "The owner whose code dispatch runs for `mi`: the facts owner for a method of a facts module."
 default_owner(mi::MethodInstance) = is_facts_method(mi.def) ? FACTS_OWNER : nothing
-"Whether plain inference in `interp` must leave `method` to an inference by facts."
-leaves_to_facts(interp::AbstractInterpreter, @nospecialize(method)) =
-    interp isa NativeInterpreter && interp.owner !== FACTS_OWNER && is_facts_method(method)
+"Whether `m` is compiled plainly whoever calls it: the compiler's own code (`jl_method_is_plain`)."
+is_plain_method(@nospecialize(m)) = m isa Method && ccall(:jl_method_is_plain, Cint, (Any,), m) != 0
+"A plain interpreter beside the facts interpreter `interp`: its world, parameters and codegen cache."
+plain_interp(interp::NativeInterpreter) =
+    NativeInterpreter(interp.world, interp.method_table, InferenceResult[], interp.codegen,
+                      interp.inf_params, interp.opt_params, false, nothing)
+"""
+The interpreter `method`'s code belongs to when `interp` reaches it, if not `interp`: a facts method
+is inferred by facts whoever calls it, and the compiler's own code plainly whoever calls it (else
+the abstract interpreter itself would run as code compiled by facts: the definition checks of
+TraitWorld, called from its slow paths, ran 6× slower). `nothing`: `interp` infers it.
+"""
+function leaves_to(interp::AbstractInterpreter, @nospecialize(method))
+    interp isa NativeInterpreter || return nothing
+    if interp.owner === FACTS_OWNER
+        is_plain_method(method) && return plain_interp(interp)
+    else
+        is_facts_method(method) && return facts_interp(interp)
+    end
+    return nothing
+end
 
 """
-A call from plain code to a facts method: the callee is inferred by facts, in an inference of its own
-(its own stack, as a request from the runtime would be), and the call names that CodeInstance, with
-the edge to it. Plain code never infers a facts method itself.
+A call to a method of the other owner (`leaves_to`: plain code calling a facts method, or code
+compiled by facts calling the compiler): the callee is inferred by `other`, in an inference of its
+own (its own stack, as a request from the runtime would be), and the call names that CodeInstance,
+with the edge to it. Neither owner infers the other's methods itself.
 """
-function facts_edge(interp::NativeInterpreter, method::Method, mi::MethodInstance, caller::AbsIntState,
-                    edgecycle::Bool, edgelimited::Bool)
-    ci = typeinf_ext(facts_interp(interp), mi, SOURCE_MODE_NOT_REQUIRED)
+function facts_edge(interp::NativeInterpreter, other::NativeInterpreter, method::Method, mi::MethodInstance,
+                    caller::AbsIntState, edgecycle::Bool, edgelimited::Bool)
+    ci = typeinf_ext(other, mi, SOURCE_MODE_NOT_REQUIRED)
     ci isa CodeInstance && return return_cached_result(interp, method, ci, caller, edgecycle, edgelimited)
     return Future(MethodCallResult(interp, caller, method, Any, Any, Effects(), nothing, edgecycle, edgelimited))
 end

@@ -208,6 +208,7 @@
     XX(jl_get_module_infer) \
     XX(jl_get_module_facts) \
     XX(jl_method_is_facts) \
+    XX(jl_method_is_plain) \
     XX(jl_set_module_facts) \
     XX(jl_get_module_of_binding) \
     XX(jl_get_module_optlevel) \

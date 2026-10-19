@@ -66,246 +66,6 @@ function VerifyMethodResultState()
 end
 
 
-# --- trait-world load filter (trait-bound PoC, design note rev 1110) ---
-# The load-time half of src/gf.c's invalidation filter: when a package image
-# is validated, an edge of trait-world code (a trait module, or a module
-# TraitWorld registers) is not failed by methods that match it now but did not
-# when the image was built, if each such method is defined outside the trait
-# world and outside Julia and its definer owns a type or the function of its
-# signature: such a method can never apply to trait-world code (layering).
-# Pirates fail the edge as before. Trait modules are recognized by their
-# `__trait_module__` binding, so a library's own image is covered while it
-# loads, before TraitWorld sees it; TraitWorld's own modules carry
-# `__trait_world_machinery__`. Off unless JULIA_TW_FILTER=1 (rule P of wrapping by facts: nothing
-# is skipped; the filter stays for comparisons). When on, it covers images loaded
-# before TraitWorld too; TraitWorld adds its registrations.
-#
-# A Base method compiled for trait-world code (a callee CodeInstance in the
-# image, shared with ordinary code) fails as before when a newcomer intersects
-# its edges; the trait-world caller keeps its code if the callee is valid under
-# the filter (`_tw_valid_under_filter`): its native code calls the callee's
-# compiled code directly, and only trait-world values reach it, to which no
-# outside, owned method applies.
-const _tw_load_filter = RefValue{Int8}(Int8(-1))   # RefValue: `Ref` has no constructors yet during the Compiler bootstrap
-# Validation runs in the compiler's world, which is fixed early in the bootstrap, before Base's
-# ENV, split, pathof and friends exist: these helpers use only what the bootstrap has (ccall,
-# pointers, symbols), and the names of Julia's standard libraries are a literal list.
-function _tw_filter_on()
-    v = _tw_load_filter[]
-    if v == Int8(-1)
-        p = ccall(:getenv, Ptr{UInt8}, (Ptr{UInt8},), "JULIA_TW_FILTER")
-        v = (p != C_NULL && unsafe_load(p) == 0x31 && unsafe_load(p + 1) == 0x00) ? Int8(1) : Int8(0)
-        _tw_load_filter[] = v
-    end
-    return v == Int8(1)
-end
-const _tw_modules = RefValue{Vector{Any}}(Any[])       # registered modules (TraitWorld itself)
-const _tw_julia_names = RefValue{Vector{Any}}(Any[:ArgTools,:Artifacts,:Base64,:CompilerSupportLibraries_jll,:CRC32c,:Dates,:DelimitedFiles,:Distributed,:Downloads,:dSFMT_jll,:FileWatching,:Future,:GMP_jll,:InteractiveUtils,:JuliaSyntaxHighlighting,:LazyArtifacts,:libblastrampoline_jll,:LibCURL,:LibCURL_jll,:Libdl,:LibGit2,:LibGit2_jll,:libLLVM_jll,:LibSSH2_jll,:LibUnwind_jll,:LibUV_jll,:LinearAlgebra,:LLD_jll,:LLVMLibUnwind_jll,:Logging,:Markdown,:Mmap,:MozillaCACerts_jll,:MPFR_jll,:NetworkOptions,:nghttp2_jll,:OpenBLAS_jll,:OpenLibm_jll,:OpenSSL_jll,:p7zip_jll,:PCRE2_jll,:Pkg,:Printf,:Profile,:Random,:REPL,:Serialization,:SHA,:SharedArrays,:Sockets,:SparseArrays,:Statistics,:StyledStrings,:SuiteSparse,:SuiteSparse_jll,:Tar,:Test,:TOML,:Unicode,:UUIDs,:Zlib_jll,:Zstd_jll])   # names of Julia's standard libraries (TraitWorld may extend it)
-const _tw_current = RefValue{Bool}(false)                    # the CodeInstance being verified is trait-world code
-const _tw_skipped = RefValue{Int}(0)                        # edges kept by the filter (for measurements)
-
-function _tw_root(m::Module)
-    while true
-        p = parentmodule(m)
-        (p === m || p === Main) && return m
-        m = p
-    end
-end
-# measurements only (x13): JULIA_TW_PROTECT=<package names> treats those packages as trait-world code
-function _tw_protected_name(r::Module)
-    p = ccall(:getenv, Ptr{UInt8}, (Ptr{UInt8},), "JULIA_TW_PROTECT")
-    p == C_NULL && return false
-    n = ccall(:jl_symbol_name, Ptr{UInt8}, (Any,), nameof(r))
-    i = 0
-    while true                                    # each comma-separated name
-        j = 0
-        while true
-            a = unsafe_load(p + i + j)
-            b = unsafe_load(n + j)
-            if a == 0x2c || a == 0x00
-                b == 0x00 && return true
-                break
-            end
-            a == b || break
-            j += 1
-        end
-        while true                                # on to the next name
-            a = unsafe_load(p + i)
-            i += 1
-            a == 0x00 && return false
-            a == 0x2c && break
-        end
-    end
-end
-function _tw_in_trait_world(m::Module)
-    _tw_protected_name(_tw_root(m)) && return true
-    while true
-        # in the latest world: validation runs in the compiler's world, where the bindings of a
-        # module being loaded (TraitWorld's own image) are not yet defined
-        (Core.invokelatest(isdefined, m, :__trait_module__)::Bool ||
-         Core.invokelatest(isdefined, m, :__trait_world_machinery__)::Bool) && return true
-        for x in _tw_modules[]
-            x === m && return true
-        end
-        p = parentmodule(m)
-        p === m && return false
-        m = p
-    end
-end
-function _tw_is_julia(r::Module)
-    (r === Base || r === Core || r === Base.Compiler) && return true
-    n = nameof(r)
-    for x in _tw_julia_names[]
-        x === n && return true
-    end
-    return false
-end
-# The package (outside Base, Core and the trait world) that every value matching `t` mentions in
-# its type, or `nothing`: as TraitWorld's policy (`_required_root`). `Type{T}` counts as `T` (a type
-# value reaches protected code, like any value, only where the code was compiled for it).
-function _tw_required_root(@nospecialize(t), depth::Int)
-    depth > 4 && return nothing
-    t isa UnionAll && return _tw_required_root(Base.unwrap_unionall(t), depth)
-    t isa TypeVar && return _tw_required_root(t.ub, depth + 1)
-    t isa Core.TypeofVararg && return isdefined(t, :T) ? _tw_required_root(t.T, depth + 1) : nothing
-    if t isa Union
-        a = _tw_required_root(t.a, depth + 1)
-        return a !== nothing && a === _tw_required_root(t.b, depth + 1) ? a : nothing
-    end
-    t isa DataType || return nothing
-    r = _tw_root(t.name.module)
-    # a standard library's types are its own (SparseArrays, LibGit2): only Base's and Core's are everyone's
-    (r === Base || r === Core || r === Base.Compiler || _tw_in_trait_world(t.name.module)) || return r
-    for p in t.parameters
-        x = _tw_required_root(p, depth + 1)
-        x === nothing || return x
-    end
-    return nothing
-end
-# The default policy, the same rule as TraitWorld's: in force until TraitWorld registers its own,
-# since TraitWorld's image (and the images loaded with it) are validated before its `__init__` runs.
-function _tw_default_policy(m::Method)
-    _tw_in_trait_world(m.module) && return nothing
-    sig = Base.unwrap_unionall(m.sig)
-    sig isa DataType || return nothing
-    for i in 2:length(sig.parameters)
-        r = _tw_required_root(sig.parameters[i], 0)
-        r === nothing || return r
-    end
-    return nothing
-end
-"Whether package `r` owns a type anywhere in `t` (a signature: arguments, parameters, a trait object's views and keys)."
-function _tw_mentions_owned(@nospecialize(t), r::Module, depth::Int)
-    depth > 8 && return false
-    if t isa Union
-        return _tw_mentions_owned(t.a, r, depth + 1) || _tw_mentions_owned(t.b, r, depth + 1)
-    elseif t isa UnionAll
-        return _tw_mentions_owned(t.var.lb, r, depth + 1) || _tw_mentions_owned(t.var.ub, r, depth + 1) ||
-               _tw_mentions_owned(t.body, r, depth + 1)
-    elseif t isa TypeVar
-        return _tw_mentions_owned(t.lb, r, depth + 1) || _tw_mentions_owned(t.ub, r, depth + 1)
-    elseif t isa Core.TypeofVararg
-        return isdefined(t, :T) && _tw_mentions_owned(t.T, r, depth + 1)
-    elseif t isa DataType
-        _tw_root(t.name.module) === r && return true
-        for p in t.parameters
-            _tw_mentions_owned(p, r, depth + 1) && return true
-        end
-    end
-    return false
-end
-"The signature of the trait-world CodeInstance being verified (rule 4: the owners of its types are in its view)."
-const _tw_current_sig = RefValue{Any}(nothing)
-"""
-The invalidation policy (julia-support.md piece 2), registered by TraitWorld: a callable
-`policy(m::Method)::Union{Module,Nothing}`, the package whose definition `m` is when it cannot
-change protected code that does not mention that package's types, `nothing` when it invalidates as
-usual. Validation runs in the compiler's world, fixed early in the bootstrap, so the policy (defined
-later) is called with `Core.invokelatest`. The same callable is registered for method insertion
-(`jl_set_invalidation_policy`).
-"""
-const _tw_policy = RefValue{Any}(nothing)
-"Whether newcomer `m` cannot change the protected code being verified: the policy names its package, and the code's signature mentions none of its types."
-function _tw_policy_skip(m::Method)
-    p = _tw_policy[]
-    r = p === nothing ? _tw_default_policy(m) : try
-        Core.invokelatest(p, m)
-    catch
-        nothing                                       # in doubt: fail the edge as usual
-    end
-    r isa Module || return false
-    sig0 = _tw_current_sig[]
-    sig0 === nothing && return true
-    return !_tw_mentions_owned(sig0, r, 0)
-end
-function _tw_protected(codeinst::CodeInstance)
-    _tw_filter_on() || return false
-    def = get_ci_mi(codeinst).def
-    return def isa Method && _tw_in_trait_world(def.module)
-end
-
-"""
-Whether `ci`'s edges hold under the filter, recursively, without changing any
-CodeInstance's validity: for a callee of trait-world code that failed the
-ordinary verification. A deleted method, a binding change, a changed `invoke`
-target or a pirate still fails it.
-"""
-function _tw_valid_under_filter(ci::CodeInstance, seen::Base.IdSet{CodeInstance}, depth::Int = 0)
-    ci in seen && return true
-    depth > 64 && return false
-    push!(seen, ci)
-    callees = ci.edges
-    world = ci.min_world
-    matches = []
-    saved = _tw_current[]
-    savedsig = _tw_current_sig[]
-    _tw_current[] = true
-    _tw_current_sig[] = get_ci_mi(ci).specTypes
-    try
-        j = 1
-        while j ≤ length(callees)
-            edge = callees[j]
-            edge isa Method && return false
-            if edge isa CodeInstance
-                edge = get_ci_mi(edge)
-            end
-            if edge isa MethodInstance
-                _, mx = verify_call(edge.specTypes, callees, j, 1, world, true, matches)
-                j += 1
-            elseif edge isa Int
-                _, mx = verify_call(callees[j+1], callees, j+2, abs(edge), world, edge > 0, matches)
-                j += 2 + abs(edge)
-            elseif edge isa Core.Binding
-                binding_was_invalidated(edge) && return false
-                j += 1
-                continue
-            else
-                callee = callees[j+1]
-                if callee isa Core.MethodTable
-                    j += 2
-                    continue
-                end
-                callee isa CodeInstance && (callee = get_ci_mi(callee))
-                meth = callee isa MethodInstance ? callee.def::Method : callee::Method
-                _, mx = verify_invokesig(edge, meth, world, matches)
-                j += 2
-            end
-            mx == 0 && return false
-        end
-    finally
-        _tw_current[] = saved
-        _tw_current_sig[] = savedsig
-    end
-    for edge in callees
-        edge isa CodeInstance || continue
-        mw = edge.max_world
-        (mw == WORLD_AGE_REVALIDATION_SENTINEL || mw < get_world_counter()) || continue
-        _tw_valid_under_filter(edge, seen, depth + 1) || return false
-    end
-    return true
-end
-
-
 # Restore backedges to external targets
 # `edges` = [caller1, ...], the list of worklist-owned code instances internally
 function insert_backedges(internal_methods::Vector{Any})
@@ -454,8 +214,6 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
                 end
             end
 
-            _tw_current[] = _tw_protected(initial.codeinst)   # trait-world load filter
-            _tw_current_sig[] = get_ci_mi(initial.codeinst).specTypes
             # Process all non-CodeInstance edges
             if !isempty(initial.callees) && maxworld != get_require_world()
                 matches = []
@@ -608,12 +366,6 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
             parent_maxworld = parent_result.result_maxworld
             parent_cause = parent_work.cause
             parent_stage = parent_work.stage
-            if max_valid2 == 0 && _tw_protected(workspace.initial_states[current_depth].codeinst) && !_tw_protected(callee) &&
-                    _tw_valid_under_filter(callee, Base.IdSet{CodeInstance}())
-                _tw_skipped[] += 1                     # trait-world load filter: the callee fails for ordinary code only
-                max_valid2 = validation_world
-                child_cycle = 0
-            end
             if parent_minworld < min_valid2
                 parent_minworld = min_valid2
             end
@@ -817,8 +569,7 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
         end
    end
     # next, compare the current result of ml_matches to the old result
-    tw = _tw_current[]
-    lim = _jl_debug_method_invalidation[] !== nothing || tw ? Int(typemax(Int32)) : n
+    lim = _jl_debug_method_invalidation[] !== nothing ? Int(typemax(Int32)) : n
     minworld = RefValue{UInt}(1)
     maxworld = RefValue{UInt}(typemax(UInt))
     has_ambig = RefValue{Int32}(0)
@@ -828,18 +579,7 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
         maxworld[] = 0
     else
         # setdiff!(result, expected)
-        nskip = 0
-        if tw
-            for k = 1:length(result)
-                mk = (result[k]::Core.MethodMatch).method
-                isexp = false
-                for j = 1:n
-                    get_method_from_edge(expecteds[i+j-1]) === mk && (isexp = true; break)
-                end
-                (!isexp && _tw_policy_skip(mk)) && (nskip += 1)
-            end
-        end
-        if length(result) - nskip ≠ n
+        if length(result) ≠ n
             maxworld[] = 0
         end
         ins = 0
@@ -852,10 +592,6 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
                     found = true
                     break
                 end
-            end
-            if !found && tw && _tw_policy_skip(match.method)
-                _tw_skipped[] += 1                     # trait-world load filter: a newcomer that cannot apply to trait-world code
-                found = true
             end
             if !found
                 # intersection has a new method or a method was

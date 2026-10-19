@@ -1051,7 +1051,8 @@ end
 # compute (and cache) an inferred AST and return the current best estimate of the result type
 function typeinf_edge(interp::AbstractInterpreter, method::Method, @nospecialize(atype), sparams::SimpleVector, caller::AbsIntState, edgecycle::Bool, edgelimited::Bool)
     mi = specialize_method(method, atype, sparams)
-    leaves_to_facts(interp, method) && return facts_edge(interp::NativeInterpreter, method, mi, caller, edgecycle, edgelimited)
+    other = leaves_to(interp, method)
+    other === nothing || return facts_edge(interp::NativeInterpreter, other, method, mi, caller, edgecycle, edgelimited)
     cache_mode = CACHE_MODE_GLOBAL # cache edge targets globally by default
     force_inline = is_stmt_inline(get_curr_ssaflag(caller))
     edge_ci = nothing
@@ -1267,7 +1268,8 @@ typeinf_frame(interp::AbstractInterpreter, method::Method, @nospecialize(atype),
     typeinf_frame(interp, specialize_method(method, atype, sparams), run_optimizer)
 function typeinf_frame(interp::AbstractInterpreter, mi::MethodInstance, run_optimizer::Bool)
     # reflection shows the code that runs: a facts method by facts (facts.jl)
-    leaves_to_facts(interp, mi.def) && return typeinf_frame(facts_interp(interp::NativeInterpreter), mi, run_optimizer)
+    other = leaves_to(interp, mi.def)
+    other === nothing || return typeinf_frame(other, mi, run_optimizer)
     result = InferenceResult(mi, typeinf_lattice(interp))
     frame = InferenceState(result, #=cache_mode=#:no, interp)
     frame === nothing && return nothing
@@ -1371,7 +1373,8 @@ end
 # compute (and cache) an inferred AST and return type
 function typeinf_ext(interp::AbstractInterpreter, mi::MethodInstance, source_mode::UInt8)
     # a facts method is inferred by facts, whoever asks (reflection, compile queues; facts.jl)
-    leaves_to_facts(interp, mi.def) && return typeinf_ext(facts_interp(interp::NativeInterpreter), mi, source_mode)
+    other = leaves_to(interp, mi.def)
+    other === nothing || return typeinf_ext(other, mi, source_mode)
     start_time = ccall(:jl_typeinf_timing_begin, UInt64, ())
     let code = get(code_cache(interp), mi, nothing)
         if code isa CodeInstance
@@ -1641,32 +1644,9 @@ function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UIn
     return ci
 end
 
-"""
-The inference hook (trait-bound PoC, julia-support.md piece 4): a callable `hook(ci::CodeInstance)`,
-called after a top-level inference request finishes, for code of a protected (trait-world) module,
-so that checks of compiled code run where it is compiled. Set by TraitWorld; `nothing` costs one
-test. It runs in the latest world (`Core.invokelatest`) and must not itself request inference of
-the code being compiled; an exception is ignored.
-"""
-const _tw_infer_hook = RefValue{Any}(nothing)
-function _tw_run_infer_hook(@nospecialize(ci))
-    hook = _tw_infer_hook[]
-    hook === nothing && return nothing
-    ci isa CodeInstance || return nothing
-    def = get_ci_mi(ci).def
-    def isa Method || return nothing
-    ReinferUtils._tw_in_trait_world(def.module) || return nothing
-    try
-        Core.invokelatest(hook, ci)
-    catch
-    end
-    return nothing
-end
-
 function typeinf_ext_toplevel(interp::AbstractInterpreter, mi::MethodInstance, source_mode::UInt8)
     ci = typeinf_ext(interp, mi, source_mode)
     ci = add_codeinsts_to_jit!(interp, ci, source_mode)
-    _tw_run_infer_hook(ci)
     return ci
 end
 
