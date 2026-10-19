@@ -161,14 +161,17 @@ struct InliningState{Interp<:AbstractInterpreter}
     world::UInt
     interp::Interp
     opt_cache::IdDict{MethodInstance,CodeInstance}
+    # members of the cycle being finished that are optimized already (facts mode: `finish_cycle`)
+    cycle_results::IdDict{MethodInstance,InferenceResult}
 end
 function InliningState(sv::InferenceState, interp::AbstractInterpreter,
-                       opt_cache::IdDict{MethodInstance,CodeInstance}=IdDict{MethodInstance,CodeInstance}())
-    return InliningState(sv.edges, frame_world(sv), interp, opt_cache)
+                       opt_cache::IdDict{MethodInstance,CodeInstance}=IdDict{MethodInstance,CodeInstance}(),
+                       cycle_results::IdDict{MethodInstance,InferenceResult}=IdDict{MethodInstance,InferenceResult}())
+    return InliningState(sv.edges, frame_world(sv), interp, opt_cache, cycle_results)
 end
 function InliningState(interp::AbstractInterpreter,
                        opt_cache::IdDict{MethodInstance,CodeInstance}=IdDict{MethodInstance,CodeInstance}())
-    return InliningState(Any[], get_inference_world(interp), interp, opt_cache)
+    return InliningState(Any[], get_inference_world(interp), interp, opt_cache, IdDict{MethodInstance,InferenceResult}())
 end
 
 struct OptimizerCache{CodeCache}
@@ -227,8 +230,9 @@ mutable struct OptimizationState{Interp<:AbstractInterpreter}
     insert_coverage::Bool
 end
 function OptimizationState(sv::InferenceState, interp::AbstractInterpreter,
-                           opt_cache::IdDict{MethodInstance,CodeInstance}=IdDict{MethodInstance,CodeInstance}())
-    inlining = InliningState(sv, interp, opt_cache)
+                           opt_cache::IdDict{MethodInstance,CodeInstance}=IdDict{MethodInstance,CodeInstance}(),
+                           cycle_results::IdDict{MethodInstance,InferenceResult}=IdDict{MethodInstance,InferenceResult}())
+    inlining = InliningState(sv, interp, opt_cache, cycle_results)
     return OptimizationState(sv.linfo, sv.src, nothing, sv.stmt_info, sv.mod,
                              sv.sptypes, sv.slottypes, inlining, sv.cfg,
                              sv.unreachable, sv.bb_vartables, sv.insert_coverage)

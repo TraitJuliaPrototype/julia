@@ -261,21 +261,31 @@ function finish_cycle(::AbstractInterpreter, frames::Vector{AbsIntState}, cyclei
         cycle_valid_effects = merge_effects(cycle_valid_effects, caller.ipo_effects)
     end
     opt_cache = IdDict{MethodInstance,CodeInstance}()
+    cycle_results = IdDict{MethodInstance,InferenceResult}()
     for frameid = cycleid:length(frames)
         caller = frames[frameid]::InferenceState
         adjust_cycle_frame!(caller, cycle_valid_worlds, cycle_valid_effects)
-        finishinfer!(caller, caller.interp, cycleid, opt_cache)
+        finishinfer!(caller, caller.interp, cycleid, opt_cache, cycle_results)
         time_now = _time_ns()
         caller.time_self_ns += (time_now - time_before)
         time_before = time_now
     end
     time_caches = 0.0 # the total and adjusted time of every entry in the cycle are the same
     time_paused = UInt64(0)
-    for frameid = cycleid:length(frames)
+    # Under facts the members are optimized callees first (the frames after a caller), and each
+    # optimized member can be inlined into the members optimized after it: a recursion through
+    # wrappers (a `Dynamic` split, an operation call on a trait object) keeps one call per turn,
+    # at the edge back to an earlier frame, instead of one call per member.
+    facts = facts_mode((frames[cycleid]::InferenceState).interp)
+    for frameid = (facts ? (length(frames):-1:cycleid) : (cycleid:length(frames)))
         caller = frames[frameid]::InferenceState
         opt = caller.result.src
         if opt isa OptimizationState # implies `may_optimize(caller.interp) === true`
             optimize(caller.interp, opt, caller.result)
+            if facts && get(opt_cache, caller.linfo, nothing) isa CodeInstance
+                opt.src.inlining_cost = compute_inlining_cost(caller.interp, caller.result, opt.optresult)
+                cycle_results[caller.linfo] = caller.result
+            end
             time_now = _time_ns()
             caller.time_self_ns += (time_now - time_before)
             time_before = time_now
@@ -584,7 +594,8 @@ const empty_edges = Core.svec()
 # inference completed on `me`
 # update the MethodInstance
 function finishinfer!(me::InferenceState, interp::AbstractInterpreter, cycleid::Int,
-                      opt_cache::IdDict{MethodInstance, CodeInstance})
+                      opt_cache::IdDict{MethodInstance, CodeInstance},
+                      cycle_results::IdDict{MethodInstance,InferenceResult}=IdDict{MethodInstance,InferenceResult}())
     # prepare to run optimization passes on fulltree
     @assert isempty(me.ip)
     # inspect whether our inference had a limited result accuracy,
@@ -642,7 +653,7 @@ function finishinfer!(me::InferenceState, interp::AbstractInterpreter, cycleid::
                 # disable optimization if we've already obtained very accurate result
                 !result_is_constabi(interp, result)
         if doopt
-            result.src = OptimizationState(me, interp, opt_cache)
+            result.src = OptimizationState(me, interp, opt_cache, cycle_results)
         else
             result.src = me.src # for reflection etc.
         end

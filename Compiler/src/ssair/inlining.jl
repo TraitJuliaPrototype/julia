@@ -825,6 +825,9 @@ struct InferredResult
     InferredResult(@nospecialize(src), effects::Effects, edge::CodeInstance) = new(src, effects, edge)
 end
 @inline function get_cached_result(state::InliningState, mi::MethodInstance)
+    # a member of the cycle being finished, optimized already: its source is not cached yet
+    r = get(state.cycle_results, mi, nothing)
+    r isa InferenceResult && return InferredResult(r.src, r.ipo_effects, state.opt_cache[mi])
     code = get(code_cache(state), mi, nothing)
     if code isa CodeInstance
         if use_const_api(code)
