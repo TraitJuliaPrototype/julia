@@ -4386,6 +4386,55 @@ JL_DLLEXPORT jl_value_t *jl_invoke_oc(jl_value_t *F, jl_value_t **args, uint32_t
     return ret;
 }
 
+// A method-cache entry whose signature has only concrete types and `Any` (no varargs, no type
+// variables, no `Type{}` or kinds), no guard signatures, and a simple signature implied by it holds for every type at its `Any`
+// positions: Julia gives an entry guard signatures where a more specific method intersects it. The
+// per-call-site cache can hold it as it is, matched with `Any` as a wildcard (`sig_match_any`):
+// `setindex!(::Array{Any}, @nospecialize(x), ::Int)` at a site that sees 16 value types took 163 ns,
+// thrashing the site's four exact entries.
+static int call_cache_any_ok(jl_typemap_entry_t *entry) JL_NOTSAFEPOINT
+{
+    if (entry->isleafsig || entry->va || !entry->issimplesig || entry->guardsigs != jl_emptysvec)
+        return 0;
+    jl_svec_t *ps = entry->sig->parameters;
+    if (entry->simplesig != (void*)jl_nothing) {
+        // the method cache matches the simple signature too: it must be implied by the signature
+        // (each of its parameters `Any` or the signature's own), so that matching the signature is enough
+        jl_svec_t *ss = ((jl_tupletype_t*)entry->simplesig)->parameters;
+        if (jl_svec_len(ss) != jl_svec_len(ps))
+            return 0;
+        for (size_t i = 0; i < jl_svec_len(ss); i++) {
+            jl_value_t *q = jl_svecref(ss, i);
+            if (q != (jl_value_t*)jl_any_type && q != jl_svecref(ps, i))
+                return 0;
+        }
+    }
+    int anyany = 0;
+    for (size_t i = 0; i < jl_svec_len(ps); i++) {
+        jl_value_t *p = jl_svecref(ps, i);
+        if (p == (jl_value_t*)jl_any_type) {
+            if (i == 0)
+                return 0;                       // the function itself is concrete
+            anyany = 1;
+            continue;
+        }
+        if (!jl_is_concrete_type(p) || jl_is_kind(p) || jl_is_type_type(p))
+            return 0;
+    }
+    return anyany;
+}
+STATIC_INLINE int sig_match_any(jl_value_t *arg1t, jl_value_t **args, jl_value_t **sig, size_t n) JL_NOTSAFEPOINT
+{
+    if (arg1t != sig[0])
+        return 0;
+    for (size_t i = 1; i < n; i++) {
+        jl_value_t *decl = sig[i];
+        if (decl != (jl_value_t*)jl_any_type && jl_typeof(args[i - 1]) != decl)
+            return 0;
+    }
+    return 1;
+}
+
 STATIC_INLINE int sig_match_fast(jl_value_t *arg1t, jl_value_t **args, jl_value_t **sig, size_t n)
 {
     // NOTE: This function is a huge performance hot spot!!
@@ -4578,7 +4627,8 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
             i = _i; \
             entry = jl_atomic_load_relaxed(&call_cache[cache_idx[i]]); \
             if (entry && nargs == jl_svec_len(entry->sig->parameters) && \
-                sig_match_fast(FT, args, jl_svec_data(entry->sig->parameters), nargs) && \
+                (entry->isleafsig ? sig_match_fast(FT, args, jl_svec_data(entry->sig->parameters), nargs) : \
+                                    sig_match_any(FT, args, jl_svec_data(entry->sig->parameters), nargs)) && \
                 world >= jl_atomic_load_relaxed(&entry->min_world) && world <= jl_atomic_load_relaxed(&entry->max_world)) { \
                 goto have_entry; \
             } \
@@ -4633,7 +4683,14 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
             jl_method_instance_t *mfunc = entry->func.linfo;
             record_dispatch_statement_on_first_dispatch(mfunc);
         }
-        if (entry != NULL && !(entry->isleafsig && entry->simplesig == (void*)jl_nothing && entry->guardsigs == jl_emptysvec))
+        if (entry != NULL && call_cache_any_ok(entry)) {
+            // one entry for every type at its `Any` positions: the cache entry itself, shared, so its
+            // max_world stays open and invalidation lowers it (a polymorphic site does not thrash)
+            int which = jl_atomic_load_relaxed(&pick_which[cache_idx[0]]) + 1;
+            jl_atomic_store_relaxed(&pick_which[cache_idx[0]], which);
+            jl_atomic_store_release(&call_cache[cache_idx[which & 3]], entry);
+        }
+        else if (entry != NULL && !(entry->isleafsig && entry->simplesig == (void*)jl_nothing && entry->guardsigs == jl_emptysvec))
             call_cache_exact(F, args, nargs, entry, world, cache_idx);
     }
 
