@@ -1676,7 +1676,7 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             # and this is either the primary world, or not applicable in the primary world
             # then we want to compile and emit this
             if item.def.primary_world <= world
-                ci = typeinf_ext(interp_for_owner(interp, default_owner(item)), item, SOURCE_MODE_GET_SOURCE)
+                ci = typeinf_ext(interp_for_mi(interp, default_owner(item), item), item, SOURCE_MODE_GET_SOURCE)
                 ci isa CodeInstance && push!(workqueue, ci)
             end
             markinspected!(workqueue, item)
@@ -1689,7 +1689,7 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
                         sig, world, #= mt_cache =# 0)
             if mi !== nothing
                 mi = mi::MethodInstance
-                ci = typeinf_ext(interp, mi, SOURCE_MODE_GET_SOURCE)
+                ci = typeinf_ext(interp_for_mi(interp, cache_owner(interp), mi), mi, SOURCE_MODE_GET_SOURCE)
                 ci isa CodeInstance && push!(invokelatest_queue, ci)
             end
             # additionally enqueue the ccallable entrypoint / adapter, which implicitly
@@ -1705,7 +1705,7 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             else
                 src = get(interp.codegen, callee, nothing)
                 if src === nothing
-                    newcallee = typeinf_ext(interp_for_owner(interp, callee.owner), mi, SOURCE_MODE_GET_SOURCE)
+                    newcallee = typeinf_ext(interp_for_mi(interp, callee.owner, mi), mi, SOURCE_MODE_GET_SOURCE)
                     if newcallee isa CodeInstance
                         @assert use_const_api(newcallee) || haskey(interp.codegen, newcallee)
                         push!(workqueue, newcallee)

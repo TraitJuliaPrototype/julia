@@ -71,9 +71,21 @@ function leaves_to(interp::AbstractInterpreter, @nospecialize(method))
     if interp.owner === FACTS_OWNER
         is_plain_method(method) && return plain_interp(interp)
     elseif interp.owner === nothing      # an interpreter with a cache of its own infers by its own rules
+        interp.facts && is_plain_method(method) && return plain_interp(interp)    # the facts image
         is_facts_method(method) && return facts_interp(interp)
     end
     return nothing
+end
+"""
+The interpreter for `mi`'s code of cache owner `owner` beside `interp`, for compile queues: as
+`interp_for_owner`, but the compiler's own code plainly also under the facts image, whose default
+owner compiles by facts (as `typeinf_ext_toplevel` does for one request). Without it the image
+builder's queue compiled the compiler by facts: its `@nospecialize` helpers became run-time sites.
+"""
+function interp_for_mi(interp::AbstractInterpreter, @nospecialize(owner), mi::MethodInstance)
+    interp = interp_for_owner(interp, owner)
+    owner === nothing && facts_mode(interp) && is_compiler_code(mi) && return plain_interp(interp)
+    return interp
 end
 
 """
