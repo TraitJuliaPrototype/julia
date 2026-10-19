@@ -783,7 +783,10 @@ function compileable_specialization(code::Union{MethodInstance,CodeInstance}, ef
     mi = code isa CodeInstance ? get_ci_mi(code) : code
     mi_invoke = mi
     method, atype, sparams = mi.def::Method, mi.specTypes, mi.sparam_vals
-    if OptimizationParams(state.interp).compilesig_invokes
+    # Under facts the invoke target is the fact signature the call was inferred at: its compileable
+    # signature (a varargs tail widened to `Vararg{Any}`) would be inferred again at wider arguments
+    # and run its calls at run time, boxing every argument (a call not inlined in a recursion cycle).
+    if OptimizationParams(state.interp).compilesig_invokes && !(facts_mode(state.interp) && isdispatchtuple(atype))
         new_atype = get_compileable_sig(method, atype, sparams)
         new_atype === nothing && return nothing
         if atype !== new_atype
