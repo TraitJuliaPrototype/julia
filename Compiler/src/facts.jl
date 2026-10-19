@@ -344,8 +344,8 @@ end
 # call in the last branch, as for union splitting. The candidates are read without an edge: a type
 # registered later reaches the fallback, which is correct, and invalidates nothing.
 
-"`f(x, args...)` for a value `x` of the open set of types registered for `K` (split at the call site)."
-dynamic_call(@nospecialize(K), f, x, args...) = f(x, args...)
+"`f(x, args...)::RT` for a value `x` of the open set of types registered for `K` (split at the call site)."
+dynamic_call(@nospecialize(K), ::Type{RT}, f, x, args...) where {RT} = f(x, args...)::RT
 
 mutable struct DynamicCandidates
     @atomic table::Any          # an IdDict{Any,Vector{Any}}, replaced on each registration, never mutated
@@ -388,6 +388,7 @@ so the split keeps the dynamic call as its last branch.
 struct DynamicSplitInfo <: CallInfo
     info::CallInfo
     open::Bool
+    rt::Any        # the declared result: the fallback's result is asserted to it
 end
 add_edges_impl(edges::Vector{Any}, info::DynamicSplitInfo) = add_edges!(edges, info.info)
 nsplit_impl(info::DynamicSplitInfo) = nsplit(info.info)
@@ -397,9 +398,12 @@ getresult_impl(info::DynamicSplitInfo, idx::Int) = getresult(info.info, idx)
 "Inference of `dynamic_call(K, f, x, args...)`: `f` at the union of `K`'s candidates (a narrower known type of `x` kept), and a fallback."
 function abstract_dynamic_call(interp::AbstractInterpreter, argtypes::Vector{Any}, si::StmtInfo, sv::AbsIntState)
     K = argtypes[2]
-    newargs = Any[argtypes[3:end]...]
+    RTa = argtypes[3]
+    RT = RTa isa Const && RTa.val isa Type ? RTa.val : (isType(widenconst(RTa)) ? widenconst(RTa).parameters[1] : Any)
+    RT isa Type || (RT = Any)
+    newargs = Any[argtypes[4:end]...]
     cands = K isa Const ? dynamic_candidates(K.val) : Any[]
-    X = widenconst(argtypes[4])
+    X = widenconst(argtypes[5])
     narrowed = false
     if !isempty(cands) && !isdispatchelem(X)
         U = Union{}
@@ -414,8 +418,10 @@ function abstract_dynamic_call(interp::AbstractInterpreter, argtypes::Vector{Any
     end
     call = abstract_call(interp, ArgInfo(nothing, newargs), si, sv)::Future
     return Future{CallMeta}(call, interp, sv) do call, _, _
-        narrowed || return CallMeta(call.rt, call.exct, call.effects, DynamicSplitInfo(call.info, false), call.refinements)
+        # the statement's own type stays what the call gives (the inliner rewrites it to the call of
+        # `f`, which asserts nothing); only a split's join is typed `RT`, its fallback asserted
+        narrowed || return CallMeta(call.rt, call.exct, call.effects, DynamicSplitInfo(call.info, false, RT), call.refinements)
         # a value of another type reaches the fallback: its result and effects are unknown
-        return CallMeta(Any, Any, merge_effects(call.effects, Effects()), DynamicSplitInfo(call.info, true))
+        return CallMeta(Any, Any, merge_effects(call.effects, Effects()), DynamicSplitInfo(call.info, true, RT))
     end
 end
