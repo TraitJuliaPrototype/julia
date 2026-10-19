@@ -6335,7 +6335,7 @@ static void emit_phic_slots_clear_for_catch(jl_codectx_t &ctx, intptr_t catch_de
 
 // --- convert expression to code ---
 
-static jl_cgval_t emit_cfunction(jl_codectx_t &ctx, jl_value_t *output_type, const jl_cgval_t &fexpr, jl_value_t *rt, jl_svec_t *argt);
+static jl_cgval_t emit_cfunction(jl_codectx_t &ctx, jl_value_t *output_type, const jl_cgval_t &fexpr, jl_value_t *rt, jl_svec_t *argt, bool caller_world);
 
 static Value *emit_condition(jl_codectx_t &ctx, const jl_cgval_t &condV, const Twine &msg)
 {
@@ -6685,7 +6685,12 @@ static jl_cgval_t emit_expr(jl_codectx_t &ctx, jl_value_t *expr, ssize_t ssaidx_
     else if (head == jl_cfunction_sym) {
         assert(nargs == 5);
         jl_cgval_t fexpr_val = emit_expr(ctx, args[1]);
-        return emit_cfunction(ctx, args[0], fexpr_val, args[2], (jl_svec_t*)args[3]);
+        // the calling convention `:caller_world`: the call runs in the caller's world (see emit_abi_call)
+        jl_value_t *cc = args[4];
+        if (jl_is_quotenode(cc))
+            cc = jl_quotenode_value(cc);
+        bool caller_world = cc == (jl_value_t*)jl_symbol("caller_world");
+        return emit_cfunction(ctx, args[0], fexpr_val, args[2], (jl_svec_t*)args[3], caller_world);
     }
     else if (head == jl_assign_sym) {
         assert(nargs == 2);
@@ -7492,7 +7497,17 @@ std::string emit_abi_constreturn(Module *M, jl_codegen_params_t &params, bool sp
 // if (last_world_v != jl_world_counter)
 //   fptr = compute_new_fptr(&last_world_v)
 // return fptr()
-static jl_cgval_t emit_abi_call(jl_codectx_t &ctx, jl_value_t *declrt, jl_value_t *sigt, ArrayRef<jl_cgval_t> inputargs, size_t nargs)
+//
+// With caller_world (the calling convention `:caller_world`), the call runs in the caller's world,
+// as a direct call does, not in the latest: the thunk is a world-checked call-site cache. Slot 1
+// holds the current entry (cfunc_world_entry_t in runtime_ccall.cpp: fptr, min_world, max_world);
+// a call whose world is in the entry's range calls its fptr, any other asks jl_get_abi_converter,
+// which keeps one entry per target and world range.
+//   acquire entry; read world age
+//   if (!(entry->min_world <= world <= entry->max_world))
+//     fptr = compute_new_fptr(cfuncdata)
+//   return fptr()
+static jl_cgval_t emit_abi_call(jl_codectx_t &ctx, jl_value_t *declrt, jl_value_t *sigt, ArrayRef<jl_cgval_t> inputargs, size_t nargs, bool caller_world)
 {
     jl_cgval_t retval;
     if (sigt) {
@@ -7507,26 +7522,52 @@ static jl_cgval_t emit_abi_call(jl_codectx_t &ctx, jl_value_t *declrt, jl_value_
         Constant *Vnull = ConstantPointerNull::get(T_ptr);
         Module *M = jl_Module;
         ArrayType *T_cfuncdata = ArrayType::get(T_ptr, 8);
-        size_t flags = specsig;
+        size_t flags = specsig | (caller_world ? 2 : 0);
+        Constant *slot1 = Vnull;
+        if (caller_world) {
+            // the empty entry (no world is in [1, 0]), so that the first call asks for one
+            ArrayType *T_entry = ArrayType::get(T_size, 5);
+            slot1 = new GlobalVariable(*M, T_entry, true, GlobalVariable::PrivateLinkage,
+                    ConstantArray::get(T_entry, {ConstantInt::get(T_size, 0), ConstantInt::get(T_size, 1),
+                        ConstantInt::get(T_size, 0), ConstantInt::get(T_size, 0), ConstantInt::get(T_size, 0)}));
+        }
         GlobalVariable *cfuncdata = new GlobalVariable(*M, T_cfuncdata, false,
                 GlobalVariable::PrivateLinkage,
                 ConstantArray::get(T_cfuncdata, {
                     Vnull,
-                    Vnull,
+                    slot1,
                     Vnull,
                     Vnull,
                     Vnull,
                     literal_pointer_val_slot(ctx.emission_context, M, declrt),
                     literal_pointer_val_slot(ctx.emission_context, M, sigt),
                     literal_static_pointer_val((void*)flags, T_ptr)}));
-        Value *last_world_p = ctx.builder.CreateConstInBoundsGEP1_32(ctx.types().T_size, cfuncdata, 1);
-        LoadInst *last_world_v = ctx.builder.CreateAlignedLoad(T_size, last_world_p, ctx.types().alignof_ptr);
-        last_world_v->setOrdering(AtomicOrdering::Acquire);
-        LoadInst *callee = ctx.builder.CreateAlignedLoad(T_ptr, cfuncdata, ctx.types().alignof_ptr);
-        callee->setOrdering(AtomicOrdering::Monotonic);
-        LoadInst *world_v = emit_world_counter_load(ctx, AtomicOrdering::Acquire);
-        emit_tls_world_age_store(ctx, world_v);
-        Value *age_not_ok = ctx.builder.CreateICmpNE(last_world_v, world_v);
+        Value *callee;
+        Value *age_not_ok;
+        if (caller_world) {
+            Value *entry_p = ctx.builder.CreateConstInBoundsGEP1_32(T_ptr, cfuncdata, 1);
+            LoadInst *entry = ctx.builder.CreateAlignedLoad(T_ptr, entry_p, ctx.types().alignof_ptr);
+            entry->setOrdering(AtomicOrdering::Acquire);
+            callee = ctx.builder.CreateAlignedLoad(T_ptr, entry, ctx.types().alignof_ptr);
+            LoadInst *min_world = ctx.builder.CreateAlignedLoad(T_size, ctx.builder.CreateConstInBoundsGEP1_32(T_size, entry, 1), ctx.types().alignof_ptr);
+            min_world->setOrdering(AtomicOrdering::Monotonic);
+            LoadInst *max_world = ctx.builder.CreateAlignedLoad(T_size, ctx.builder.CreateConstInBoundsGEP1_32(T_size, entry, 2), ctx.types().alignof_ptr);
+            max_world->setOrdering(AtomicOrdering::Monotonic);
+            Value *world_v = emit_tls_world_age_load(ctx);
+            age_not_ok = ctx.builder.CreateOr(ctx.builder.CreateICmpULT(world_v, min_world),
+                                              ctx.builder.CreateICmpUGT(world_v, max_world));
+        }
+        else {
+            Value *last_world_p = ctx.builder.CreateConstInBoundsGEP1_32(ctx.types().T_size, cfuncdata, 1);
+            LoadInst *last_world_v = ctx.builder.CreateAlignedLoad(T_size, last_world_p, ctx.types().alignof_ptr);
+            last_world_v->setOrdering(AtomicOrdering::Acquire);
+            LoadInst *callee_v = ctx.builder.CreateAlignedLoad(T_ptr, cfuncdata, ctx.types().alignof_ptr);
+            callee_v->setOrdering(AtomicOrdering::Monotonic);
+            callee = callee_v;
+            LoadInst *world_v = emit_world_counter_load(ctx, AtomicOrdering::Acquire);
+            emit_tls_world_age_store(ctx, world_v);
+            age_not_ok = ctx.builder.CreateICmpNE(last_world_v, world_v);
+        }
         Value *target = emit_guarded_test(ctx, age_not_ok, callee, [&] {
                 Function *getcaller = prepare_call(jlgetabiconverter_func);
                 CallInst *cw = ctx.builder.CreateCall(getcaller, {get_current_task(ctx), cfuncdata});
@@ -7566,7 +7607,7 @@ static Function *gen_cfun_wrapper(
     Module *into, jl_codegen_params_t &params,
     const function_sig_t &sig, jl_value_t *ff, const char *aliasname,
     jl_value_t *declrt, jl_value_t *sigt,
-    jl_unionall_t *unionall_env, jl_svec_t *sparam_vals, jl_array_t **closure_types)
+    jl_unionall_t *unionall_env, jl_svec_t *sparam_vals, jl_array_t **closure_types, bool caller_world = false)
 {
     ++GeneratedCFuncWrappers;
     // Generate a c-callable wrapper
@@ -7811,7 +7852,7 @@ static Function *gen_cfun_wrapper(
     assert(AI == cw->arg_end());
 
     // Create the call
-    jl_cgval_t retval = emit_abi_call(ctx, declrt, sigt, inputargs, nargs + 1);
+    jl_cgval_t retval = emit_abi_call(ctx, declrt, sigt, inputargs, nargs + 1, caller_world);
     bool jlfunc_sret = retval.V && isa<AllocaInst>(retval.V) && !retval.TIndex && retval.inline_roots.empty();
 
     // Prepare the return value
@@ -7904,7 +7945,7 @@ static const char *derive_sigt_name(jl_value_t *jargty)
 // Get the LLVM Function* for the C-callable entry point for a certain function
 // and argument types.
 // here argt does not include the leading function type argument
-static jl_cgval_t emit_cfunction(jl_codectx_t &ctx, jl_value_t *output_type, const jl_cgval_t &fexpr_val, jl_value_t *declrt, jl_svec_t *argt)
+static jl_cgval_t emit_cfunction(jl_codectx_t &ctx, jl_value_t *output_type, const jl_cgval_t &fexpr_val, jl_value_t *declrt, jl_svec_t *argt, bool caller_world)
 {
     jl_unionall_t *unionall_env = (jl_is_method(ctx.linfo->def.method) && jl_is_unionall(ctx.linfo->def.method->sig))
         ? (jl_unionall_t*)ctx.linfo->def.method->sig
@@ -8005,7 +8046,7 @@ static jl_cgval_t emit_cfunction(jl_codectx_t &ctx, jl_value_t *output_type, con
             jl_Module, ctx.emission_context,
             sig, fexpr_val.constant, name,
             declrt, sigt,
-            unionall_env, sparam_vals, &closure_types);
+            unionall_env, sparam_vals, &closure_types, caller_world);
     bool outboxed;
     if (nest) {
         // F is actually an init_trampoline function that returns the real address

@@ -372,6 +372,114 @@ static const inline char *name_from_method_instance(jl_method_instance_t *mi) JL
 }
 
 static jl_mutex_t cfun_lock;
+
+// The calling convention `:caller_world` (flags & 2): the call runs in the caller's world. Each
+// target the thunk has called through is an entry, valid for a range of worlds: the worlds where the
+// dispatch of sigt and the target's CodeInstance both hold, up to the latest world when it was
+// looked up (a later world may differ, so it asks again and extends the range). Slot 1 of the thunk
+// (cfuncdata->last_world) holds the entry the last call used; slot 3 (last_codeinst) the list of all
+// entries. Entries are never freed: there is one per target, and targets are rooted by their
+// MethodInstances' caches, as last_codeinst is.
+struct cfunc_world_entry_t {
+    void *fptr;
+    _Atomic(size_t) min_world; // the range only grows: a reader that sees part of a change sees less
+    _Atomic(size_t) max_world;
+    jl_code_instance_t *codeinst; // NULL: the adapter to a dynamic dispatch
+    cfunc_world_entry_t *next;
+};
+
+static void *jl_get_abi_converter_caller_world(jl_task_t *ct, cfuncdata_t *cfuncdata)
+{
+    jl_value_t *sigt = *cfuncdata->sigt;
+    JL_GC_PROMISE_ROOTED(sigt);
+    jl_value_t *declrt = *cfuncdata->declrt;
+    JL_GC_PROMISE_ROOTED(declrt);
+    bool specsig = cfuncdata->flags & 1;
+    size_t nargs = jl_nparams(sigt);
+    size_t world = ct->world_age;
+    if (world == 0) // a thread without a world: as a C callback, the latest
+        ct->world_age = world = jl_atomic_load_acquire(&jl_world_counter);
+    _Atomic(cfunc_world_entry_t*) *pcurrent = (_Atomic(cfunc_world_entry_t*)*)&cfuncdata->last_world;
+    cfunc_world_entry_t **pentries = (cfunc_world_entry_t**)&cfuncdata->last_codeinst;
+    JL_LOCK(&cfun_lock);
+    for (cfunc_world_entry_t *e = *pentries; e; e = e->next) {
+        if (jl_atomic_load_relaxed(&e->min_world) <= world && world <= jl_atomic_load_relaxed(&e->max_world)) {
+            jl_atomic_store_release(pcurrent, e);
+            JL_UNLOCK(&cfun_lock);
+            return e->fptr;
+        }
+    }
+    JL_UNLOCK(&cfun_lock);
+    // look the target up in the caller's world, outside the lock (inference is slow)
+    size_t latest = jl_atomic_load_acquire(&jl_world_counter);
+    size_t min_valid = 1, max_valid = ~(size_t)0;
+    jl_value_t *mi = jl_nothing;
+    jl_code_instance_t *codeinst = nullptr;
+    JL_GC_PUSH2(&mi, &codeinst);
+    mi = jl_get_specialization1_worlds((jl_tupletype_t*)sigt, world, &min_valid, &max_valid);
+    if (mi != jl_nothing && !jl_subtype(sigt, ((jl_method_instance_t*)mi)->def.method->sig))
+        mi = jl_nothing; // partially-covered: not a guaranteed dispatch
+    if (mi != jl_nothing)
+        codeinst = jl_type_infer((jl_method_instance_t*)mi, world, SOURCE_MODE_ABI, jl_options.trim);
+    size_t lo = min_valid, hi = max_valid < latest ? max_valid : latest;
+    if (codeinst) {
+        size_t cmin = jl_atomic_load_relaxed(&codeinst->min_world), cmax = jl_atomic_load_relaxed(&codeinst->max_world);
+        lo = cmin > lo ? cmin : lo;
+        hi = cmax < hi ? cmax : hi;
+    }
+    if (!(lo <= world && world <= hi))
+        lo = hi = world; // cannot happen, but then: valid for this world only
+    JL_LOCK(&cfun_lock);
+    // the same target, in a range that meets this one: join the two (both are valid for the target)
+    for (cfunc_world_entry_t *e = *pentries; e; e = e->next) {
+        size_t emin = jl_atomic_load_relaxed(&e->min_world), emax = jl_atomic_load_relaxed(&e->max_world);
+        if (e->codeinst == codeinst && lo <= emax + 1 && emin <= hi + 1) {
+            if (lo < emin)
+                jl_atomic_store_relaxed(&e->min_world, lo);
+            if (hi > emax)
+                jl_atomic_store_relaxed(&e->max_world, hi);
+            jl_atomic_store_release(pcurrent, e);
+            JL_UNLOCK(&cfun_lock);
+            JL_GC_POP();
+            return e->fptr;
+        }
+    }
+    bool is_opaque_closure = false;
+    jl_abi_t from_abi = { sigt, declrt, nargs, specsig, is_opaque_closure };
+    void *f = nullptr;
+    if (codeinst) {
+        jl_value_t *astrt = codeinst->rettype;
+        if (astrt != (jl_value_t*)jl_bottom_type && jl_type_intersection(astrt, declrt) == jl_bottom_type)
+            jl_printf(JL_STDERR, "WARNING: cfunction: return type of %s does not match\n", name_from_method_instance((jl_method_instance_t*)mi));
+        // compiled ahead of time for this target (aotcompile.cpp)?
+        void *aot = jl_atomic_load_relaxed(&cfuncdata->fptr);
+        if (aot && cfuncdata->plast_codeinst && *cfuncdata->plast_codeinst == codeinst)
+            f = aot;
+        else
+            f = jl_jit_abi_converter(ct, from_abi, codeinst);
+    }
+    if (f == nullptr) {
+        // a dynamic dispatch (in the caller's world), or JIT is unavailable
+        if (cfuncdata->unspecialized == nullptr)
+            cfuncdata->unspecialized = jl_jit_abi_converter(ct, from_abi, nullptr);
+        f = cfuncdata->unspecialized;
+        if (f == nullptr) {
+            JL_UNLOCK(&cfun_lock);
+            jl_errorf("cfunction not available in this build of Julia");
+        }
+    }
+    cfunc_world_entry_t *e = (cfunc_world_entry_t*)malloc_s(sizeof(cfunc_world_entry_t));
+    e->fptr = f;
+    jl_atomic_store_relaxed(&e->min_world, lo);
+    jl_atomic_store_relaxed(&e->max_world, hi);
+    e->codeinst = f == cfuncdata->unspecialized ? nullptr : codeinst;
+    e->next = *pentries;
+    *pentries = e;
+    jl_atomic_store_release(pcurrent, e);
+    JL_UNLOCK(&cfun_lock);
+    JL_GC_POP();
+    return f;
+}
 // release jl_world_counter
 // store theFptr
 // release last_world_v
@@ -383,6 +491,8 @@ extern "C" JL_DLLEXPORT
 void *jl_get_abi_converter(jl_task_t *ct, void *data)
 {
     cfuncdata_t *cfuncdata = (cfuncdata_t*)data;
+    if (cfuncdata->flags & 2)
+        return jl_get_abi_converter_caller_world(ct, cfuncdata);
     jl_value_t *sigt = *cfuncdata->sigt;
     JL_GC_PROMISE_ROOTED(sigt);
     jl_value_t *declrt = *cfuncdata->declrt;

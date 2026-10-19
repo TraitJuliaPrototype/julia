@@ -4109,6 +4109,25 @@ jl_value_t *jl_get_specialization1(jl_tupletype_t *types, size_t world, int mt_c
     return mi;
 }
 
+// jl_get_specialization1, with the range of worlds where its answer holds (for the calling
+// convention `:caller_world` of cfunction, runtime_ccall.cpp)
+JL_DLLEXPORT jl_value_t *jl_get_specialization1_worlds(jl_tupletype_t *types, size_t world, size_t *min_valid, size_t *max_valid)
+{
+    if (jl_has_free_typevars((jl_value_t*)types))
+        return jl_nothing;
+    if (!jl_has_concrete_subtype((jl_value_t*)types))
+        return jl_nothing;
+    int ambig = 0;
+    jl_value_t *matches = jl_matching_methods(types, jl_nothing, 1, 1, world, min_valid, max_valid, &ambig);
+    if (matches == jl_nothing || jl_array_nrows(matches) != 1 || ambig)
+        return jl_nothing;
+    JL_GC_PUSH1(&matches);
+    jl_method_match_t *match = (jl_method_match_t*)jl_array_ptr_ref(matches, 0);
+    jl_value_t *mi = jl_method_match_to_mi(match, world, *min_valid, *max_valid, 0);
+    JL_GC_POP();
+    return mi;
+}
+
 // Try to get a MethodInstance for a precompile() call. This uses a special kind of lookup that
 // tries to find a method for which the requested signature is compileable.
 JL_DLLEXPORT jl_value_t *jl_get_compile_hint_specialization(jl_tupletype_t *types JL_PROPAGATES_ROOT, size_t world, int mt_cache)
