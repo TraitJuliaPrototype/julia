@@ -535,13 +535,13 @@
                          (and (pair? x) (eq? (car x) 'purity))))
                    (cdr e))))
 
-;; `facts n` in a meta (alone, or merged with others by `pushmeta!`): a method compiled by facts (1)
-;; or in its caller's mode (0, a boundary); every method a definition lowers to carries it
-;; (Compiler/src/facts.jl)
+;; `facts_boundary` or `facts_always` in a meta (alone, or merged with others by `pushmeta!`): a
+;; method compiled in its caller's mode, or always by facts (Compiler/src/facts.jl); copied alone
+;; to the methods lowering makes from it, as the keyword sorter
 (define (facts-meta? e)
-  (and (pair? e) (eq? (car e) 'meta) (pair? (memq 'facts (cdr e))) (pair? (cdr (memq 'facts (cdr e))))))
+  (and (pair? e) (eq? (car e) 'meta) (or (memq 'facts_boundary (cdr e)) (memq 'facts_always (cdr e))) #t))
 (define (facts-meta-only e)
-  `(meta facts ,(cadr (memq 'facts (cdr e)))))
+  (if (memq 'facts_always (cdr e)) '(meta facts_always) '(meta facts_boundary)))
 
 (define (argwide-nospecialize-meta? e)
   (and (length= e 2) (eq? (car e) 'meta) (memq (cadr e) '(nospecialize specialize))))

@@ -1986,6 +1986,8 @@ JL_DLLEXPORT int jl_isabspath(const char *in) JL_NOTSAFEPOINT;
     XX(incomplete_sym) \
     XX(inert_sym) \
     XX(facts_sym) \
+    XX(facts_boundary_sym) \
+    XX(facts_always_sym) \
     XX(infer_sym) \
     XX(inline_sym) \
     XX(invoke_modify_sym) \

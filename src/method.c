@@ -955,6 +955,15 @@ JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src)
         jl_value_t *st = jl_array_ptr_ref(stmts, i);
         if (jl_is_expr(st) && ((jl_expr_t*)st)->head == jl_meta_sym) {
             size_t nargs = jl_expr_nargs(st);
+            if (nargs > 1) {
+                // a facts marker merged into another meta (`pushmeta!`, as `@inline` does); the meta stays
+                for (size_t k = 0; k < nargs; k++) {
+                    if (jl_exprarg(st, k) == (jl_value_t*)jl_facts_boundary_sym)
+                        m->facts = 1;
+                    else if (jl_exprarg(st, k) == (jl_value_t*)jl_facts_always_sym)
+                        m->facts = 2;
+                }
+            }
             if (nargs >= 1 && jl_exprarg(st, 0) == (jl_value_t*)jl_nospecialize_sym) {
                 if (nargs == 1) // bare `@nospecialize` is special: it prevents specialization on all args
                     m->nospecialize = -1;
@@ -1002,17 +1011,11 @@ JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src)
                 }
                 st = jl_nothing;
             }
-            else if (nargs == 2 && jl_exprarg(st, 0) == (jl_value_t*)jl_facts_sym && jl_is_long(jl_exprarg(st, 1))) {
-                m->facts = jl_unbox_long(jl_exprarg(st, 1)) != 0 ? 2 : 1;   // `Expr(:meta, :facts, 0)`: a boundary
+            else if (nargs == 1 && (jl_exprarg(st, 0) == (jl_value_t*)jl_facts_boundary_sym ||
+                                    jl_exprarg(st, 0) == (jl_value_t*)jl_facts_always_sym)) {
+                // `Expr(:meta, :facts_boundary)`: compiled in its caller's mode; `Expr(:meta, :facts_always)`: by facts
+                m->facts = jl_exprarg(st, 0) == (jl_value_t*)jl_facts_always_sym ? 2 : 1;
                 st = jl_nothing;
-            }
-            else if (nargs > 2) {
-                // `facts n` merged into another meta (`pushmeta!`, as `@inline` does)
-                size_t k;
-                for (k = 0; k + 1 < nargs; k++) {
-                    if (jl_exprarg(st, k) == (jl_value_t*)jl_facts_sym && jl_is_long(jl_exprarg(st, k + 1)))
-                        m->facts = jl_unbox_long(jl_exprarg(st, k + 1)) != 0 ? 2 : 1;
-                }
             }
             else if (nargs == 2 && jl_exprarg(st, 0) == (jl_value_t*)jl_generated_sym) {
                 if (m->generator != NULL)

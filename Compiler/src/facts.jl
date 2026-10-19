@@ -33,7 +33,7 @@ facts_mode(interp::AbstractInterpreter) = interp isa NativeInterpreter && interp
 const FACTS_OWNER = :facts
 """
 Whether `m` is compiled by facts: a method of a module compiled by facts, unless it is a boundary
-(`Expr(:meta, :facts, 0)` in its body: compiled in its caller's mode, as a trait entry is).
+(`Expr(:meta, :facts_boundary)` in its body: compiled in its caller's mode, as a trait entry is).
 """
 is_facts_method(@nospecialize(m)) = m isa Method && ccall(:jl_method_is_facts, Cint, (Any,), m) != 0
 "A facts interpreter beside `interp`: its world, parameters and codegen cache, the facts owner."
@@ -368,7 +368,7 @@ function facts_plain_return_type(interp::AbstractInterpreter, @nospecialize(sig)
 end
 
 # --- (D): a call on a dynamic value, split at the call site ---------------------------------------
-# `dynamic_call(K, f, x, args...)` is `f(x, args...)` where `x` is a value of an open set of types
+# `split_call(K, f, x, args...)` is `f(x, args...)` where `x` is a value of an open set of types
 # (a trait's dynamic value, `K` the trait). Inference splits it over the candidate types registered
 # for `K` (at most `MAX_FACT_SPLITS`): `f` at their union, each split a fact with its edge, plus a
 # fallback for any other type; the inliner emits `isa` branches with direct calls and the dynamic
@@ -376,7 +376,7 @@ end
 # registered later reaches the fallback, which is correct, and invalidates nothing.
 
 "`f(x, args...)::RT` for a value `x` of the open set of types registered for `K` (split at the call site)."
-dynamic_call(@nospecialize(K), ::Type{RT}, f, x, args...) where {RT} = f(x, args...)::RT
+split_call(@nospecialize(K), ::Type{RT}, f, x, args...) where {RT} = f(x, args...)::RT
 
 """
     known_type(x) -> Bool
@@ -423,22 +423,22 @@ function dynamic_candidates(@nospecialize(K))
 end
 
 """
-The call info of a `dynamic_call`: the call of `f` (at the candidates' union when `x`'s type is open);
+The call info of a `split_call`: the call of `f` (at the candidates' union when `x`'s type is open);
 the inliner always rewrites the statement to that call. `open`: a value of another type may come,
 so the split keeps the dynamic call as its last branch.
 """
-struct DynamicSplitInfo <: CallInfo
+struct SplitCallInfo <: CallInfo
     info::CallInfo
     open::Bool
     rt::Any        # the declared result: the fallback's result is asserted to it
 end
-add_edges_impl(edges::Vector{Any}, info::DynamicSplitInfo) = add_edges!(edges, info.info)
-nsplit_impl(info::DynamicSplitInfo) = nsplit(info.info)
-getsplit_impl(info::DynamicSplitInfo, idx::Int) = getsplit(info.info, idx)
-getresult_impl(info::DynamicSplitInfo, idx::Int) = getresult(info.info, idx)
+add_edges_impl(edges::Vector{Any}, info::SplitCallInfo) = add_edges!(edges, info.info)
+nsplit_impl(info::SplitCallInfo) = nsplit(info.info)
+getsplit_impl(info::SplitCallInfo, idx::Int) = getsplit(info.info, idx)
+getresult_impl(info::SplitCallInfo, idx::Int) = getresult(info.info, idx)
 
-"Inference of `dynamic_call(K, f, x, args...)`: `f` at the union of `K`'s candidates (a narrower known type of `x` kept), and a fallback."
-function abstract_dynamic_call(interp::AbstractInterpreter, argtypes::Vector{Any}, si::StmtInfo, sv::AbsIntState)
+"Inference of `split_call(K, f, x, args...)`: `f` at the union of `K`'s candidates (a narrower known type of `x` kept), and a fallback."
+function abstract_split_call(interp::AbstractInterpreter, argtypes::Vector{Any}, si::StmtInfo, sv::AbsIntState)
     K = argtypes[2]
     RTa = argtypes[3]
     RT = RTa isa Const && RTa.val isa Type ? RTa.val : (isType(widenconst(RTa)) ? widenconst(RTa).parameters[1] : Any)
@@ -462,8 +462,8 @@ function abstract_dynamic_call(interp::AbstractInterpreter, argtypes::Vector{Any
     return Future{CallMeta}(call, interp, sv) do call, _, _
         # the statement's own type stays what the call gives (the inliner rewrites it to the call of
         # `f`, which asserts nothing); only a split's join is typed `RT`, its fallback asserted
-        narrowed || return CallMeta(call.rt, call.exct, call.effects, DynamicSplitInfo(call.info, false, RT), call.refinements)
+        narrowed || return CallMeta(call.rt, call.exct, call.effects, SplitCallInfo(call.info, false, RT), call.refinements)
         # a value of another type reaches the fallback: its result and effects are unknown
-        return CallMeta(Any, Any, merge_effects(call.effects, Effects()), DynamicSplitInfo(call.info, true, RT))
+        return CallMeta(Any, Any, merge_effects(call.effects, Effects()), SplitCallInfo(call.info, true, RT))
     end
 end

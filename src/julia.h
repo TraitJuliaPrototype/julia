@@ -388,7 +388,7 @@ typedef struct _jl_method_t {
     _jl_purity_overrides_t purity;
 
     // compiled by facts (Compiler/src/facts.jl): 0 as its module says, 1 in its caller's mode
-    // (a boundary, `Expr(:meta, :facts, 0)`), 2 always (`Expr(:meta, :facts, 1)`)
+    // (a boundary, `Expr(:meta, :facts_boundary)`), 2 always (`Expr(:meta, :facts_always)`)
     uint8_t facts;
 
 // hidden fields:

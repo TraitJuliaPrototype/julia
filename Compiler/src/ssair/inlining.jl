@@ -1329,11 +1329,11 @@ function process_simple!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::Int, flag
     sig = inline_apply!(todo, ir, idx, stmt, sig, state)
     sig === nothing && return nothing
 
-    # a call on a dynamic value (`dynamic_call(K, f, x, args...)`, facts.jl): the call of `f`,
+    # a call on a dynamic value (`split_call(K, f, x, args...)`, facts.jl): the call of `f`,
     # split by inference over the candidates (after `inline_apply!`, which makes a splat a call)
-    if inst[:info] isa DynamicSplitInfo && isexpr(stmt, :call) && length(stmt.args) >= 5
+    if inst[:info] isa SplitCallInfo && isexpr(stmt, :call) && length(stmt.args) >= 5
         stmt = Expr(:call, stmt.args[4:end]...)
-        inst[:stmt] = stmt              # the info stays a `DynamicSplitInfo`: never fully covered
+        inst[:stmt] = stmt              # the info stays a `SplitCallInfo`: never fully covered
         sig = call_sig(ir, stmt)
         sig === nothing && return nothing
     end
@@ -1456,7 +1456,7 @@ function compute_inlining_cases(@nospecialize(info::CallInfo), flag::UInt32, sig
         end
         fully_covered &= split_fully_covered
     end
-    if info isa DynamicSplitInfo && info.open
+    if info isa SplitCallInfo && info.open
         # a value of a type not among the candidates reaches the call itself (facts.jl, part D)
         handled_all_cases = fully_covered = false
     end
@@ -1491,7 +1491,7 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
     cases, handled_all_cases, fully_covered, joint_effects = cases
     atype = argtypes_to_type(sig.argtypes)
     atype === Union{} && return nothing # accidentally actually unreachable
-    fallback_rt = info isa DynamicSplitInfo && info.open && info.rt !== Any ? info.rt : nothing
+    fallback_rt = info isa SplitCallInfo && info.open && info.rt !== Any ? info.rt : nothing
     handle_cases!(todo, ir, idx, stmt, atype, cases, handled_all_cases, fully_covered, joint_effects, fallback_rt)
 end
 
