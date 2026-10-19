@@ -366,6 +366,17 @@ end
 "`f(x, args...)::RT` for a value `x` of the open set of types registered for `K` (split at the call site)."
 dynamic_call(@nospecialize(K), ::Type{RT}, f, x, args...) where {RT} = f(x, args...)::RT
 
+"""
+    known_type(x) -> Bool
+
+Whether inference knows the concrete type of `x` where this call is compiled: folded to a constant
+there, and `false` wherever it is not folded (the interpreter, code compiled at abstract types).
+GCC's `__builtin_constant_p`, for types. Code branches on it only between paths that compute the
+same result: TraitWorld's entry takes the folded path where the type is known and the table of
+declared implementations where it is not.
+"""
+known_type(@nospecialize(x)) = false
+
 mutable struct DynamicCandidates
     @atomic table::Any          # an IdDict{Any,Vector{Any}}, replaced on each registration, never mutated
 end

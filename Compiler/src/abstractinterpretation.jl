@@ -2805,6 +2805,9 @@ function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
     elseif f === dynamic_call && la >= 5
         # a call on a dynamic value: split over its trait's candidate types (facts.jl, part D)
         return abstract_dynamic_call(interp, argtypes, si, sv)
+    elseif f === known_type && la == 2
+        # whether inference knows the argument's concrete type (facts.jl): folded, never a call
+        return Future(CallMeta(Const(isdispatchelem(widenconst(argtypes[2]))), Union{}, EFFECTS_TOTAL, NoCallInfo()))
     elseif isa(f, Core.OpaqueClosure)
         # calling an OpaqueClosure about which we have no information returns no information
         return Future(CallMeta(typeof(f).parameters[2], Any, Effects(), NoCallInfo()))
