@@ -70,7 +70,7 @@ function leaves_to(interp::AbstractInterpreter, @nospecialize(method))
     interp isa NativeInterpreter || return nothing
     if interp.owner === FACTS_OWNER
         is_plain_method(method) && return plain_interp(interp)
-    else
+    elseif interp.owner === nothing      # an interpreter with a cache of its own infers by its own rules
         is_facts_method(method) && return facts_interp(interp)
     end
     return nothing
