@@ -477,11 +477,10 @@ function cycle_fix_limited(@nospecialize(typ), sv::InferenceState, cycleid::Int)
     return typ
 end
 
-# under the facts mode, a method's asserted effects are trusted only for Julia's own methods (Base,
-# Core): an assertion over a run-time site would let a caller fold a dispatch no edge records
-# (facts.jl, `facts_eval_refused`; acceptance G1.10)
-adjust_effects(ipo_effects::Effects, def::Method, interp::AbstractInterpreter) =
-    facts_mode(interp) && !facts_trusts_assertions(def) ? ipo_effects : adjust_effects(ipo_effects, def)
+# under the facts mode, no asserted effect applies to a frame with a run-time site: the assertion
+# would let a caller fold a dispatch no edge records (facts.jl; acceptance G1.10)
+adjust_effects(ipo_effects::Effects, def::Method, frame) =
+    frame isa InferenceState && facts_mode(frame.interp) && frame.facts_rtsite ? ipo_effects : adjust_effects(ipo_effects, def)
 
 function adjust_effects(ipo_effects::Effects, def::Method)
     # override the analyzed effects using manually annotated effect settings
@@ -569,7 +568,7 @@ function adjust_effects(sv::InferenceState)
     # override the analyzed effects using manually annotated effect settings
     def = sv.linfo.def
     if isa(def, Method)
-        ipo_effects = adjust_effects(ipo_effects, def, sv.interp)
+        ipo_effects = adjust_effects(ipo_effects, def, sv)
     end
 
     return ipo_effects
@@ -1117,7 +1116,7 @@ function typeinf_edge(interp::AbstractInterpreter, method::Method, @nospecialize
                 local isinferred = is_inferred(frame)
                 local edge = isinferred ? edge_ci : nothing
                 local effects = isinferred ? frame.result.ipo_effects : # effects are adjusted already within `finish` for ipo_effects
-                    adjust_effects(effects_for_cycle(frame.ipo_effects), method, interp)
+                    adjust_effects(effects_for_cycle(frame.ipo_effects), method, frame)
                 local bestguess = frame.bestguess
                 local exc_bestguess = refine_exception_type(frame.exc_bestguess, effects)
                 # propagate newly inferred source to the inliner, allowing efficient inlining w/o deserialization:
@@ -1141,7 +1140,7 @@ function typeinf_edge(interp::AbstractInterpreter, method::Method, @nospecialize
     # return the current knowledge about this cycle
     frame = frame::InferenceState
     update_valid_age!(caller, frame.world.valid_worlds)
-    effects = adjust_effects(effects_for_cycle(frame.ipo_effects), method, interp)
+    effects = adjust_effects(effects_for_cycle(frame.ipo_effects), method, frame)
     bestguess = frame.bestguess
     exc_bestguess = refine_exception_type(frame.exc_bestguess, effects)
     add_cycle_backedge!(caller, frame)

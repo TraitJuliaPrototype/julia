@@ -94,22 +94,30 @@ is_fact_sig(@nospecialize(T)) = T isa DataType && (isdispatchtuple(T) || fact_sp
     (T <: Tuple && length(T.parameters) >= 1 && is_closure_type(T.parameters[1]) && kinds_ok(T.parameters)))
 
 """
-A tuple of concrete types ending in `Vararg{E}` with `E` concrete and not a kind: every tuple it admits
-is a dispatch tuple with the same owners in it, so only their stakeholders or a pirate can change
-dispatch at any of them (the user, session 29: "Anything that satisfies 'can only be changed by
-stakeholders or pirates' is fine"). Julia's core test of issue #10981 splats 2·10^6 arguments.
+A tuple type every value of which is a dispatch tuple with the same owners in it: concrete elements
+(not kinds), tuple elements of the same kind, and a `Vararg{E}` tail of such an `E`. A call
+signature of this form is a fact, and so is an argument of this type: only the stakeholders of its
+members or a pirate can change dispatch at any of them (the user, session 29: "Anything that
+satisfies 'can only be changed by stakeholders or pirates' is fine"). Julia's core test of issue
+#10981 splats 2·10^6 arguments; a function of varargs passes them on as `Tuple{Vararg{E}}`.
 """
 function vararg_fact(@nospecialize(T))
     (T isa DataType && T <: Tuple) || return false
+    isdispatchtuple(T) && return false                 # a dispatch tuple is a fact already
     ps = T.parameters
-    (isempty(ps) || !isvarargtype(ps[end])) && return false
-    va = unwrapva(ps[end])
-    (isdispatchelem(va) && !iskindtype(va)) || return false
-    for i in 1:length(ps)-1
-        isdispatchelem(ps[i]) || return false
+    for i in 1:length(ps)
+        p = ps[i]
+        if isvarargtype(p)
+            i == length(ps) || return false
+            concrete_member(unwrapva(p)) || return false
+        else
+            concrete_member(p) || return false
+        end
     end
     return true
 end
+"Whether every value of type `p` has the same concrete type's owners: a concrete type (not a kind), or a tuple type of such members."
+concrete_member(@nospecialize(p)) = (isdispatchelem(p) && !iskindtype(p)) || vararg_fact(p)
 
 function fact_splits_ok(@nospecialize(T))
     (T isa DataType && T <: Tuple) || return false
@@ -179,28 +187,6 @@ function facts_find_method_matches(interp::AbstractInterpreter, argtypes::Vector
     end
     is_fact_sig(atype) || return FACTS_ABSTRACT_SITE
     return find_simple_method_matches(interp, atype, max_methods)
-end
-
-"Whether the facts mode trusts `m`'s asserted effects: methods of Base and Core only."
-function facts_trusts_assertions(m::Method)
-    r = Base.moduleroot(m.module)
-    return r === Base || r === Core
-end
-
-"""
-Compile-time evaluation under the facts mode: a dynamic call already taints the caller's effects,
-so only asserted effects (`@assume_effects`) can make code over a run-time site foldable; folding it
-would bake in a dispatch no edge records. Allowed only for Julia's own methods (Base, Core), whose
-assertions plain Julia trusts in the same way (lesson 1.2).
-"""
-function facts_eval_refused(result::MethodCallResult)
-    edge = result.edge
-    edge isa CodeInstance || return false
-    m = get_ci_mi(edge).def
-    m isa Method || return false
-    m.purity == 0 && return false                 # effects inferred, not asserted
-    r = Base.moduleroot(m.module)
-    return !(r === Base || r === Core)
 end
 
 # --- `return_type` under the facts mode, step 2 (as TraitWorld's `_native_return_type`) -------------
@@ -394,9 +380,14 @@ function dynamic_candidates(@nospecialize(K))
     return length(v) <= MAX_FACT_SPLITS ? v : v[1:MAX_FACT_SPLITS]
 end
 
-"The call info of a `dynamic_call`: the call of `f` at the candidates' union; the inliner rewrites the statement."
+"""
+The call info of a `dynamic_call`: the call of `f` (at the candidates' union when `x`'s type is open);
+the inliner always rewrites the statement to that call. `open`: a value of another type may come,
+so the split keeps the dynamic call as its last branch.
+"""
 struct DynamicSplitInfo <: CallInfo
     info::CallInfo
+    open::Bool
 end
 add_edges_impl(edges::Vector{Any}, info::DynamicSplitInfo) = add_edges!(edges, info.info)
 nsplit_impl(info::DynamicSplitInfo) = nsplit(info.info)
@@ -422,9 +413,9 @@ function abstract_dynamic_call(interp::AbstractInterpreter, argtypes::Vector{Any
         end
     end
     call = abstract_call(interp, ArgInfo(nothing, newargs), si, sv)::Future
-    narrowed || return call
     return Future{CallMeta}(call, interp, sv) do call, _, _
+        narrowed || return CallMeta(call.rt, call.exct, call.effects, DynamicSplitInfo(call.info, false), call.refinements)
         # a value of another type reaches the fallback: its result and effects are unknown
-        return CallMeta(Any, Any, merge_effects(call.effects, Effects()), DynamicSplitInfo(call.info))
+        return CallMeta(Any, Any, merge_effects(call.effects, Effects()), DynamicSplitInfo(call.info, true))
     end
 end

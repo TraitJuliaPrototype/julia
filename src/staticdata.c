@@ -1224,6 +1224,8 @@ static void jl_write_module(jl_serializer_state *s, uintptr_t item, jl_module_t 
 
     // Handle the fields requiring special attention
     jl_module_t *newm = (jl_module_t*)&s->s->buf[reloc_offset];
+    if (jl_options.trim != JL_TRIM_NO)
+        newm->facts = 0;        // a trimmed image compiled plain code: no module compiled by facts
     newm->name = NULL;
     arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, name)));
     arraylist_push(&s->relocs_list, (void*)backref_id(s, m->name, s->link_ids_relocs));
@@ -1724,6 +1726,8 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                 write_padding(f, sizeof(jl_method_t) - tot); // hidden fields
                 jl_method_t *m = (jl_method_t*)v;
                 jl_method_t *newm = (jl_method_t*)&f->buf[reloc_offset];
+                if (jl_options.trim != JL_TRIM_NO && newm->facts != 0)
+                    newm->facts = 1;    // a trimmed image compiled plain code: no facts method in it
                 if (s->incremental) {
                     if (jl_atomic_load_relaxed(&newm->primary_world) > 1) {
                         jl_atomic_store_relaxed(&newm->primary_world, ~(size_t)0); // min-world

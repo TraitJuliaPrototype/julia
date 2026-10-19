@@ -318,6 +318,10 @@ mutable struct InferenceState
     # NativeInterpreter. But other interpreters may use this to detect cycles
     interp::AbstractInterpreter
 
+    # under the facts mode: whether this frame has a run-time site (a call at no fact signature);
+    # then no asserted effect of the method or its statements applies (facts.jl)
+    facts_rtsite::Bool
+
     # src is assumed to be a newly-allocated CodeInfo, that can be modified in-place to contain intermediate results
     function InferenceState(result::InferenceResult, src::CodeInfo, cache_mode::UInt8,
                             interp::AbstractInterpreter)
@@ -398,7 +402,7 @@ mutable struct InferenceState
             result, unreachable, bestguess, exc_bestguess, ipo_effects,
             _time_ns(), 0.0, 0, 0,
             restrict_abstract_call_sites, cache_mode, insert_coverage,
-            interp)
+            interp, false)
 
         # some more setups
         if !iszero(cache_mode & CACHE_MODE_LOCAL)

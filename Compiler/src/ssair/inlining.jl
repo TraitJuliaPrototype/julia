@@ -1408,7 +1408,7 @@ function compute_inlining_cases(@nospecialize(info::CallInfo), flag::UInt32, sig
         end
         fully_covered &= split_fully_covered
     end
-    if info isa DynamicSplitInfo
+    if info isa DynamicSplitInfo && info.open
         # a value of a type not among the candidates reaches the call itself (facts.jl, part D)
         handled_all_cases = fully_covered = false
     end

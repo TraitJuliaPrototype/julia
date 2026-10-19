@@ -131,6 +131,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     end
     matches = find_method_matches(interp, argtypes, atype; max_methods)
     if isa(matches, FailedMethodMatch)
+        matches === FACTS_ABSTRACT_SITE && sv isa InferenceState && (sv.facts_rtsite = true)
         add_remark!(interp, sv, matches.reason)
         return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
     end
@@ -960,7 +961,6 @@ end
 function concrete_eval_eligible(interp::AbstractInterpreter,
     @nospecialize(f), result::MethodCallResult, arginfo::ArgInfo, sv::AbsIntState)
     (;effects) = result
-    facts_mode(interp) && facts_eval_refused(result) && return :none
     if inbounds_option() === :off
         if !is_nothrow(effects)
             # Disable concrete evaluation in `--check-bounds=no` mode,
@@ -3638,9 +3638,8 @@ function merge_override_effects!(interp::AbstractInterpreter, effects::Effects, 
     # It is possible for arguments (GlobalRef/:static_parameter) to throw,
     # but these will be recomputed during SSA construction later.
     override = decode_statement_effects_override(sv)
-    # under the facts mode, assertions are trusted only in Julia's own methods (facts.jl)
-    def = frame_instance(sv).def
-    if !(facts_mode(interp) && def isa Method && !facts_trusts_assertions(def))
+    # under the facts mode, no assertion applies over a run-time site (facts.jl)
+    if !(facts_mode(interp) && sv.facts_rtsite)
         effects = override_effects(effects, override)
     end
     set_curr_ssaflag!(sv, flags_for_effects(effects), IR_FLAGS_EFFECTS)
