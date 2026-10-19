@@ -272,17 +272,16 @@ function finish_cycle(::AbstractInterpreter, frames::Vector{AbsIntState}, cyclei
     end
     time_caches = 0.0 # the total and adjusted time of every entry in the cycle are the same
     time_paused = UInt64(0)
-    # Under facts the members are optimized callees first (the frames after a caller), and each
-    # optimized member can be inlined into the members optimized after it: a recursion through
-    # wrappers (a `Dynamic` split, an operation call on a trait object) keeps one call per turn,
-    # at the edge back to an earlier frame, instead of one call per member.
-    facts = facts_mode((frames[cycleid]::InferenceState).interp)
-    for frameid = (facts ? (length(frames):-1:cycleid) : (cycleid:length(frames)))
+    # The members are optimized callees first (the frames after a caller), and each optimized member
+    # can be inlined into the members optimized after it: a recursion through wrappers (a `Dynamic`
+    # split, an operation call on a trait object, a varargs wrapper) keeps one call per turn, at the
+    # edge back to an earlier frame, instead of one call per member.
+    for frameid = length(frames):-1:cycleid
         caller = frames[frameid]::InferenceState
         opt = caller.result.src
         if opt isa OptimizationState # implies `may_optimize(caller.interp) === true`
             optimize(caller.interp, opt, caller.result)
-            if facts && get(opt_cache, caller.linfo, nothing) isa CodeInstance
+            if get(opt_cache, caller.linfo, nothing) isa CodeInstance
                 opt.src.inlining_cost = compute_inlining_cost(caller.interp, caller.result, opt.optresult)
                 cycle_results[caller.linfo] = caller.result
             end

@@ -161,7 +161,7 @@ struct InliningState{Interp<:AbstractInterpreter}
     world::UInt
     interp::Interp
     opt_cache::IdDict{MethodInstance,CodeInstance}
-    # members of the cycle being finished that are optimized already (facts mode: `finish_cycle`)
+    # members of the cycle being finished that are optimized already (`finish_cycle`)
     cycle_results::IdDict{MethodInstance,InferenceResult}
 end
 function InliningState(sv::InferenceState, interp::AbstractInterpreter,

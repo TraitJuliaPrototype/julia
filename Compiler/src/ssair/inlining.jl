@@ -778,18 +778,37 @@ function rewrite_apply_exprargs!(todo::Vector{Pair{Int,Any}},
     return new_argtypes
 end
 
+"Whether the compileable signature `new` differs from `atype` only by a varargs tail widened to `Vararg`."
+function only_vararg_widened(@nospecialize(atype), @nospecialize(new))
+    (atype isa DataType && new isa DataType) || return false
+    np = length(new.parameters)
+    (np >= 1 && isvarargtype(new.parameters[np])) || return false
+    length(atype.parameters) >= np - 1 || return false
+    for i in 1:np-1
+        new.parameters[i] === atype.parameters[i] || return false
+    end
+    return true
+end
+
 function compileable_specialization(code::Union{MethodInstance,CodeInstance}, effects::Effects,
     et::InliningEdgeTracker, @nospecialize(info::CallInfo), state::InliningState)
     mi = code isa CodeInstance ? get_ci_mi(code) : code
     mi_invoke = mi
     method, atype, sparams = mi.def::Method, mi.specTypes, mi.sparam_vals
-    # Under facts the invoke target is the fact signature the call was inferred at: its compileable
-    # signature (a varargs tail widened to `Vararg{Any}`) would be inferred again at wider arguments
-    # and run its calls at run time, boxing every argument (a call not inlined in a recursion cycle).
-    if OptimizationParams(state.interp).compilesig_invokes && !(facts_mode(state.interp) && isdispatchtuple(atype))
+    # (a facts method's code is in the facts cache, whoever calls it, and the compiler's in the plain one: facts.jl)
+    other = leaves_to(state.interp, method)
+    cache = other === nothing ? code_cache(state) : code_cache(other)
+    # A call inferred at concrete argument types keeps its exact specialization when the compileable
+    # signature only widens a varargs tail to `Vararg{Any}`: the widened specialization would be
+    # inferred again at `Any` arguments and run its calls at run time, boxing every argument (a call
+    # not inlined, as in a recursion cycle: a varargs wrapper in a recursion ran 56x slower). Julia's
+    # other widenings (a type or a function passed to an argument that does not specialize on it)
+    # stay: they are what keeps the number of compiled specializations small.
+    exact = isdispatchtuple(atype) ? get(cache, mi, nothing) : nothing
+    if OptimizationParams(state.interp).compilesig_invokes
         new_atype = get_compileable_sig(method, atype, sparams)
         new_atype === nothing && return nothing
-        if atype !== new_atype
+        if atype !== new_atype && !(exact isa CodeInstance && only_vararg_widened(atype, new_atype))
             sp_ = ccall(:jl_type_intersection_with_env, Any, (Any, Any), new_atype, method.sig)::SimpleVector
             sparams = sp_[2]::SimpleVector
             mi_invoke = specialize_method(method, new_atype, sparams)
@@ -806,10 +825,7 @@ function compileable_specialization(code::Union{MethodInstance,CodeInstance}, ef
     end
     # prefer using a CodeInstance gotten from the cache, since that is where the invoke target should get compiled to normally
     # TODO: can this code be gotten directly from inference sometimes?
-    # (a facts method's code is in the facts cache, whoever calls it, and the compiler's in the plain one: facts.jl)
-    other = leaves_to(state.interp, method)
-    code = other === nothing ? get(code_cache(state), mi_invoke, nothing) :
-        get(code_cache(other), mi_invoke, nothing)
+    code = mi_invoke === mi && exact isa CodeInstance ? exact : get(cache, mi_invoke, nothing)
     if !isa(code, CodeInstance)
         #println("missing code for ", mi_invoke, " for ", mi)
         code = mi_invoke
