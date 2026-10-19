@@ -892,6 +892,16 @@ function resolve_todo(mi::MethodInstance, result::Union{Nothing,InferenceResult,
         effects = decode_effects(inferred_result.ipo_purity_bits)
         edge = inferred_result
     else # there is no cached source available for this, but there might be code for the compilation sig
+        # a method whose code belongs to the other owner (facts.jl, `leaves_to`): inline that code
+        other = leaves_to(state.interp, mi.def)
+        if other !== nothing
+            ci = get(code_cache(other), mi, nothing)
+            if ci isa CodeInstance
+                case = resolve_todo(ci, info, flag, state)
+                case === nothing || return case
+                return compileable_specialization(ci, decode_effects(ci.ipo_purity_bits), et, info, state)
+            end
+        end
         return compileable_specialization(mi, Effects(), et, info, state)
     end
 
@@ -929,7 +939,12 @@ function resolve_todo(mi::MethodInstance, @nospecialize(info::CallInfo), flag::U
     elseif cached_result isa CodeInstance
         src = @atomic :monotonic cached_result.inferred
         effects = decode_effects(cached_result.ipo_purity_bits)
-    else # there is no cached source available, bail out
+    else # there is no cached source available, bail out (unless the code belongs to the other owner)
+        other = leaves_to(state.interp, mi.def)
+        if other !== nothing
+            ci = get(code_cache(other), mi, nothing)
+            ci isa CodeInstance && return resolve_todo(ci, info, flag, state)
+        end
         return nothing
     end
 
