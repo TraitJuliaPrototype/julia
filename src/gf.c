@@ -4408,6 +4408,38 @@ STATIC_INLINE int sig_match_fast(jl_value_t *arg1t, jl_value_t **args, jl_value_
 
 _Atomic(jl_typemap_entry_t*) call_cache[N_CALL_CACHE] JL_GLOBALLY_ROOTED;
 static _Atomic(uint8_t) pick_which[N_CALL_CACHE];
+
+// An inline cache entry for the exact argument types of a call, when Julia's cache entry for the
+// method found is not a leaf signature (a `@nospecialize` method, an entry with guards, `Any` in its
+// signature), which the per-call-site cache could not hold: every such call paid the full lookup
+// (`push!(::Vector{Any}, x)`: 69 ns under the facts mode, where the call is not inlined). The new
+// entry maps exactly these types to the same method instance, valid from the cache entry's first
+// world up to the latest world now: a later world misses and looks up again, so it never outlives
+// the entry it copies (whose max_world invalidation lowers). Matched by exact types only.
+static void call_cache_exact(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_typemap_entry_t *entry,
+                             size_t world, uint32_t *cache_idx)
+{
+    if (jl_is_type(F))
+        return;
+    for (uint32_t i = 0; i + 1 < nargs; i++)        // `nargs` counts `F`: `args` holds nargs - 1
+        if (jl_is_type(args[i]))
+            return;                                 // a type argument is matched as `Type{T}`, not by its type
+    size_t latest = jl_atomic_load_acquire(&jl_world_counter);
+    size_t lo = jl_atomic_load_relaxed(&entry->min_world);
+    size_t hi = jl_atomic_load_relaxed(&entry->max_world);
+    if (hi > latest)
+        hi = latest;
+    if (!(lo <= world && world <= hi))
+        return;
+    jl_tupletype_t *tt = arg_type_tuple(F, args, nargs);
+    JL_GC_PUSH1(&tt);
+    jl_typemap_entry_t *ic = jl_typemap_alloc(tt, NULL, jl_emptysvec, entry->func.value, lo, hi);
+    int which = jl_atomic_load_relaxed(&pick_which[cache_idx[0]]) + 1;
+    jl_atomic_store_relaxed(&pick_which[cache_idx[0]], which);
+    jl_atomic_store_release(&call_cache[cache_idx[which & 3]], ic);
+    JL_GC_POP();
+}
+
 #ifdef JL_GF_PROFILE
 size_t ncalls;
 void call_cache_stats()
@@ -4524,6 +4556,8 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
             jl_method_instance_t *mfunc = entry->func.linfo;
             record_dispatch_statement_on_first_dispatch(mfunc);
         }
+        if (entry != NULL && !(entry->isleafsig && entry->simplesig == (void*)jl_nothing && entry->guardsigs == jl_emptysvec))
+            call_cache_exact(F, args, nargs, entry, world, cache_idx);
     }
 
     jl_method_instance_t *mfunc;
