@@ -3169,6 +3169,9 @@ function return_type_tfunc(interp::AbstractInterpreter, argtypes::Vector{Any}, s
     end
     call = abstract_call(interp, ArgInfo(nothing, argtypes_vec), si, sv, #=max_methods=#-1)
     tt = Core.Box(tt)
+    # the facts mode's signature (below), boxed as `tt` is: a closure capturing a type is specialized
+    # on it, and the compiler compiled this closure again for every query (70 ms each)
+    fsig = Core.Box(facts_mode(interp) ? (length(argtypes) == 3 ? Tuple{widenconst(aft), af_argtype.parameters...} : af_argtype) : nothing)
     return Future{CallMeta}(call, interp, sv) do call, _, sv
         if isa(sv, InferenceState)
             sv.restrict_abstract_call_sites = old_restrict
@@ -3178,8 +3181,7 @@ function return_type_tfunc(interp::AbstractInterpreter, argtypes::Vector{Any}, s
         # facts mode: the answer may be wider than plain inference's; fold only an answer that
         # cannot be wider (a constant, a concrete type, Union{}), else plain Julia's at run time
         if facts_mode(interp) && !(isa(rt, Const) || (w = widenconst(rt); w === Bottom || (isconcretetype(w) && !iskindtype(w))))
-            sig = length(argtypes) == 3 ? Tuple{widenconst(aft), af_argtype.parameters...} : af_argtype
-            r = facts_plain_return_type(interp, sig, sv)
+            r = facts_plain_return_type(interp, fsig.contents, sv)
             return r === nothing ? UNKNOWN : r
         end
         if isa(rt, Const)
