@@ -4409,6 +4409,80 @@ STATIC_INLINE int sig_match_fast(jl_value_t *arg1t, jl_value_t **args, jl_value_
 _Atomic(jl_typemap_entry_t*) call_cache[N_CALL_CACHE] JL_GLOBALLY_ROOTED;
 static _Atomic(uint8_t) pick_which[N_CALL_CACHE];
 
+// ---- the facts mode's dispatch profiler (JULIA_FACTS_DISPATCH_PROFILE=1) ----
+// Counts dynamic calls per callee method and per the path their lookup took: the per-call-site
+// cache, the leaf cache, the method cache's search, or the full lookup; separately for calls from
+// code of the owner `:facts` (part B, jl_apply_generic_facts) and from code of the default owner
+// (plain code, or everything under the facts image, where the default owner compiles by facts). Printed at exit, the methods
+// with the most calls first. A tool for finding hot run-time sites, off by default (one load and
+// a branch per call).
+#define DP_SLOTS 4096
+enum { DP_SITE = 0, DP_LEAF = 1, DP_ASSOC = 2, DP_FULL = 3 };
+typedef struct { _Atomic(jl_method_t*) m; _Atomic(uint64_t) n[2][4]; } dp_slot_t;
+static dp_slot_t dp_table[DP_SLOTS];
+static int dp_on = -1;
+static _Thread_local int dp_from_facts = 0;
+JL_DLLEXPORT void jl_facts_dispatch_profile_print(void);
+static int dp_enabled(void) JL_NOTSAFEPOINT
+{
+    if (dp_on < 0) {
+        const char *e = getenv("JULIA_FACTS_DISPATCH_PROFILE");
+        int on = e && e[0] == '1';
+        static _Atomic(int) dp_registered = 0;
+        int expected = 0;
+        if (on && jl_atomic_cmpswap(&dp_registered, &expected, 1))
+            atexit(jl_facts_dispatch_profile_print);
+        dp_on = on;
+    }
+    return dp_on;
+}
+static void dp_count(jl_method_instance_t *mfunc, int path) JL_NOTSAFEPOINT
+{
+    jl_method_t *m = jl_is_method(mfunc->def.method) ? mfunc->def.method : NULL;
+    if (m == NULL)
+        return;
+    uintptr_t h = ((uintptr_t)m >> 4) * 0x9E3779B97F4A7C15ull;
+    for (size_t k = 0; k < DP_SLOTS; k++) {
+        dp_slot_t *s = &dp_table[(h + k) & (DP_SLOTS - 1)];
+        jl_method_t *cur = jl_atomic_load_relaxed(&s->m);
+        if (cur == NULL) {
+            jl_method_t *expected = NULL;
+            if (!jl_atomic_cmpswap(&s->m, &expected, m) && expected != m)
+                continue;
+            cur = m;
+        }
+        if (cur == m) {
+            jl_atomic_fetch_add_relaxed(&s->n[dp_from_facts][path], 1);
+            return;
+        }
+    }
+}
+JL_DLLEXPORT void jl_facts_dispatch_profile_print(void)
+{
+    size_t idx[DP_SLOTS], cnt = 0;
+    uint64_t tot[DP_SLOTS];
+    for (size_t i = 0; i < DP_SLOTS; i++) {
+        if (jl_atomic_load_relaxed(&dp_table[i].m) == NULL) continue;
+        uint64_t t = 0;
+        for (int f = 0; f < 2; f++) for (int p = 0; p < 4; p++) t += jl_atomic_load_relaxed(&dp_table[i].n[f][p]);
+        tot[i] = t; idx[cnt++] = i;
+    }
+    for (size_t a = 0; a < cnt; a++)            // a selection of the top 40 by total
+        for (size_t b = a + 1; b < cnt; b++)
+            if (tot[idx[b]] > tot[idx[a]]) { size_t x = idx[a]; idx[a] = idx[b]; idx[b] = x; }
+    jl_safe_printf("\n-- dynamic calls by callee method (owner :facts: site/leaf/assoc/full | default owner: site/leaf/assoc/full)\n");
+    for (size_t a = 0; a < cnt && a < 40; a++) {
+        dp_slot_t *s = &dp_table[idx[a]];
+        jl_method_t *m = jl_atomic_load_relaxed(&s->m);
+        jl_safe_printf("%12llu  %s.%s  %s:%d   :facts %llu/%llu/%llu/%llu | default %llu/%llu/%llu/%llu\n",
+            (unsigned long long)tot[idx[a]], jl_symbol_name(m->module->name), jl_symbol_name(m->name),
+            jl_symbol_name(m->file), (int)m->line,
+            (unsigned long long)s->n[1][0], (unsigned long long)s->n[1][1], (unsigned long long)s->n[1][2], (unsigned long long)s->n[1][3],
+            (unsigned long long)s->n[0][0], (unsigned long long)s->n[0][1], (unsigned long long)s->n[0][2], (unsigned long long)s->n[0][3]);
+    }
+}
+
+
 // An inline cache entry for the exact argument types of a call, when Julia's cache entry for the
 // method found is not a leaf signature (a `@nospecialize` method, an entry with guards, `Any` in its
 // signature), which the per-call-site cache could not hold: every such call paid the full lookup
@@ -4494,6 +4568,7 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
     int i;
     jl_tupletype_t *tt = NULL;
     int64_t last_alloc = 0;
+    int dp_path = DP_SITE;                          // the dispatch profiler's path (above)
     // check each cache entry to see if it matches
     //#pragma unroll
     //for (i = 0; i < 4; i++) {
@@ -4526,8 +4601,10 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
             tt = lookup_arg_type_tuple(F, args, nargs);
             if (tt != NULL)
                 entry = lookup_leafcache(leafcache, (jl_value_t*)tt, world);
+            dp_path = DP_LEAF;
         }
         if (entry == NULL) {
+            dp_path = DP_ASSOC;
             jl_typemap_t *cache = jl_atomic_load_relaxed(&mc->cache); // XXX: gc root required?
             entry = jl_typemap_assoc_exact(cache, F, args, nargs, jl_cachearg_offset(), world);
             if (entry == NULL) {
@@ -4568,6 +4645,7 @@ have_entry:
     else {
         assert(tt);
         // cache miss case
+        dp_path = DP_FULL;
         jl_methcache_t *mc = jl_method_table->cache;
         mfunc = jl_mt_assoc_by_type(jl_method_table, mc, tt, world);
         if (jl_options.malloc_log)
@@ -4588,7 +4666,8 @@ have_entry:
     if (traceen)
         jl_printf(JL_STDOUT, " at %s:%d\n", jl_symbol_name(mfunc->def.method->file), mfunc->def.method->line);
 #endif
-
+    if (__unlikely(dp_on != 0) && dp_enabled())
+        dp_count(mfunc, dp_path);
     return mfunc;
 }
 
@@ -4615,9 +4694,11 @@ STATIC_INLINE jl_value_t *facts_callee_owner(jl_method_instance_t *mfunc) JL_NOT
 JL_DLLEXPORT jl_value_t *jl_apply_generic_facts(jl_value_t *F, jl_value_t **args, uint32_t nargs)
 {
     size_t world = jl_current_task->world_age;
+    dp_from_facts = 1;
     jl_method_instance_t *mfunc = jl_lookup_generic_(F, args, nargs,
                                                      jl_int32hash_fast(jl_return_address()),
                                                      world);
+    dp_from_facts = 0;
     JL_GC_PROMISE_ROOTED(mfunc);
     return _jl_invoke_owner(F, args, nargs, mfunc, world, facts_callee_owner(mfunc));
 }
