@@ -1121,6 +1121,66 @@ JL_DLLEXPORT int jl_compile_by_facts(void)
     return m;
 }
 
+// What follows a call-site split (Compiler/src/facts.jl, `SplitTable`): one table per call
+// signature, from the value's type to a `:caller_world` pointer to the call's target compiled for
+// that type. The layouts mirror the Julia types. A table's state is replaced on each addition,
+// never mutated, so a reader loads it once; a state of another session (a table saved in a package
+// image) counts as empty.
+typedef struct {
+    jl_genericmemory_t *kv;   // Memory{UInt}: pairs (type address, pointer) by open addressing; 0 is empty
+    uint64_t session;         // the session that filled it
+    jl_genericmemory_t *keys; // Memory{Any}: the types, rooted
+} jl_split_state_t;
+typedef struct {
+    _Atomic(jl_split_state_t*) state;
+} jl_split_table_t;
+
+static _Atomic(uint64_t) jl_split_session_id = 0;
+static jl_value_t *jl_split_table_miss_func JL_GLOBALLY_ROOTED = NULL;
+
+// This session's stamp for split tables: made at its first use, never 0.
+JL_DLLEXPORT uint64_t jl_split_session(void)
+{
+    uint64_t s = jl_atomic_load_relaxed(&jl_split_session_id);
+    if (s == 0) {
+        uint64_t n = jl_hrtime() | 1;
+        if (jl_atomic_cmpswap(&jl_split_session_id, &s, n))
+            s = n;
+    }
+    return s;
+}
+
+// Base's `_split_table_miss!(tbl, T)`: makes the pointer for a type met the first time, and adds it.
+JL_DLLEXPORT void jl_set_split_table_miss(jl_value_t *f)
+{
+    jl_split_table_miss_func = f;
+}
+
+// The pointer for the type `T` in split table `tbl`: one probe, else made by the miss function, in
+// the caller's world.
+JL_DLLEXPORT void *jl_split_table_ptr(jl_value_t *tbl, jl_value_t *T)
+{
+    jl_split_state_t *st = jl_atomic_load_acquire(&((jl_split_table_t*)tbl)->state);
+    if (st->session == jl_atomic_load_relaxed(&jl_split_session_id)) {
+        jl_genericmemory_t *kv = st->kv;
+        uint64_t *d = (uint64_t*)kv->ptr;
+        size_t mask = kv->length / 2 - 1;
+        uint64_t a = (uint64_t)(uintptr_t)T;
+        size_t i = (size_t)(a >> 4) & mask;
+        while (1) {
+            uint64_t k = d[2 * i];
+            if (k == a)
+                return (void*)(uintptr_t)d[2 * i + 1];
+            if (k == 0)
+                break;
+            i = (i + 1) & mask;
+        }
+    }
+    jl_value_t *args[2] = {tbl, T};
+    jl_value_t *fp = jl_apply_generic(jl_split_table_miss_func, args, 2);
+    return jl_unbox_voidpointer(fp);
+}
+
 static int very_general_type(jl_value_t *t)
 {
     return (t == (jl_value_t*)jl_any_type || jl_types_equal(t, (jl_value_t*)jl_type_type));

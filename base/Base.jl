@@ -249,6 +249,7 @@ using .MathConstants: ℯ, π, pi
 
 # experimental API's
 include("experimental.jl")
+include("splittable.jl")
 
 # utilities
 include("deepcopy.jl")
@@ -392,6 +393,8 @@ function __init__()
         start_profile_listener()
     end
     _require_world_age[] = get_world_counter()
+    # the miss of the compiler's split tables (splittable.jl)
+    ccall(:jl_set_split_table_miss, Cvoid, (Any,), _split_table_miss!)
     # Prevent spawned Julia process from getting stuck waiting on Tracy to connect.
     delete!(ENV, "JULIA_WAIT_FOR_TRACY")
     if get_bool_env("JULIA_USE_FLISP_PARSER", false) === false
