@@ -446,8 +446,9 @@ mutable struct SplitState
 end
 """
 The table of one call signature at a split's last branch: the called function's type `f`, the other
-arguments' types `args` (a tuple type), the pointer's result type `rt`, and whether the target is
-compiled by facts. The runtime reads its first field (`jl_split_table_ptr`).
+arguments' types at the site `args` (a tuple type), the declared result type `rt`, and whether the
+target is compiled by facts. The pointer passes and returns values as `split_ccall_type` says. The
+runtime reads its first field (`jl_split_table_ptr`).
 """
 mutable struct SplitTable
     @atomic state::SplitState
@@ -530,8 +531,16 @@ function split_kv_insert!(kv::Memory{UInt}, k::UInt, v::UInt)
     return nothing
 end
 
-"A type a split table's pointer passes as it is: concrete, not a kind; any other passes boxed (`Any`)."
+"The type a split table's key records for an argument at the site: its concrete type, or `Any`."
 split_table_type(@nospecialize(T)) = (isconcretetype(T) && !iskindtype(T)) ? T : Any
+"""
+How a split table's pointer passes a value of type `T` (the C ABI of `ccall` and `cfunction`): by
+value where `T` is an isbits type of nonzero size, boxed (`Any`) otherwise, so that a mutable
+object keeps its identity and a struct with references is never copied field by field.
+"""
+split_ccall_type(@nospecialize(T)) = (T isa DataType && isbitstype(T) && sizeof(T) > 0) ? T : Any
+"How a split table's pointer returns a result of type `R`: as `split_ccall_type`, and `Nothing` as no value."
+split_ccall_rt(@nospecialize(R)) = R === Nothing ? Nothing : split_ccall_type(R)
 
 """
 The call info of a `split_call`: the call of `f` (at the candidates' union when `x`'s type is open);

@@ -1176,6 +1176,8 @@ JL_DLLEXPORT void *jl_split_table_ptr(jl_value_t *tbl, jl_value_t *T)
             i = (i + 1) & mask;
         }
     }
+    if (jl_split_table_miss_func == NULL)
+        jl_error("a split's table was reached before Base was initialized");
     jl_value_t *args[2] = {tbl, T};
     jl_value_t *fp = jl_apply_generic(jl_split_table_miss_func, args, 2);
     return jl_unbox_voidpointer(fp);

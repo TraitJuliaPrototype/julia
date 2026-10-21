@@ -496,15 +496,19 @@ end
 """
 The last branch of a split through its table (facts.jl, `SplitTable`): `typeof(x)`, the pointer for it
 (`jl_split_table_ptr`: one probe, or the pointer made at the first miss), and the call through it,
-typed by the table. `argexprs` are the call's: `f`, `x`, the other arguments.
+typed as `split_ccall_type` says. `argexprs` are the call's: `f`, `x`, the other arguments.
 """
 function split_table_call!(compact::IncrementalCompact, argexprs::Vector{Any}, table::SplitTable, line)
     T = insert_node_here!(compact, NewInstruction(Expr(:call, GlobalRef(Core, :typeof), argexprs[2]), DataType, line))
     fp = insert_node_here!(compact, NewInstruction(Expr(:foreigncall, Expr(:tuple, QuoteNode(:jl_split_table_ptr)), Ptr{Cvoid},
         svec(Any, Any), 0, QuoteNode(:ccall), table, T), Ptr{Cvoid}, line))
-    ats = svec(Any, Any, (table.args::DataType).parameters...)
-    return insert_node_here!(compact, NewInstruction(Expr(:foreigncall, fp, table.rt, ats, 0, QuoteNode(:ccall), argexprs...),
-        table.rt, line))
+    ats = Any[Any, Any]
+    for A in (table.args::DataType).parameters
+        push!(ats, split_ccall_type(A))
+    end
+    rt = split_ccall_rt(table.rt)
+    return insert_node_here!(compact, NewInstruction(Expr(:foreigncall, fp, rt, svec(ats...), 0, QuoteNode(:ccall), argexprs...),
+        rt, line))
 end
 
 """
