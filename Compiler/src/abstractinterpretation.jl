@@ -893,7 +893,14 @@ function abstract_call_method_with_const_args(interp::AbstractInterpreter,
     if bail_out_const_call(interp, result, si, match, sv)
         return nothing
     end
-    leaves_to(interp, match.method) === nothing || return nothing   # a method of the other owner is inferred there (facts.jl)
+    other = leaves_to(interp, match.method)
+    if other !== nothing
+        # a method of the other owner is inferred there (facts.jl); constants cross into code
+        # compiled by facts only, in an inference of its own
+        other = other::NativeInterpreter
+        other.owner === FACTS_OWNER || return nothing
+        return facts_const_prop_call(interp::NativeInterpreter, other, result, f, arginfo, si, match, sv)
+    end
     eligibility = concrete_eval_eligible(interp, f, result, arginfo, sv)
     concrete_eval_result = nothing
     if eligibility === :concrete_eval

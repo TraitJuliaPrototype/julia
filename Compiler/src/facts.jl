@@ -101,6 +101,61 @@ function facts_edge(interp::NativeInterpreter, other::NativeInterpreter, method:
     return Future(MethodCallResult(interp, caller, method, Any, Any, Effects(), nothing, edgecycle, edgelimited))
 end
 
+"""
+Constant propagation from plain code into a facts method (writeup/reference/facts.md §6.3): the
+heuristics are a plain callee's, the cache they peek at the facts owner's. The callee is inferred
+again for the constants by `other` (the facts rules), in an inference of its own: a frame at the
+bottom of a call stack of its own, so that no cycle joins it to the caller's frames (a cycle back
+to it gives up, as one back to any constant frame does). Its result is local: no cache of the facts
+owner holds it, and the caller's inference cache memoizes it (the caller never infers a facts
+method itself). The caller keeps its result and the edges of that inference, in the uncached
+CodeInstance of the facts owner that constant propagation's edges always are (`ci_as_edge`).
+Concrete and semi-concrete evaluation are not tried: they rest on the callee's whole CodeInstance.
+The other direction, code compiled by facts calling the compiler's plain code, propagates nothing.
+"""
+function facts_const_prop_call(interp::NativeInterpreter, other::NativeInterpreter, result::MethodCallResult,
+                               @nospecialize(f), arginfo::ArgInfo, si::StmtInfo, match::MethodMatch, sv::AbsIntState)
+    mi = maybe_get_const_prop_profitable(other, result, f, arginfo, si, match, sv)
+    mi === nothing && return nothing
+    if is_constprop_recursed(result, mi, sv)
+        add_remark!(interp, sv, "[constprop] Edge cycle encountered")
+        return nothing
+    end
+    𝕃ᵢ = typeinf_lattice(other)
+    forwarded_argtypes = compute_forwarded_argtypes(interp, arginfo, sv)
+    cache_argtypes = matching_cache_argtypes(𝕃ᵢ, mi)
+    argtypes = matching_cache_argtypes(𝕃ᵢ, mi, forwarded_argtypes, cache_argtypes)
+    argtypes = get_nospecializeinfer_argtypes(argtypes, cache_argtypes, mi.def::Method)
+    cache = get_inference_cache(interp)
+    inf_result = cache_lookup(𝕃ᵢ, mi, argtypes, cache)
+    inf_result === missing && return nothing                # a limited result before: not again
+    inf_result isa InferenceResult && return const_prop_result(inf_result)
+    overridden_by_const = falses(length(argtypes))
+    for i = 1:length(argtypes)
+        if argtypes[i] !== argtype_by_index(cache_argtypes, i)
+            overridden_by_const[i] = true
+        end
+    end
+    any(overridden_by_const) || return nothing
+    inf_result = InferenceResult(mi, argtypes, overridden_by_const)
+    frame = InferenceState(inf_result, #=cache_mode=#:local, other)
+    frame === nothing && return nothing
+    callstack = frame.callstack::Vector{AbsIntState}
+    push!(callstack, frame)
+    frame.cycleid = frame.frameid = 1
+    if !typeinf(other, frame)
+        add_remark!(interp, sv, "[constprop] Fresh constant inference hit a cycle")
+        return nothing
+    end
+    push!(cache, inf_result)
+    if inf_result.tombstone
+        add_remark!(interp, sv, "[constprop] Constant inference produced a limited result")
+        return nothing
+    end
+    inf_result.ci_as_edge = codeinst_as_edge(other, frame, result.edge)
+    return const_prop_result(inf_result)
+end
+
 "Whether `mi` is the compiler's own code (a method of `Compiler` or a module inside it)."
 function is_compiler_code(mi::MethodInstance)
     m = mi.def
