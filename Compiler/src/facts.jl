@@ -102,6 +102,39 @@ function facts_edge(interp::NativeInterpreter, other::NativeInterpreter, method:
 end
 
 """
+A plain call with constant arguments to a facts method (writeup/reference/facts.md §6.3), in the order
+of `abstract_call_method_with_const_args`: concrete evaluation on the effects facts inferred for the
+callee, then semi-concrete evaluation of its facts code by `other` (the facts rules), then constant
+propagation (`facts_const_prop_call`). The first two rest on the callee's facts CodeInstance, the
+call's edge, as inlining does; a callee whose facts code has a run-time site has no foldable effects
+(no assertion applies over it), so it is not evaluated at compile time.
+"""
+function facts_const_call(interp::NativeInterpreter, other::NativeInterpreter, result::MethodCallResult,
+                          @nospecialize(f), arginfo::ArgInfo, si::StmtInfo, match::MethodMatch, sv::AbsIntState,
+                          invokecall::Union{Nothing,InvokeCall})
+    eligibility = concrete_eval_eligible(interp, f, result, arginfo, sv)
+    concrete_eval_result = nothing
+    if eligibility === :concrete_eval
+        concrete_eval_result = concrete_eval_call(interp, f, result, arginfo, sv, invokecall)
+        if (concrete_eval_result !== nothing &&
+            (!may_optimize(interp) ||
+             may_inline_concrete_result(concrete_eval_result.const_result::ConcreteResult) ||
+             concrete_eval_result.rt === Bottom))
+            return concrete_eval_result
+        end
+    end
+    if eligibility === :semi_concrete_eval
+        mi = maybe_get_const_prop_profitable(other, result, f, arginfo, si, match, sv)
+        if mi !== nothing && !is_constprop_recursed(result, mi, sv)
+            irinterp_result = semi_concrete_eval_call(other, mi, result, arginfo, sv)
+            irinterp_result === nothing || return irinterp_result
+        end
+    end
+    r = facts_const_prop_call(interp, other, result, f, arginfo, si, match, sv)
+    return r === nothing ? concrete_eval_result : r
+end
+
+"""
 Constant propagation from plain code into a facts method (writeup/reference/facts.md §6.3): the
 heuristics are a plain callee's, the cache they peek at the facts owner's. The callee is inferred
 again for the constants by `other` (the facts rules), in an inference of its own: a frame at the
@@ -110,7 +143,6 @@ to it gives up, as one back to any constant frame does). Its result is local: no
 owner holds it, and the caller's inference cache memoizes it (the caller never infers a facts
 method itself). The caller keeps its result and the edges of that inference, in the uncached
 CodeInstance of the facts owner that constant propagation's edges always are (`ci_as_edge`).
-Concrete and semi-concrete evaluation are not tried: they rest on the callee's whole CodeInstance.
 The other direction, code compiled by facts calling the compiler's plain code, propagates nothing.
 """
 function facts_const_prop_call(interp::NativeInterpreter, other::NativeInterpreter, result::MethodCallResult,
@@ -168,15 +200,18 @@ function is_compiler_code(mi::MethodInstance)
     end
 end
 
-"The most concrete signatures one fact may stand for: Julia's own bound on union splitting."
+"The most concrete signatures `return_type`'s plain answer is merged over, and the `Dynamic` split's candidates."
 const MAX_FACT_SPLITS = 4
+"The interpreter's default bound on union splitting, for the checks that have no interpreter at hand (an edge's signature)."
+const FACT_UNION_SPLITTING = InferenceParams().max_union_splitting
 
 """
 Whether `T` (a call's argument types) is a fact signature: a dispatch tuple; a tuple whose
 tuple-typed arguments have unions of concrete element types (it admits exactly the values of its
 splits, as top-level union splitting); or a closure's call at kinds (only its owner adds methods).
 """
-is_fact_sig(@nospecialize(T)) = T isa DataType && (isdispatchtuple(T) || fact_splits_ok(T) || vararg_fact(T) ||
+is_fact_sig(@nospecialize(T), max_union_splitting::Int = FACT_UNION_SPLITTING) =
+    T isa DataType && (isdispatchtuple(T) || fact_splits_ok(T, max_union_splitting) || vararg_fact(T) ||
     (T <: Tuple && length(T.parameters) >= 1 && is_closure_type(T.parameters[1]) && kinds_ok(T.parameters)))
 
 """
@@ -205,18 +240,53 @@ end
 "Whether every value of type `p` has the same concrete type's owners: a concrete type (not a kind), or a tuple type of such members."
 concrete_member(@nospecialize(p)) = (isdispatchelem(p) && !iskindtype(p)) || vararg_fact(p)
 
-function fact_splits_ok(@nospecialize(T))
+"""
+Whether the tuple-typed arguments of `T` have unions of concrete element types that split by Julia's
+union-splitting cost (`unionsplitcost`: the union lengths multiplied, the largest counted as 2) at
+most `max_union_splitting`, as top-level unions split (writeup/reference/facts.md §3).
+"""
+function fact_splits_ok(@nospecialize(T), max_union_splitting::Int)
     (T isa DataType && T <: Tuple) || return false
     ps = T.parameters
     (isempty(ps) || isvarargtype(ps[end])) && return false
-    n = 1
+    lens = Int[]
     for p in ps
-        k = isdispatchelem(p) ? 1 : tuple_splits(p)
-        k == 0 && return false
-        n *= k
-        n > MAX_FACT_SPLITS && return false
+        isdispatchelem(p) && continue
+        tuple_union_lengths!(lens, p) || return false
+    end
+    return union_split_cost(lens) <= max_union_splitting
+end
+"Push the lengths of the unions among `P`'s elements (nested tuples included); false unless `P` is a tuple of concrete elements and unions of concrete types."
+function tuple_union_lengths!(lens::Vector{Int}, @nospecialize(P))
+    (P isa DataType && P <: Tuple) || return false
+    ps = P.parameters
+    (isempty(ps) || isvarargtype(ps[end])) && return false
+    for q in ps
+        if isdispatchelem(q)
+            continue
+        elseif q isa Union
+            us = uniontypes(q)
+            for u in us
+                isdispatchelem(u) || return false
+            end
+            push!(lens, length(us))
+        else
+            tuple_union_lengths!(lens, q) || return false
+        end
     end
     return true
+end
+"Julia's union-splitting cost (`unionsplitcost`) of unions of these lengths."
+function union_split_cost(lens::Vector{Int})
+    nu, max = 1, 2
+    for nti in lens
+        if nti > max
+            max, nti = nti, max
+        end
+        nu, ovf = Core.Intrinsics.checked_smul_int(nu, nti)
+        ovf && return typemax(Int)
+    end
+    return nu
 end
 "The number of concrete tuple types `P` admits when its elements are concrete or unions of concrete types; 0 if not such a tuple."
 function tuple_splits(@nospecialize(P))
@@ -267,11 +337,11 @@ function facts_find_method_matches(interp::AbstractInterpreter, argtypes::Vector
         for arg_n in switchtupleunion(𝕃, argtypes)
             sig_n = argtypes_to_type(arg_n)
             sig_n === Union{} && continue
-            is_fact_sig(sig_n) || return FACTS_ABSTRACT_SITE
+            is_fact_sig(sig_n, max_union_splitting) || return FACTS_ABSTRACT_SITE
         end
         return find_union_split_method_matches(interp, argtypes, max_methods)
     end
-    is_fact_sig(atype) || return FACTS_ABSTRACT_SITE
+    is_fact_sig(atype, max_union_splitting) || return FACTS_ABSTRACT_SITE
     return find_simple_method_matches(interp, atype, max_methods)
 end
 

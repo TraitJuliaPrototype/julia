@@ -899,7 +899,7 @@ function abstract_call_method_with_const_args(interp::AbstractInterpreter,
         # compiled by facts only, in an inference of its own
         other = other::NativeInterpreter
         other.owner === FACTS_OWNER || return nothing
-        return facts_const_prop_call(interp::NativeInterpreter, other, result, f, arginfo, si, match, sv)
+        return facts_const_call(interp::NativeInterpreter, other, result, f, arginfo, si, match, sv, invokecall)
     end
     eligibility = concrete_eval_eligible(interp, f, result, arginfo, sv)
     concrete_eval_result = nothing
