@@ -539,10 +539,13 @@ ERROR: ArgumentError: Cannot call tail on an empty tuple.
 tail(x::Tuple) = argtail(x...)
 tail(::Tuple{}) = throw(ArgumentError("Cannot call tail on an empty tuple."))
 
+# The type-introspection helpers read a type's fields with `getfield` and call each other through
+# `invoke` at the callee's own signature: a call or a property read at a type value (a kind) is no fact
+# signature in the patched build's facts mode, and would leave a run-time site under their assertions.
 function unwrap_unionall(@nospecialize(a))
     @_foldable_meta
     while isa(a,UnionAll)
-        a = a.body
+        a = getfield(a, :body)
     end
     return a
 end
@@ -590,10 +593,11 @@ end
 
 function isvatuple(@nospecialize(t))
     @_foldable_meta
-    t = unwrap_unionall(t)
+    t = invoke(unwrap_unionall, Tuple{Any}, t)
     if isa(t, DataType)
-        n = length(t.parameters)
-        return n > 0 && isvarargtype(t.parameters[n])
+        ps = getfield(t, :parameters)
+        n = length(ps)
+        return n > 0 && isvarargtype(ps[n])
     end
     return false
 end

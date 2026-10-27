@@ -591,7 +591,7 @@ alignment of the elements, not the whole object.
 """
 function datatype_alignment(dt::DataType)
     @_foldable_meta
-    layout = dt.layout::Ptr{Cvoid}
+    layout = getfield(dt, :layout)::Ptr{Cvoid}
     layout == C_NULL && throw(UndefRefError())
     alignment = unsafe_load(convert(Ptr{DataTypeLayout}, layout)).alignment
     return Int(alignment)
@@ -676,7 +676,7 @@ Return the number of pointers in the layout of a datatype.
 """
 function datatype_npointers(dt::DataType)
     @_foldable_meta
-    layout = dt.layout::Ptr{Cvoid}
+    layout = getfield(dt, :layout)::Ptr{Cvoid}
     layout == C_NULL && throw(UndefRefError())
     return unsafe_load(convert(Ptr{DataTypeLayout}, layout)).npointers
 end
@@ -1110,9 +1110,9 @@ false
 """
 function isabstracttype(@nospecialize(t))
     @_total_meta
-    t = unwrap_unionall(t)
+    t = invoke(unwrap_unionall, Tuple{Any}, t)
     # TODO: what to do for `Union`?
-    return isa(t, DataType) && (t.name.flags & 0x1) == 0x1
+    return isa(t, DataType) && (getfield(getfield(t, :name), :flags) & 0x1) == 0x1
 end
 
 function is_datatype_layoutopaque(dt::DataType)
@@ -1278,25 +1278,27 @@ function argument_datatype(@nospecialize t)
 end
 
 function datatype_fieldcount(t::DataType)
-    if t.name === _NAMEDTUPLE_NAME
-        names, types = t.parameters[1], t.parameters[2]
+    tn = getfield(t, :name)
+    if tn === _NAMEDTUPLE_NAME
+        ps = getfield(t, :parameters)
+        names, types = ps[1], ps[2]
         if names isa Tuple
             return length(names)
         end
         if types isa DataType && types <: Tuple
-            return datatype_fieldcount(types)
+            return invoke(datatype_fieldcount, Tuple{DataType}, types)
         end
         return nothing
-    elseif isabstracttype(t)
+    elseif invoke(isabstracttype, Tuple{Any}, t)
         return nothing
     end
-    if t.name === Tuple.name
-        isvatuple(t) && return nothing
-        return length(t.types)
+    if tn === Tuple.name
+        invoke(isvatuple, Tuple{Any}, t) && return nothing
+        return length(getfield(t, :parameters))   # a tuple type's field types are its parameters
     end
     # Equivalent to length(t.types), but `t.types` is lazy and we do not want
     # to be forced to compute it.
-    return length(t.name.names)
+    return length(getfield(tn, :names))
 end
 
 """
@@ -1308,7 +1310,7 @@ An error is thrown if the type is too abstract to determine this.
 function fieldcount(@nospecialize t)
     @_foldable_meta
     if t isa UnionAll || t isa Union
-        t = argument_datatype(t)
+        t = invoke(argument_datatype, Tuple{Any}, t)
         if t === nothing
             throw(ArgumentError("type does not have a definite number of fields"))
         end
@@ -1318,7 +1320,7 @@ function fieldcount(@nospecialize t)
     if !(t isa DataType)
         throw(TypeError(:fieldcount, DataType, t))
     end
-    fcount = datatype_fieldcount(t)
+    fcount = invoke(datatype_fieldcount, Tuple{DataType}, t)
     if fcount === nothing
         throw(ArgumentError("type does not have a definite number of fields"))
     end
@@ -1327,7 +1329,7 @@ end
 
 function fieldcount_noerror(@nospecialize t)
     if t isa UnionAll || t isa Union
-        t = argument_datatype(t)
+        t = invoke(argument_datatype, Tuple{Any}, t)
         if t === nothing
             return nothing
         end
