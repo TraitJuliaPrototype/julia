@@ -555,6 +555,14 @@ static jl_array_t *queue_external_cis(jl_array_t *list, jl_query_cache *query_ca
         // compile queue infers it again by facts (precompile.jl); without its source it was dropped
         int keep_without_source = jl_image_keep_compiled && ci->owner == (jl_value_t*)jl_facts_sym &&
                                   jl_atomic_load_relaxed(&ci->invoke) != NULL;
+        // code specialized on one runtime value whose signature type has no hash (a type value pushed into
+        // a `Type[]`, `_push!(::Vector{Type}, ::Type{Union{Tuple{…},…}})`) is not kept: such instances are
+        // inserted at load by a scan of the method's whole list of specializations (gf.c,
+        // jl_specializations_get_linfo_), and the documentation system made thousands of them under the
+        // facts image (3 s of a load). Dropping compiled code from an image changes no result.
+        jl_value_t *ut = jl_unwrap_unionall(mi->specTypes);
+        if (jl_is_datatype(ut) && ((jl_datatype_t*)ut)->hash == 0)
+            continue;
         if ((jl_atomic_load_relaxed(&ci->inferred) || keep_without_source) && jl_is_method(m) && jl_object_in_image((jl_value_t*)m->module)) {
             int found = has_backedge_to_worklist(mi, &visited, &stack, query_cache);
             assert(found == 0 || found == 1 || found == 2);
