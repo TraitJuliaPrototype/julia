@@ -3,14 +3,11 @@
 using ..Compiler.Base
 using ..Compiler: _findsup, store_backedges, FoldRecord, fold_holds, JLOptions, get_world_counter,
     _methods_by_ftype, get_methodtable, get_ci_mi, should_instrument,
-    morespecific, RefValue, get_require_world, Vector, IdDict
+    morespecific, RefValue, get_require_world, Vector, IdDict, IdSet
 using .Core: CodeInstance, MethodInstance
 
 const CI_FLAGS_NATIVE_CACHE_VALID = 0b1000
 const WORLD_AGE_REVALIDATION_SENTINEL::UInt = 1
-# remembered validation: awaiting validation, with its method lookups remembered (set and cleared within one image's
-# `insert_backedges_remembered`)
-const WORLD_AGE_REMEMBERED_SENTINEL::UInt = 2
 const _jl_debug_method_invalidation = RefValue{Union{Nothing,Vector{Any}}}(nothing)
 debug_method_invalidation(onoff::Bool) =
     _jl_debug_method_invalidation[] = onoff ? Any[] : nothing
@@ -47,10 +44,12 @@ struct VerifyMethodWorkspace
     stack::Vector{CodeInstance}
     visiting::IdDict{CodeInstance,Int}
 
+    # remembered validation: the CodeInstances whose method lookups a session with the same chain key found valid
+    remembered::IdSet{CodeInstance}
 
     function VerifyMethodWorkspace()
         new(VerifyMethodInitialState[], VerifyMethodWorkState[], VerifyMethodResultState[],
-            CodeInstance[], IdDict{CodeInstance,Int}())
+            CodeInstance[], IdDict{CodeInstance,Int}(), IdSet{CodeInstance}())
     end
 end
 
@@ -178,9 +177,8 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
         if work.stage == :init_and_process_callees
             # Initialize state and handle early returns
             world = initial.codeinst.min_world
-            remembered = initial.codeinst.max_world == WORLD_AGE_REMEMBERED_SENTINEL
             let max_valid2 = initial.codeinst.max_world
-                if max_valid2 ≠ WORLD_AGE_REVALIDATION_SENTINEL && max_valid2 ≠ WORLD_AGE_REMEMBERED_SENTINEL
+                if max_valid2 ≠ WORLD_AGE_REVALIDATION_SENTINEL
                     workspace.result_states[current_depth] = VerifyMethodResultState(0, world, max_valid2)
                     workspace.work_states[current_depth] = VerifyMethodWorkState(work.depth, work.cause, work.recursive_index, :return_to_parent)
                     continue
@@ -223,6 +221,7 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
             # remembered validation: the method lookups' answers are those of a session with the same method table;
             # bindings, folds and the CodeInstance edges below are checked as always, and the code's world range
             # starts at the validation world
+            remembered = initial.codeinst in workspace.remembered
             remembered && (minworld = validation_world)
             if !isempty(initial.callees) && maxworld != get_require_world()
                 matches = []
@@ -679,28 +678,18 @@ function insert_backedges_remembered(internal_methods::Vector{Any}, valid::Vecto
     backedges_only = unsafe_load(cglobal(:jl_first_image_replacement_world, UInt)) == typemax(UInt)
     scan_new_methods!(internal_methods, backedges_only)
     workspace = VerifyMethodWorkspace()
-    n = length(internal_methods)
-    marked = _jl_debug_method_invalidation[] === nothing   # the invalidation logger sees the full walk
-    marked && for i = 1:n                                   # the mark: a second sentinel, no allocation
-        ci = internal_methods[i]
-        if ci isa CodeInstance && valid[i] == 0x01 && ci.max_world == WORLD_AGE_REVALIDATION_SENTINEL
-            @atomic :monotonic ci.max_world = WORLD_AGE_REMEMBERED_SENTINEL
+    if _jl_debug_method_invalidation[] === nothing      # the invalidation logger sees the full walk
+        for i = 1:length(internal_methods)
+            ci = internal_methods[i]
+            ci isa CodeInstance && valid[i] == 0x01 && push!(workspace.remembered, ci)
         end
     end
     w = RefValue{UInt}(0)
-    for i = 1:n
+    for i = 1:length(internal_methods)
         codeinst = internal_methods[i]
         codeinst isa CodeInstance || continue
         k = @ccall jl_load_chain_key_and_world(w::Ptr{UInt})::UInt64
-        if marked && k != key                               # the table changed: the rest in full
-            for j = i:n
-                cj = internal_methods[j]
-                if cj isa CodeInstance && cj.max_world == WORLD_AGE_REMEMBERED_SENTINEL
-                    @atomic :monotonic cj.max_world = WORLD_AGE_REVALIDATION_SENTINEL
-                end
-            end
-            marked = false
-        end
+        k == key || empty!(workspace.remembered)
         validation_world = w[]
         verify_method_graph(codeinst, validation_world, workspace)
         @ccall jl_promote_ci_to_current(codeinst::Any, validation_world::UInt)::Cvoid
