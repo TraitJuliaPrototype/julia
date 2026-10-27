@@ -597,7 +597,7 @@ function isvatuple(@nospecialize(t))
     if isa(t, DataType)
         ps = getfield(t, :parameters)
         n = length(ps)
-        return n > 0 && isvarargtype(ps[n])
+        return n > 0 && isa(ps[n], Core.TypeofVararg)   # `isvarargtype`'s test, on an element of unknown type
     end
     return false
 end

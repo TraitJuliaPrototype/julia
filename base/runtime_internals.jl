@@ -1283,7 +1283,7 @@ function datatype_fieldcount(t::DataType)
         ps = getfield(t, :parameters)
         names, types = ps[1], ps[2]
         if names isa Tuple
-            return length(names)
+            return nfields(names)   # a builtin: `length` at an abstract `Tuple` is no fact signature
         end
         if types isa DataType && types <: Tuple
             return invoke(datatype_fieldcount, Tuple{DataType}, types)
@@ -1318,7 +1318,7 @@ function fieldcount(@nospecialize t)
         throw(ArgumentError("The empty type does not have a well-defined number of fields since it does not have instances."))
     end
     if !(t isa DataType)
-        throw(TypeError(:fieldcount, DataType, t))
+        throw(invoke(TypeError, Tuple{Any, Type, Any}, :fieldcount, DataType, t))
     end
     fcount = invoke(datatype_fieldcount, Tuple{DataType}, t)
     if fcount === nothing
