@@ -1,7 +1,7 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
 using ..Compiler.Base
-using ..Compiler: _findsup, store_backedges, JLOptions, get_world_counter,
+using ..Compiler: _findsup, store_backedges, FoldRecord, fold_holds, JLOptions, get_world_counter,
     _methods_by_ftype, get_methodtable, get_ci_mi, should_instrument,
     morespecific, RefValue, get_require_world, Vector, IdDict
 using .Core: CodeInstance, MethodInstance
