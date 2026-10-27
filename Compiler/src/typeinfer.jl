@@ -743,6 +743,10 @@ function Base.iterate(it::ForwardToBackedgeIterator, i::Int = 1)
             continue
         elseif isa(item, Core.Binding)
             return ((nothing, item), i + 1)
+        elseif isa(item, FoldRecord)
+            # a fold has no backedge: nothing invalidates it in a session (facts.jl)
+            i += 1
+            continue
         end
         if isa(item, CodeInstance)
             item = get_ci_mi(item)

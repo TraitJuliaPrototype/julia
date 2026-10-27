@@ -1370,6 +1370,13 @@ function process_simple!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::Int, flag
         return nothing
     end
 
+    # a folded `fold_call` (facts.jl): its value replaces the call whatever its size, since the call
+    # left in place would return `nothing` where the folded code expects the value
+    if inst[:info] isa FoldCallInfo && rt isa Const
+        inst[:stmt] = quoted(rt.val)
+        return nothing
+    end
+
     sig = call_sig(ir, stmt)
     sig === nothing && return nothing
 

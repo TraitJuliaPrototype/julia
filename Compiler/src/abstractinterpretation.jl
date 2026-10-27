@@ -2811,6 +2811,9 @@ function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
     elseif f === split_call && la >= 5
         # a call on a dynamic value: split over its trait's candidate types (facts.jl, part D)
         return abstract_split_call(interp, argtypes, si, sv)
+    elseif f === fold_call && la >= 2
+        # a value fixed where the code is compiled (facts.jl, W-40)
+        return Future(abstract_fold_call(interp, argtypes, sv))
     elseif f === known_type && la == 2
         # whether inference knows the argument's concrete type (facts.jl): folded, never a call
         return Future(CallMeta(Const(isdispatchelem(widenconst(argtypes[2]))), Union{}, EFFECTS_TOTAL, NoCallInfo()))

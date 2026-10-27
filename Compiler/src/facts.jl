@@ -442,7 +442,9 @@ function rests_on_facts(ci::CodeInstance, limit::Int = 2000)
         i = 1
         while i <= length(es)
             e = es[i]
-            if e isa Int || e isa Core.MethodTable || e isa MethodInstance
+            if e isa FoldRecord                 # evaluated again at load: rests on the session's answer
+                i += 1
+            elseif e isa Int || e isa Core.MethodTable || e isa MethodInstance
                 return false
             elseif e isa Core.Binding
                 i += 1
@@ -516,6 +518,69 @@ same result: TraitWorld's entry takes the folded path where the type is known an
 declared implementations where it is not.
 """
 known_type(@nospecialize(x)) = false
+
+"""
+    fold_call(g, args...) -> value or nothing
+
+`g(args...)` where inference folds it, else `nothing` (the interpreter, code compiled at abstract
+types, an argument inference does not know, a frame that is not compiled for the global cache).
+Where every argument is a constant to inference, the native interpreter calls `g(args...)` in the
+inference world: a value folds, with a `FoldRecord` in the frame's edges, which is evaluated again
+when a package image keeps the code (`g(AtLoad(), args...)`); `nothing` and `Undecided()` do not.
+Code uses it only between paths that compute the same result, as `known_type`.
+"""
+fold_call(@nospecialize(g), @nospecialize(args...)) = nothing
+"`g`'s answer for not now: the call is compiled unfolded, and nothing is remembered."
+struct Undecided end
+"The argument `g` gets as its first when a fold is evaluated again at load (it may wait for a lock there)."
+struct AtLoad end
+"A fold kept with the code: `g(args...)` gave `value`; evaluated again at load."
+struct FoldRecord
+    g::Any
+    args::Tuple
+    value::Any
+end
+struct FoldCallInfo <: CallInfo
+    record::FoldRecord
+end
+add_edges_impl(edges::Vector{Any}, info::FoldCallInfo) = (push!(edges, info.record); nothing)
+
+const NOT_FOLDED = CallMeta(Const(nothing), Union{}, EFFECTS_TOTAL, NoCallInfo())
+"Inference of `fold_call(g, args...)` (the W-40 design note, §4.1, §11)."
+function abstract_fold_call(interp::AbstractInterpreter, argtypes::Vector{Any}, sv::AbsIntState)
+    # only the native interpreter's frames compiled for the global cache: not reflection's top frame,
+    # analysis tools, constant propagation or semi-concrete evaluation (which keep no record)
+    (interp isa NativeInterpreter && sv isa InferenceState && !iszero(sv.cache_mode & CACHE_MODE_GLOBAL)) || return NOT_FOLDED
+    vals = Any[]
+    for a in argtypes[2:end]
+        isvarargtype(a) && return NOT_FOLDED
+        a = widenslotwrapper(a)
+        if a isa Const
+            push!(vals, a.val)
+        else
+            v = singleton_type(a)
+            v === nothing && return NOT_FOLDED
+            push!(vals, v)
+        end
+    end
+    g = vals[1]
+    r = try
+        Core._call_in_world(get_inference_world(interp), g, vals[2:end]...)
+    catch
+        nothing
+    end
+    (r === nothing || r isa Undecided) && return NOT_FOLDED
+    return CallMeta(Const(r), Union{}, EFFECTS_TOTAL, FoldCallInfo(FoldRecord(g, Tuple(vals[2:end]), r)))
+end
+"Whether a fold kept in an image's code holds in the loading session: `g(AtLoad(), args...)` gives its value."
+function fold_holds(rec::FoldRecord, world::UInt)
+    r = try
+        Core._call_in_world(world, rec.g, AtLoad(), rec.args...)
+    catch
+        nothing
+    end
+    return r === rec.value
+end
 
 mutable struct DynamicCandidates
     @atomic table::Any          # an IdDict{Any,Vector{Any}}, replaced on each registration, never mutated

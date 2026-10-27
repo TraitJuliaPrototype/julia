@@ -239,6 +239,11 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
                         min_valid2, max_valid2 = verify_call(sig, initial.callees, j+2, nmatches, world, fully_covers, matches)
                         j += 2 + nmatches
                         edge = sig
+                    elseif edge isa FoldRecord
+                        # a fold kept with the code: valid if its library gives the same value in this session (facts.jl)
+                        j += 1
+                        min_valid2 = minworld
+                        max_valid2 = fold_holds(edge, validation_world) ? maxworld : UInt(0)
                     elseif edge isa Core.Binding
                         j += 1
                         min_valid2 = minworld
