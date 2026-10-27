@@ -2927,6 +2927,7 @@ static int erase_all_backedges(jl_methtable_t *mt, void *env)
 
 JL_DLLEXPORT void jl_disable_new_worlds(void)
 {
+    jl_load_chain_break();      // images restored from now on leave their methods inactive (remembered validation)
     if (jl_generating_output())
         jl_error("Disabling Method changes is not possible when generating output.");
     JL_LOCK(&world_counter_lock);
@@ -2958,6 +2959,7 @@ JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
         assert(jl_atomic_load_relaxed(&methodentry->max_world) == ~(size_t)0);
         jl_atomic_store_relaxed(&methodentry->max_world, world);
         jl_method_table_invalidate(method, world, 1);
+        jl_load_chain_mix(~jl_object_id(method->sig));   // a deletion changes the chain key
         jl_atomic_store_release(&jl_world_counter, world + 1);
     }
     JL_UNLOCK(&world_counter_lock);
@@ -3392,6 +3394,39 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     JL_GC_POP();
 }
 
+// The chain key of the method table's changes (remembered validation, writeup/plans/2026-10-27-remembered-validation.md):
+// mixed at each image restored (its checksum) and each method defined or deleted at run time (its signature's
+// object id), in order, under the world counter lock. Two sessions with the same key before an image's validation
+// have the same method table. 0 when broken (an image whose methods the image hook left inactive).
+static _Atomic(uint64_t) jl_load_chain = 0x6a09e667f3bcc909ULL;
+static _Atomic(int) jl_load_chain_broken = 0;
+void jl_load_chain_mix(uint64_t x)
+{
+    uint64_t h = jl_atomic_load_relaxed(&jl_load_chain) ^ x;
+    h *= 0x9e3779b97f4a7c15ULL;
+    h ^= h >> 31;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 29;
+    jl_atomic_store_relaxed(&jl_load_chain, h);
+}
+void jl_load_chain_break(void)
+{
+    jl_atomic_store_relaxed(&jl_load_chain_broken, 1);
+}
+JL_DLLEXPORT uint64_t jl_load_chain_key(void)
+{
+    return jl_atomic_load_relaxed(&jl_load_chain_broken) ? 0 : jl_atomic_load_relaxed(&jl_load_chain);
+}
+// the key and the world counter read together: a definition changes both under the lock
+JL_DLLEXPORT uint64_t jl_load_chain_key_and_world(size_t *world)
+{
+    JL_LOCK(&world_counter_lock);
+    uint64_t k = jl_load_chain_key();
+    *world = jl_atomic_load_relaxed(&jl_world_counter);
+    JL_UNLOCK(&world_counter_lock);
+    return k;
+}
+
 JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method, jl_tupletype_t *simpletype)
 {
     jl_run_method_def_hook(method, 0);              // may throw: the method is refused before it enters the table
@@ -3403,6 +3438,8 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
     size_t world = jl_atomic_load_relaxed(&jl_world_counter) + 1;
     jl_atomic_store_relaxed(&method->primary_world, world);
     jl_method_table_activate(newentry);
+    // a definition at run time changes the chain key; an overlay table's method is not the global table's
+    jl_load_chain_mix(jl_object_id(method->sig) ^ (mt == jl_method_table ? 0 : jl_object_id((jl_value_t*)mt->name) * 31 + jl_object_id((jl_value_t*)mt->module)));
     jl_atomic_store_release(&jl_world_counter, world);
     JL_UNLOCK(&world_counter_lock);
     jl_run_method_def_hook(method, 1);              // the method is visible now

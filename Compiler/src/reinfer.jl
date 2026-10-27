@@ -3,7 +3,7 @@
 using ..Compiler.Base
 using ..Compiler: _findsup, store_backedges, FoldRecord, fold_holds, JLOptions, get_world_counter,
     _methods_by_ftype, get_methodtable, get_ci_mi, should_instrument,
-    morespecific, RefValue, get_require_world, Vector, IdDict
+    morespecific, RefValue, get_require_world, Vector, IdDict, IdSet
 using .Core: CodeInstance, MethodInstance
 
 const CI_FLAGS_NATIVE_CACHE_VALID = 0b1000
@@ -44,9 +44,12 @@ struct VerifyMethodWorkspace
     stack::Vector{CodeInstance}
     visiting::IdDict{CodeInstance,Int}
 
+    # remembered validation: the CodeInstances whose method lookups a session with the same chain key found valid
+    remembered::IdSet{CodeInstance}
+
     function VerifyMethodWorkspace()
         new(VerifyMethodInitialState[], VerifyMethodWorkState[], VerifyMethodResultState[],
-            CodeInstance[], IdDict{CodeInstance,Int}())
+            CodeInstance[], IdDict{CodeInstance,Int}(), IdSet{CodeInstance}())
     end
 end
 
@@ -215,6 +218,11 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
             end
 
             # Process all non-CodeInstance edges
+            # remembered validation: the method lookups' answers are those of a session with the same method table;
+            # bindings, folds and the CodeInstance edges below are checked as always, and the code's world range
+            # starts at the validation world
+            remembered = initial.codeinst in workspace.remembered
+            remembered && (minworld = validation_world)
             if !isempty(initial.callees) && maxworld != get_require_world()
                 matches = []
                 j = 1
@@ -230,13 +238,15 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
 
                     if edge isa MethodInstance
                         sig = edge.specTypes
-                        min_valid2, max_valid2 = verify_call(sig, initial.callees, j, 1, world, true, matches)
+                        min_valid2, max_valid2 = remembered ? (minworld, maxworld) :
+                            verify_call(sig, initial.callees, j, 1, world, true, matches)
                         j += 1
                     elseif edge isa Int
                         sig = initial.callees[j+1]
                         nmatches = abs(edge)
                         fully_covers = edge > 0
-                        min_valid2, max_valid2 = verify_call(sig, initial.callees, j+2, nmatches, world, fully_covers, matches)
+                        min_valid2, max_valid2 = remembered ? (minworld, maxworld) :
+                            verify_call(sig, initial.callees, j+2, nmatches, world, fully_covers, matches)
                         j += 2 + nmatches
                         edge = sig
                     elseif edge isa FoldRecord
@@ -271,7 +281,8 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
                         else
                             meth = callee::Method
                         end
-                        min_valid2, max_valid2 = verify_invokesig(edge, meth, world, matches)
+                        min_valid2, max_valid2 = remembered ? (minworld, maxworld) :
+                            verify_invokesig(edge, meth, world, matches)
                         j += 2
                     end
 
@@ -656,6 +667,49 @@ function verify_invokesig(@nospecialize(invokesig), expected::Method, world::UIn
         end
     end
     return minworld, maxworld
+end
+
+# Validation remembered for an unchanged environment (writeup/plans/2026-10-27-remembered-validation.md): with the
+# same chain key as a session that validated this image, the method table is the same, so the method lookups of a
+# CodeInstance recorded valid there give the same answers here. The walk is the usual one (`verify_method`), without
+# those lookups for such CodeInstances: a callee found invalid still invalidates its callers. The key and the world are
+# read together for each CodeInstance; once either moves, the rest is validated in full.
+function insert_backedges_remembered(internal_methods::Vector{Any}, valid::Vector{UInt8}, key::UInt64)
+    backedges_only = unsafe_load(cglobal(:jl_first_image_replacement_world, UInt)) == typemax(UInt)
+    scan_new_methods!(internal_methods, backedges_only)
+    workspace = VerifyMethodWorkspace()
+    if _jl_debug_method_invalidation[] === nothing      # the invalidation logger sees the full walk
+        for i = 1:length(internal_methods)
+            ci = internal_methods[i]
+            ci isa CodeInstance && valid[i] == 0x01 && push!(workspace.remembered, ci)
+        end
+    end
+    w = RefValue{UInt}(0)
+    for i = 1:length(internal_methods)
+        codeinst = internal_methods[i]
+        codeinst isa CodeInstance || continue
+        k = @ccall jl_load_chain_key_and_world(w::Ptr{UInt})::UInt64
+        k == key || empty!(workspace.remembered)
+        validation_world = w[]
+        verify_method_graph(codeinst, validation_world, workspace)
+        @ccall jl_promote_ci_to_current(codeinst::Any, validation_world::UInt)::Cvoid
+    end
+    nothing
+end
+
+"The outcome of validating an image, for the record: 0x01 where a CodeInstance is valid in the current world."
+function validation_outcome(internal_methods::Vector{Any})
+    out = Vector{UInt8}(undef, length(internal_methods))
+    for i = 1:length(internal_methods)
+        ci = internal_methods[i]
+        out[i] = ci isa CodeInstance && ci.max_world == typemax(UInt) ? 0x01 : 0x00
+    end
+    return out
+end
+
+function insert_backedges_remembered_typeinf(internal_methods::Vector{Any}, valid::Vector{UInt8}, key::UInt64)
+    args = Any[insert_backedges_remembered, internal_methods, valid, key]
+    return ccall(:jl_call_in_typeinf_world, Any, (Ptr{Any}, Cint), args, length(args))
 end
 
 # Wrapper to call insert_backedges in typeinf_world for external calls
