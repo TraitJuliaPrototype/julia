@@ -22,6 +22,9 @@ function facts_default()
 end
 facts_mode(interp::AbstractInterpreter) = interp isa NativeInterpreter && interp.facts
 
+"The effects of a call compiled without an edge: under the facts mode a run-time site, which no asserted effect reaches over."
+unedged_effects(interp::AbstractInterpreter) = facts_mode(interp) ? EFFECTS_RTSITE : Effects()
+
 # --- (B): code compiled by facts beside plain code ------------------------------------------------
 # A module compiled by facts (`@compiler_options facts=true`, as `@trait_module` declares) has its
 # methods compiled by facts under their own cache owner, whoever calls them; everything a facts frame
@@ -709,6 +712,6 @@ function abstract_split_call(interp::AbstractInterpreter, argtypes::Vector{Any},
         # `f`, which asserts nothing); only a split's join is typed `RT`, its fallback asserted
         narrowed || return CallMeta(call.rt, call.exct, call.effects, SplitCallInfo(call.info, false, RT), call.refinements)
         # a value of another type reaches the fallback: its result and effects are unknown
-        return CallMeta(Any, Any, merge_effects(call.effects, Effects()), SplitCallInfo(call.info, true, RT))
+        return CallMeta(Any, Any, merge_effects(call.effects, EFFECTS_RTSITE), SplitCallInfo(call.info, true, RT))
     end
 end

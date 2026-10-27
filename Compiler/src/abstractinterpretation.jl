@@ -127,13 +127,12 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     argtypes = arginfo.argtypes
     if si.saw_latestworld
         add_remark!(interp, sv, "Cannot infer call, because we previously saw :latestworld")
-        return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+        return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
     end
     matches = find_method_matches(interp, argtypes, atype; max_methods)
     if isa(matches, FailedMethodMatch)
-        matches === FACTS_ABSTRACT_SITE && sv isa InferenceState && (sv.facts_rtsite = true)
         add_remark!(interp, sv, matches.reason)
-        return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+        return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
     end
 
     (; valid_worlds, applicable) = matches
@@ -145,7 +144,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         for i = 1:length(applicable)
             if !isdispatchtuple(applicable[i].match.spec_types)
                 add_remark!(interp, sv, "Refusing to infer non-concrete call site for concrete-only function")
-                return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+                return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
             end
         end
     end
@@ -156,7 +155,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
             if !isdispatchtuple(sig)
                 # only infer fully concrete call sites in top-level expressions (ignoring even isa_compileable_sig matches)
                 add_remark!(interp, sv, "Refusing to infer non-concrete call site in top-level expression")
-                return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+                return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
             end
         end
     end
@@ -2352,13 +2351,13 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
             argtype = argtypes_to_type(pushfirst!(argtype_tail(argtypes, 4), ft))
             nargtype = typeintersect(lookupsig, argtype)
             nargtype === Bottom && return Future(CallMeta(Bottom, TypeError, EFFECTS_THROWS, NoCallInfo()))
-            nargtype isa DataType || return Future(CallMeta(Any, Any, Effects(), NoCallInfo())) # other cases are not implemented below
+            nargtype isa DataType || return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo())) # other cases are not implemented below
             # Fall through to generic invoke handling
         end
     else
-        hasintersect(widenconst(types), Union{Method, CodeInstance}) && return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+        hasintersect(widenconst(types), Union{Method, CodeInstance}) && return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
         types, isexact, _, _ = instanceof_tfunc(argtype_by_index(argtypes, 3), false)
-        isexact || return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+        isexact || return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
         unwrapped = unwrap_unionall(types)
         types === Bottom && return Future(CallMeta(Bottom, Any, EFFECTS_THROWS, NoCallInfo()))
         if !(unwrapped isa DataType && unwrapped.name === Tuple.name)
@@ -2367,14 +2366,14 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
         argtype = argtypes_to_type(argtype_tail(argtypes, 4))
         nargtype = typeintersect(types, argtype)
         nargtype === Bottom && return Future(CallMeta(Bottom, TypeError, EFFECTS_THROWS, NoCallInfo()))
-        nargtype isa DataType || return Future(CallMeta(Any, Any, Effects(), NoCallInfo())) # other cases are not implemented below
-        isdispatchelem(ft) || return Future(CallMeta(Any, Any, Effects(), NoCallInfo())) # check that we might not have a subtype of `ft` at runtime, before doing supertype lookup below
+        nargtype isa DataType || return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo())) # other cases are not implemented below
+        isdispatchelem(ft) || return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo())) # check that we might not have a subtype of `ft` at runtime, before doing supertype lookup below
         ft = ft::DataType
         lookupsig = rewrap_unionall(Tuple{ft, unwrapped.parameters...}, types)::Type
         nargtype = Tuple{ft, nargtype.parameters...}
         argtype = Tuple{ft, argtype.parameters...}
         matched, valid_worlds = findsup(lookupsig, method_table(interp))
-        matched === nothing && return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+        matched === nothing && return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
         update_valid_age!(sv, valid_worlds)
         method = matched.method
     end
@@ -3648,8 +3647,8 @@ function merge_override_effects!(interp::AbstractInterpreter, effects::Effects, 
     # It is possible for arguments (GlobalRef/:static_parameter) to throw,
     # but these will be recomputed during SSA construction later.
     override = decode_statement_effects_override(sv)
-    # under the facts mode, no assertion applies over a run-time site (facts.jl)
-    if !(facts_mode(interp) && sv.facts_rtsite)
+    # under the facts mode, no assertion applies over a call that holds a run-time site (facts.jl)
+    if !(facts_mode(interp) && !is_nortsite(effects))
         effects = override_effects(effects, override)
     end
     set_curr_ssaflag!(sv, flags_for_effects(effects), IR_FLAGS_EFFECTS)
