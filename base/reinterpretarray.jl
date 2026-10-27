@@ -752,15 +752,18 @@ end
 eltype(::Type{<:CyclePadding}) = Padding
 IteratorSize(::Type{<:CyclePadding}) = IsInfinite()
 isempty(cp::CyclePadding) = isempty(cp.padding)
+# the elements of `padding`'s `svec` are `Padding`s: asserted, so the code over them is fully typed
+# (a facts-mode caller then folds the asserted helpers below over no run-time site)
 function iterate(cp::CyclePadding)
     y = iterate(cp.padding)
     y === nothing && return nothing
-    y[1], (0, y[2])
+    y[1]::Padding, (0, y[2])
 end
 function iterate(cp::CyclePadding, state::Tuple)
     y = iterate(cp.padding, tail(state)...)
     y === nothing && return iterate(cp, (state[1]+cp.total_size,))
-    Padding(y[1].offset+state[1], y[1].size), (state[1], tail(y)...)
+    p = y[1]::Padding
+    Padding(p.offset+state[1], p.size), (state[1], tail(y)...)
 end
 
 """
@@ -768,26 +771,34 @@ end
 """
 @assume_effects :foldable function padding(T::DataType, baseoffset::Int = 0)
     pads = Padding[]
+    invoke(padding!, Tuple{Vector{Padding}, DataType, Int}, pads, T, baseoffset)
+    return Core.svec(pads...)
+end
+# Calls on a type value go through `invoke` at the method's own signature or a builtin: a call at
+# `DataType` is no fact signature under the facts mode (any type's owner may add a method for its type)
+# and would leave a run-time site below the asserted helpers here.
+function padding!(pads::Vector{Padding}, T::DataType, baseoffset::Int)
     last_end::Int = baseoffset
-    for i = 1:fieldcount(T)
-        offset = baseoffset + Int(fieldoffset(T, i))
-        fT = fieldtype(T, i)
-        append!(pads, padding(fT, offset))
+    for i = 1:(invoke(fieldcount, Tuple{Any}, T)::Int)
+        offset = baseoffset + Int(ccall(:jl_get_field_offset, Csize_t, (Any, Cint), T, i))
+        fT = Core.fieldtype(T, i)::DataType
+        invoke(padding!, Tuple{Vector{Padding}, DataType, Int}, pads, fT, offset)
         if offset != last_end
             push!(pads, Padding(offset, offset-last_end))
         end
-        last_end = offset + sizeof(fT)
+        last_end = offset + Core.sizeof(fT)
     end
-    if 0 < last_end - baseoffset < sizeof(T)
-        push!(pads, Padding(baseoffset + sizeof(T), sizeof(T) - last_end + baseoffset))
+    sT = Core.sizeof(T)
+    if 0 < last_end - baseoffset < sT
+        push!(pads, Padding(baseoffset + sT, sT - last_end + baseoffset))
     end
-    return Core.svec(pads...)
+    return pads
 end
 
 function CyclePadding(T::DataType)
-    a, s = datatype_alignment(T), sizeof(T)
+    a, s = invoke(datatype_alignment, Tuple{DataType}, T)::Int, Core.sizeof(T)
     as = s + (a - (s % a)) % a
-    pad = padding(T)
+    pad = invoke(padding, Tuple{DataType, Int}, T, 0)
     if s != as
         pad = Core.svec(pad..., Padding(s, as - s))
     end
@@ -795,8 +806,8 @@ function CyclePadding(T::DataType)
 end
 
 @assume_effects :total function array_subpadding(S, T)
-    lcm_size = lcm(sizeof(S), sizeof(T))
-    s, t = CyclePadding(S), CyclePadding(T)
+    lcm_size = lcm(Core.sizeof(S)::Int, Core.sizeof(T)::Int)
+    s, t = invoke(CyclePadding, Tuple{DataType}, S), invoke(CyclePadding, Tuple{DataType}, T)
     checked_size = 0
     # use of Stateful harms inference and makes this vulnerable to invalidation
     (pad, tstate) = let
@@ -828,7 +839,11 @@ end
 
 @assume_effects :foldable function packedsize(::Type{T}) where T
     pads = padding(T)
-    return sizeof(T) - sum((p.size for p ∈ pads), init = 0)
+    n = 0
+    for p in pads
+        n += (p::Padding).size
+    end
+    return sizeof(T) - n
 end
 
 @assume_effects :foldable ispacked(::Type{T}) where T = isempty(padding(T))
