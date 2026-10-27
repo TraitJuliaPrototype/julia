@@ -1341,7 +1341,7 @@ function _include_from_serialized(pkg::PkgId, path::String, ocachepath::Union{No
         sv = sv::SimpleVector
         internal_methods = sv[3]::Vector{Any}
         Compiler.@zone "CC: INSERT_BACKEDGES" begin
-            insert_backedges_maybe_remembered(internal_methods)
+            ReinferUtils.insert_backedges_typeinf(internal_methods)
         end
         restored = register_restored_modules(sv, pkg, path)
 
@@ -1362,53 +1362,6 @@ function _include_from_serialized(pkg::PkgId, path::String, ocachepath::Union{No
     finally
         timing_imports && cumulative_compile_timing(false)
     end
-end
-
-# Validation remembered for an unchanged environment (writeup/plans/2026-10-27-remembered-validation.md; opt-in,
-# JULIA_REMEMBER_VALIDATION=1): an image's validation outcome is recorded under the runtime's chain key, which names
-# the method table at this point, together with the system image and the runtime's build; a later session with the
-# same key skips the method lookups of the CodeInstances recorded valid (`ReinferUtils.insert_backedges_remembered`).
-const REMEMBER_VALIDATION_MAGIC = UInt8[0x4a, 0x52, 0x56, 0x02]   # "JRV", version 2
-function remembered_validation_salt()
-    h = hash(module_build_id(Base), hash(module_build_id(Core)))
-    for f in (unsafe_string(JLOptions().image_file), Libc.Libdl.dlpath("libjulia-internal"))
-        st = try stat(f) catch; nothing end
-        h = hash(f, h)
-        st === nothing || (h = hash(st.size, hash(st.mtime, h)))
-    end
-    return h
-end
-function insert_backedges_maybe_remembered(internal_methods::Vector{Any})
-    key = ccall(:jl_load_chain_key, UInt64, ())
-    if key == 0 || get(ENV, "JULIA_REMEMBER_VALIDATION", "0") != "1" || isempty(DEPOT_PATH) ||
-            JLOptions().code_coverage != 0 || JLOptions().malloc_log != 0 || generating_output()
-        return ReinferUtils.insert_backedges_typeinf(internal_methods)
-    end
-    name = string(hash(remembered_validation_salt(), key); base = 16)
-    dir = joinpath(DEPOT_PATH[1], "compiled", "v$(VERSION.major).$(VERSION.minor)", "validation")
-    file = joinpath(dir, name)
-    n = length(internal_methods)
-    data = try
-        isfile(file) ? read(file) : nothing
-    catch
-        nothing
-    end
-    if data isa Vector{UInt8} && length(data) == 12 + n && data[1:4] == REMEMBER_VALIDATION_MAGIC &&
-            reinterpret(Int64, data[5:12])[1] == n
-        return ReinferUtils.insert_backedges_remembered_typeinf(internal_methods, data[13:end], key)
-    end
-    ReinferUtils.insert_backedges_typeinf(internal_methods)
-    # recorded only if the method table did not change while this image was validated
-    ccall(:jl_load_chain_key, UInt64, ()) == key || return nothing
-    tmp = string(file, ".", getpid(), ".", rand(UInt32), ".tmp")
-    try
-        mkpath(dir)
-        write(tmp, vcat(REMEMBER_VALIDATION_MAGIC, reinterpret(UInt8, [Int64(n)]), ReinferUtils.validation_outcome(internal_methods)))
-        mv(tmp, file; force = true)
-    catch
-        rm(tmp; force = true)
-    end
-    return nothing
 end
 
 # printing functions for @time_imports

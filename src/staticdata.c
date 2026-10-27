@@ -4466,13 +4466,6 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
             if (new_methods)
                 world += 1;
             jl_activate_methods(extext_methods, internal_methods, world, pkgname, refused);
-            // the chain key: this image's methods are in the table now (remembered validation, gf.c)
-            if (refused != NULL && jl_is_array((jl_value_t*)refused) && jl_array_nrows(refused) > 0)
-                jl_load_chain_break();
-            else {
-                jl_load_chain_mix(checksum);
-                jl_load_chain_mix(jl_worklist_key((jl_array_t*)restored));   // more bits than the checksum's
-            }
             // TODO: inject internal_methods into caches here, so the system can see them immediately as potential candidates (before validation)
             // allow users to start running in this updated world
             if (new_methods)
