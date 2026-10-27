@@ -546,6 +546,17 @@ end
 add_edges_impl(edges::Vector{Any}, info::FoldCallInfo) = (push!(edges, info.record); nothing)
 
 const NOT_FOLDED = CallMeta(Const(nothing), Union{}, EFFECTS_TOTAL, NoCallInfo())
+
+"""
+The withdrawn-assertion log (W-57's tool; off by default): `Compiler.WITHDRAWN_LOG[] = true` prints a line
+for each method whose asserted effects the facts mode withdraws because the frame, or a callee, holds
+a run-time site: `withdrawn <module>.<name> at <file>:<line> for <specTypes>`.
+"""
+const WITHDRAWN_LOG = RefValue{Bool}(false)
+function log_withdrawn(def::Method, frame)
+    Core.println("withdrawn ", def.module, ".", def.name, " at ", def.file, ":", def.line, " for ", frame.linfo.specTypes)
+    return nothing
+end
 "Inference of `fold_call(g, args...)` (the W-40 design note, §4.1, §11)."
 function abstract_fold_call(interp::AbstractInterpreter, argtypes::Vector{Any}, sv::AbsIntState)
     # only the native interpreter's frames compiled for the global cache: not reflection's top frame,

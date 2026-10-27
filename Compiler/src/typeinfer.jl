@@ -489,8 +489,13 @@ end
 # under the facts mode, no asserted effect applies to a frame that holds a run-time site, itself or in
 # a callee (`nortsite` is carried through calls): the assertion would let a caller fold a dispatch no
 # edge records (facts.jl; acceptance G1.10)
-adjust_effects(ipo_effects::Effects, def::Method, frame) =
-    frame isa InferenceState && facts_mode(frame.interp) && !is_nortsite(ipo_effects) ? ipo_effects : adjust_effects(ipo_effects, def)
+function adjust_effects(ipo_effects::Effects, def::Method, frame)
+    if frame isa InferenceState && facts_mode(frame.interp) && !is_nortsite(ipo_effects)
+        WITHDRAWN_LOG[] && def.purity != 0x0000 && log_withdrawn(def, frame)
+        return ipo_effects
+    end
+    return adjust_effects(ipo_effects, def)
+end
 
 function adjust_effects(ipo_effects::Effects, def::Method)
     # override the analyzed effects using manually annotated effect settings
