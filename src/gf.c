@@ -640,11 +640,11 @@ JL_DLLEXPORT jl_value_t *jl_call_in_typeinf_world(jl_value_t **args, int nargs)
     return ret;
 }
 
-JL_DLLEXPORT jl_code_instance_t *jl_get_method_inferred(
-        jl_method_instance_t *mi JL_PROPAGATES_ROOT, jl_value_t *rettype,
+// the CodeInstance of `owner` for `mi` with these worlds, result and edges, made if missing
+static jl_code_instance_t *jl_get_method_inferred_owner(
+        jl_method_instance_t *mi JL_PROPAGATES_ROOT, jl_value_t *owner, jl_value_t *rettype,
         size_t min_world, size_t max_world, jl_debuginfo_t *di, jl_svec_t *edges)
 {
-    jl_value_t *owner = jl_nothing; // TODO: owner should be arg
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     for (; codeinst; codeinst = jl_atomic_load_relaxed(&codeinst->next)) {
         if (jl_atomic_load_relaxed(&codeinst->min_world) == min_world &&
@@ -670,6 +670,12 @@ JL_DLLEXPORT jl_code_instance_t *jl_get_method_inferred(
         0, min_world, max_world, 0, jl_nothing, di, edges);
     jl_mi_cache_insert(mi, codeinst);
     return codeinst;
+}
+JL_DLLEXPORT jl_code_instance_t *jl_get_method_inferred(
+        jl_method_instance_t *mi JL_PROPAGATES_ROOT, jl_value_t *rettype,
+        size_t min_world, size_t max_world, jl_debuginfo_t *di, jl_svec_t *edges)
+{
+    return jl_get_method_inferred_owner(mi, jl_nothing, rettype, min_world, max_world, di, edges);
 }
 
 JL_DLLEXPORT int jl_mi_cache_has_ci(jl_method_instance_t *mi,
@@ -3837,10 +3843,10 @@ static jl_code_instance_t *jl_compile_method_internal_owner(jl_method_instance_t
     jl_method_instance_t *mi2 = jl_normalize_to_compilable_mi(mi);
     if (mi2 != mi) {
         jl_code_instance_t *codeinst2 = jl_compile_method_internal_owner(mi2, world, owner);
-        if (owner != jl_nothing)
-            return codeinst2; // code compiled by facts: the wider instance's code serves
-        jl_code_instance_t *codeinst = jl_get_method_inferred(
-                mi, codeinst2->rettype,
+        // the wider instance's code copied onto this instance, for every owner: it then runs with this
+        // instance's static parameters (facts F-21), and the next call finds it here (compiler C-4)
+        jl_code_instance_t *codeinst = jl_get_method_inferred_owner(
+                mi, owner, codeinst2->rettype,
                 jl_atomic_load_relaxed(&codeinst2->min_world),
                 jl_atomic_load_relaxed(&codeinst2->max_world),
                 jl_atomic_load_relaxed(&codeinst2->debuginfo),
