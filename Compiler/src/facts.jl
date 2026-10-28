@@ -361,10 +361,11 @@ function add_edges_impl(edges::Vector{Any}, info::PlainRTInfo)
 end
 
 """
-The interpreter for `return_type` at run time: under the facts mode, plain inference in its own cache
-owner, so that the answer is plain Julia's and no plain code enters the cache code is compiled from.
+The interpreter for `return_type` at run time, in both settings: plain inference in its own cache owner,
+the compile-time fold's, so that the run-time answer is the folded one, plain Julia's, also for a facts
+method, and no plain code enters a cache code is compiled from (W-22, E-190).
 """
-return_type_interp(world::UInt) = facts_default() ? PlainRTInterp(world) : NativeInterpreter(world)
+return_type_interp(world::UInt) = PlainRTInterp(world)
 
 "The concrete signatures `sig` admits (top-level unions and unions in tuple arguments split, at most `MAX_FACT_SPLITS`), or `nothing`."
 function concrete_splits(@nospecialize(sig))
