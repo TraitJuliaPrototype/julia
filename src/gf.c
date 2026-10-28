@@ -419,13 +419,45 @@ jl_mutex_t jl_typeinf_lock;
 // returns the inferred source, and may cache the result in mi
 // if successful, also updates the mi argument to describe the validity of this src
 // if inference doesn't occur (or can't finish), returns NULL instead
+JL_DLLEXPORT int jl_compile_by_facts(void) JL_NOTSAFEPOINT;
+// The facts system image's default: `Compiler.FACTS_IMAGE[]` as the image saved it, read once the image is
+// restored and before any of its code runs (`_finish_jl_init_`). The runtime calls the modules' `__init__`
+// under the default owner, so the default must be known before the first of them.
+static _Atomic(int) jl_facts_image_on = 0;
+void jl_read_facts_image_default(void)
+{
+    if (jl_base_module == NULL)
+        return;
+    jl_value_t *cc = jl_get_global(jl_base_module, jl_symbol("Compiler"));
+    if (cc == NULL || !jl_is_module(cc))
+        return;
+    jl_value_t *r = jl_get_global((jl_module_t*)cc, jl_symbol("FACTS_IMAGE"));
+    if (r == NULL || jl_nfields(r) != 1)
+        return;
+    jl_atomic_store_relaxed(&jl_facts_image_on, jl_get_nth_field(r, 0) == jl_true);
+}
+static int facts_setting_on(void) JL_NOTSAFEPOINT
+{
+    int m = jl_compile_by_facts();
+    return m == 1 || (m == 2 && jl_atomic_load_relaxed(&jl_facts_image_on));
+}
 // The cache owner whose code dispatch runs for `mi` (Compiler/src/facts.jl, part (B)): `:facts` for a
-// method of a module compiled by facts, else plain Julia's (`nothing`).
+// method of a module compiled by facts, else plain Julia's (`nothing`). The setting decides only the
+// default owner of a method that is neither a facts method nor the compiler's own code: under the test
+// bed `all` it is the facts owner, so the mode is the owner in both settings (W-22).
 JL_DLLEXPORT jl_value_t *jl_default_owner(jl_method_instance_t *mi) JL_NOTSAFEPOINT
 {
-    jl_method_t *def = mi->def.method;
-    if (jl_is_method(def) && jl_method_is_facts(def))
-        return (jl_value_t*)jl_facts_sym;
+    jl_value_t *def = mi->def.value;
+    if (jl_is_method(def)) {
+        jl_method_t *m = (jl_method_t*)def;
+        if (jl_method_is_facts(m) || (facts_setting_on() && !jl_method_is_plain(m)))
+            return (jl_value_t*)jl_facts_sym;
+    }
+    else if (jl_is_module(def)) {
+        // a top-level thunk: under the test bed, as a method of its module would be
+        if (facts_setting_on() && ((jl_module_t*)def)->facts != 2)
+            return (jl_value_t*)jl_facts_sym;
+    }
     return jl_nothing;
 }
 
@@ -1107,7 +1139,7 @@ JL_DLLEXPORT void jl_set_compile_and_emit_func(jl_value_t *f)
 
 // The process switch of the compiler's facts mode (Compiler/src/facts.jl): JULIA_COMPILE_BY_FACTS,
 // read once. 1 on, 0 off, 2 unset (the system image decides).
-JL_DLLEXPORT int jl_compile_by_facts(void)
+JL_DLLEXPORT int jl_compile_by_facts(void) JL_NOTSAFEPOINT
 {
     static _Atomic(int) mode = -1;
     int m = jl_atomic_load_relaxed(&mode);

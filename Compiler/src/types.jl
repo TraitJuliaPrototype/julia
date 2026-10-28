@@ -401,8 +401,8 @@ end
 function NativeInterpreter(world::UInt = get_world_counter();
                            inf_params::InferenceParams = InferenceParams(),
                            opt_params::OptimizationParams = OptimizationParams(),
-                           facts::Bool = facts_default(),
-                           owner = nothing)
+                           owner = facts_default() ? FACTS_OWNER : nothing,
+                           facts::Bool = owner === FACTS_OWNER)
     curr_max_world = get_world_counter()
     # Sometimes the caller is lazy and passes typemax(UInt).
     # we cap it to the current world age for correctness

@@ -1663,8 +1663,8 @@ end
 # code of cache owner `owner` (`nothing`, or `FACTS_OWNER` for code compiled by facts beside it)
 function typeinf_ext_toplevel(mi::MethodInstance, world::UInt, source_mode::UInt8, trim_mode::UInt8, @nospecialize(owner))
     inf_params = InferenceParams(; force_enable_inference = trim_mode != TRIM_NO)
-    interp = owner === FACTS_OWNER ? NativeInterpreter(world; inf_params, facts = true, owner = FACTS_OWNER) :
-        NativeInterpreter(world; inf_params, facts = facts_default() && !is_compiler_code(mi))
+    # the mode is the owner (W-22): the runtime's default owner already follows the setting
+    interp = NativeInterpreter(world; inf_params, owner = owner === FACTS_OWNER ? FACTS_OWNER : nothing)
     return typeinf_ext_toplevel(interp, mi, source_mode)
 end
 typeinf_ext_toplevel(mi::MethodInstance, world::UInt, source_mode::UInt8, trim_mode::UInt8) =

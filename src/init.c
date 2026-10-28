@@ -383,6 +383,7 @@ JL_DLLEXPORT void jl_postoutput_hook(void)
 }
 
 void post_boot_hooks(void);
+void jl_read_facts_image_default(void);
 
 JL_DLLEXPORT void *jl_libjulia_internal_handle;
 JL_DLLEXPORT void *jl_libjulia_handle;
@@ -624,6 +625,9 @@ static NOINLINE void _finish_jl_init_(jl_image_buf_t sysimage, jl_ptls_t ptls, j
     uv_barrier_wait(&thread_init_done);
 
     jl_gc_enable(1);
+
+    // the facts system image's default owner, before any code of the image runs (W-22; gf.c)
+    jl_read_facts_image_default();
 
     if ((sysimage.kind != JL_IMAGE_KIND_NONE) &&
             (!jl_generating_output() || jl_options.incremental) && jl_module_init_order) {

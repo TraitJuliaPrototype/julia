@@ -52,11 +52,13 @@ function interp_for_owner(interp::AbstractInterpreter, @nospecialize(owner))
     interp isa NativeInterpreter || return interp
     owner === FACTS_OWNER && return facts_interp(interp)
     owner === nothing || return interp
-    return NativeInterpreter(interp.world, interp.method_table, InferenceResult[], interp.codegen,
-                             interp.inf_params, interp.opt_params, facts_default(), nothing)
+    return plain_interp(interp)
 end
-"The owner whose code dispatch runs for `mi`: the facts owner for a method of a facts module."
-default_owner(mi::MethodInstance) = is_facts_method(mi.def) ? FACTS_OWNER : nothing
+"""
+The owner whose code dispatch runs for `mi`: the facts owner for a method of a facts module, and
+under the setting `all` for every method but the compiler's own (the runtime's `jl_default_owner`).
+"""
+default_owner(mi::MethodInstance) = ccall(:jl_default_owner, Any, (Any,), mi)
 "Whether `m` is compiled plainly whoever calls it: the compiler's own code (`jl_method_is_plain`)."
 is_plain_method(@nospecialize(m)) = m isa Method && ccall(:jl_method_is_plain, Cint, (Any,), m) != 0
 "A plain interpreter beside the facts interpreter `interp`: its world, parameters and codegen cache."
@@ -74,22 +76,12 @@ function leaves_to(interp::AbstractInterpreter, @nospecialize(method))
     if interp.owner === FACTS_OWNER
         is_plain_method(method) && return plain_interp(interp)
     elseif interp.owner === nothing      # an interpreter with a cache of its own infers by its own rules
-        interp.facts && is_plain_method(method) && return plain_interp(interp)    # the facts image
         is_facts_method(method) && return facts_interp(interp)
     end
     return nothing
 end
-"""
-The interpreter for `mi`'s code of cache owner `owner` beside `interp`, for compile queues: as
-`interp_for_owner`, but the compiler's own code plainly also under the facts image, whose default
-owner compiles by facts (as `typeinf_ext_toplevel` does for one request). Without it the image
-builder's queue compiled the compiler by facts: its `@nospecialize` helpers became run-time sites.
-"""
-function interp_for_mi(interp::AbstractInterpreter, @nospecialize(owner), mi::MethodInstance)
-    interp = interp_for_owner(interp, owner)
-    owner === nothing && facts_mode(interp) && is_compiler_code(mi) && return plain_interp(interp)
-    return interp
-end
+"The interpreter for `mi`'s code of cache owner `owner` beside `interp`, for compile queues (the mode is the owner, W-22)."
+interp_for_mi(interp::AbstractInterpreter, @nospecialize(owner), mi::MethodInstance) = interp_for_owner(interp, owner)
 
 """
 A call to a method of the other owner (`leaves_to`: plain code calling a facts method, or code
@@ -189,18 +181,6 @@ function facts_const_prop_call(interp::NativeInterpreter, other::NativeInterpret
     end
     inf_result.ci_as_edge = codeinst_as_edge(other, frame, result.edge)
     return const_prop_result(inf_result)
-end
-
-"Whether `mi` is the compiler's own code (a method of `Compiler` or a module inside it)."
-function is_compiler_code(mi::MethodInstance)
-    m = mi.def
-    mod = m isa Method ? m.module : m::Module
-    while true
-        mod === Compiler && return true
-        p = parentmodule(mod)
-        p === mod && return false
-        mod = p
-    end
 end
 
 "The most concrete signatures `return_type`'s plain answer is merged over, and the `Dynamic` split's candidates."
