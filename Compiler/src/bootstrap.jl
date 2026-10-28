@@ -31,12 +31,30 @@ function bootstrap!()
         # the entry of `return_type` at run time (`collect` of a generator, `map` over an empty
         # collection): without it, its first call in every session compiled it (80-90 ms)
         return_type_tt = Tuple{typeof(_return_type), NativeInterpreter, DataType}
+        # `return_type`'s own interpreter (facts.jl): the run-time entry in both settings, the
+        # inference behind a fold of `return_type` in code compiled by facts, and what inference
+        # reaches by dynamic dispatch for it. Without them, the first run-time `return_type` of a
+        # session compiled the compiler for it (about 5 s)
+        plain_rt_tt = Tuple{typeof(_return_type), PlainRTInterp, DataType}
+        plain_rt_ext_tt = Tuple{typeof(typeinf_ext_toplevel), PlainRTInterp, MethodInstance, UInt8}
+        plain_rt_dyn = Any[
+            Tuple{typeof(optimize), PlainRTInterp, OptimizationState{PlainRTInterp}, InferenceResult},
+            Tuple{typeof(ssa_inlining_pass!), IRCode, InliningState{PlainRTInterp}, Bool},
+            Tuple{typeof(typeinf), PlainRTInterp, InferenceState},
+            Tuple{typeof(typeinf_edge), PlainRTInterp, Method, Any, SimpleVector, InferenceState, Bool, Bool},
+            Tuple{typeof(typeinf_local), PlainRTInterp, InferenceState, CurrentState},
+            Tuple{typeof(doworkloop), PlainRTInterp, InferenceState},
+            Tuple{typeof(finishinfer!), InferenceState, PlainRTInterp, Int, IdDict{MethodInstance, CodeInstance}},
+            Tuple{typeof(finish!), PlainRTInterp, InferenceState, UInt64, UInt64},
+            Tuple{typeof(finish_nocycle), PlainRTInterp, InferenceState, UInt64},
+            Tuple{typeof(is_already_cached), PlainRTInterp, InferenceResult, CodeInstance}]
         fs = Any[
             # we first create caches for the optimizer, because they contain many loop constructions
             # and they're better to not run in interpreter even during bootstrapping
             compact!, ssa_inlining_pass!_tt, optimize_tt,
             # then we create caches for inference entries
-            typeinf_ext_tt, typeinf_tt, typeinf_edge_tt, return_type_tt,
+            typeinf_ext_tt, typeinf_tt, typeinf_edge_tt, return_type_tt, plain_rt_tt, plain_rt_ext_tt,
+            plain_rt_dyn...,
         ]
         # tfuncs can't be inferred from the inference entries above, so here we infer them manually
         for x in T_FFUNC_VAL
