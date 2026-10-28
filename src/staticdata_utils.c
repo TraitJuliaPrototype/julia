@@ -570,8 +570,12 @@ static jl_array_t *queue_external_cis(jl_array_t *list, jl_query_cache *query_ca
             if (found == 1) {
                 jl_array_ptr_1d_push(new_ext_cis, (jl_value_t*)ci);
             }
-            else if (found == 0 && jl_image_keep_compiled && jl_atomic_load_relaxed(&ci->invoke) != NULL) {
-                jl_array_ptr_1d_push(new_ext_cis, (jl_value_t*)ci);   // compiled by the workload (piece 5)
+            else if (found == 0 && jl_image_keep_compiled && ci->owner == (jl_value_t*)jl_facts_sym &&
+                     jl_atomic_load_relaxed(&ci->invoke) != NULL) {
+                // code compiled by facts that the workload reached only dynamically (piece 5): valid across
+                // unrelated loads (G2). Plain code reached that way depends on the whole method table and
+                // is not kept, as in stock Julia.
+                jl_array_ptr_1d_push(new_ext_cis, (jl_value_t*)ci);
             }
         }
     }
