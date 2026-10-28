@@ -420,6 +420,10 @@ jl_mutex_t jl_typeinf_lock;
 // if successful, also updates the mi argument to describe the validity of this src
 // if inference doesn't occur (or can't finish), returns NULL instead
 JL_DLLEXPORT int jl_compile_by_facts(void) JL_NOTSAFEPOINT;
+// what reaches code, for jl_code_owner (Compiler/src/facts.jl: REACH_RUNTIME, REACH_PLAIN, REACH_FACTS)
+#define JL_REACH_RUNTIME 0
+#define JL_REACH_PLAIN 1
+#define JL_REACH_FACTS 2
 // The facts system image's default: `Compiler.FACTS_IMAGE[]` as the image saved it, read once the image is
 // restored and before any of its code runs (`_finish_jl_init_`). The runtime calls the modules' `__init__`
 // under the default owner, so the default must be known before the first of them.
@@ -441,24 +445,34 @@ static int facts_setting_on(void) JL_NOTSAFEPOINT
     int m = jl_compile_by_facts();
     return m == 1 || (m == 2 && jl_atomic_load_relaxed(&jl_facts_image_on));
 }
-// The cache owner whose code dispatch runs for `mi` (Compiler/src/facts.jl, part (B)): `:facts` for a
-// method of a module compiled by facts, else plain Julia's (`nothing`). The setting decides only the
-// default owner of a method that is neither a facts method nor the compiler's own code: under the test
-// bed `all` it is the facts owner, so the mode is the owner in both settings (W-22).
-JL_DLLEXPORT jl_value_t *jl_default_owner(jl_method_instance_t *mi) JL_NOTSAFEPOINT
+// The one rule for the mode and cache owner of a method's (or a top-level thunk's) code, given what reaches
+// it (Compiler/src/facts.jl, part (B); compiler §2.3): `reach` is JL_REACH_RUNTIME (the runtime, a
+// top-level call, a compile request), JL_REACH_PLAIN (plain code) or JL_REACH_FACTS (code of the facts
+// owner). A facts method's code is the facts owner's and the compiler's own code plain, whoever reaches
+// them; any other method's is the reaching code's mode; reached from the runtime, the setting decides:
+// the facts owner under the test bed `all`, plain in the product setting. Returns `:facts` or `nothing`.
+JL_DLLEXPORT jl_value_t *jl_code_owner(jl_value_t *def, int reach) JL_NOTSAFEPOINT
 {
-    jl_value_t *def = mi->def.value;
     if (jl_is_method(def)) {
         jl_method_t *m = (jl_method_t*)def;
-        if (jl_method_is_facts(m) || (facts_setting_on() && !jl_method_is_plain(m)))
+        if (jl_method_is_facts(m))
             return (jl_value_t*)jl_facts_sym;
+        if (jl_method_is_plain(m))
+            return jl_nothing;
     }
-    else if (jl_is_module(def)) {
-        // a top-level thunk: under the test bed, as a method of its module would be
-        if (facts_setting_on() && ((jl_module_t*)def)->facts != 2)
-            return (jl_value_t*)jl_facts_sym;
+    else if (!jl_is_module(def) || ((jl_module_t*)def)->facts == 2) {
+        return jl_nothing;                         // the compiler's own top-level code
     }
+    if (reach == JL_REACH_FACTS)
+        return (jl_value_t*)jl_facts_sym;
+    if (reach == JL_REACH_RUNTIME && facts_setting_on())
+        return (jl_value_t*)jl_facts_sym;
     return jl_nothing;
+}
+// The cache owner whose code dispatch runs for `mi`, reached from the runtime.
+JL_DLLEXPORT jl_value_t *jl_default_owner(jl_method_instance_t *mi) JL_NOTSAFEPOINT
+{
+    return jl_code_owner(mi->def.value, JL_REACH_RUNTIME);
 }
 
 static jl_code_instance_t *jl_type_infer_owner(jl_method_instance_t *mi, size_t world, uint8_t source_mode, uint8_t trim_mode, jl_value_t *owner);
@@ -4895,8 +4909,7 @@ JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t *F, jl_value_t **args, uint
 // a method compiled plainly whoever calls it (the compiler's own code, `jl_method_is_plain`).
 STATIC_INLINE jl_value_t *facts_callee_owner(jl_method_instance_t *mfunc) JL_NOTSAFEPOINT
 {
-    jl_method_t *def = mfunc->def.method;
-    return jl_is_method(def) && jl_method_is_plain(def) ? jl_nothing : (jl_value_t*)jl_facts_sym;
+    return jl_code_owner(mfunc->def.value, JL_REACH_FACTS);
 }
 
 // Dispatch at run time from code compiled by facts (part (C)): the same method lookup, then the

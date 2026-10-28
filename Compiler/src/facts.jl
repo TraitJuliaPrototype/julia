@@ -34,11 +34,6 @@ unedged_effects(interp::AbstractInterpreter) = facts_mode(interp) ? EFFECTS_RTSI
 
 "The cache owner of code compiled by facts beside plain code."
 const FACTS_OWNER = :facts
-"""
-Whether `m` is compiled by facts: a method of a module compiled by facts, unless it is a boundary
-(`Expr(:meta, :facts_boundary)` in its body: compiled in its caller's mode, as a trait entry is).
-"""
-is_facts_method(@nospecialize(m)) = m isa Method && ccall(:jl_method_is_facts, Cint, (Any,), m) != 0
 "A facts interpreter beside `interp`: its world, parameters and codegen cache, the facts owner."
 facts_interp(interp::NativeInterpreter) =
     NativeInterpreter(interp.world, interp.method_table, InferenceResult[], interp.codegen,
@@ -54,13 +49,18 @@ function interp_for_owner(interp::AbstractInterpreter, @nospecialize(owner))
     owner === nothing || return interp
     return plain_interp(interp)
 end
+# What reaches code, for `code_owner` (the runtime's `jl_code_owner`, src/gf.c).
+const REACH_RUNTIME = Cint(0)   # the runtime, a top-level call, a compile request
+const REACH_PLAIN = Cint(1)     # plain code
+const REACH_FACTS = Cint(2)     # code of the facts owner
 """
-The owner whose code dispatch runs for `mi`: the facts owner for a method of a facts module, and
-under the setting `all` for every method but the compiler's own (the runtime's `jl_default_owner`).
+The one rule for the cache owner, and so the mode, of `def`'s code (a method, or a module's top-level
+thunk) when `reach` reaches it: `FACTS_OWNER` or `nothing` (compiler §2.3; the runtime decides with
+the same function).
 """
-default_owner(mi::MethodInstance) = ccall(:jl_default_owner, Any, (Any,), mi)
-"Whether `m` is compiled plainly whoever calls it: the compiler's own code (`jl_method_is_plain`)."
-is_plain_method(@nospecialize(m)) = m isa Method && ccall(:jl_method_is_plain, Cint, (Any,), m) != 0
+code_owner(@nospecialize(def), reach::Cint) = ccall(:jl_code_owner, Any, (Any, Cint), def, reach)
+"The owner whose code dispatch runs for `mi`: its code's owner reached from the runtime."
+default_owner(mi::MethodInstance) = code_owner(mi.def, REACH_RUNTIME)
 "A plain interpreter beside the facts interpreter `interp`: its world, parameters and codegen cache."
 plain_interp(interp::NativeInterpreter) =
     NativeInterpreter(interp.world, interp.method_table, InferenceResult[], interp.codegen,
@@ -73,12 +73,12 @@ TraitWorld, called from its slow paths, ran 6× slower). `nothing`: `interp` inf
 """
 function leaves_to(interp::AbstractInterpreter, @nospecialize(method))
     interp isa NativeInterpreter || return nothing
-    if interp.owner === FACTS_OWNER
-        is_plain_method(method) && return plain_interp(interp)
-    elseif interp.owner === nothing      # an interpreter with a cache of its own infers by its own rules
-        is_facts_method(method) && return facts_interp(interp)
-    end
-    return nothing
+    owner = interp.owner
+    # an interpreter with a cache of its own infers by its own rules
+    reach = owner === FACTS_OWNER ? REACH_FACTS : owner === nothing ? REACH_PLAIN : return nothing
+    o = code_owner(method, reach)
+    o === owner && return nothing
+    return o === FACTS_OWNER ? facts_interp(interp) : plain_interp(interp)
 end
 "The interpreter for `mi`'s code of cache owner `owner` beside `interp`, for compile queues (the mode is the owner, W-22)."
 interp_for_mi(interp::AbstractInterpreter, @nospecialize(owner), mi::MethodInstance) = interp_for_owner(interp, owner)
