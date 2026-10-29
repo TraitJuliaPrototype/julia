@@ -240,10 +240,11 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
                         j += 2 + nmatches
                         edge = sig
                     elseif edge isa FoldRecord
-                        # a fold kept with the code: valid if its library gives the same value in this session (facts.jl)
+                        # a fold kept with the code: valid if its library gives the same value in this session (facts.jl);
+                        # one that holds bounds nothing, as a call edge that holds, so the log names only a failed one
                         j += 1
                         min_valid2 = minworld
-                        max_valid2 = fold_holds(edge, validation_world) ? maxworld : UInt(0)
+                        max_valid2 = fold_holds(edge, validation_world) ? typemax(UInt) : UInt(0)
                     elseif edge isa Core.Binding
                         j += 1
                         min_valid2 = minworld
