@@ -907,6 +907,18 @@ jl_datatype_t *jl_new_abstracttype(jl_value_t *name, jl_module_t *module,
 JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *set_instance,
                                                jl_value_t *key, jl_value_t *declarer,
                                                jl_value_t *by);
+// review B2: generation counter for the memoized has_open_set bit — bumped on
+// every jl_set_open_set, no world advance; memos stamped with an older epoch are
+// recomputed structurally on read (datatype.c). Compared for INEQUALITY.
+extern _Atomic(uint16_t) jl_open_set_epoch;
+int jl_has_open_set_in(jl_value_t *v) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_has_open_set(jl_value_t *v);
+JL_DLLEXPORT int jl_is_open_set(jl_value_t *T);
+JL_DLLEXPORT void jl_set_open_set(jl_value_t *T);
+JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X);
+JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X);
+JL_DLLEXPORT int jl_lookup_membership(jl_value_t *x, jl_value_t *set_instance, size_t world);
+JL_DLLEXPORT int jl_membership_flip_possible(jl_value_t *a, jl_value_t *b);
 jl_datatype_t *jl_new_uninitialized_datatype(void);
 void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable);
 JL_DLLEXPORT jl_datatype_t *jl_wrap_Type(jl_value_t *t);  // x -> Type{x}

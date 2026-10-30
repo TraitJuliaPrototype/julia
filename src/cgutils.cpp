@@ -1975,14 +1975,25 @@ static std::pair<Value*, bool> emit_isa(jl_codectx_t &ctx, const jl_cgval_t &x, 
     // `typeassert`s if we can make it correct.
     std::optional<bool> known_isa;
     jl_value_t *intersected_type = type;
-    if (x.constant)
-        known_isa = jl_isa(x.constant, type);
-    else if (jl_is_not_broken_subtype(x.typ, type) && jl_subtype(x.typ, type)) {
+    if (x.constant) {
+        // a membership flips this answer in another world: keep the runtime
+        // check when the pair is membership-relevant (plan §4.1 M1b)
+        bool v = jl_isa(x.constant, type);
+        if (!(v ? jl_subtype_via_membership(jl_typeof(x.constant), type)
+                : jl_membership_flip_possible(jl_typeof(x.constant), type)))
+            known_isa = v;
+    }
+    else if (jl_is_not_broken_subtype(x.typ, type) && jl_subtype(x.typ, type) &&
+             !jl_subtype_via_membership(x.typ, type)) {
         known_isa = true;
     } else {
         intersected_type = jl_type_intersection(x.typ, type);
-        if (intersected_type == (jl_value_t*)jl_bottom_type)
-            known_isa = false;
+        if (intersected_type == (jl_value_t*)jl_bottom_type) {
+            if (jl_membership_flip_possible(x.typ, type))
+                intersected_type = type; // keep the check, against `type` itself
+            else
+                known_isa = false;
+        }
     }
     if (intersected_type == (jl_value_t*)jl_typeofbottom_type->super)
         intersected_type = (jl_value_t*)jl_typeofbottom_type; // swap abstract Type{Union{}} for concrete typeof(Union{})

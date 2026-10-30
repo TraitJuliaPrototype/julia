@@ -2000,6 +2000,7 @@ end
     if isexact_tty && !isa(tty_ub, TypeVar)
         tty_lb = tty_ub # TODO: this would be wrong if !isexact_tty, but instanceof_tfunc doesn't preserve this info
         if !has_free_typevars(tty_lb) && !has_free_typevars(tty_ub)
+            negative_fold_blocked(tty, tty_ub) && return nothing # H3: refine neither side
             thentype = typeintersect(tty, tty_ub)
             if iskindtype(tty_ub) && thentype !== Bottom
                 # `typeintersect` may be unable narrow down `Type`-type

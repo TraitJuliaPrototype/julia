@@ -575,7 +575,7 @@ typedef struct {
 // `S{T} where T`, the instance is the set applied to them, `X{T}`.
 typedef struct {
     JL_DATA_TYPE
-    JL_NONNULL jl_typename_t *set;   // the set's TypeName (X)
+    jl_typename_t *JL_NONNULL set;   // the set's TypeName (X)
     jl_value_t *JL_NONNULL member;   // the member pattern: S, or S{T} where T
     jl_value_t *JL_NONNULL instance; // the set instance for the pattern
     jl_value_t *JL_NONNULL key;      // Keyed{X,R,F} for the pattern, or Nothing
@@ -669,6 +669,7 @@ typedef struct _jl_datatype_t {
     uint32_t ismutationfree:1; // whether any mutable memory is reachable through this type (in the type or via fields)
     uint32_t isidentityfree:1; // whether this type or any object reachable through its fields has non-content-based identity
     uint32_t has_open_set:1; // whether an open set (or a Keyed/Dynamic/Compiled/Kept wrapper) occurs structurally in this type, incl. via parameters and unions (review H3); when clear, no membership can ever affect a query about this type
+    uint32_t open_set_epoch:15; // generation tag of has_open_set (review B2): trusted only while it equals jl_open_set_epoch, else recomputed (datatype.c); with the flags above and smalltag this fills the word exactly (11+15+6)
     uint32_t smalltag:6; // whether this type has a small-tag optimization
 } jl_datatype_t;
 

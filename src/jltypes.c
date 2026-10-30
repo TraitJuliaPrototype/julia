@@ -1845,6 +1845,10 @@ void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable)
     int istuple = (dt->name == jl_tuple_typename);
     dt->hasfreetypevars = 0;
     dt->maybe_subtype_of_cache = 1;
+    // own name first, so a recursive bound reading this bit mid-loop sees it (H3);
+    // the epoch is stamped before the loop for the same reason (review B2)
+    dt->open_set_epoch = jl_atomic_load_relaxed(&jl_open_set_epoch);
+    dt->has_open_set = (dt->name->open_set || dt->name->generic_wrapper);
     dt->isconcretetype = !dt->name->abstract;
     dt->isdispatchtuple = istuple;
     size_t i, l = jl_nparams(dt);
@@ -1867,6 +1871,8 @@ void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable)
         }
         if (jl_is_vararg(p))
             p = ((jl_vararg_t*)p)->T;
+        if (!dt->has_open_set && p && jl_has_open_set(p))
+            dt->has_open_set = 1;
         if (istuple && dt->has_concrete_subtype) {
             // tuple types like Tuple{:x} and Tuple{Union{}} cannot have instances
             if (p && !jl_is_type(p) && !jl_is_typevar(p))
@@ -3024,7 +3030,7 @@ void jl_init_types(void) JL_GC_DISABLED
             jl_any_type, // instance
             jl_any_type /*jl_voidpointer_type*/,
             jl_any_type /*jl_int32_type*/,
-            jl_any_type /*jl_uint16_type*/);
+            jl_any_type /*jl_uint32_type*/);
     const static uint32_t datatype_constfields[1] = { 0x00000057 }; // (1<<0)|(1<<1)|(1<<2)|(1<<4)|(1<<6)
     const static uint32_t datatype_atomicfields[1] = { 0x00000028 }; // (1<<3)|(1<<5)
     jl_datatype_type->name->constfields = datatype_constfields;
@@ -3881,7 +3887,9 @@ void jl_init_types(void) JL_GC_DISABLED
         jl_tvar_t *keyedX = jl_new_typevar(jl_symbol("X"), (jl_value_t*)jl_bottom_type, (jl_value_t*)jl_any_type);
         jl_tvar_t *keyedR = jl_new_typevar(jl_symbol("R"), (jl_value_t*)jl_bottom_type, (jl_value_t*)jl_any_type);
         jl_tvar_t *keyedF = jl_new_typevar(jl_symbol("F"), (jl_value_t*)jl_bottom_type, (jl_value_t*)jl_any_type);
-        jl_keyed_type = jl_new_abstracttype((jl_value_t*)jl_symbol("Keyed"), jl_core_module, NULL,
+        // super must be jl_any_type, as for every other jl_new_abstracttype caller:
+        // a NULL super made mtcache walk off the chain when printing Keyed{...} (review M4)
+        jl_keyed_type = jl_new_abstracttype((jl_value_t*)jl_symbol("Keyed"), jl_core_module, jl_any_type,
                                            jl_svec(3, keyedX, keyedR, keyedF));
         jl_keyed_type->name->generic_wrapper = 1;
     }
@@ -3905,7 +3913,7 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_uint8pointer_type = (jl_datatype_t*)jl_apply_type1((jl_value_t*)jl_pointer_type, (jl_value_t*)jl_uint8_type);
     jl_svecset(jl_datatype_type->types, 5, jl_voidpointer_type);
     jl_svecset(jl_datatype_type->types, 6, jl_int32_type);
-    jl_svecset(jl_datatype_type->types, 7, jl_uint16_type);
+    jl_svecset(jl_datatype_type->types, 7, jl_uint32_type); // the memoized bitfield word (11+15+6 bits = 32)
     jl_svecset(jl_typename_type->types, 1, jl_module_type);
     jl_svecset(jl_typename_type->types, 4, jl_voidpointer_type);
     jl_svecset(jl_typename_type->types, 5, jl_voidpointer_type);

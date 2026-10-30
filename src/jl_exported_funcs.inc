@@ -95,6 +95,7 @@
     XX(jl_crc32c_sw) \
     XX(jl_create_system_image) \
     XX(jl_cstr_to_string) \
+    XX(jl_could_join) \
     XX(jl_current_exception) \
     XX(jl_debug_method_invalidation) \
     XX(jl_deprecate_binding) \
@@ -178,6 +179,7 @@
     XX(jl_generating_output) \
     XX(jl_declare_const_gf) \
     XX(jl_declare_constant_val) \
+    XX(jl_declare_membership) \
     XX(jl_gensym) \
     XX(jl_getaffinity) \
     XX(jl_getallocationgranularity) \
@@ -231,6 +233,7 @@
     XX(jl_global_event_loop) \
     XX(jl_has_empty_intersection) \
     XX(jl_has_free_typevars) \
+    XX(jl_has_open_set) \
     XX(jl_has_so_reuseport) \
     XX(jl_has_typevar) \
     XX(jl_has_typevar_from_unionall) \
@@ -261,6 +264,7 @@
     XX(jl_ir_inlining_cost) \
     XX(jl_ir_nslots) \
     XX(jl_ir_slotflag) \
+    XX(jl_is_open_set) \
     XX(jl_isa) \
     XX(jl_isa_compileable_sig) \
     XX(jl_islayout_inline) \
@@ -290,6 +294,7 @@
     XX(jl_load_dynamic_library) \
     XX(jl_load_file_string) \
     XX(jl_lookup_code_address) \
+    XX(jl_lookup_membership) \
     XX(jl_lower) \
     XX(jl_lseek) \
     XX(jl_lstat) \
@@ -384,6 +389,7 @@
     XX(jl_cache_flags) \
     XX(jl_match_cache_flags_current) \
     XX(jl_match_cache_flags) \
+    XX(jl_membership_flip_possible) \
     XX(jl_read_verify_header) \
     XX(jl_realloc) \
     XX(jl_register_newmeth_tracer) \
@@ -407,6 +413,7 @@
     XX(jl_set_istopmod) \
     XX(jl_set_module_compile) \
     XX(jl_set_module_infer) \
+    XX(jl_set_open_set) \
     XX(jl_set_module_nospecialize) \
     XX(jl_set_module_optlevel) \
     XX(jl_set_module_uuid) \
@@ -433,6 +440,7 @@
     XX(jl_stored_inline) \
     XX(jl_string_ptr) \
     XX(jl_subtype) \
+    XX(jl_subtype_via_membership) \
     XX(jl_subtype_env) \
     XX(jl_subtype_env_size) \
     XX(jl_svec) \

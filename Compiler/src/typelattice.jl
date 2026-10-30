@@ -650,6 +650,10 @@ end
 @nospecializeinfer function tmeet(lattice::ConstsLattice, @nospecialize(v), @nospecialize(t::Type))
     if isa(v, Const)
         if !has_free_typevars(t) && !isa(v.val, t)
+            # the `isa` above answered with this world's membership picture;
+            # the widened lattice arms carry the entry-aware (H3) guard, so
+            # widen and let those decide when the pair is membership-relevant
+            negative_fold_blocked(typeof(v.val), t) && return tmeet(widenlattice(lattice), widenconst(v), t)
             return Bottom
         end
         return v
@@ -660,6 +664,9 @@ end
 @nospecializeinfer function tmeet(lattice::ConditionalsLattice, @nospecialize(v), @nospecialize(t::Type))
     if isa(v, Conditional)
         if !(Bool <: t)
+            # `Bool <: t` answers with this world's membership picture too (H3):
+            # widen and let the entry-aware arms decide
+            negative_fold_blocked(Bool, t) && return tmeet(widenlattice(lattice), Bool, t)
             return Bottom
         end
         return v

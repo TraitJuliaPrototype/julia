@@ -83,6 +83,9 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     tn->names = NULL;
     tn->hash = bitmix(bitmix(module ? module->build_id.lo : 0, name->hash), 0xa1ada1da);
     tn->_unused = 0;
+    tn->open_set = 0;
+    tn->never_member = 0;
+    tn->generic_wrapper = 0;
     tn->abstract = abstract;
     tn->mutabl = mutabl;
     tn->mayinlinealloc = 0;
@@ -96,6 +99,79 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     tn->concrete_only = 0;
     jl_atomic_store_relaxed(&tn->memberships, jl_emptysvec);
     return tn;
+}
+
+// review B2: the memoized has_open_set bit is stamped with this epoch. Opening
+// a set does not advance the world and never rebuilds the types built against
+// it, so a memo from an older epoch is untrusted and recomputed structurally on
+// the spot. The check is INEQUALITY, not less-than, so a restarted (e.g. after
+// image serialization) epoch stays sound.
+_Atomic(uint16_t) jl_open_set_epoch = 0;
+
+typedef struct jl_open_set_visit {
+    jl_datatype_t *dt;
+    struct jl_open_set_visit *prev;
+} jl_open_set_visit_t;
+
+static int open_set_witness(jl_value_t *v, jl_open_set_visit_t *stack) JL_NOTSAFEPOINT;
+
+// the memoized bit of dt: trusted while its epoch is current; else recompute by
+// depth-first structural recomputation — nested dts are refreshed at every stop
+// before their bit is read, and a DFS back-edge answers false, which is sound:
+// a positive witness has a finite simple path, so no witness needs an edge back
+// into a node whose own parameters are still being explored (review B2).
+static int open_set_bit(jl_datatype_t *dt, jl_open_set_visit_t *stack) JL_NOTSAFEPOINT
+{
+    uint16_t epoch = jl_atomic_load_relaxed(&jl_open_set_epoch);
+    if (dt->open_set_epoch == epoch)
+        return dt->has_open_set;
+    for (jl_open_set_visit_t *p = stack; p; p = p->prev)
+        if (p->dt == dt)
+            return 0; // back-edge (see above)
+    jl_open_set_visit_t cell = { dt, stack };
+    int res = dt->name->open_set || dt->name->generic_wrapper;
+    if (!res) {
+        size_t i, l = jl_nparams(dt);
+        for (i = 0; i < l; i++) {
+            jl_value_t *p = jl_tparam(dt, i);
+            if (p && open_set_witness(p, &cell)) {
+                res = 1;
+                break;
+            }
+        }
+    }
+    dt->has_open_set = res;
+    dt->open_set_epoch = epoch;
+    return res;
+}
+
+static int open_set_witness(jl_value_t *v, jl_open_set_visit_t *stack) JL_NOTSAFEPOINT
+{
+    jl_value_t *uw = jl_is_unionall(v) ? jl_unwrap_unionall(v) : v;
+    if (jl_is_vararg(uw))
+        uw = ((jl_vararg_t*)uw)->T; // mirrors jl_precompute_memoized_dt's parameter unwrap
+    if (uw == NULL)
+        return 0;
+    if (jl_is_datatype(uw)) {
+        jl_datatype_t *dt = (jl_datatype_t*)uw;
+        return dt->name->open_set || dt->name->generic_wrapper || open_set_bit(dt, stack);
+    }
+    if (jl_is_uniontype(uw))
+        return open_set_witness(((jl_uniontype_t*)uw)->a, stack) ||
+               open_set_witness(((jl_uniontype_t*)uw)->b, stack);
+    if (jl_is_typevar(uw))
+        return open_set_witness(((jl_tvar_t*)uw)->ub, stack); // ub stops at a DataType's bit
+    return 0;
+}
+
+// structural open-set question (H3): true when an open set or an attribute wrapper
+// occurs in the type, incl. under Union/UnionAll/parameters. recursion stops at
+// each parameter DataType's memoized bit (refreshed against jl_open_set_epoch,
+// review B2), so it terminates; the same convention as maybe_subtype_of_cache
+// and has_concrete_supertype (jltypes.c), which never re-enter a partial type's params.
+int jl_has_open_set_in(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    return open_set_witness(v, NULL);
 }
 
 extern _Atomic(int) allow_new_worlds; // gf.c
@@ -123,7 +199,7 @@ static jl_value_t *jl_declare_membership_world(jl_value_t *member, jl_value_t *s
     entry->instance = set_instance;
     entry->key = key;
     entry->min_world = world;
-    entry->max_world = (uint64_t)-1;
+    entry->max_world = (uint64_t)-1; // entries are never revoked yet; if M2's world work retires one, this becomes the kill world
     entry->declarer = declarer;
     entry->by = by;
     jl_svec_t *old = jl_typename_memberships(tn);
@@ -164,14 +240,59 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         jl_error("a set is not a member of itself");
     // ownership is checked by the declaring code (the library's), not by the
     // runtime: the runtime only records the declarer (exploration §2.1)
+    // The entry is visible from the world the declaring code runs in — the
+    // task's world age — as a mutation is: `min_world = w_old + 1` for an
+    // author who read the world just before (gate m1_late_implement), not from
+    // a fresh world on top of the counter, which statements between the read
+    // would have advanced. A world is still opened afterwards, so code
+    // compiled later, from the method tables up, sees the member (§3).
+    jl_task_t *ct = jl_get_current_task();
+    size_t min_world = ct && ct->world_age != (size_t)-1 ? ct->world_age
+                    : jl_atomic_load_relaxed(&jl_world_counter);
     JL_LOCK(&world_counter_lock);
     if (!jl_atomic_load_relaxed(&allow_new_worlds))
         jl_error("Membership changes have been disabled via a call to disable_new_worlds.");
     size_t world = jl_atomic_load_relaxed(&jl_world_counter) + 1;
-    jl_value_t *entry = jl_declare_membership_world(member, set_instance, key, declarer, by, world);
+    jl_value_t *entry = NULL;
+    JL_GC_PUSH1(&entry);
+    entry = jl_declare_membership_world(member, set_instance, key, declarer, by, min_world);
     jl_atomic_store_release(&jl_world_counter, world);
     JL_UNLOCK(&world_counter_lock);
+    JL_GC_POP();
     return entry;
+}
+
+// open a set (Traits.@trait). errors unless T is an abstract type; does not
+// advance the world (the declaration that created T already did).
+JL_DLLEXPORT void jl_set_open_set(jl_value_t *T)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->abstract)
+        jl_error("jl_set_open_set: only an abstract type can be an open set");
+    if (((jl_datatype_t*)uw)->name->never_member)
+        jl_error("jl_set_open_set: Core kinds cannot be open sets");
+    jl_typename_t *tn = ((jl_datatype_t*)uw)->name;
+    if (!tn->open_set) {
+        // review B2: invalidate every memoized has_open_set stamped so far. The
+        // flag store is ordered before the epoch store (release), so a reader
+        // that sees the new epoch also sees the set open.
+        uint16_t e = jl_atomic_load_relaxed(&jl_open_set_epoch);
+        if (e >= 32767)
+            jl_error("jl_set_open_set: the open-set epoch is exhausted (too many sets opened)");
+        tn->open_set = 1;
+        jl_atomic_store_release(&jl_open_set_epoch, e + 1);
+    }
+}
+
+JL_DLLEXPORT int jl_is_open_set(jl_value_t *T)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    return jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->open_set;
+}
+
+JL_DLLEXPORT int jl_has_open_set(jl_value_t *v)
+{
+    return jl_has_open_set_in(v);
 }
 
 // allocating DataTypes -----------------------------------------------------------
@@ -194,6 +315,8 @@ jl_datatype_t *jl_new_uninitialized_datatype(void)
     t->zeroinit = 0;
     t->has_concrete_subtype = 1;
     t->maybe_subtype_of_cache = 1;
+    t->has_open_set = 0;
+    t->open_set_epoch = 0; // bisect config B: epoch zeroing ON
     t->ismutationfree = 0;
     t->isidentityfree = 0;
     t->smalltag = 0;

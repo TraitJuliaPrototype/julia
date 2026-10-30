@@ -538,6 +538,8 @@ static int obviously_in_union(jl_value_t *u, jl_value_t *x)
     return obviously_egal(u, x);
 }
 
+static int jl_membership_answer(jl_value_t *x, jl_value_t *y);
+
 int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
 {
     if (a == b || a == (jl_value_t*)jl_any_type || b == (jl_value_t*)jl_any_type)
@@ -564,8 +566,15 @@ int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
                 temp = bd;
                 while (temp != jl_any_type && temp->name != ad->name)
                     temp = temp->super;
-                if (temp == jl_any_type)
+                if (temp == jl_any_type) {
+                    // H2: a known membership keeps the pair non-disjoint; a
+                    // non-member still is, exactly, in the current world
+                    if (jl_membership_answer(a, (jl_value_t*)bd))
+                        return 0;
+                    if (jl_membership_answer(b, (jl_value_t*)ad))
+                        return 0;
                     return 1;
+                }
                 bd = temp;
             }
             else {
@@ -1100,6 +1109,297 @@ static int check_vararg_length(jl_value_t *v, ssize_t n, jl_stenv_t *e)
 
 static int forall_exists_equal(jl_value_t *x, jl_value_t *y, jl_stenv_t *e);
 
+// membership fallback (plan §4.1): after a supertype chain missed, a declared
+// membership may still relate the pair. one helper for the subtype, isa,
+// disjointness and intersection probes; entries live on the member's TypeName
+// and are filtered by world. world 0 is the image builder: it sees everything.
+static size_t jl_membership_world(void)
+{
+    jl_task_t *ct = jl_get_current_task(); // safe even without a task (image build)
+    return ct ? ct->world_age : 0;
+}
+
+// unify a member pattern against a member type, binding the pattern's tvars to
+// x's parameters. the library can only declare `S` or `S{T...} where T...` with
+// the tvars bare in S's parameters (exploration §2.5); env receives the bindings
+// for jl_instantiate_type_with.
+static int jl_membership_env_match(jl_value_t *member, jl_value_t *x, jl_value_t **env, size_t *envn)
+{
+    size_t i, j, n = 0;
+    jl_tvar_t *vars[8];
+    jl_value_t *m = member;
+    *envn = 0;
+    for (i = 0; i < 8; i++)
+        env[i] = NULL;
+    while (jl_is_unionall(m)) {
+        if (n >= 8)
+            return 0;
+        vars[n++] = ((jl_unionall_t*)m)->var;
+        m = ((jl_unionall_t*)m)->body;
+    }
+    jl_value_t *xu = jl_unwrap_unionall(x);
+    if (!jl_is_datatype(m) || !jl_is_datatype(xu))
+        return 0;
+    if (n == 0)
+        return m == x; // ground member pattern: the member itself
+    jl_datatype_t *md = (jl_datatype_t*)m, *xd = (jl_datatype_t*)xu;
+    if (md->name != xd->name || jl_nparams(md) != jl_nparams(xd))
+        return 0;
+    for (i = 0; i < jl_nparams(md); i++) {
+        jl_value_t *pi = jl_tparam(md, i), *xi = jl_tparam(xd, i);
+        int isvar = 0;
+        for (j = 0; j < n; j++) {
+            if (pi == (jl_value_t*)vars[j]) {
+                if (*envn > j && env[j] != xi)
+                    return 0; // a variable bound twice must bind the same value
+                env[j] = xi;
+                if (*envn < j + 1)
+                    *envn = j + 1;
+                isvar = 1;
+                break;
+            }
+        }
+        if (!isvar && !obviously_egal(pi, xi))
+            return 0;
+    }
+    for (j = 0; j < n; j++)
+        if (env[j] == NULL)
+            return 0; // every pattern variable must be pinned by the member
+    return 1;
+}
+
+// find the live entry on the member's TypeName naming set_name whose pattern
+// matches x; on success the entry's instance, bound to the match, is stored in
+// *instance_out (a slot the caller keeps rooted). returns the entry or NULL.
+static jl_value_t *jl_membership_lookup(jl_value_t *x, jl_typename_t *set_name,
+                                        jl_value_t **instance_out, size_t world)
+{
+    jl_value_t *xu = jl_unwrap_unionall(x);
+    *instance_out = NULL;
+    if (!jl_is_datatype(xu))
+        return NULL;
+    jl_svec_t *list = jl_typename_memberships(((jl_datatype_t*)xu)->name);
+    jl_value_t *inst = NULL, *match = NULL;
+    JL_GC_PUSH3(&list, &inst, &match);
+    size_t i, l = jl_svec_len(list);
+    for (i = 0; i < l; i++) {
+        jl_value_t *entry_v = jl_svecref(list, i);
+        jl_membership_t *en = (jl_membership_t*)entry_v;
+        if (en->set != set_name)
+            continue;
+        if (!(world == 0 || (world >= en->min_world && world <= en->max_world)))
+            continue;
+        jl_value_t *env[8];
+        size_t envn;
+        if (!jl_membership_env_match(en->member, x, env, &envn))
+            continue;
+        jl_value_t *inst2 = en->instance;
+        if (envn > 0) {
+            // pair the pattern's and the instance's UnionAll chains POSITIONALLY
+            // (review M1): what was bound at pattern-variable depth k substitutes
+            // for the instance's own variable at the same depth. An unequal nesting
+            // shape, or an instance still carrying free typevars after the
+            // substitution (an x-side variable must not flow into the recursive
+            // subtype below), is REFUSED — the lookup answers 0, never mis-answers.
+            // vals[] carries the depth-ordered VALUES: the binding contract of
+            // jl_instantiate_type_in_env, the pair-instancing helper vanilla uses
+            // for wrapper instantiation (jltypes.c:1671). jl_instantiate_type_with
+            // does NOT take interleaved (tvar,value) pairs — passing them there
+            // silently substitutes nothing (round-1 runtime fix; the wrong call
+            // let a whole-family entry answer every parameter query).
+            jl_value_t *vals[8]; // depth-ordered bindings for the instance's chain
+            jl_value_t *mp = en->member, *ip = en->instance;
+            size_t k;
+            int ok = 1;
+            for (k = 0; k < envn; k++) {
+                if (!jl_is_unionall(mp) || !jl_is_unionall(ip) || env[k] == NULL) {
+                    ok = 0;
+                    break;
+                }
+                vals[k] = env[k];
+                JL_GC_PROMISE_ROOTED(vals[k]); // a parameter of the rooted query x
+                mp = ((jl_unionall_t*)mp)->body;
+                ip = ((jl_unionall_t*)ip)->body;
+            }
+            if (!ok || jl_is_unionall(mp) || jl_is_unionall(ip))
+                continue; // shape mismatch: refuse to answer
+            inst2 = jl_instantiate_type_in_env(jl_unwrap_unionall(en->instance),
+                                               (jl_unionall_t*)en->instance, vals);
+            if (!inst2 || jl_has_free_typevars(inst2))
+                continue;
+        }
+        inst = inst2;
+        match = entry_v;
+        break;
+    }
+    *instance_out = inst;
+    JL_GC_POP();
+    return match;
+}
+
+// the answer: does a membership entry relate x to the set y (an instance of an
+// open set, or the bare wrapper for a whole-family query)? the entry's instance
+// declares the family x joins; the query answers by containment in it: a bare
+// declaration (`instance == the set's wrapper`) covers every instance, a narrow
+// one only its own parameterization. the fresh-env subtype treats the entry's
+// tvars existentially (`PSet{Int} <: PSet{T} where T` is true), where the
+// chain's matched-name convention (∀ the x-side's vars) would never answer a
+// concrete query through a bare entry. parametric equality below the name
+// stays invariant here; M5's family work refines.
+static int jl_membership_answer(jl_value_t *x, jl_value_t *y)
+{
+    jl_value_t *yu = jl_unwrap_unionall(y);
+    if (!jl_is_datatype(yu) || !((jl_datatype_t*)yu)->name->open_set)
+        return 0;
+    jl_value_t *ask = x;
+    if (jl_is_type_type(jl_unwrap_unionall(x)) && !jl_has_free_typevars(x)) {
+        // the induced Type{S} membership: Type{S} answers as S (§2.8, open issue 91)
+        jl_value_t *tp0 = jl_tparam0((jl_datatype_t*)jl_unwrap_unionall(x));
+        if (jl_is_datatype(tp0))
+            ask = tp0;
+    }
+    size_t world = jl_membership_world();
+    jl_value_t *inst = NULL;
+    jl_value_t *en_v = NULL;
+    int ans = 0;
+    JL_GC_PUSH2(&inst, &en_v); // the slots stay rooted across the lookup and comparison
+    en_v = jl_membership_lookup(ask, ((jl_datatype_t*)yu)->name, &inst, world);
+    if (en_v != NULL) {
+        jl_value_t *wrapper = (jl_value_t*)((jl_datatype_t*)yu)->name->wrapper;
+        if (inst == y)
+            ans = 1;
+        else if ((y == wrapper || y == jl_unwrap_unionall(wrapper)) &&
+                 jl_types_equal(((jl_membership_t*)en_v)->instance, wrapper))
+            // a whole-family declaration answers the bare query (review M1): the
+            // subtype chain's unionall fast path hands us the wrapper's BODY, so
+            // that shape counts as the bare-family query too
+            ans = 1;
+        else if (!jl_has_free_typevars(inst))
+            ans = jl_subtype(y, inst); // the instance is ground: no x-side variable is oriented
+    }
+    JL_GC_POP();
+    return ans;
+}
+
+// forward-looking conservative predicate for the inference lattice and the
+// compiler's negative folds (H2/H3): could a future declaration make S (or
+// something structurally inside it) a subtype of X? conservatively true is
+// always safe — its only job is refusing a negative fold. never used by
+// dispatch's match construction. M2's stopgap refines the future-world picture.
+JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X)
+{
+    jl_value_t *su = jl_unwrap_unionall(S);
+    jl_value_t *xu = jl_unwrap_unionall(X);
+    if (jl_is_uniontype(xu))
+        return jl_could_join(S, ((jl_uniontype_t*)xu)->a) || jl_could_join(S, ((jl_uniontype_t*)xu)->b);
+    if (jl_is_uniontype(su))
+        return jl_could_join(((jl_uniontype_t*)su)->a, X) || jl_could_join(((jl_uniontype_t*)su)->b, X);
+    if (!jl_is_datatype(su) || !jl_is_datatype(xu))
+        return 1; // unknown shapes are conservative
+    if (jl_is_type_type(su)) {
+        // Type{S} joins X exactly when S does (the induced entry, §2.8)
+        jl_value_t *tp0 = jl_tparam0((jl_datatype_t*)su);
+        if (jl_is_datatype(tp0) && !jl_has_free_typevars(tp0))
+            return jl_could_join(tp0, X);
+    }
+    jl_datatype_t *sud = (jl_datatype_t*)su, *xud = (jl_datatype_t*)xu;
+    if (xud->name->open_set && sud->name != xud->name) {
+        if (sud->name == jl_datatype_type->name || sud->name == jl_type_typename)
+            return 1; // type objects: a later entry induces the Type{S} answer (§2.8)
+        // a differently-headed S could join the family later unless it is a Core kind
+        return !sud->name->never_member;
+    }
+    // same open family (review B1: PS{Union{Baz,X2}} vs PS{X2}) falls through to the
+    // parameter recursion below — it is conservative and catches membership flips
+    // at parameter positions that the head rule would have short-circuited
+    if (sud->name == xud->name && jl_nparams(su) == jl_nparams(xu)) {
+        // inside a container a membership can flip the answer at a position
+        // (Tuple{S} vs Tuple{X}); invariant parameters count too, since a union
+        // inside one can collapse (H3's Vector{Union{S,X}} case). per position.
+        size_t i, np = jl_nparams(su);
+        for (i = 0; i < np; i++) {
+            jl_value_t *pi = jl_tparam(su, i), *qi = jl_tparam(xu, i);
+            if (jl_is_vararg(pi))
+                pi = jl_unwrap_vararg(pi);
+            if (jl_is_vararg(qi))
+                qi = jl_unwrap_vararg(qi);
+            if (!jl_is_type(pi) || !jl_is_type(qi))
+                return 1;
+            if (jl_could_join(pi, qi))
+                return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+// the caller found S <: X true — was that answer from an entry rather than the
+// chain? anything it cannot resolve is 1 (refuse the fold). mirrors subtype's walk.
+JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X)
+{
+    if (S == jl_bottom_type || X == (jl_value_t*)jl_any_type)
+        return 0;
+    jl_value_t *su = jl_unwrap_unionall(S);
+    jl_value_t *xu = jl_unwrap_unionall(X);
+    if (!jl_is_datatype(su) || !jl_is_datatype(xu) || jl_is_uniontype(xu))
+        return 1;
+    if (((jl_datatype_t*)su)->name->generic_wrapper)
+        return jl_subtype_via_membership(jl_tparam0((jl_datatype_t*)su), X); // §6 erasure answered it
+    if (jl_is_type_type(su) && ((jl_datatype_t*)xu)->name->open_set)
+        return 1; // the induced Type{S} rule is always entry-answered
+    if (((jl_datatype_t*)su)->name == ((jl_datatype_t*)xu)->name && jl_nparams(su) == jl_nparams(xu)) {
+        // the same container (review M2): the truth may come from a PARAMETER
+        // (Tuple{Bar,Int} vs Tuple{SetB,Int} with Bar a declared member) — mirror
+        // jl_could_join's per-position walk: 1 whenever any position could be
+        // entry-derived or is unresolvable, 0 only when every parameter says chain
+        size_t i, np = jl_nparams(su);
+        for (i = 0; i < np; i++) {
+            jl_value_t *pi = jl_tparam(su, i), *qi = jl_tparam(xu, i);
+            if (jl_is_vararg(pi))
+                pi = jl_unwrap_vararg(pi);
+            if (jl_is_vararg(qi))
+                qi = jl_unwrap_vararg(qi);
+            if (!jl_is_type(pi) || !jl_is_type(qi))
+                return 1;
+            if (jl_subtype_via_membership(pi, qi))
+                return 1;
+        }
+        return 0;
+    }
+    jl_datatype_t *xd = (jl_datatype_t*)su;
+    while (xd != jl_any_type && xd->name != ((jl_datatype_t*)xu)->name) {
+        if (xd->super == NULL)
+            return 1;
+        xd = xd->super;
+    }
+    return xd == jl_any_type; // the chain missed: only an entry could say true
+}
+
+// the bare table read for tests and Julia-side introspection: is there a live
+// entry naming the set `set_instance` whose member pattern matches `x` in
+// `world` (0 = ignore the range)? no fallback, no open-set question, no family
+// rule — the plan §1 lookup helper, next to the predicates above.
+JL_DLLEXPORT int jl_lookup_membership(jl_value_t *x, jl_value_t *set_instance, size_t world)
+{
+    jl_value_t *yu = jl_unwrap_unionall(set_instance);
+    if (!jl_is_datatype(yu))
+        return 0;
+    jl_value_t *inst = NULL;
+    int found;
+    JL_GC_PUSH1(&inst);
+    found = jl_membership_lookup(x, ((jl_datatype_t*)yu)->name, &inst, world) != NULL;
+    JL_GC_POP();
+    return found;
+}
+
+// orientation-free pair relevance used by codegen (item 10e)
+JL_DLLEXPORT int jl_membership_flip_possible(jl_value_t *a, jl_value_t *b)
+{
+    if (!jl_has_open_set(a) && !jl_has_open_set(b))
+        return 0;
+    return jl_could_join(a, b) || jl_could_join(b, a);
+}
+
 static int subtype_tuple_varargs(
     jl_vararg_t *vtx, jl_vararg_t *vty,
     jl_value_t *lastx, jl_value_t *lasty,
@@ -1531,11 +1831,16 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
         if (uy == (jl_value_t*)jl_any_type)
             return 1;
         jl_datatype_t *xd = (jl_datatype_t*)ux, *yd = (jl_datatype_t*)uy;
+        if (xd->name->generic_wrapper && xd->name != yd->name)
+            return subtype(jl_tparam0(xd), y, e, param); // §6; the recursion re-enters unwrapped
         while (xd != NULL && xd != jl_any_type && xd->name != yd->name) {
             xd = xd->super;
         }
-        if (xd == jl_any_type)
+        if (xd == jl_any_type) {
+            if (yd->name->open_set)
+                return jl_membership_answer(x, y); // same fallback, or the bare-name case never runs
             return 0;
+        }
     }
     // handle forall ("left") vars first
     if (jl_is_unionall(x)) {
@@ -1549,6 +1854,13 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
         if (x == y) return 1;
         if (y == (jl_value_t*)jl_any_type) return 1;
         jl_datatype_t *xd = (jl_datatype_t*)x, *yd = (jl_datatype_t*)y;
+        if (xd->name->generic_wrapper && xd->name != yd->name) {
+            // Dynamic{S}/Compiled{S}/Kept{S} are members of S's set at the erased
+            // key; Keyed{X,R,F} vs a non-Keyed y erases to X (§2.6-2.7, review M3).
+            // TODO M2: Keyed-vs-Keyed and the key match when y is a set the
+            // entry's key refines (rides with C7).
+            return subtype(jl_tparam0(xd), y, e, param);
+        }
         if (jl_is_type_type(x) && !jl_is_type_type(y)) {
             jl_value_t *tp0 = jl_tparam0(xd);
             if (!jl_is_typevar(tp0)) {
@@ -1557,7 +1869,11 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
                 // Int isa DataType, Int isa Type{Int}, Type{Int} more specific than DataType,
                 // !(Type{Int} <: DataType), !isleaftype(Type{Int}), because non-DataTypes can
                 // be type-equal to `Int`.
-                return jl_typeof(tp0) == (jl_value_t*)yd;
+                if (jl_typeof(tp0) == (jl_value_t*)yd)
+                    return 1;
+                if (yd->name->open_set && jl_is_datatype(tp0) && !jl_has_free_typevars(tp0))
+                    return jl_membership_answer(tp0, (jl_value_t*)yd); // Type{S} answers via S's entries
+                return 0;
             }
             return 0;
         }
@@ -1579,7 +1895,11 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
             }
             xd = xd->super;
         }
-        if (xd == jl_any_type) return 0;
+        if (xd == jl_any_type) {
+            if (yd->name->open_set)
+                return jl_membership_answer(x, y);
+            return 0;
+        }
         if (xd->name == jl_tuple_typename)
             return subtype_tuple(xd, yd, e, param);
         size_t i, np = jl_nparams(xd);
@@ -2099,6 +2419,12 @@ static int obvious_subtype(jl_value_t *x, jl_value_t *y, jl_value_t *y0, int *su
                     if (temp == NULL) // invalid state during type declaration
                         return 0;
                     if (temp == jl_any_type) {
+                        // a membership (or a wrapper erasure) can still relate the
+                        // pair: abstain so the full subtype consults the fallback
+                        if (((jl_datatype_t*)y)->name->open_set && !((jl_datatype_t*)x)->name->never_member)
+                            return 0;
+                        if (((jl_datatype_t*)x)->name->generic_wrapper)
+                            return 0;
                         *subtype = 0;
                         return 1;
                     }
@@ -2544,8 +2870,26 @@ JL_DLLEXPORT int jl_isa(jl_value_t *x, jl_value_t *t)
                     }
                 }
                 else {
-                    return 0;
+                    if (!((jl_datatype_t*)t2)->name->open_set)
+                        return 0; // vanilla: a type object's typeof is a Core kind
+                    // L10: an open set answers the Type{S} question through the
+                    // member's entries; jl_subtype has the induced rule (§2.8)
+                    JL_GC_PUSH1(&x);
+                    x = (jl_value_t*)jl_wrap_Type(x);
+                    int ans = jl_subtype(x, t);
+                    JL_GC_POP();
+                    return ans;
                 }
+            }
+            else if (jl_is_uniontype(t2) && !jl_has_free_typevars(t2)) {
+                // review M3: a union answers the type-value question arm by arm, so a
+                // declared member's value satisfies the arm that contains the set
+                // (the Type{S} rule, §2.8) — isa stays in step with dispatch.
+                // Only for a GROUND union BODY: an arm under a binder is answered by
+                // vanilla's quantifier convention over the whole query (the split
+                // would drop the binder — #53034's Type elimination, core.jl:8413 —
+                // and the whole union, not the arm, is what the quantifier governs).
+                return jl_isa(x, ((jl_uniontype_t*)t2)->a) || jl_isa(x, ((jl_uniontype_t*)t2)->b);
             }
             if (jl_subtype(jl_typeof(x), t))
                 return 1;
@@ -4296,8 +4640,18 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
             xd = (jl_datatype_t*)x;
             while (yd != jl_any_type && yd->name != xd->name)
                 yd = yd->super;
-            if (yd == jl_any_type)
+            if (yd == jl_any_type) {
+                // exact in the current world (H2): a known member intersects to
+                // itself, continuing as the matched-name case would have; the
+                // ground pair usually went through the jl_subtype fast path at
+                // the top (which consults §1) — this catches union branches,
+                // where e->Loffset suppresses it. non-members stay bottom.
+                if (jl_membership_answer(x, y))
+                    return (jl_value_t*)x;
+                if (jl_membership_answer(y, x))
+                    return (jl_value_t*)y;
                 return jl_bottom_type;
+            }
             return intersect_sub_datatype((jl_datatype_t*)y, xd, e, 1, param);
         }
         return intersect_sub_datatype((jl_datatype_t*)x, yd, e, 0, param);
