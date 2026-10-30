@@ -895,6 +895,18 @@ JL_DLLEXPORT jl_value_t *jl_nth_union_component(jl_value_t *v JL_PROPAGATES_ROOT
 int jl_find_union_component(jl_value_t *haystack, jl_value_t *needle, unsigned *nth) JL_NOTSAFEPOINT;
 jl_datatype_t *jl_new_abstracttype(jl_value_t *name, jl_module_t *module,
                                    jl_datatype_t *super, jl_svec_t *parameters);
+// membership in open sets (exploration §2.1-2.2): entries (jl_membership_type,
+// Core's) live on the member's TypeName, published copy-on-write; Keyed/Dynamic/
+// Compiled/Kept are Core types whose subtyping erases to parameter 1.
+#define jl_typename_memberships(tn) jl_atomic_load_acquire(&(tn)->memberships)
+// declares `member` (a DataType, or a UnionAll member pattern) to be a member of
+// the set named by set_instance (X, or an instance X{...} sharing the pattern's
+// variables). key is a Keyed type or Nothing; declarer a Module; by a Symbol or
+// Nothing. Takes the world lock, stamps min_world, publishes, advances the world
+// counter (the jl_method_table_insert protocol). Returns the MembershipEntry.
+JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *set_instance,
+                                               jl_value_t *key, jl_value_t *declarer,
+                                               jl_value_t *by);
 jl_datatype_t *jl_new_uninitialized_datatype(void);
 void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable);
 JL_DLLEXPORT jl_datatype_t *jl_wrap_Type(jl_value_t *t);  // x -> Type{x}

@@ -94,7 +94,84 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     jl_atomic_store_relaxed(&tn->cache_entry_count, 0);
     tn->constprop_heustic = 0;
     tn->concrete_only = 0;
+    jl_atomic_store_relaxed(&tn->memberships, jl_emptysvec);
     return tn;
+}
+
+extern _Atomic(int) allow_new_worlds; // gf.c
+
+// membership in open sets (exploration §2.1): publish one entry onto the member
+// pattern's TypeName, copy-on-write. Readers filter entries by the world range,
+// so the entry stays invisible until `world` is published by the caller; the
+// entry object itself is stable (guard cells and the store's identity refer to
+// it, never to the vector). Validation done, pattern/instance already unwrapped
+// to DataTypes by the caller.
+static jl_value_t *jl_declare_membership_world(jl_value_t *member, jl_value_t *set_instance,
+                                               jl_value_t *key, jl_value_t *declarer,
+                                               jl_value_t *by, size_t world)
+{
+    jl_datatype_t *mpattern = (jl_datatype_t*)jl_unwrap_unionall(member);
+    jl_typename_t *setname = ((jl_datatype_t*)jl_unwrap_unionall(set_instance))->name;
+    jl_typename_t *tn = mpattern->name;
+    jl_value_t *entry_v = jl_gc_alloc(jl_current_task->ptls, sizeof(jl_membership_t),
+                                      jl_membership_type);
+    jl_value_t *nd = NULL;
+    JL_GC_PUSH2(&entry_v, &nd);
+    jl_membership_t *entry = (jl_membership_t*)entry_v;
+    entry->set = setname;
+    entry->member = member;
+    entry->instance = set_instance;
+    entry->key = key;
+    entry->min_world = world;
+    entry->max_world = (uint64_t)-1;
+    entry->declarer = declarer;
+    entry->by = by;
+    jl_svec_t *old = jl_typename_memberships(tn);
+    nd = (jl_value_t*)jl_alloc_svec_uninit(jl_svec_len(old) + 1);
+    jl_svec_t *newsvec = (jl_svec_t*)nd;
+    jl_svecset(newsvec, jl_svec_len(newsvec) - 1, entry_v);
+    for (size_t i = 0; i + 1 < (size_t)jl_svec_len(newsvec); i++)
+        jl_svecset(newsvec, i, jl_svecref(old, i));
+    jl_atomic_store_release(&tn->memberships, newsvec);
+    jl_gc_wb(tn, newsvec);
+    JL_GC_POP();
+    return entry_v;
+}
+
+JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *set_instance,
+                                               jl_value_t *key, jl_value_t *declarer,
+                                               jl_value_t *by)
+{
+    if (!jl_is_type(member))
+        jl_error("membership member pattern must be a type (a DataType, or a UnionAll member pattern)");
+    if (!jl_is_type(set_instance))
+        jl_error("set instance must be a type");
+    jl_value_t *pattern = jl_unwrap_unionall(member);
+    if (!jl_is_datatype(pattern))
+        jl_error("membership member pattern must be a DataType at its core");
+    jl_value_t *setuw = jl_unwrap_unionall(set_instance);
+    if (!jl_is_datatype(setuw))
+        jl_error("set instance must be a DataType at its core");
+    jl_typename_t *setname = ((jl_datatype_t*)setuw)->name;
+    jl_typename_t *mpname = ((jl_datatype_t*)pattern)->name;
+    if (mpname->never_member)
+        jl_errorf("%s is a Core kind and can never be a member of a set", jl_symbol_name(mpname->name));
+    if (mpname->generic_wrapper)
+        jl_error("Keyed, Dynamic, Compiled and Kept are members by rule, not by declaration");
+    if (!setname->open_set)
+        jl_errorf("%s is not an open set", jl_symbol_name(setname->name));
+    if (mpname == setname)
+        jl_error("a set is not a member of itself");
+    // ownership is checked by the declaring code (the library's), not by the
+    // runtime: the runtime only records the declarer (exploration §2.1)
+    JL_LOCK(&world_counter_lock);
+    if (!jl_atomic_load_relaxed(&allow_new_worlds))
+        jl_error("Membership changes have been disabled via a call to disable_new_worlds.");
+    size_t world = jl_atomic_load_relaxed(&jl_world_counter) + 1;
+    jl_value_t *entry = jl_declare_membership_world(member, set_instance, key, declarer, by, world);
+    jl_atomic_store_release(&jl_world_counter, world);
+    JL_UNLOCK(&world_counter_lock);
+    return entry;
 }
 
 // allocating DataTypes -----------------------------------------------------------
@@ -962,6 +1039,16 @@ JL_DLLEXPORT jl_datatype_t *jl_new_datatype(
             tn->mayinlinealloc = 1;
     }
     jl_precompute_memoized_dt(t, 0);
+
+    // `T <: X` with X an open set: a membership final as the supertype, declared
+    // with the type (exploration §2.1); entry min_world is the type's own world
+    if (jl_membership_type && super != NULL && jl_is_datatype(super) &&
+        super->name->open_set && super->name != tn) {
+        jl_value_t *declarer = module ? (jl_value_t*)module : jl_nothing;
+        jl_declare_membership_world((jl_value_t*)tn->wrapper, (jl_value_t*)super,
+                                    jl_nothing, declarer, jl_nothing,
+                                    jl_atomic_load_relaxed(&jl_world_counter));
+    }
 
     if (!abstract && t->types != NULL)
         jl_compute_field_offsets(t);

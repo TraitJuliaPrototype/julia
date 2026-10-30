@@ -33,12 +33,14 @@
     XX(char_type, jl_datatype_t*) \
     XX(code_info_type, jl_datatype_t*) \
     XX(code_instance_type, jl_datatype_t*) \
+    XX(compiled_type, jl_datatype_t*) \
     XX(const_type, jl_datatype_t*) \
     XX(core_module, jl_module_t*) \
     XX(datatype_type, jl_datatype_t*) \
     XX(debuginfo_type, jl_datatype_t*) \
     XX(densearray_type, jl_unionall_t*) \
     XX(diverror_exception, jl_value_t*) \
+    XX(dynamic_type, jl_datatype_t*) \
     XX(emptysvec, jl_svec_t*) \
     XX(emptytuple, jl_value_t*) \
     XX(emptytuple_type, jl_datatype_t*) \
@@ -64,6 +66,8 @@
     XX(interconditional_type, jl_datatype_t*) \
     XX(interrupt_exception, jl_value_t*) \
     XX(intrinsic_type, jl_datatype_t*) \
+    XX(kept_type, jl_datatype_t*) \
+    XX(keyed_type, jl_datatype_t*) \
     XX(kwcall_type, jl_datatype_t*) \
     XX(lineinfonode_type, jl_datatype_t*) \
     XX(linenumbernode_type, jl_datatype_t*) \
@@ -83,6 +87,7 @@
     XX(genericmemoryref_type, jl_unionall_t*) \
     XX(genericmemoryref_typename, jl_typename_t*) \
     XX(memoryref_uint8_type, jl_value_t*) \
+    XX(membership_type, jl_datatype_t*) \
     XX(methoderror_type, jl_datatype_t*) \
     XX(method_instance_type, jl_datatype_t*) \
     XX(method_match_type, jl_datatype_t*) \

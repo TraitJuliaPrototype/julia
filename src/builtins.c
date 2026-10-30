@@ -2601,6 +2601,11 @@ void jl_init_primitives(void) JL_GC_DISABLED
     add_builtin("Nothing", (jl_value_t*)jl_nothing_type);
     add_builtin("nothing", (jl_value_t*)jl_nothing);
     add_builtin("TypeName", (jl_value_t*)jl_typename_type);
+    add_builtin("MembershipEntry", (jl_value_t*)jl_membership_type);
+    add_builtin("Keyed", (jl_value_t*)jl_keyed_type);
+    add_builtin("Dynamic", (jl_value_t*)jl_dynamic_type);
+    add_builtin("Compiled", (jl_value_t*)jl_compiled_type);
+    add_builtin("Kept", (jl_value_t*)jl_kept_type);
     add_builtin("DataType", (jl_value_t*)jl_datatype_type);
     add_builtin("TypeVar", (jl_value_t*)jl_tvar_type);
     add_builtin("UnionAll", (jl_value_t*)jl_unionall_type);
