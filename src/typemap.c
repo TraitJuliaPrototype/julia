@@ -541,12 +541,53 @@ static int jl_typemap_intersection_node_visitor(jl_typemap_entry_t *ml, struct t
             penv = &closure->env;
         }
         closure->ti = jl_type_intersection_env_s(closure->type, (jl_value_t*)ml->sig, penv, &closure->issubty);
+        // M2a fix round 2 (gate m2_dispatch_worlds): an entry-row that fails at
+        // this world — whether the intersection bottoms out or only misses the
+        // subtype filter — may hold at a later world once its entries are
+        // visible. Bound the world range of the answer this walk reports, so a
+        // cache entry made for the current (negative) answer is recomputed once
+        // the entry appears — §7 only lowers cache entries that existed when
+        // the declaration ran. Bit-identical without open sets (memoized bit).
+        if (jl_has_open_set_in((jl_value_t*)ml->sig)) {
+            size_t fmin = 0;
+            if (!jl_membership_match_sig(closure->type, (jl_value_t*)ml->sig, closure->world, &fmin) &&
+                fmin && closure->max_valid >= fmin)
+                closure->max_valid = fmin - 1;
+        }
         if (closure->ti != (jl_value_t*)jl_bottom_type) {
             // In some corner cases type intersection is conservative and returns something
             // for intersect(A, B) even though A is a dispatch tuple and !(A <: B).
             // For dispatch purposes in such a case we know there's no match. This check
             // fixes issue #30394.
-            if (closure->issubty || !jl_is_dispatch_tupletype(closure->type))
+            // M2a fix round (gate m2_set_in_set's dispatch pin): issubty answers
+            // DIRECT membership entries now (subtype's chain-miss fallback, I1),
+            // so a dispatch tuple that reaches the set only through a composed
+            // entry chain would be discarded here. The intersection above already
+            // met the pair on the entry arms; ask the composed match at the entry
+            // — the same question, chain=1 — when the sig names an open set.
+            // Bit-identical for every other entry (memoized bit read; I3).
+            int qualifies = closure->issubty || !jl_is_dispatch_tupletype(closure->type);
+            if (!qualifies && jl_has_open_set_in((jl_value_t*)ml->sig)) {
+                size_t fmin = 0;
+                qualifies = jl_membership_match_sig(closure->type, (jl_value_t*)ml->sig, closure->world, &fmin);
+                if (!qualifies && fmin && closure->max_valid >= fmin)
+                    // the entry below does not match at this world — but it will
+                    // at fmin, and could win from there. Bound the match result
+                    // this walk reports so a cache entry made for the current
+                    // answer is recomputed once the entry is visible (gate
+                    // m2_dispatch_worlds' r0→r1 flip through an already-primed
+                    // call site without §7 having seen it).
+                    closure->max_valid = fmin - 1;
+                // a composed match whose intersection is the whole query covers it
+                // exactly as a subtype match does: say so, so the match visitors
+                // (ml_matches_visitor's issubty row filter, the LATEST_ONLY stop in
+                // get_intersect_visitor — replay-guarded separately) treat the row
+                // as full. When ti is narrower than the query, issubty stays 0 and
+                // the row keeps its partial status.
+                if (qualifies && closure->ti == closure->type)
+                    closure->issubty = 1;
+            }
+            if (qualifies)
                 if (!fptr(ml, closure))
                     return 0;
         }
@@ -862,6 +903,16 @@ static jl_typemap_entry_t *jl_typemap_entry_assoc_by_type(
                 if (ismatch && search->env)
                     resetenv = 1;
             }
+
+            // M2a fix round (gate m2_set_in_set's dispatch pin): a set method is
+            // reached by a member whose chain does not name the set, through the
+            // transitive entry chain. The vanilla answers above are subtype-based
+            // and subtype answers direct entries only (I1), so the composed
+            // question is asked at the entry: with no open set in the sig this is
+            // one memoized bit read (I3), and a sig without one is exactly the
+            // vanilla behavior. Guards below still apply to the composed answer.
+            if (!ismatch && jl_has_open_set_in((jl_value_t*)ml->sig))
+                ismatch = jl_membership_match_sig(types, (jl_value_t*)ml->sig, search->world, NULL);
 
             if (ismatch) {
                 size_t i, l;
@@ -1423,6 +1474,23 @@ static void jl_typemap_level_insert_(
     }
     if (t1 == (jl_value_t*)jl_typeofbottom_type)
         t1 = (jl_value_t*)jl_assume(jl_typeofbottom_type)->super;
+    // bounded methods (plan §4.2, review M1): an entry whose signature names an
+    // open set must stay in the linear list, which every walk visits — name1
+    // probes key on the query's supertype chain, and a membership is not in any
+    // chain. one memoized bit read (epoch-aware); false for every method when no
+    // set is open (I3). this also holds when a list overflows MAX_METHLIST_COUNT
+    // and jl_method_convert_list_to_cache re-inserts every entry: open-set sigs
+    // are routed back to linear at the level they are reached, where every lookup
+    // that intersects the earlier positions arrives (assoc_exact and assoc_by_type
+    // walk linear after the name probes, before the any bucket; the intersection
+    // visitor and the any bucket always visit it). review W3: the only walks that
+    // return early without reaching a level's linear list are the subtype=0
+    // lookups, which reach only jl_method_table->defs — the builtin-only table
+    // where this bit is false, so their type-equality premise keeps holding.
+    if (jl_has_open_set((jl_value_t*)newrec->sig)) {
+        jl_typemap_list_insert_(map, &cache->linear, (jl_value_t*)cache, newrec);
+        return;
+    }
     // If the type at `offs` is Any, put it in the Any list
     if (t1 && jl_is_any(t1)) {
         jl_typemap_insert_generic(map, &cache->any, (jl_value_t*)cache, newrec, 0, offs+1, NULL);

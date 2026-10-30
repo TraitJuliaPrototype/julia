@@ -539,6 +539,7 @@ static int obviously_in_union(jl_value_t *u, jl_value_t *x)
 }
 
 static int jl_membership_answer(jl_value_t *x, jl_value_t *y);
+static int jl_membership_answer_direct(jl_value_t *x, jl_value_t *y);
 
 int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
 {
@@ -1112,17 +1113,57 @@ static int forall_exists_equal(jl_value_t *x, jl_value_t *y, jl_stenv_t *e);
 // membership fallback (plan §4.1): after a supertype chain missed, a declared
 // membership may still relate the pair. one helper for the subtype, isa,
 // disjointness and intersection probes; entries live on the member's TypeName
-// and are filtered by world. world 0 is the image builder: it sees everything.
+// and are filtered by world. world 0 means there is no task at all (pre-task C
+// startup, serialization): such a query ignores the range and sees every entry —
+// during image build and precompilation a task exists, with a real world_age.
+// M2 §0: C-driven subtyping contexts run with a frozen task world — inference
+// sets ct->world_age = jl_typeinf_world, strictly below every runtime entry —
+// so they set a per-thread query-world override for the length of the query.
+// 0 = unset, follow the task.
+static __thread size_t jl_mq_world = 0;
+
+// set the override, returning the previous value for save/restore around a call
+// (JL_NOTSAFEPOINT: a thread-local store, never a GC point — the wrappers that
+// call it while holding an unrooted result rely on this)
+JL_DLLEXPORT size_t jl_set_membership_query_world(size_t world) JL_NOTSAFEPOINT
+{
+    size_t last = jl_mq_world;
+    jl_mq_world = world;
+    return last;
+}
+
+// the current override (0 = unset): callers that would layer a world of their
+// own read this to tell whether an enclosing §0 region already set one
+JL_DLLEXPORT size_t jl_membership_query_world(void) JL_NOTSAFEPOINT
+{
+    return jl_mq_world;
+}
+
 static size_t jl_membership_world(void)
 {
+    if (jl_mq_world)
+        return jl_mq_world;
     jl_task_t *ct = jl_get_current_task(); // safe even without a task (image build)
     return ct ? ct->world_age : 0;
+}
+
+// the y-side whose entries carry keys (review M3): one read for every call site
+// that guards a membership probe on "y is a set"
+static int jl_is_keyed_name(jl_datatype_t *yd)
+{
+    // review W2-2 (BLOCKER): the subtype fast path runs during jl_init_types
+    // itself (jl_type_union at jltypes.c), long before Core.Keyed exists —
+    // dereferencing jl_keyed_type then is a SEGV (image dumps with --output-ji).
+    // No set is keyed before the type exists, so bootstrap answers 0.
+    if (!jl_keyed_type)
+        return 0;
+    return yd->name == jl_keyed_type->name;
 }
 
 // unify a member pattern against a member type, binding the pattern's tvars to
 // x's parameters. the library can only declare `S` or `S{T...} where T...` with
 // the tvars bare in S's parameters (exploration §2.5); env receives the bindings
-// for jl_instantiate_type_with.
+// for membership_instantiate.
 static int jl_membership_env_match(jl_value_t *member, jl_value_t *x, jl_value_t **env, size_t *envn)
 {
     size_t i, j, n = 0;
@@ -1168,73 +1209,175 @@ static int jl_membership_env_match(jl_value_t *member, jl_value_t *x, jl_value_t
     return 1;
 }
 
-// find the live entry on the member's TypeName naming set_name whose pattern
-// matches x; on success the entry's instance, bound to the match, is stored in
-// *instance_out (a slot the caller keeps rooted). returns the entry or NULL.
-static jl_value_t *jl_membership_lookup(jl_value_t *x, jl_typename_t *set_name,
-                                        jl_value_t **instance_out, size_t world)
+// the entry's family instance at a pattern match. vals[] carries the
+// depth-ordered VALUES: the binding contract of jl_instantiate_type_in_env, the
+// pair-instancing helper vanilla uses for wrapper instantiation (jltypes.c:1671).
+// jl_instantiate_type_with does NOT take interleaved (tvar,value) pairs — passing
+// them there silently substitutes nothing (round-1 runtime fix; the wrong call let
+// a whole-family entry answer every parameter query). What was bound at
+// pattern-variable depth k substitutes for the instance's own variable at the same
+// depth (review M1). An unequal nesting shape, or an instance still carrying free
+// typevars after the substitution (an x-side variable must not flow into the
+// recursive subtype below), is REFUSED — NULL, so the lookup answers 0, never
+// mis-answers.
+static jl_value_t *membership_instantiate(jl_membership_t *en, jl_value_t **env, size_t envn)
+{
+    if (envn == 0)
+        return en->instance;
+    jl_value_t *vals[8]; // depth-ordered bindings for the instance's chain
+    jl_value_t *mp = en->member, *ip = en->instance;
+    size_t k;
+    for (k = 0; k < envn; k++) {
+        if (!jl_is_unionall(mp) || !jl_is_unionall(ip) || env[k] == NULL)
+            return NULL;
+        vals[k] = env[k];
+        JL_GC_PROMISE_ROOTED(vals[k]); // a parameter of the rooted query x
+        mp = ((jl_unionall_t*)mp)->body;
+        ip = ((jl_unionall_t*)ip)->body;
+    }
+    if (jl_is_unionall(mp) || jl_is_unionall(ip))
+        return NULL; // shape mismatch: refuse to answer
+    jl_value_t *inst = jl_instantiate_type_in_env(jl_unwrap_unionall(en->instance),
+                                                  (jl_unionall_t*)en->instance, vals);
+    if (inst == NULL || jl_has_free_typevars(inst))
+        return NULL;
+    return inst;
+}
+
+// find the live entry chain on the member's TypeName that answers the query x for
+// set_name: the direct scan, plus the set-in-set composition (plan §4.1:
+// "sets-in-sets by their own entries"). lo/hi, when non-NULL, receive the composed
+// world range of the chain (an indirect membership holds only while every link
+// lives). depth bounds the walk; jl_declare_membership refuses set-in-set cycles,
+// so the bound is a belt, not the rule. the entry returned is the TOP of the chain
+// — the link whose `set` names set_name — because that is the entry whose key and
+// instance describe the queried set (review W2-1); the composed instance goes to
+// *instance_out (a slot the caller keeps rooted).
+// M2a fix round (gate m2_set_in_set split): `chain` selects whether the set-in-set
+// composition is consulted. Subtyping (`<:`) answers DIRECT entries only — a
+// composed chain is not a subtype link (gate item 1, I1 exactness) — while isa,
+// the induced Type{S} rule, dispatch's §0 lookup, C7 and the conservative
+// predicates (could_join, disjointness, intersection) compose.
+static jl_value_t *jl_membership_lookup_level(jl_value_t *x, jl_typename_t *set_name,
+                                              jl_value_t **instance_out, size_t world,
+                                              size_t *lo, size_t *hi, int depth, int chain)
 {
     jl_value_t *xu = jl_unwrap_unionall(x);
     *instance_out = NULL;
+    if (lo)
+        *lo = 1;
+    if (hi)
+        *hi = ~(size_t)0;
     if (!jl_is_datatype(xu))
         return NULL;
     jl_svec_t *list = jl_typename_memberships(((jl_datatype_t*)xu)->name);
-    jl_value_t *inst = NULL, *match = NULL;
-    JL_GC_PUSH3(&list, &inst, &match);
+    jl_value_t *inst = NULL, *match = NULL, *mid = NULL, *inst2 = NULL, *top = NULL;
+    JL_GC_PUSH6(&list, &inst, &match, &mid, &inst2, &top);
     size_t i, l = jl_svec_len(list);
+    // review A-F3 (BLOCKER): a world == 0 scan with an `lo` asked is a BOUNDING
+    // query — "when could this first hold?" — and with two proving chains the
+    // first-scanned one need not be the earliest-completing (M→TB→TA is scanned
+    // before M→TC→TA yet completes later). The negative answer may only be
+    // cached while NO chain has completed, so its lo must be the MIN over every
+    // proving chain: keep scanning after the first proof instead of breaking.
+    // The POSITIVE path (world != 0, match_range bounding a holding answer)
+    // deliberately keeps the first-found break: there an over-high lo costs a
+    // re-resolve, not soundness — the consumer's world already proved the
+    // answer true — while a negative over-high lo leaks stale answers. The
+    // asymmetry is deliberate. (scanall never carries an `hi`: every world == 0
+    // caller bounds through lo only.)
+    int scanall = (lo != NULL && world == 0);
+    size_t best_lo = 0;
     for (i = 0; i < l; i++) {
         jl_value_t *entry_v = jl_svecref(list, i);
         jl_membership_t *en = (jl_membership_t*)entry_v;
-        if (en->set != set_name)
-            continue;
         if (!(world == 0 || (world >= en->min_world && world <= en->max_world)))
             continue;
         jl_value_t *env[8];
         size_t envn;
         if (!jl_membership_env_match(en->member, x, env, &envn))
             continue;
-        jl_value_t *inst2 = en->instance;
-        if (envn > 0) {
-            // pair the pattern's and the instance's UnionAll chains POSITIONALLY
-            // (review M1): what was bound at pattern-variable depth k substitutes
-            // for the instance's own variable at the same depth. An unequal nesting
-            // shape, or an instance still carrying free typevars after the
-            // substitution (an x-side variable must not flow into the recursive
-            // subtype below), is REFUSED — the lookup answers 0, never mis-answers.
-            // vals[] carries the depth-ordered VALUES: the binding contract of
-            // jl_instantiate_type_in_env, the pair-instancing helper vanilla uses
-            // for wrapper instantiation (jltypes.c:1671). jl_instantiate_type_with
-            // does NOT take interleaved (tvar,value) pairs — passing them there
-            // silently substitutes nothing (round-1 runtime fix; the wrong call
-            // let a whole-family entry answer every parameter query).
-            jl_value_t *vals[8]; // depth-ordered bindings for the instance's chain
-            jl_value_t *mp = en->member, *ip = en->instance;
-            size_t k;
-            int ok = 1;
-            for (k = 0; k < envn; k++) {
-                if (!jl_is_unionall(mp) || !jl_is_unionall(ip) || env[k] == NULL) {
-                    ok = 0;
-                    break;
-                }
-                vals[k] = env[k];
-                JL_GC_PROMISE_ROOTED(vals[k]); // a parameter of the rooted query x
-                mp = ((jl_unionall_t*)mp)->body;
-                ip = ((jl_unionall_t*)ip)->body;
-            }
-            if (!ok || jl_is_unionall(mp) || jl_is_unionall(ip))
-                continue; // shape mismatch: refuse to answer
-            inst2 = jl_instantiate_type_in_env(jl_unwrap_unionall(en->instance),
-                                               (jl_unionall_t*)en->instance, vals);
-            if (!inst2 || jl_has_free_typevars(inst2))
+        if (en->set == set_name) {
+            inst2 = membership_instantiate(en, env, envn);
+            if (inst2 == NULL)
                 continue;
+            // the answer holds exactly while this entry lives (M2a fix round 2):
+            // consumers bound cached dispatch/CI worlds through these ranges
+            // (jl_membership_match_range raises ml_matches' min_valid to the
+            // entry's min_world — without it a composed match's answer was
+            // cached world-unbounded and answered old worlds the new answer).
+            if (lo && !scanall)
+                *lo = en->min_world;
+            if (hi)
+                *hi = en->max_world;
+            if (scanall) {
+                if (match == NULL) {
+                    inst = inst2; // first-found answers the lookup (return value)
+                    match = entry_v;
+                }
+                if (best_lo == 0 || en->min_world < best_lo)
+                    best_lo = en->min_world;
+                continue; // A-F3: keep looking for an earlier-completing chain
+            }
+            inst = inst2;
+            match = entry_v;
+            break;
         }
-        inst = inst2;
-        match = entry_v;
-        break;
+        // the entry names another open set: x may reach set_name THROUGH it. the
+        // chain-key rule (D5 ruling) answers a chain only at the erased key — a
+        // keyed link answers 0 rather than mis-answering with another set's key.
+        if (chain && depth < 8 && en->set->open_set && en->key == jl_nothing) {
+            mid = membership_instantiate(en, env, envn);
+            if (mid == NULL)
+                continue;
+            size_t lo2 = 1, hi2 = ~(size_t)0;
+            top = jl_membership_lookup_level(mid, set_name, &inst2, world, &lo2, &hi2, depth + 1, chain);
+            mid = NULL;
+            if (top != NULL && ((jl_membership_t*)top)->key == jl_nothing) {
+                size_t a = en->min_world, b = en->max_world;
+                if (lo2 > a)
+                    a = lo2;
+                if (hi2 < b)
+                    b = hi2;
+                if (world == 0 || (world >= a && world <= b)) {
+                    if (scanall) {
+                        if (match == NULL) {
+                            match = top; // first-found answers the lookup
+                            inst = inst2;
+                        }
+                        if (best_lo == 0 || a < best_lo)
+                            best_lo = a; // A-F3: completion of THIS chain
+                    }
+                    else {
+                        match = top; // the top link is the one naming set_name
+                        inst = inst2;
+                        if (lo)
+                            *lo = a;
+                        if (hi)
+                            *hi = b;
+                        break;
+                    }
+                }
+            }
+            inst2 = NULL;
+            top = NULL;
+        }
     }
+    if (scanall && best_lo != 0)
+        *lo = best_lo; // the earliest completion over ALL proving chains (A-F3)
     *instance_out = inst;
     JL_GC_POP();
     return match;
+}
+
+// the direct form: the entry answering for set_name, without the world range.
+// chain=1: this is the dispatch/§0 question ("can this value reach the set
+// method?"), which composes (gate m2_set_in_set's g2 pin); the name says
+// "direct" only about the world range.
+static jl_value_t *jl_membership_lookup(jl_value_t *x, jl_typename_t *set_name,
+                                        jl_value_t **instance_out, size_t world)
+{
+    return jl_membership_lookup_level(x, set_name, instance_out, world, NULL, NULL, 0, 1);
 }
 
 // the answer: does a membership entry relate x to the set y (an instance of an
@@ -1245,11 +1388,48 @@ static jl_value_t *jl_membership_lookup(jl_value_t *x, jl_typename_t *set_name,
 // tvars existentially (`PSet{Int} <: PSet{T} where T` is true), where the
 // chain's matched-name convention (∀ the x-side's vars) would never answer a
 // concrete query through a bare entry. parametric equality below the name
-// stays invariant here; M5's family work refines.
-static int jl_membership_answer(jl_value_t *x, jl_value_t *y)
+// stays invariant here; M5's family work refines. lo/hi, when non-NULL, receive
+// the world range the answer holds in (plan §6; M6's fold raise, D2).
+static int jl_membership_holds(jl_value_t *x, jl_value_t *y, size_t world, size_t *lo, size_t *hi, int chain)
 {
+    // bootstrap belt (M2a fix round): jl_isa now asks this for every non-concrete
+    // query, including during sysimage bootstrap before Core's MembershipEntry /
+    // Keyed types exist. No entries can exist that early, so the answer is 0.
+    // (Review W2-2/W1-F5 reconciliation: jl_is_keyed_name now self-guards, so the
+    // jl_keyed_type arm here is no longer what protects the keyed reads in the
+    // fast path — it stays as the belt for this function's own direct
+    // jl_keyed_type->name read below. The jl_membership_type arm guards the
+    // entry-list walk.)
+    if (!jl_membership_type || !jl_keyed_type)
+        return 0;
     jl_value_t *yu = jl_unwrap_unionall(y);
-    if (!jl_is_datatype(yu) || !((jl_datatype_t*)yu)->name->open_set)
+    if (!jl_is_datatype(yu))
+        return 0;
+    jl_typename_t *yn = ((jl_datatype_t*)yu)->name;
+    jl_typename_t *askset = yn->open_set ? yn : NULL;
+    int wantkey = 0;
+    jl_value_t *yq = y; // the set instance the containment test runs against
+    if (askset == NULL && yn == jl_keyed_type->name) {
+        // Keyed{X, R, F} is the members of X carrying key (R,F) (§2.6, review M3).
+        // M2 knows one key form: the erased one (nothing ⇄ Keyed{X,Nothing,Nothing});
+        // real key objects arrive with M5's compilation-sig rule (open question D5).
+        jl_value_t *kr = jl_tparam1((jl_datatype_t*)yu), *kf = jl_tparam2((jl_datatype_t*)yu);
+        // M2a fix round (fix 3): Keyed's parameters are TYPES — the erased form
+        // is Nothing the TYPE. (The entry side compares the jl_nothing VALUE,
+        // which is correct: entry->key stores the declared key object.)
+        if (kr != (jl_value_t*)jl_typeof(jl_nothing) || kf != (jl_value_t*)jl_typeof(jl_nothing))
+            return 0; // a non-erased key can only match a non-erased entry: no folds, no matches yet
+        jl_value_t *xset = jl_unwrap_unionall(jl_tparam0((jl_datatype_t*)yu));
+        if (!jl_is_datatype(xset))
+            return 0;
+        askset = ((jl_datatype_t*)xset)->name;
+        wantkey = 1;
+        // the erased key asks for the members of X as a family: the query is the set
+        yq = askset->wrapper;
+        if (yq == NULL)
+            return 0;
+    }
+    if (askset == NULL || !askset->open_set)
         return 0;
     jl_value_t *ask = x;
     if (jl_is_type_type(jl_unwrap_unionall(x)) && !jl_has_free_typevars(x)) {
@@ -1258,27 +1438,188 @@ static int jl_membership_answer(jl_value_t *x, jl_value_t *y)
         if (jl_is_datatype(tp0))
             ask = tp0;
     }
-    size_t world = jl_membership_world();
     jl_value_t *inst = NULL;
     jl_value_t *en_v = NULL;
     int ans = 0;
-    JL_GC_PUSH2(&inst, &en_v); // the slots stay rooted across the lookup and comparison
-    en_v = jl_membership_lookup(ask, ((jl_datatype_t*)yu)->name, &inst, world);
+    JL_GC_PUSH3(&inst, &en_v, &yq); // the slots stay rooted across the lookup and comparison
+    en_v = jl_membership_lookup_level(ask, askset, &inst, world, lo, hi, 0, chain);
+    // n.b. (review W2-1) the entry handed back is the TOP of the chain, the one
+    // naming askset; a direct link's key belongs to a different set.
+    if (en_v != NULL && wantkey && ((jl_membership_t*)en_v)->key != jl_nothing)
+        en_v = NULL; // an erased query matches only erased entries, exactly (I1)
     if (en_v != NULL) {
-        jl_value_t *wrapper = (jl_value_t*)((jl_datatype_t*)yu)->name->wrapper;
-        if (inst == y)
+        jl_value_t *wrapper = ((jl_datatype_t*)jl_unwrap_unionall(yq))->name->wrapper;
+        if (inst == yq)
             ans = 1;
-        else if ((y == wrapper || y == jl_unwrap_unionall(wrapper)) &&
+        else if ((yq == wrapper || yq == jl_unwrap_unionall(wrapper)) &&
                  jl_types_equal(((jl_membership_t*)en_v)->instance, wrapper))
             // a whole-family declaration answers the bare query (review M1): the
             // subtype chain's unionall fast path hands us the wrapper's BODY, so
             // that shape counts as the bare-family query too
             ans = 1;
         else if (!jl_has_free_typevars(inst))
-            ans = jl_subtype(y, inst); // the instance is ground: no x-side variable is oriented
+            ans = jl_subtype(yq, inst); // the instance is ground: no x-side variable is oriented
     }
     JL_GC_POP();
     return ans;
+}
+
+static int jl_membership_answer(jl_value_t *x, jl_value_t *y)
+{
+    return jl_membership_holds(x, y, jl_membership_world(), NULL, NULL, 1);
+}
+
+// the chain question at an explicit world (§8's suppression scan in gf.c runs
+// under the declare protocol, where the entry's world is the argument, M2a fix
+// round 2)
+int jl_membership_holds_at(jl_value_t *x, jl_value_t *y, size_t world)
+{
+    return jl_membership_holds(x, y, world, NULL, NULL, 1);
+}
+
+// the direct form for subtype()'s chain-miss fallback (M2a fix round, gate
+// m2_set_in_set:19): a membership composed through an intermediate set is not a
+// subtype link, so `Late2 <: A2` answers false on the strength of the entries
+// naming A2 on Late2's own TypeName. isa, the induced Type{S} rule and dispatch
+// compose (jl_membership_answer / jl_lookup_membership keep chain=1).
+static int jl_membership_answer_direct(jl_value_t *x, jl_value_t *y)
+{
+    return jl_membership_holds(x, y, jl_membership_world(), NULL, NULL, 0);
+}
+
+// C7's open-vs-open question (plan P3, review M2/W1-3): does the set `ub` answer
+// through `ua`'s entries, i.e. is ua a (possibly indirect) member of ub? NOT a
+// bare jl_subtype: at the type_morespecific_ recursion points a fresh env would
+// re-quantify the tvars bound in that walk, so the entry table is asked directly,
+// at the query world of §0. the reverse question is a belt: morespecific has to
+// stay a partial order and a two-set cycle is refused at declare time (§1), so
+// both directions answering should be unreachable — if it ever happens, the pair
+// stays unordered.
+static int membership_set_in_set(jl_datatype_t *ua, jl_datatype_t *ub, size_t world)
+{
+    if (!ua->name->open_set || !ub->name->open_set || ua->name == ub->name)
+        return 0;
+    jl_value_t *inst = NULL;
+    int ans;
+    JL_GC_PUSH1(&inst);
+    ans = jl_membership_lookup_level((jl_value_t*)ua, ub->name, &inst, world, NULL, NULL, 0, 1) != NULL;
+    if (ans) {
+        inst = NULL;
+        if (jl_membership_lookup_level((jl_value_t*)ub, ua->name, &inst, world, NULL, NULL, 0, 1) != NULL)
+            ans = 0;
+    }
+    JL_GC_POP();
+    return ans;
+}
+
+// world range of the membership (chain) that makes `ti` — the intersection of a
+// dispatch query with the signature `sig` — applicable to it (plan §6, I5): for
+// each signature position naming an open (or Keyed) set, ask the query side's
+// entries through the same front the answer uses, and intersect the ranges.
+// returns 0 when no position consults a live entry, leaving *lo/*hi untouched.
+// M6's positive-fold raise makes the same call with an sv-side consumer (D2).
+// review W1-F1(iii): the range question at one sig position. A union `sp` splits
+// exactly like jl_membership_position's hold test; with several answering arms
+// the reported range INTERSECTS theirs, so it is a SUB-range of truth — the
+// consumers raise min_valid / lower max_valid from these bounds, and
+// under-claiming only recomputes sooner while over-claiming leaks a world that
+// no arm has confirmed.
+static int membership_position_range(jl_value_t *tp, jl_value_t *sp, size_t world,
+                                     size_t *lo, size_t *hi)
+{
+    if (jl_is_uniontype(sp)) {
+        size_t la = 1, ha = ~(size_t)0, lb = 1, hb = ~(size_t)0;
+        int fa = membership_position_range(tp, ((jl_uniontype_t*)sp)->a, world, &la, &ha);
+        int fb = membership_position_range(tp, ((jl_uniontype_t*)sp)->b, world, &lb, &hb);
+        if (!fa && !fb)
+            return 0;
+        if (fa && fb) {
+            *lo = la > lb ? la : lb;
+            *hi = ha < hb ? ha : hb;
+        }
+        else if (fa) {
+            *lo = la; *hi = ha;
+        }
+        else {
+            *lo = lb; *hi = hb;
+        }
+        return 1;
+    }
+    return jl_membership_holds(tp, sp, world, lo, hi, 1);
+}
+
+// review A-F2: the NEGATIVE bound at one sig position — the earliest future world
+// in which a currently-failing position could start holding ("future_min"). A
+// union `sp` splits exactly like jl_membership_position's hold test: the answer
+// holds when ANY arm holds, so its flip is the EARLIEST completing arm — the MIN
+// over the arms that prove, 0 when none does. (The old code passed the raw Union
+// to jl_membership_holds, which failed its datatype test at the unwrap_unionall
+// — unwrap strips a UnionAll, never a Union — and reported no bound at all: an
+// unbounded stale :any through a union position.)
+static size_t membership_position_future_min(jl_value_t *tp, jl_value_t *sp, size_t world)
+{
+    if (jl_is_uniontype(sp)) {
+        size_t fa = membership_position_future_min(tp, ((jl_uniontype_t*)sp)->a, world);
+        size_t fb = membership_position_future_min(tp, ((jl_uniontype_t*)sp)->b, world);
+        if (fa && fb)
+            return fa < fb ? fa : fb;
+        return fa ? fa : fb;
+    }
+    size_t lo = 1;
+    if (jl_membership_holds(tp, sp, 0, &lo, NULL, 1))
+        return lo > world ? lo : 0;
+    return 0;
+}
+
+JL_DLLEXPORT int jl_membership_match_range(jl_value_t *sig, jl_value_t *ti, size_t world,
+                                          size_t *lo, size_t *hi)
+{
+    jl_value_t *su = jl_unwrap_unionall(sig);
+    jl_value_t *tu = jl_unwrap_unionall(ti);
+    if (!jl_is_tuple_type(su) || !jl_is_tuple_type(tu))
+        return 0;
+    // review W1-F1(i,ii): a sig's trailing Vararg stands for zero or more query
+    // positions — the old fixed nparams equality dropped those rows, so a primed
+    // cache carried a membership-dependent answer into pre-declare worlds (the I5
+    // leak: A1/A2 of the W1 probe answered :set in the old world). Align the
+    // fixed part positionally; the vararg ELEMENT is asked per consumed position
+    // and the ranges intersect across them, like the fixed positions do.
+    size_t nsp = jl_nparams(su), ntp = jl_nparams(tu);
+    jl_value_t *sv = nsp > 0 ? jl_unwrap_unionall(jl_tparam((jl_datatype_t*)su, nsp - 1)) : NULL;
+    int sva = nsp > 0 && jl_is_vararg(sv);
+    size_t nfix = sva ? nsp - 1 : nsp;
+    if (ntp < nfix || (!sva && ntp != nfix))
+        return 0; // no alignment story for these shapes
+    if (sva && jl_va_tuple_kind((jl_datatype_t*)su) != JL_VARARG_UNBOUND)
+        return 0; // a counted vararg needs length reasoning this query does not do
+    size_t a = 1, b = ~(size_t)0;
+    int found = 0;
+    for (size_t i = 0; i < ntp; i++) {
+        jl_value_t *sp = i < nfix ? jl_tparam((jl_datatype_t*)su, i)
+                                  : jl_unwrap_vararg(sv); // covers every trailing position
+        jl_value_t *tp = jl_tparam((jl_datatype_t*)tu, i);
+        if (jl_is_vararg(tp))
+            tp = jl_unwrap_vararg(tp); // a query-side vararg answers through its element
+        // review A-F12a: a QUERY-side Union (tp) contributes no range — holds
+        // bottoms out on its non-datatype x side, so such a position is simply
+        // not bounded by this match. Sound refusal: intersection collapses a
+        // query union into per-concrete-type rows before caching, so cached
+        // queries reaching here are union-free; M5's consumer must arm-split if
+        // it ever caches a union key.
+        size_t lo2 = 1, hi2 = ~(size_t)0;
+        if (membership_position_range(tp, sp, world, &lo2, &hi2)) {
+            found = 1;
+            if (lo2 > a)
+                a = lo2;
+            if (hi2 < b)
+                b = hi2;
+        }
+    }
+    if (found) {
+        *lo = a;
+        *hi = b;
+    }
+    return found;
 }
 
 // forward-looking conservative predicate for the inference lattice and the
@@ -1303,6 +1644,10 @@ JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X)
             return jl_could_join(tp0, X);
     }
     jl_datatype_t *sud = (jl_datatype_t*)su, *xud = (jl_datatype_t*)xu;
+    if (xud->name->generic_wrapper && sud->name != xud->name)
+        return jl_could_join(S, jl_tparam0(xud)); // a wrapper's set answers the question (§2.6 erasure):
+                                                  // else isa(v, Keyed{X,Nothing,Nothing}) could fold
+                                                  // Const(false) forever while erased entries land
     if (xud->name->open_set && sud->name != xud->name) {
         if (sud->name == jl_datatype_type->name || sud->name == jl_type_typename)
             return 1; // type objects: a later entry induces the Type{S} answer (§2.8)
@@ -1345,6 +1690,8 @@ JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X)
         return 1;
     if (((jl_datatype_t*)su)->name->generic_wrapper)
         return jl_subtype_via_membership(jl_tparam0((jl_datatype_t*)su), X); // §6 erasure answered it
+    if (((jl_datatype_t*)xu)->name->generic_wrapper)
+        return 1; // a wrapper or Keyed query (Keyed's name is one) is entry territory: refuse the fold (§3)
     if (jl_is_type_type(su) && ((jl_datatype_t*)xu)->name->open_set)
         return 1; // the induced Type{S} rule is always entry-answered
     if (((jl_datatype_t*)su)->name == ((jl_datatype_t*)xu)->name && jl_nparams(su) == jl_nparams(xu)) {
@@ -1373,6 +1720,87 @@ JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X)
         xd = xd->super;
     }
     return xd == jl_any_type; // the chain missed: only an entry could say true
+}
+
+// one position of the composed match below: the vanilla subtype answer already
+// failed at this position; the entry chain may still carry the query into the
+// set (union sig positions answer arm by arm, as isa does).
+static int jl_membership_position(jl_value_t *qt, jl_value_t *qs, size_t world)
+{
+    if (jl_is_uniontype(qs))
+        return jl_membership_position(qt, ((jl_uniontype_t*)qs)->a, world) ||
+               jl_membership_position(qt, ((jl_uniontype_t*)qs)->b, world);
+    if (!jl_is_datatype(qs))
+        return 0;
+    if (!((jl_datatype_t*)qs)->name->open_set && !jl_is_keyed_name((jl_datatype_t*)qs))
+        return 0; // the position names no set: the vanilla answer was final
+    if (!jl_is_datatype(jl_unwrap_unionall(qt)))
+        return 0;
+    return jl_membership_holds(qt, qs, world, NULL, NULL, 1);
+}
+
+// the composed membership match for a set method's typemap entry (M2a fix round,
+// gate m2_set_in_set's dispatch pin): does the query tuple match the sig when
+// each position, at a chain miss against an open set, is answered through the
+// TRANSITIVE entry chain? The vanilla match cannot ask this — subtype answers
+// direct entries only now (gate :19, I1) — and jl_subtype_via_membership is a
+// fold gate that deliberately over-answers. Restricted to ground pairs: a
+// parametric set method needs the sparams the entry chain does not bind. A sig's
+// trailing Vararg is answered per consumed query position (review W1-F3/W2-6:
+// the old refusal at the first vararg left vararg-shaped set methods outside the
+// composed match AND outside its future_min bound); a query-side vararg keeps
+// the refusal — its length is unknown here.
+int jl_membership_match_sig(jl_value_t *types, jl_value_t *sig, size_t world, size_t *future_min)
+{
+    if (future_min)
+        *future_min = 0;
+    if (jl_has_free_typevars(types) || jl_has_free_typevars(sig))
+        return 0;
+    jl_value_t *tu = jl_unwrap_unionall(types);
+    jl_value_t *su = jl_unwrap_unionall(sig);
+    if (!jl_is_tuple_type(tu) || !jl_is_tuple_type(su))
+        return 0;
+    size_t n = jl_nparams(tu), nsp = jl_nparams(su);
+    jl_value_t *sv = nsp > 0 ? jl_unwrap_unionall(jl_tparam((jl_datatype_t*)su, nsp - 1)) : NULL;
+    int sva = nsp > 0 && jl_is_vararg(sv);
+    size_t nfix = sva ? nsp - 1 : nsp;
+    if (n < nfix || (!sva && n != nfix))
+        return 0;
+    if (sva && jl_va_tuple_kind((jl_datatype_t*)su) != JL_VARARG_UNBOUND)
+        return 0;
+    size_t fmin = 0;
+    for (size_t i = 0; i < n; i++) {
+        // review A-F12a: a QUERY-side Union (qt) contributes no range — holds
+        // bottoms out on its non-datatype x side, so such a position is simply
+        // not bounded by this match. Sound refusal: intersection collapses a
+        // query union into per-concrete-type rows before caching, so cached
+        // queries reaching here are union-free; M5's consumer must arm-split if
+        // it ever caches a union key.
+        jl_value_t *qt = jl_tparam(tu, i);
+        if (jl_is_vararg(qt))
+            return 0;
+        jl_value_t *qs = i < nfix ? jl_tparam((jl_datatype_t*)su, i) : jl_unwrap_vararg(sv);
+        if (jl_subtype(qt, qs))
+            continue;
+        if (!jl_membership_position(qt, jl_unwrap_unionall(qs), world)) {
+            // the match fails here — but a not-yet-visible entry could make it
+            // hold at a later world (M2a fix round 2, gate m2_dispatch_worlds):
+            // report the earliest such world so the caller bounds the answer
+            // that stands in its place (a negative answer may only be cached
+            // while the entry stays invisible). Review A-F2: per-arm through a
+            // union qs, MIN over the arms that prove (earliest completion).
+            if (future_min) {
+                size_t fm = membership_position_future_min(qt, jl_unwrap_unionall(qs), world);
+                if (fm && (fmin == 0 || fm < fmin))
+                    fmin = fm;
+                *future_min = fmin;   // the failure path must report it too
+            }
+            return 0;
+        }
+    }
+    if (future_min)
+        *future_min = fmin;
+    return 1;
 }
 
 // the bare table read for tests and Julia-side introspection: is there a live
@@ -1837,8 +2265,9 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
             xd = xd->super;
         }
         if (xd == jl_any_type) {
-            if (yd->name->open_set)
-                return jl_membership_answer(x, y); // same fallback, or the bare-name case never runs
+            if (yd->name->open_set || jl_is_keyed_name(yd))
+                return jl_membership_answer_direct(x, y); // direct entries only (chain=0):
+                                                          // membership is not subtype (I1)
             return 0;
         }
     }
@@ -1871,8 +2300,11 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
                 // be type-equal to `Int`.
                 if (jl_typeof(tp0) == (jl_value_t*)yd)
                     return 1;
-                if (yd->name->open_set && jl_is_datatype(tp0) && !jl_has_free_typevars(tp0))
-                    return jl_membership_answer(tp0, (jl_value_t*)yd); // Type{S} answers via S's entries
+                if ((yd->name->open_set || jl_is_keyed_name(yd)) && jl_is_datatype(tp0) && !jl_has_free_typevars(tp0))
+                    // Type{S} answers via S's entries — TRANSITIVE on purpose: gate
+                    // m2_set_in_set:17 pins `Late2 isa A2` (the induced Type-side
+                    // composition, §2.8); only the bare datatype fallbacks are direct.
+                    return jl_membership_answer(tp0, (jl_value_t*)yd);
                 return 0;
             }
             return 0;
@@ -1896,8 +2328,11 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
             xd = xd->super;
         }
         if (xd == jl_any_type) {
-            if (yd->name->open_set)
-                return jl_membership_answer(x, y);
+            if (yd->name->open_set || jl_is_keyed_name(yd))
+                return jl_membership_answer_direct(x, y); // the main chain-miss fallback:
+                // direct entries only (chain=0), as in the UnionAll fast path above —
+                // gate m2_set_in_set:19 pins `!(Late2 <: A2)` while the isa/dispatch
+                // paths compose.
             return 0;
         }
         if (xd->name == jl_tuple_typename)
@@ -2420,8 +2855,10 @@ static int obvious_subtype(jl_value_t *x, jl_value_t *y, jl_value_t *y0, int *su
                         return 0;
                     if (temp == jl_any_type) {
                         // a membership (or a wrapper erasure) can still relate the
-                        // pair: abstain so the full subtype consults the fallback
-                        if (((jl_datatype_t*)y)->name->open_set && !((jl_datatype_t*)x)->name->never_member)
+                        // pair: abstain so the full subtype consults the fallback.
+                        // §3: the erased Keyed form of a set is entry territory too
+                        jl_datatype_t *ydd = (jl_datatype_t*)y;
+                        if ((ydd->name->open_set || jl_is_keyed_name(ydd)) && !((jl_datatype_t*)x)->name->never_member)
                             return 0;
                         if (((jl_datatype_t*)x)->name->generic_wrapper)
                             return 0;
@@ -2870,10 +3307,11 @@ JL_DLLEXPORT int jl_isa(jl_value_t *x, jl_value_t *t)
                     }
                 }
                 else {
-                    if (!((jl_datatype_t*)t2)->name->open_set)
+                    if (!((jl_datatype_t*)t2)->name->open_set && !jl_is_keyed_name((jl_datatype_t*)t2))
                         return 0; // vanilla: a type object's typeof is a Core kind
                     // L10: an open set answers the Type{S} question through the
-                    // member's entries; jl_subtype has the induced rule (§2.8)
+                    // member's entries; jl_subtype has the induced rule (§2.8). §3:
+                    // so does the erased Keyed form of a set.
                     JL_GC_PUSH1(&x);
                     x = (jl_value_t*)jl_wrap_Type(x);
                     int ans = jl_subtype(x, t);
@@ -2905,7 +3343,13 @@ JL_DLLEXPORT int jl_isa(jl_value_t *x, jl_value_t *t)
     }
     if (jl_is_concrete_type(t))
         return 0;
-    return jl_subtype(jl_typeof(x), t);
+    // M2a fix round (gate m2_set_in_set split): isa composes the set-in-set chain
+    // (:16/:38/:45-47 pins) where subtype() above now answers direct entries only
+    // (:19). Without open sets the holds is a cheap false (I3). World pinning
+    // rides on jl_membership_world (the invoke_in_world-pinned task world).
+    if (jl_subtype(jl_typeof(x), t))
+        return 1;
+    return jl_membership_holds(jl_typeof(x), t, jl_membership_world(), NULL, NULL, 1);
 }
 
 // type intersection
@@ -4633,7 +5077,14 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
             JL_GC_POP();
             return res;
         }
-        if (param == 2) return jl_bottom_type;
+        if (param == 2) return jl_bottom_type; // vanilla guard (review A-F4): the
+        // membership arm that once stood here REPLACED this line — with the arm
+        // gone as provably dead (W1-F4), the guard returns so control flow at
+        // invariant positions matches vanilla exactly.
+        // (review W1-F4: the param == 2 membership arm that stood here was dead —
+        // intersect_invariant's both-way subtype tests already consult the entry
+        // table and refuse what it accepted, and the arm contradicted this
+        // function's invariant-vanilla contract; gates C1/C2 pin the Union{}.)
         while (xd != jl_any_type && xd->name != yd->name)
             xd = xd->super;
         if (xd == jl_any_type) {
@@ -4936,6 +5387,14 @@ static int might_intersect_concrete(jl_value_t *a)
     if (jl_is_type_type(a))
         return 1;
     if (jl_is_datatype(a)) {
+        // M2a fix round (gate m2_set_in_set's dispatch pin): an open set's
+        // members are exactly its concrete subtypes-to-come — a query tuple
+        // naming one must not be dismissed as unable to meet a concrete.
+        // (The subtype_env fast path above still answers direct members by
+        // subtype; this arm is the composed/transitive route's conservativity,
+        // intersected down by the entry arms below. Closed world unaffected.)
+        if (((jl_datatype_t*)a)->name->open_set || jl_is_keyed_name((jl_datatype_t*)a))
+            return 1;
         int tpl = jl_is_tuple_type(a);
         int i, n = jl_nparams(a);
         for (i = 0; i < n; i++) {
@@ -5837,6 +6296,31 @@ static int type_morespecific_(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_v
             }
             tta = tta->super; super = 1;
         }
+        if (!invariant) {
+            // c7 (plan P3, review M2): at a position, a closed non-Any typename
+            // orders above an open one; open-vs-open goes by the set-in-set
+            // entries, else unordered. attribute wrappers erase to their held set
+            // (review M3); a key strictly refines its own set. with no open sets
+            // this is two false bit reads (I3). invariant (container-parameter)
+            // positions keep vanilla semantics — bounded positions are arguments.
+            jl_datatype_t *ua = (jl_datatype_t*)jl_unwrap_unionall(a);
+            jl_datatype_t *ub = (jl_datatype_t*)jl_unwrap_unionall(b);
+            if (ua->name->generic_wrapper && ua->name != ub->name && jl_nparams(ua) > 0) {
+                // Keyed/Dynamic/Compiled/Kept erase to parameter 1; erasure is
+                // strict when it lands on b's own name (Keyed{X,..} vs X)
+                jl_value_t *held = jl_tparam0(ua);
+                jl_value_t *heldu = jl_unwrap_unionall(held);
+                if (jl_is_datatype(heldu) && ((jl_datatype_t*)heldu)->name == ub->name)
+                    return 1;
+                return type_morespecific_(held, b, a0, b0, invariant, env);
+            }
+            if (ub->name->open_set && a != (jl_value_t*)jl_any_type && !ua->name->open_set)
+                return 1; // closed (non-Any) beats open — the C7 rule
+            if (ua->name->open_set && ub->name->open_set)
+                // review W1-3: the entry question at the query world of §0, not a
+                // bare jl_subtype (a fresh env would re-quantify this walk's tvars)
+                return membership_set_in_set(ua, ub, jl_membership_world());
+        }
         return 0;
     }
 
@@ -5905,7 +6389,14 @@ static int type_morespecific_(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_v
 
 JL_DLLEXPORT int jl_type_morespecific(jl_value_t *a, jl_value_t *b)
 {
-    if (obviously_disjoint(a, b, 1))
+    // M2a fix round (fix 2): a closed-vs-open pair is chain-disjoint, so this
+    // short-circuit rejected the pair before C7's arm in type_morespecific_
+    // could order it. Skip it when either side mentions an open set (memoized
+    // bit, union-safe structural form); with no open set anywhere the two bit
+    // reads are false and behavior is bit-identical (I3). The full walk still
+    // answers 0 for genuinely unordered pairs — obviously_disjoint itself is
+    // unchanged.
+    if (!(jl_has_open_set(a) || jl_has_open_set(b)) && obviously_disjoint(a, b, 1))
         return 0;
     if (jl_has_free_typevars(a) || jl_has_free_typevars(b))
         return 0;
@@ -5927,7 +6418,8 @@ JL_DLLEXPORT int jl_method_morespecific(jl_method_t *ma, jl_method_t *mb)
 {
     jl_value_t *a = (jl_value_t*)ma->sig;
     jl_value_t *b = (jl_value_t*)mb->sig;
-    if (obviously_disjoint(a, b, 1))
+    // M2a fix round (fix 2): same open-set skip as jl_type_morespecific above
+    if (!(jl_has_open_set(a) || jl_has_open_set(b)) && obviously_disjoint(a, b, 1))
         return 0;
     if (jl_has_free_typevars(a) || jl_has_free_typevars(b))
         return 0;

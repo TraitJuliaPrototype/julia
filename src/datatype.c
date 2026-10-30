@@ -181,8 +181,9 @@ extern _Atomic(int) allow_new_worlds; // gf.c
 // so the entry stays invisible until `world` is published by the caller; the
 // entry object itself is stable (guard cells and the store's identity refer to
 // it, never to the vector). Validation done, pattern/instance already unwrapped
-// to DataTypes by the caller.
-static jl_value_t *jl_declare_membership_world(jl_value_t *member, jl_value_t *set_instance,
+// to DataTypes by the caller. Exported (M2a fix round) for builtins.c's
+// jl_set_datatype_super hook: the supertype-membership declaration.
+JL_DLLEXPORT jl_value_t *jl_declare_membership_world(jl_value_t *member, jl_value_t *set_instance,
                                                jl_value_t *key, jl_value_t *declarer,
                                                jl_value_t *by, size_t world)
 {
@@ -238,25 +239,69 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         jl_errorf("%s is not an open set", jl_symbol_name(setname->name));
     if (mpname == setname)
         jl_error("a set is not a member of itself");
+    // set-in-set must stay acyclic: the new set may not sit above the member
+    // (only a set-member can close a cycle; entry lists are small, once per declare)
+    if (mpname->open_set) {
+        jl_typename_t *seen[8]; size_t ns = 0;
+        jl_typename_t *cur = setname;
+        for (int hop = 0; hop < 8 && cur; hop++) {
+            if (cur == mpname)
+                // names the REJECTED declaration (member <: set), review W3-F3:
+                // `@implement CY1 CY2` must print `CY1 <: CY2`, not the reverse
+                jl_errorf("set-in-set membership %s <: %s would create a cycle",
+                          jl_symbol_name(mpname->name), jl_symbol_name(setname->name));
+            seen[ns++] = cur;
+            jl_svec_t *list = jl_typename_memberships(cur);
+            cur = NULL;
+            for (size_t i = 0; i < (size_t)jl_svec_len(list); i++) {
+                jl_typename_t *s = ((jl_membership_t*)jl_svecref(list, i))->set;
+                size_t k; for (k = 0; k < ns && seen[k] != s; k++);
+                if (k == ns) { cur = s; break; }
+            }
+        }
+    }
     // ownership is checked by the declaring code (the library's), not by the
     // runtime: the runtime only records the declarer (exploration §2.1)
-    // The entry is visible from the world the declaring code runs in — the
-    // task's world age — as a mutation is: `min_world = w_old + 1` for an
-    // author who read the world just before (gate m1_late_implement), not from
-    // a fresh world on top of the counter, which statements between the read
-    // would have advanced. A world is still opened afterwards, so code
-    // compiled later, from the method tables up, sees the member (§3).
-    jl_task_t *ct = jl_get_current_task();
-    size_t min_world = ct && ct->world_age != (size_t)-1 ? ct->world_age
-                    : jl_atomic_load_relaxed(&jl_world_counter);
+    // Single-bump protocol (M2a fix round 2, ruling): the entry's min_world is
+    // one above the world counter, read inside world_counter_lock. The task's
+    // world_age is NOT the anchor — in a bare script it lags the counter, and
+    // anchoring on it made the entry visible in a world that predates the
+    // declaration (jl_lookup_membership at a captured older world answered
+    // true). The counter is published right after the entry, so the §7 walk
+    // and §8's report run at world == counter (ml_matches' future guard passes
+    // with min; the §7 conservative path therefore calls the counter-free
+    // invalidate CORE, not jl_method_table_invalidate, whose debug assert
+    // pins the insertion-time equality counter == max_world, review W2-3), and
+    // the declaring task is synced to the new world:
+    // it continues in it, as a toplevel method definition does (gate
+    // m1_late_implement's post-declare query needs no invoke_in_world).
     JL_LOCK(&world_counter_lock);
     if (!jl_atomic_load_relaxed(&allow_new_worlds))
         jl_error("Membership changes have been disabled via a call to disable_new_worlds.");
-    size_t world = jl_atomic_load_relaxed(&jl_world_counter) + 1;
+    size_t min_world = jl_atomic_load_relaxed(&jl_world_counter) + 1;
     jl_value_t *entry = NULL;
     JL_GC_PUSH1(&entry);
     entry = jl_declare_membership_world(member, set_instance, key, declarer, by, min_world);
-    jl_atomic_store_release(&jl_world_counter, world);
+    jl_atomic_store_release(&jl_world_counter, min_world); // publish the world first:
+                                                           // §7/§8 query it (above), so
+                                                           // their world == counter now
+    // dispatch half (plan §4.2, P6): re-resolve cached dispatch and compiled
+    // decisions for the methods this member can now reach, then §8's report.
+    // the jl_new_datatype hook does not replay:
+    // a type being defined has no compiled callers or leaf entries yet. §0's
+    // override pins the membership lookups of the §7/§8 region to the entry's
+    // world explicitly (D1: set-and-forget, not leaning on the n3 equality).
+    size_t mq = jl_set_membership_query_world(min_world);
+    jl_membership_dispatch_walk(member, set_instance, min_world);
+    jl_membership_ambiguity_report(member, set_instance, min_world);
+    jl_set_membership_query_world(mq);
+    // accepted risk (D-M2-6): the §7/§8 region runs under world_counter_lock and
+    // is written throw-free; a throw there (OOM-class) leaks BOTH the lock and
+    // this §0 query-world override — the override leak joins that set (review
+    // W1-F3's survivable throws are wrapped at their own frames, not here).
+    jl_task_t *ct = jl_get_current_task(); // sync the declaring task into the new
+    if (ct && ct->world_age != (size_t)-1 && ct->world_age < min_world)
+        ct->world_age = min_world;         // world (vanilla's toplevel semantics)
     JL_UNLOCK(&world_counter_lock);
     JL_GC_POP();
     return entry;
@@ -1163,15 +1208,10 @@ JL_DLLEXPORT jl_datatype_t *jl_new_datatype(
     }
     jl_precompute_memoized_dt(t, 0);
 
-    // `T <: X` with X an open set: a membership final as the supertype, declared
-    // with the type (exploration §2.1); entry min_world is the type's own world
-    if (jl_membership_type && super != NULL && jl_is_datatype(super) &&
-        super->name->open_set && super->name != tn) {
-        jl_value_t *declarer = module ? (jl_value_t*)module : jl_nothing;
-        jl_declare_membership_world((jl_value_t*)tn->wrapper, (jl_value_t*)super,
-                                    jl_nothing, declarer, jl_nothing,
-                                    jl_atomic_load_relaxed(&jl_world_counter));
-    }
+    // (M2a fix round) the `T <: X` supertype-membership hook moved to
+    // jl_set_datatype_super (builtins.c): _structtype/_abstracttype lower eval'd
+    // types with super=NULL and set the supertype in a later _setsuper!, so a
+    // hook here only ever saw the bootstrap calls — never an eval'd subtype.
 
     if (!abstract && t->types != NULL)
         jl_compute_field_offsets(t);

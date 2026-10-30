@@ -444,6 +444,10 @@ extern tracer_cb jl_newmeth_tracer;
 void jl_call_tracer(tracer_cb callback, jl_value_t *tracee);
 void print_func_loc(JL_STREAM *s, jl_method_t *m);
 extern jl_array_t *_jl_debug_method_invalidation JL_GLOBALLY_ROOTED;
+// the set->methods index (gf.c, plan §4.2): a C global the stock/MMTk collectors
+// must mark explicitly (review A-F1: JL_GLOBALLY_ROOTED is analyzer-only — an
+// unmarked global is swept; marked alongside _jl_debug_method_invalidation below)
+extern jl_array_t *open_set_methods JL_GLOBALLY_ROOTED;
 JL_DLLEXPORT extern arraylist_t jl_linkage_blobs; // external linkage: sysimg/pkgimages
 JL_DLLEXPORT extern arraylist_t jl_image_relocs;  // external linkage: sysimg/pkgimages
 JL_DLLEXPORT extern arraylist_t jl_top_mods;  // external linkage: sysimg/pkgimages
@@ -907,6 +911,13 @@ jl_datatype_t *jl_new_abstracttype(jl_value_t *name, jl_module_t *module,
 JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *set_instance,
                                                jl_value_t *key, jl_value_t *declarer,
                                                jl_value_t *by);
+// the validated, side-effect-free core: stamps min_world = `world` (the caller
+// owns publication and any world advance). builtins.c's jl_set_datatype_super
+// calls it for the `T <: X` supertype-membership final (min_world = the current
+// counter, no replay: a type being defined has no compiled callers yet).
+JL_DLLEXPORT jl_value_t *jl_declare_membership_world(jl_value_t *member, jl_value_t *set_instance,
+                                               jl_value_t *key, jl_value_t *declarer,
+                                               jl_value_t *by, size_t world);
 // review B2: generation counter for the memoized has_open_set bit — bumped on
 // every jl_set_open_set, no world advance; memos stamped with an older epoch are
 // recomputed structurally on read (datatype.c). Compared for INEQUALITY.
@@ -917,8 +928,41 @@ JL_DLLEXPORT int jl_is_open_set(jl_value_t *T);
 JL_DLLEXPORT void jl_set_open_set(jl_value_t *T);
 JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X);
 JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X);
+// the composed match a set method's typemap entry asks when the vanilla subtype
+// answer is false (typemap.c's by-type walk; see subtype.c). future_min (optional
+// out) receives the earliest world a currently-invisible entry could make the
+// match hold, when the match fails — the bound for the negative answer.
+int jl_membership_match_sig(jl_value_t *types, jl_value_t *sig, size_t world, size_t *future_min);
+// the chain question (x ∈ y through the entry chain) at an explicit world
+int jl_membership_holds_at(jl_value_t *x, jl_value_t *y, size_t world);
 JL_DLLEXPORT int jl_lookup_membership(jl_value_t *x, jl_value_t *set_instance, size_t world);
 JL_DLLEXPORT int jl_membership_flip_possible(jl_value_t *a, jl_value_t *b);
+// M2 §0: the query-world override for C-driven subtyping contexts (inference, the
+// declaration-time walks), whose task world is frozen below the runtime entries.
+// Set it (raii-style: the call returns the previous value) for the query region;
+// 0 clears it back to "follow the task".
+JL_DLLEXPORT size_t jl_set_membership_query_world(size_t world) JL_NOTSAFEPOINT;
+// the current override (0 = unset): lets a region tell whether an enclosing one
+// already set a world before layering its own
+JL_DLLEXPORT size_t jl_membership_query_world(void) JL_NOTSAFEPOINT;
+// world range of the membership chain that makes the intersection `ti` of a
+// dispatch query applicable to the signature `sig` (subtype.c; plan §6): 0 when no
+// position consults an entry, in which case *lo/*hi are left untouched.
+JL_DLLEXPORT int jl_membership_match_range(jl_value_t *sig, jl_value_t *ti, size_t world,
+                                           size_t *lo, size_t *hi);
+// the declaration-time dispatch half (gf.c; plan §4.2, P6): replay "insert m with
+// the member substituted" for every method m at the set or a set the member joins,
+// and report the ambiguities the member's set-join creates. Calling convention
+// (single-bump protocol, review W3-F4): call under world_counter_lock with the
+// entry published AND the counter already advanced to entry_min_world — the walk
+// runs at world == counter (§6's bounds answer there); it does NOT bump the
+// counter, and §0's query-world override is set to entry_min_world by the caller.
+JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *set_instance,
+                                              size_t entry_min_world);
+JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t *set_instance,
+                                                 size_t entry_min_world);
+// counters for the walk (gates ccall by index; see jl_membership_stat in gf.c)
+JL_DLLEXPORT size_t jl_membership_stat(int which);
 jl_datatype_t *jl_new_uninitialized_datatype(void);
 void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable);
 JL_DLLEXPORT jl_datatype_t *jl_wrap_Type(jl_value_t *t);  // x -> Type{x}
@@ -1912,6 +1956,9 @@ struct typemap_intersection_env {
     jl_value_t *const type; // type to match
     jl_value_t *const va; // the tparam0 for the vararg in type, if applicable (or NULL)
     size_t search_slurp;
+    size_t world; // the query world for the walk (M2a fix round: the membership
+                  // arms at the entries ask the entry chain at this world — 0 is
+                  // no reader's default; both in-tree callers set it)
     // output values
     size_t min_valid;
     size_t max_valid;
