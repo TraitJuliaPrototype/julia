@@ -1845,6 +1845,10 @@ void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable)
     int istuple = (dt->name == jl_tuple_typename);
     dt->hasfreetypevars = 0;
     dt->maybe_subtype_of_cache = 1;
+    // own name first, so a recursive bound reading this bit mid-loop sees it.
+    // A set is open from its declaration, before any type can name it, so the bit
+    // is final here (compiler §4.1)
+    dt->has_open_set = dt->name->open_set;
     dt->isconcretetype = !dt->name->abstract;
     dt->isdispatchtuple = istuple;
     size_t i, l = jl_nparams(dt);
@@ -1867,6 +1871,8 @@ void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable)
         }
         if (jl_is_vararg(p))
             p = ((jl_vararg_t*)p)->T;
+        if (!dt->has_open_set && p && jl_has_open_set(p))
+            dt->has_open_set = 1;
         if (istuple && dt->has_concrete_subtype) {
             // tuple types like Tuple{:x} and Tuple{Union{}} cannot have instances
             if (p && !jl_is_type(p) && !jl_is_typevar(p))
@@ -3024,7 +3030,7 @@ void jl_init_types(void) JL_GC_DISABLED
             jl_any_type, // instance
             jl_any_type /*jl_voidpointer_type*/,
             jl_any_type /*jl_int32_type*/,
-            jl_any_type /*jl_uint16_type*/);
+            jl_any_type /*jl_uint32_type*/);
     const static uint32_t datatype_constfields[1] = { 0x00000057 }; // (1<<0)|(1<<1)|(1<<2)|(1<<4)|(1<<6)
     const static uint32_t datatype_atomicfields[1] = { 0x00000028 }; // (1<<3)|(1<<5)
     jl_datatype_type->name->constfields = datatype_constfields;
@@ -3035,20 +3041,20 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_typename_type->name->wrapper = (jl_value_t*)jl_typename_type;
     jl_typename_type->super = jl_any_type;
     jl_typename_type->parameters = jl_emptysvec;
-    jl_typename_type->name->n_uninitialized = 19 - 2;
-    jl_typename_type->name->names = jl_perm_symsvec(19, "name", "module", "singletonname",
+    jl_typename_type->name->n_uninitialized = 21 - 2; // only name+module are set before the first allocation inside jl_new_typename_in (same reason as the old 19 - 2)
+    jl_typename_type->name->names = jl_perm_symsvec(21, "name", "module", "singletonname",
                                                     "names", "atomicfields", "constfields",
                                                     "wrapper", "Typeofwrapper", "cache", "linearcache",
                                                     "partial", "hash", "max_args", "n_uninitialized",
                                                     "flags", // "abstract", "mutable", "mayinlinealloc",
                                                     "cache_entry_count", "max_methods", "constprop_heuristic",
-                                                    "concrete_only");
+                                                    "concrete_only", "memberships", "contract");
     const static uint32_t typename_constfields[1]  = { 0b0000110100001001011 }; // TODO: put back atomicfields and constfields in this list
-    const static uint32_t typename_atomicfields[1] = { 0b0001001001110000000 };
+    const static uint32_t typename_atomicfields[1] = { 0b0001001001110000000 | (1u << 19) | (1u << 20) };
     jl_typename_type->name->constfields = typename_constfields;
     jl_typename_type->name->atomicfields = typename_atomicfields;
     jl_precompute_memoized_dt(jl_typename_type, 1);
-    jl_typename_type->types = jl_svec(19, jl_symbol_type, jl_any_type /*jl_module_type*/, jl_symbol_type,
+    jl_typename_type->types = jl_svec(21, jl_symbol_type, jl_any_type /*jl_module_type*/, jl_symbol_type,
                                       jl_simplevector_type,
                                       jl_any_type/*jl_voidpointer_type*/, jl_any_type/*jl_voidpointer_type*/,
                                       jl_type_type, jl_simplevector_type, jl_simplevector_type,
@@ -3060,7 +3066,9 @@ void jl_init_types(void) JL_GC_DISABLED
                                       jl_any_type /*jl_uint8_type*/,
                                       jl_any_type /*jl_uint8_type*/,
                                       jl_any_type /*jl_uint8_type*/,
-                                      jl_any_type /*jl_bool_type*/);
+                                      jl_any_type /*jl_bool_type*/,
+                                      jl_simplevector_type,
+                                      jl_any_type);
 
     jl_methcache_type->name = jl_new_typename_in(jl_symbol("MethodCache"), core, 0, 1);
     jl_methcache_type->name->wrapper = (jl_value_t*)jl_methcache_type;
@@ -3870,11 +3878,22 @@ void jl_init_types(void) JL_GC_DISABLED
         jl_svec(4, jl_type_type, jl_any_type, jl_method_instance_type, jl_any_type),
         jl_emptysvec, 0, 0, 4);
 
+    // the membership entry (compiler §4.2); mutable, since a redeclaration lowers
+    // the old entry's max_world (its one atomic field)
+    jl_membership_type = jl_new_datatype(jl_symbol("MembershipEntry"), jl_core_module, jl_any_type, jl_emptysvec,
+        jl_perm_symsvec(8, "set", "member", "instance", "receiver", "min_world", "max_world", "declarer", "by"),
+        jl_svec(8, jl_any_type, jl_any_type, jl_any_type, jl_any_type, jl_uint64_type, jl_uint64_type, jl_any_type, jl_any_type),
+        jl_emptysvec, 0, 1, 8);
+    {
+        const static uint32_t membership_atomicfields[1] = { 1u << 5 };
+        jl_membership_type->name->atomicfields = membership_atomicfields;
+    }
+
     // complete builtin type metadata
     jl_uint8pointer_type = (jl_datatype_t*)jl_apply_type1((jl_value_t*)jl_pointer_type, (jl_value_t*)jl_uint8_type);
     jl_svecset(jl_datatype_type->types, 5, jl_voidpointer_type);
     jl_svecset(jl_datatype_type->types, 6, jl_int32_type);
-    jl_svecset(jl_datatype_type->types, 7, jl_uint16_type);
+    jl_svecset(jl_datatype_type->types, 7, jl_uint32_type); // the memoized bitfield word (11+15+6 bits = 32)
     jl_svecset(jl_typename_type->types, 1, jl_module_type);
     jl_svecset(jl_typename_type->types, 4, jl_voidpointer_type);
     jl_svecset(jl_typename_type->types, 5, jl_voidpointer_type);
@@ -3923,6 +3942,19 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_unionall_type->ismutationfree = 1;
     assert(((jl_datatype_t*)jl_array_any_type)->ismutationfree == 0);
     assert(((jl_datatype_t*)jl_array_uint8_type)->ismutationfree == 0);
+
+    // Core's kinds can never be members of an open set (compiler §4.1: the
+    // compiler's negative folds are overwhelmingly about these; E-255)
+    jl_datatype_type->name->never_member = 1;
+    ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_unionall_type))->name->never_member = 1;
+    ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_uniontype_type))->name->never_member = 1;
+    jl_typeofbottom_type->name->never_member = 1;
+    jl_module_type->name->never_member = 1;
+    jl_tvar_type->name->never_member = 1;
+    jl_intrinsic_type->name->never_member = 1;
+    jl_opaque_closure_typename->never_member = 1;
+    jl_genericmemory_typename->never_member = 1;
+    jl_genericmemoryref_typename->never_member = 1;
 
     // Technically not ismutationfree, but there's a separate system to deal
     // with mutations for global state.

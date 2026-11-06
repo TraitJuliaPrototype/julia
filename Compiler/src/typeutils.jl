@@ -48,6 +48,20 @@ has_extended_info(@nospecialize x) = (!isa(x, Type) && !isvarargtype(x)) || isTy
 # certain combinations of `a` and `b` where one/both isa/are `Union`/`UnionAll` type(s)s.
 isnotbrokensubtype(@nospecialize(a), @nospecialize(b)) = (!iskindtype(b) || !isType(a) || hasuniquerep(a.parameters[1]) || b <: a)
 
+# membership fold gates (compiler §4.8): a negative about a pair that a future
+# declaration could join never folds; a positive answered by a membership entry
+# never folds either until the fold raises the code's min_world (W-100). Both are
+# cheap flag reads in a session without open sets.
+function negative_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
+    (ccall(:jl_has_open_set, Cint, (Any,), a) != 0 || ccall(:jl_has_open_set, Cint, (Any,), b) != 0) || return false
+    return ccall(:jl_could_join, Cint, (Any, Any), a, b) != 0 ||
+           ccall(:jl_could_join, Cint, (Any, Any), b, a) != 0
+end
+function positive_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
+    (ccall(:jl_has_open_set, Cint, (Any,), a) != 0 || ccall(:jl_has_open_set, Cint, (Any,), b) != 0) || return false
+    return ccall(:jl_subtype_via_membership, Cint, (Any, Any), a, b) != 0
+end
+
 function argtypes_to_type(argtypes::Array{Any,1})
     argtypes = anymap(@nospecialize(a) -> isvarargtype(a) ? a : widenconst(a), argtypes)
     filter!(@nospecialize(x) -> !isvarargtype(x) || valid_as_lattice(unwrapva(x), true), argtypes)
@@ -61,7 +75,7 @@ function isknownlength(t::DataType)
     return isdefined(va, :N) && va.N isa Int
 end
 
-has_concrete_subtype(d::DataType) = d.flags & 0x0020 == 0x0020 # n.b. often computed only after setting the type and layout fields
+has_concrete_subtype(d::DataType) = d.flags & 0x00000020 == 0x00000020 # n.b. often computed only after setting the type and layout fields; the memoized flags word is UInt32 (widened fork field)
 
 # determine whether x is a valid lattice element
 # For example, Type{v} is not valid if v is a value
@@ -125,6 +139,9 @@ end
 # such that `return <: a` && `Union{return, b} == Union{a, b}`
 function typesubtract(@nospecialize(a), @nospecialize(b), max_union_splitting::Int)
     if a <: b && isnotbrokensubtype(a, b)
+        # subtracting to Bottom keeps the else-branch dead only while the positive
+        # answer holds: an entry answer does not bound older worlds (compiler §4.8)
+        positive_fold_blocked(a, b) && return a
         return Bottom
     end
     ua = unwrap_unionall(a)
@@ -141,6 +158,7 @@ function typesubtract(@nospecialize(a), @nospecialize(b), max_union_splitting::I
                     ta = switchtupleunion(a)
                     return typesubtract(Union{ta...}, b, 0)
                 elseif b isa DataType
+                    negative_fold_blocked(a, b) && return a
                     if !compatible_vatuple(a, b)
                         return a
                     end

@@ -850,7 +850,9 @@ function isprimitivetype(@nospecialize t)
     t = unwrap_unionall(t)
     # TODO: what to do for `Union`?
     isa(t, DataType) || return false
-    return (t.flags & 0x0080) == 0x0080
+    # n.b. DataType's memoized `flags` word is UInt32 here (the traits fork widened
+    # it, and the field's self-description follows); the masks keep that width
+    return (t.flags & 0x00000080) == 0x00000080
 end
 
 """
@@ -877,7 +879,7 @@ julia> isbitstype(Complex)
 false
 ```
 """
-isbitstype(@nospecialize t) = (@_total_meta; isa(t, DataType) && (t.flags & 0x0008) == 0x0008)
+isbitstype(@nospecialize t) = (@_total_meta; isa(t, DataType) && (t.flags & 0x00000008) == 0x00000008)
 
 """
     isbits(x)
@@ -944,9 +946,9 @@ julia> isdispatchtuple(Tuple{Type})
 false
 ```
 """
-isdispatchtuple(@nospecialize(t)) = (@_total_meta; isa(t, DataType) && (t.flags & 0x0004) == 0x0004)
+isdispatchtuple(@nospecialize(t)) = (@_total_meta; isa(t, DataType) && (t.flags & 0x00000004) == 0x00000004)
 
-datatype_ismutationfree(dt::DataType) = (@_total_meta; (dt.flags & 0x0100) == 0x0100)
+datatype_ismutationfree(dt::DataType) = (@_total_meta; (dt.flags & 0x00000100) == 0x00000100)
 
 """
     Base.ismutationfree(T)
@@ -968,7 +970,7 @@ function ismutationfree(@nospecialize(t))
     return false
 end
 
-datatype_isidentityfree(dt::DataType) = (@_total_meta; (dt.flags & 0x0200) == 0x0200)
+datatype_isidentityfree(dt::DataType) = (@_total_meta; (dt.flags & 0x00000200) == 0x00000200)
 
 """
     Base.isidentityfree(T)
@@ -1083,7 +1085,7 @@ julia> isconcretetype(Tuple{T} where T<:Int)
 false
 ```
 """
-isconcretetype(@nospecialize(t)) = (@_total_meta; isa(t, DataType) && (t.flags & 0x0002) == 0x0002)
+isconcretetype(@nospecialize(t)) = (@_total_meta; isa(t, DataType) && (t.flags & 0x00000002) == 0x00000002)
 
 """
     isabstracttype(T)

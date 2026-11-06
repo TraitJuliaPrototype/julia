@@ -869,6 +869,7 @@ add_tfunc(typeassert, 2, 2, typeassert_tfunc, 4)
     # return exact && v ⊑ ty
     if (isType(t) && !has_free_typevars(t) && v ⊑ t.parameters[1]) ||
         (isa(t, Const) && isa(t.val, Type) && v ⊑ t.val)
+        positive_fold_blocked(widenconst(v), isType(t) ? t.parameters[1] : t.val) && return false
         return true
     end
     return false
@@ -885,20 +886,26 @@ end
     if !has_free_typevars(t)
         if ⊑(𝕃, v, t)
             if isexact && isnotbrokensubtype(v, t)
+                positive_fold_blocked(widenconst(v), t) && return Bool
                 return Const(true)
             end
         else
             if isa(v, Const) || isa(v, Conditional)
                 # this and the `isdispatchelem` below test for knowledge of a
                 # leaftype appearing on the LHS (ensuring the isa is precise)
+                negative_fold_blocked(widenconst(v), t) && return Bool
                 return Const(false)
             end
             v = widenconst(v)
-            isdispatchelem(v) && return Const(false)
+            if isdispatchelem(v)
+                negative_fold_blocked(v, t) && return Bool
+                return Const(false)
+            end
             if !hasintersect(v, t)
                 # similar to `isnotbrokensubtype` check above, `typeintersect(v, t)`
                 # can't be trusted for kind types so we do an extra check here
                 if !iskindtype(v)
+                    negative_fold_blocked(v, t) && return Bool
                     return Const(false)
                 end
             end
@@ -920,10 +927,12 @@ end
     if !has_free_typevars(a) && !has_free_typevars(b)
         if a <: b
             if isexact_b || a === Bottom
+                positive_fold_blocked(a, b) && return Bool
                 return Const(true)
             end
         else
             if isexact_a || (b !== Bottom && !hasintersect(a, b))
+                negative_fold_blocked(a, b) && return Bool
                 return Const(false)
             end
         end
@@ -2794,12 +2803,30 @@ function builtin_nothrow(𝕃::AbstractLattice, @nospecialize(f), argtypes::Vect
     return _builtin_nothrow(𝕃, f, argtypes, rt)
 end
 
+# membership fold gate for the early constant evaluation below (compiler §4.8):
+# this arm runs `isa`/`<:`/`>:`/`typeassert` with the world of the
+# compilation and records the answer as a Const — a CodeInstance so built would
+# carry one world's membership answer into every later one. A pair where either
+# side involves an open set is left to isa_tfunc/subtype_tfunc/typeassert_tfunc,
+# which apply the entry-aware gates. A cheap flag read elsewhere.
+function early_consteval_world_sensitive(f, argtypes::Vector{Any})::Bool
+    (f === isa || f === (<:) || f === (>:) || f === typeassert) || return false
+    for i = 1:length(argtypes)
+        a = widenslotwrapper(argtypes[i])
+        isa(a, Const) || continue
+        v = a.val
+        T = v isa Type ? v : typeof(v)  # an `isa` subject may be a value, not a type
+        ccall(:jl_has_open_set, Cint, (Any,), T) != 0 && return true
+    end
+    return false
+end
+
 function builtin_tfunction(interp::AbstractInterpreter, @nospecialize(f), argtypes::Vector{Any},
                            sv::Union{AbsIntState, Nothing})
     𝕃ᵢ = typeinf_lattice(interp)
     # Early constant evaluation for foldable builtins with all const args
     if isa(f, IntrinsicFunction) ? is_pure_intrinsic_infer(f) : (f in _PURE_BUILTINS || (f in _CONSISTENT_BUILTINS && f in _EFFECT_FREE_BUILTINS))
-        if is_all_const_arg(argtypes, 1)
+        if is_all_const_arg(argtypes, 1) && !early_consteval_world_sensitive(f, argtypes)
             argvals = collect_const_args(argtypes, 1)
             try
                 # unroll a few common cases for better codegen

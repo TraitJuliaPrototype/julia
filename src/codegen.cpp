@@ -2414,8 +2414,17 @@ static inline jl_cgval_t update_julia_type(jl_codectx_t &ctx, const jl_cgval_t &
 {
     if (v.typ == jl_bottom_type || typ == (jl_value_t*)jl_any_type || jl_egal(v.typ, typ))
         return v; // fast-path
-    if (v.constant)
-        return jl_isa(v.constant, typ) ? v : jl_cgval_t();
+    if (v.constant) {
+        // a membership answers this from one world's picture (compiler §4.8): when the
+        // pair is membership-relevant, skip the refinement (keeping v's own
+        // type is exact for a constant) instead of committing to a
+        // Bottom-typed rejection that would trap in another world
+        bool has = jl_isa(v.constant, typ);
+        if (has ? jl_subtype_via_membership(jl_typeof(v.constant), typ)
+                : jl_membership_flip_possible(jl_typeof(v.constant), typ))
+            return v;
+        return has ? v : jl_cgval_t();
+    }
     if (jl_is_concrete_type(v.typ) && !jl_is_kind(v.typ)) {
         if (jl_is_concrete_type(typ) && !jl_is_kind(typ)) {
             // type mismatch: changing from one leaftype to another
@@ -4229,9 +4238,15 @@ static bool emit_builtin_call(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
         const jl_cgval_t &tb = argv[2];
         if (jl_is_type_type(ta.typ) && !jl_has_free_typevars(ta.typ) &&
             jl_is_type_type(tb.typ) && !jl_has_free_typevars(tb.typ)) {
-            int issub = jl_subtype(jl_tparam0(ta.typ), jl_tparam0(tb.typ));
-            *ret = mark_julia_type(ctx, ConstantInt::get(getInt8Ty(ctx.builder.getContext()), issub), false, jl_bool_type);
-            return true;
+            jl_value_t *A = jl_tparam0(ta.typ), *B = jl_tparam0(tb.typ);
+            int issub = jl_subtype(A, B);
+            // a membership can flip this answer across worlds (compiler §4.8): keep the
+            // generic call, whose jl_subtype consults the entries per world
+            if (!(issub ? jl_subtype_via_membership(A, B)
+                        : jl_membership_flip_possible(A, B))) {
+                *ret = mark_julia_type(ctx, ConstantInt::get(getInt8Ty(ctx.builder.getContext()), issub), false, jl_bool_type);
+                return true;
+            }
         }
     }
 
