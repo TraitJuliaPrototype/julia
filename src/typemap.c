@@ -541,12 +541,26 @@ static int jl_typemap_intersection_node_visitor(jl_typemap_entry_t *ml, struct t
             penv = &closure->env;
         }
         closure->ti = jl_type_intersection_env_s(closure->type, (jl_value_t*)ml->sig, penv, &closure->issubty);
+        // the answer at a method at a set holds while the memberships the query's
+        // types can read stay as they are in this world: bound the walk's range by
+        // them, so a cache entry made later for this answer (by a task in an older
+        // world) is not used once a membership changes it. The declaration's
+        // stopgap lowers only the cache entries that existed when it ran.
+        // Bit-identical without open sets (a memoized bit).
+        if (jl_has_open_set_in((jl_value_t*)ml->sig)) {
+            size_t lo = closure->min_valid, hi = closure->max_valid;
+            if (jl_membership_world_range(closure->type, closure->world, &lo, &hi)) {
+                closure->min_valid = lo;
+                closure->max_valid = hi;
+            }
+        }
         if (closure->ti != (jl_value_t*)jl_bottom_type) {
             // In some corner cases type intersection is conservative and returns something
             // for intersect(A, B) even though A is a dispatch tuple and !(A <: B).
             // For dispatch purposes in such a case we know there's no match. This check
             // fixes issue #30394.
-            if (closure->issubty || !jl_is_dispatch_tupletype(closure->type))
+            int qualifies = closure->issubty || !jl_is_dispatch_tupletype(closure->type);
+            if (qualifies)
                 if (!fptr(ml, closure))
                     return 0;
         }
@@ -1423,6 +1437,22 @@ static void jl_typemap_level_insert_(
     }
     if (t1 == (jl_value_t*)jl_typeofbottom_type)
         t1 = (jl_value_t*)jl_assume(jl_typeofbottom_type)->super;
+    // a method at an open set (compiler §5.1): its entry stays in the linear list,
+    // which every walk visits — name1 probes key on the query's supertype chain,
+    // and a membership is not in any chain. One memoized bit read; false for every
+    // method when no set is open. This also holds when a list overflows
+    // MAX_METHLIST_COUNT and jl_method_convert_list_to_cache re-inserts every
+    // entry: open-set sigs are routed back to linear at the level they are reached,
+    // where every lookup that intersects the earlier positions arrives (assoc_exact
+    // and assoc_by_type walk linear after the name probes, before the any bucket;
+    // the intersection visitor and the any bucket always visit it). The only walks
+    // that return early without reaching a level's linear list are the subtype=0
+    // lookups, which reach only jl_method_table->defs — the builtin-only table
+    // where this bit is false, so their type-equality premise keeps holding.
+    if (jl_has_open_set((jl_value_t*)newrec->sig)) {
+        jl_typemap_list_insert_(map, &cache->linear, (jl_value_t*)cache, newrec);
+        return;
+    }
     // If the type at `offs` is Any, put it in the Any list
     if (t1 && jl_is_any(t1)) {
         jl_typemap_insert_generic(map, &cache->any, (jl_value_t*)cache, newrec, 0, offs+1, NULL);
