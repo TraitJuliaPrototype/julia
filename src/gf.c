@@ -532,6 +532,7 @@ jl_code_instance_t *jl_type_infer(jl_method_instance_t *mi, size_t world, uint8_
 JL_DLLEXPORT jl_code_info_t *jl_gdbcodetyped1(jl_method_instance_t *mi, size_t world)
 {
     jl_task_t *ct = jl_current_task;
+    jl_code_info_t *ci = NULL;
     int last_errno = errno;
 #ifdef _OS_WINDOWS_
     DWORD last_error = GetLastError();
@@ -543,32 +544,16 @@ JL_DLLEXPORT jl_code_info_t *jl_gdbcodetyped1(jl_method_instance_t *mi, size_t w
     size_t last_mq = jl_set_membership_query_world(world); // see jl_type_infer
     jl_value_t **fargs;
     JL_GC_PUSHARGS(fargs, 4);
-    // typeinf_code's throws survive this frame (StackOverflow): restore the query
-    // world and the frozen world before rethrowing, as jl_type_infer's catch-all
-    // restores around its apply.
-    JL_TRY {
-        jl_module_t *CC = (jl_module_t*)jl_get_global_value(jl_core_module, jl_symbol("Compiler"), ct->world_age);
-        if (CC != NULL && jl_is_module(CC)) {
-            JL_GC_PROMISE_ROOTED(CC);
-            fargs[0] = jl_get_global_value(CC, jl_symbol("NativeInterpreter"), ct->world_age);
-            fargs[1] = jl_box_ulong(world);
-            fargs[1] = jl_apply(fargs, 2);
-            fargs[0] = jl_get_global_value(CC, jl_symbol("typeinf_code"), ct->world_age);
-            fargs[2] = (jl_value_t*)mi;
-            fargs[3] = jl_true;
-            fargs[0] = jl_apply(fargs, 4); // the result stays rooted across the restore below
-        }
-    }
-    JL_CATCH {
-        jl_set_membership_query_world(last_mq);
-        ct->world_age = last_age;
-        ct->ptls->in_pure_callback = last_pure;
-#ifdef _OS_WINDOWS_
-        SetLastError(last_error);
-#endif
-        errno = last_errno;
-        JL_GC_POP();
-        jl_rethrow();
+    jl_module_t *CC = (jl_module_t*)jl_get_global_value(jl_core_module, jl_symbol("Compiler"), ct->world_age);
+    if (CC != NULL && jl_is_module(CC)) {
+        JL_GC_PROMISE_ROOTED(CC);
+        fargs[0] = jl_get_global_value(CC, jl_symbol("NativeInterpreter"), ct->world_age);
+        fargs[1] = jl_box_ulong(world);
+        fargs[1] = jl_apply(fargs, 2);
+        fargs[0] = jl_get_global_value(CC, jl_symbol("typeinf_code"), ct->world_age);
+        fargs[2] = (jl_value_t*)mi;
+        fargs[3] = jl_true;
+        ci = (jl_code_info_t*)jl_apply(fargs, 4);
     }
     jl_set_membership_query_world(last_mq);
     ct->world_age = last_age;
@@ -577,11 +562,11 @@ JL_DLLEXPORT jl_code_info_t *jl_gdbcodetyped1(jl_method_instance_t *mi, size_t w
     SetLastError(last_error);
 #endif
     errno = last_errno;
-    jl_value_t *result = fargs[0];
-    if (result && !jl_is_code_info(result))
-        result = NULL;
+    if (ci && !jl_is_code_info(ci)) {
+        ci = NULL;
+    }
     JL_GC_POP();
-    return (jl_code_info_t*)result;
+    return ci;
 }
 
 JL_DLLEXPORT jl_value_t *jl_call_in_typeinf_world(jl_value_t **args, int nargs)
@@ -589,26 +574,14 @@ JL_DLLEXPORT jl_value_t *jl_call_in_typeinf_world(jl_value_t **args, int nargs)
     jl_task_t *ct = jl_current_task;
     size_t last_age = ct->world_age;
     ct->world_age = jl_typeinf_world;
-    // the freeze point for the Julia-driven inference path (Base.code_typed, every
-    // Compiler._entry; compiler §4.11, see the ml_matches wrapper). Membership
-    // queries during the run answer at the caller's real world (last_age), not the
-    // frozen one; a query world already set by an enclosing region (jl_type_infer,
-    // a declaration) wins.
+    // the freeze point of the Julia-driven inference path (Base.code_typed, every
+    // Compiler._entry; compiler §4.11): membership questions during the run answer at the
+    // caller's real world (last_age), not the frozen one; a query world already set by an
+    // enclosing region (jl_type_infer, a declaration) wins
     size_t last_mq = jl_set_membership_query_world(jl_membership_query_world() ? jl_membership_query_world() : last_age);
     int last_pure = ct->ptls->in_pure_callback;
     ct->ptls->in_pure_callback = 0;
-    // an enclosing query world wins here (last_mq restates it), and a throw must
-    // not strand it (or the frozen jl_typeinf_world in ct->world_age) on this task.
-    jl_value_t *ret;
-    JL_TRY {
-        ret = jl_apply(args, nargs);
-    }
-    JL_CATCH {
-        ct->ptls->in_pure_callback = last_pure;
-        ct->world_age = last_age;
-        jl_set_membership_query_world(last_mq);
-        jl_rethrow();
-    }
+    jl_value_t *ret = jl_apply(args, nargs);
     ct->ptls->in_pure_callback = last_pure;
     ct->world_age = last_age;
     jl_set_membership_query_world(last_mq);
@@ -1205,33 +1178,20 @@ static jl_value_t *ml_matches_i(jl_methtable_t *mt, jl_methcache_t *mc,
                               int intersections, size_t world, int cache_result,
                               size_t *min_valid, size_t *max_valid, int *ambig);
 
-// The query world (compiler §4.11) for method matching: the task world is frozen at
-// jl_typeinf_world on the Julia-driven path Base.code_typed -> Base.invoke_in_world(w, ...)
-// -> jl_call_in_typeinf_world -> Compiler.typeinf_code, strictly below every runtime
-// entry, so the match's membership questions would see no members. ml_matches
-// always receives the query's world as an argument, so the whole match runs under it.
-// Nested calls save and restore. The nesting differs deliberately from
-// jl_call_in_typeinf_world's: here the world argument overrides whatever the
-// enclosing region set (it is the truth for these queries); there an enclosing
-// query world (jl_type_infer's, a declaration's) wins and the caller's task world
-// serves only when nothing is set. The run may throw (StackOverflow through
-// code_typed is routine) and survives: the query world must not outlive it, so it
-// is restored before rethrowing, as jl_type_infer's catch-all restores around its apply.
+// The query world (compiler §4.11) for method matching: on the Julia-driven path
+// Base.code_typed -> Base.invoke_in_world(w, ...) -> jl_call_in_typeinf_world ->
+// Compiler.typeinf_code the task world is frozen at jl_typeinf_world, strictly below every
+// runtime entry, so the match's membership questions would see no members. ml_matches always
+// receives the query's world as an argument, so the whole match runs in it. A throw restores
+// the task's query world in the handler that catches it, as it restores the world age.
 static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
                               jl_tupletype_t *type, int lim, int include_ambiguous,
                               int intersections, size_t world, int cache_result,
                               size_t *min_valid, size_t *max_valid, int *ambig)
 {
     size_t last_mq = jl_set_membership_query_world(world);
-    jl_value_t *r;
-    JL_TRY {
-        r = ml_matches_i(mt, mc, type, lim, include_ambiguous, intersections,
-                         world, cache_result, min_valid, max_valid, ambig);
-    }
-    JL_CATCH {
-        jl_set_membership_query_world(last_mq);
-        jl_rethrow();
-    }
+    jl_value_t *r = ml_matches_i(mt, mc, type, lim, include_ambiguous, intersections,
+                                 world, cache_result, min_valid, max_valid, ambig);
     jl_set_membership_query_world(last_mq);
     return r;
 }

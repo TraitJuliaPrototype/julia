@@ -2374,6 +2374,7 @@ struct _jl_handler_t {
     sig_atomic_t defer_signal;
     jl_timing_block_t *timing_stack;
     size_t world_age;
+    size_t membership_world;
 };
 
 #define JL_TASK_STATE_RUNNABLE 0
