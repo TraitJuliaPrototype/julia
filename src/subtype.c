@@ -538,6 +538,8 @@ static int obviously_in_union(jl_value_t *u, jl_value_t *x)
     return obviously_egal(u, x);
 }
 
+static int membership_may_reach(jl_datatype_t *x, jl_typename_t *yname);
+
 int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
 {
     if (a == b || a == (jl_value_t*)jl_any_type || b == (jl_value_t*)jl_any_type)
@@ -565,10 +567,15 @@ int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
                 while (temp != jl_any_type && temp->name != ad->name)
                     temp = temp->super;
                 if (temp == jl_any_type) {
-                    // a membership can relate a pair the chains do not
-                    // (compiler §4.5): not obviously disjoint
-                    if (ad->name->open_set || bd->name->open_set)
-                        return 0;
+                    // a membership can relate a pair the chains do not (compiler §4.5): not
+                    // obviously disjoint, unless one side is a concrete type no entry of whose
+                    // chain can reach the other, a set (subtyping's fast path for a non-member)
+                    if (bd->name->open_set)
+                        return !specificity && !ad->name->open_set && jl_is_concrete_type((jl_value_t*)ad) &&
+                               !membership_may_reach(ad, bd->name);
+                    if (ad->name->open_set)
+                        return !specificity && jl_is_concrete_type((jl_value_t*)bd) &&
+                               !membership_may_reach(bd, ad->name);
                     return 1;
                 }
                 bd = temp;
@@ -1575,6 +1582,33 @@ static int membership_range_visit(jl_value_t *t, size_t world, size_t *lo, size_
         }
     }
     return found;
+}
+
+// whether a type, a type inside it, or a type on one of their supertype chains holds membership
+// entries: without any, no membership can narrow the worlds of an answer about the type
+JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT
+{
+    if (t == NULL)
+        return 0;
+    if (jl_is_unionall(t)) {
+        jl_unionall_t *u = (jl_unionall_t*)t;
+        return jl_type_has_memberships(u->var->lb) || jl_type_has_memberships(u->var->ub) ||
+               jl_type_has_memberships(u->body);
+    }
+    if (jl_is_uniontype(t))
+        return jl_type_has_memberships(((jl_uniontype_t*)t)->a) ||
+               jl_type_has_memberships(((jl_uniontype_t*)t)->b);
+    if (jl_is_vararg(t))
+        return jl_type_has_memberships(((jl_vararg_t*)t)->T);
+    if (!jl_is_datatype(t))
+        return 0;
+    for (jl_datatype_t *d = (jl_datatype_t*)t; d != NULL && d != jl_any_type; d = d->super)
+        if (jl_svec_len(jl_typename_memberships(d->name)) != 0)
+            return 1;
+    for (size_t i = 0; i < jl_nparams(t); i++)
+        if (jl_type_has_memberships(jl_tparam(t, i)))
+            return 1;
+    return 0;
 }
 
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *lo, size_t *hi) JL_NOTSAFEPOINT
