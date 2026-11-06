@@ -448,6 +448,8 @@ extern jl_array_t *_jl_debug_method_invalidation JL_GLOBALLY_ROOTED;
 // collectors mark explicitly (JL_GLOBALLY_ROOTED is an annotation for the analyzer
 // only; marked alongside _jl_debug_method_invalidation)
 extern jl_array_t *open_set_methods JL_GLOBALLY_ROOTED;
+// the member hook (gf.c, compiler §10.4), rooted alongside it
+extern jl_value_t *jl_member_hook JL_GLOBALLY_ROOTED;
 JL_DLLEXPORT extern arraylist_t jl_linkage_blobs; // external linkage: sysimg/pkgimages
 JL_DLLEXPORT extern arraylist_t jl_image_relocs;  // external linkage: sysimg/pkgimages
 JL_DLLEXPORT extern arraylist_t jl_top_mods;  // external linkage: sysimg/pkgimages

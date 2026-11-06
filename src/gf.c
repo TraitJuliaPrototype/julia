@@ -5198,6 +5198,101 @@ void call_cache_stats()
 }
 #endif
 
+// The member hook (compiler §10.4): hook(T, X) checks the member T of a pattern's membership in
+// the set X at its first use. The library sets it; it is rooted for the collectors.
+jl_value_t *jl_member_hook JL_GLOBALLY_ROOTED = NULL;
+JL_DLLEXPORT void jl_set_member_hook(jl_value_t *hook)
+{
+    jl_member_hook = hook == jl_nothing ? NULL : hook;
+}
+
+// whether a type or a type on its supertype chain holds membership entries
+static int chain_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT
+{
+    if (!jl_is_datatype(t))
+        return 0;
+    for (jl_datatype_t *dt = (jl_datatype_t*)t; dt != jl_any_type; dt = dt->super)
+        if (jl_svec_len(jl_typename_memberships(dt->name)) != 0)
+            return 1;
+    return 0;
+}
+
+// After a failed check: lower the method-cache entries for these argument types that the check
+// itself may have made (its method matching caches), so the next call misses and asks the hook
+// again, which raises the kept failure.
+static void member_hook_uncache(jl_tupletype_t *tt)
+{
+    jl_methcache_t *mc = jl_method_table->cache;
+    size_t world = jl_atomic_load_acquire(&jl_world_counter);
+    JL_LOCK(&mc->writelock);
+    for (;;) {
+        jl_typemap_entry_t *entry = jl_mt_find_cache_entry(mc, (jl_datatype_t*)tt, world);
+        if (entry == NULL)
+            break;
+        jl_atomic_store_relaxed(&entry->max_world, world - 1);
+    }
+    JL_UNLOCK(&mc->writelock);
+}
+
+// At dispatch, before the instance lookup of a call that a method at a set serves: for each
+// argument at a position the method types by a set, and a member through a membership, the
+// library checks the member at its first use. The hook runs in the latest world with no lock
+// held, and may throw: then nothing is cached, and the next call asks it again (the library
+// keeps its answer, a failure too).
+static void member_hook_at_dispatch(jl_tupletype_t *tt, size_t world)
+{
+    size_t n = jl_nparams(tt);
+    int any = 0;
+    for (size_t i = 1; i < n && !any; i++)
+        any = chain_has_memberships(jl_tparam(tt, i));
+    if (!any)
+        return;
+    size_t min_valid = 0, max_valid = ~(size_t)0;
+    jl_method_match_t *matc = _gf_invoke_lookup((jl_value_t*)tt, jl_method_table, world, 0, &min_valid, &max_valid);
+    if (matc == NULL)
+        return;
+    jl_value_t **roots;
+    JL_GC_PUSHARGS(roots, 4);
+    roots[0] = (jl_value_t*)matc;
+    jl_value_t *sig = jl_unwrap_unionall((jl_value_t*)matc->method->sig);
+    size_t ns = jl_nparams(sig);
+    if (jl_has_open_set(sig) && ns > 0) {
+        for (size_t i = 1; i < n; i++) {
+            size_t j = i < ns ? i : ns - 1;
+            jl_value_t *p = jl_tparam(sig, j);
+            if (jl_is_vararg(p))
+                p = jl_unwrap_vararg(p);
+            else if (i >= ns)
+                break;
+            if (p == NULL)
+                continue;
+            if (jl_is_typevar(p))
+                p = ((jl_tvar_t*)p)->ub;
+            p = jl_unwrap_unionall(p);
+            if (!jl_is_datatype(p) || !((jl_datatype_t*)p)->name->open_set)
+                continue;
+            jl_value_t *a = jl_tparam(tt, i);
+            if (!chain_has_memberships(a))
+                continue; // a declared subtype, or no member at all
+            roots[1] = jl_member_hook;
+            roots[2] = a;
+            roots[3] = ((jl_datatype_t*)p)->name->wrapper;
+            jl_task_t *ct = jl_current_task;
+            size_t last_age = ct->world_age;
+            ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
+            JL_TRY {
+                jl_apply(&roots[1], 3);
+            }
+            JL_CATCH {
+                member_hook_uncache(tt);
+                jl_rethrow();
+            }
+            ct->world_age = last_age;
+        }
+    }
+    JL_GC_POP();
+}
+
 STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t **args, uint32_t nargs,
                                                        uint32_t callsite, size_t world)
 {
@@ -5320,6 +5415,8 @@ have_entry:
         // cache miss case
         dp_path = DP_FULL;
         jl_methcache_t *mc = jl_method_table->cache;
+        if (jl_member_hook != NULL)
+            member_hook_at_dispatch(tt, world);
         mfunc = jl_mt_assoc_by_type(jl_method_table, mc, tt, world);
         if (jl_options.malloc_log)
             jl_gc_sync_total_bytes(last_alloc); // discard allocation count from compilation
