@@ -1114,31 +1114,34 @@ static int forall_exists_equal(jl_value_t *x, jl_value_t *y, jl_stenv_t *e);
 // type's parameters do: invariant, with `X{<:T}` and `X{>:T}` given by the
 // variables of the right-hand side.
 
-// The world membership questions answer in. C-driven contexts whose task world is
-// frozen below the entries (inference) set a per-thread override for the length
-// of a query (the audit's A4: W-99 carries the world in the query instead). With
-// no task (0), a query sees every entry.
-static __thread size_t jl_mq_world = 0;
+// The world membership questions answer in (compiler §4.11): the task's query world, set for the
+// length of a query by the contexts whose task world is frozen below the entries (inference,
+// method matching, a declaration) and restored by exception handlers as the world age is; else
+// the task's world age. With no task (0), a query sees every entry.
 
-// set the override, returning the previous value for the caller to restore
+// set the task's query world, returning the previous value for the caller to restore
 JL_DLLEXPORT size_t jl_set_membership_query_world(size_t world) JL_NOTSAFEPOINT
 {
-    size_t last = jl_mq_world;
-    jl_mq_world = world;
+    jl_task_t *ct = jl_get_current_task();
+    if (ct == NULL)
+        return 0;
+    size_t last = ct->membership_world;
+    ct->membership_world = world;
     return last;
 }
 
-// the override (0: unset)
+// the task's query world (0: unset)
 JL_DLLEXPORT size_t jl_membership_query_world(void) JL_NOTSAFEPOINT
 {
-    return jl_mq_world;
+    jl_task_t *ct = jl_get_current_task();
+    return ct ? ct->membership_world : 0;
 }
 
 static size_t jl_membership_world(void) JL_NOTSAFEPOINT
 {
-    if (jl_mq_world)
-        return jl_mq_world;
     jl_task_t *ct = jl_get_current_task();
+    if (ct && ct->membership_world)
+        return ct->membership_world;
     return ct ? ct->world_age : 0;
 }
 
