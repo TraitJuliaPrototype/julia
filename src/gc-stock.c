@@ -2909,6 +2909,8 @@ static void gc_mark_roots(jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT
     gc_heap_snapshot_record_gc_roots((jl_value_t*)_jl_debug_method_invalidation, "debug_method_invalidation");
     gc_try_claim_and_push(mq, open_set_methods, NULL); // the set->methods index (gf.c)
     gc_heap_snapshot_record_gc_roots((jl_value_t*)open_set_methods, "open_set_methods");
+    gc_try_claim_and_push(mq, jl_member_hook, NULL); // the member hook (gf.c)
+    gc_heap_snapshot_record_gc_roots(jl_member_hook, "member_hook");
     // constants
     gc_try_claim_and_push(mq, jl_emptytuple_type, NULL);
     gc_heap_snapshot_record_gc_roots((jl_value_t*)jl_emptytuple_type, "emptytuple_type");
