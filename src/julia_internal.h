@@ -934,6 +934,7 @@ JL_DLLEXPORT size_t jl_membership_query_world(void) JL_NOTSAFEPOINT;
 // the world range over which the memberships a question about t can read are what
 // they are in `world`; returns whether t reaches any entry (*lo/*hi untouched if not)
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *lo, size_t *hi) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
 // dispatch at a declaration (gf.c; compiler §5.4, §5.5): replay "insert m with the
 // member substituted" for every method m at the set or a set the member joins, and
 // report the ambiguities the member's set-join creates. Call under
