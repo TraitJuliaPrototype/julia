@@ -6271,21 +6271,94 @@ static jl_value_t *ml_matches_i(jl_methtable_t *mt, jl_methcache_t *mc,
 // own dispatch raises it at the call; we warn now, at the declaration, where the
 // whole picture exists. WARN-ONLY contract (W4-10): this runs under
 // world_counter_lock — nothing here may throw; jl_printf/jl_static_show only.
-static void membership_ambig_warn(jl_methtable_t *mt, jl_value_t *X, jl_value_t *Y,
-                                  jl_value_t *member)
+static void membership_ambig_warn(jl_method_t *m, jl_value_t *X, jl_value_t *Y,
+                                  jl_value_t *member, jl_value_t *joint)
 {
-    jl_printf(JL_STDERR, "WARNING: method ");
-    if (mt && mt->name)
-        jl_printf(JL_STDERR, "%s", jl_symbol_name(mt->name));
-    else
-        jl_printf(JL_STDERR, "<unknown>");
+    jl_printf(JL_STDERR, "WARNING: method %s", jl_symbol_name(m->name));
     jl_printf(JL_STDERR, " at ");
     jl_static_show(JL_STDERR, X);
     jl_printf(JL_STDERR, " and ");
     jl_static_show(JL_STDERR, Y);
     jl_printf(JL_STDERR, " is ambiguous for ");
     jl_static_show(JL_STDERR, member);
-    jl_printf(JL_STDERR, ", a member of both sets\n");
+    jl_printf(JL_STDERR, ", a member of both sets");
+    if (joint) {
+        jl_printf(JL_STDERR, "; a method at ");
+        jl_static_show(JL_STDERR, joint);
+        jl_printf(JL_STDERR, " would resolve it");
+    }
+    jl_printf(JL_STDERR, "\n");
+}
+
+// `sig` with `member` in place of each argument typed by an instance of the set `tn`, also
+// inside a Vararg; NULL where no argument is. The method's other arguments stay as they are,
+// so the query has the method's own arity (compiler §5.4).
+static jl_value_t *sig_at_member(jl_value_t *sig, jl_typename_t *tn, jl_value_t *member)
+{
+    jl_value_t *body = jl_unwrap_unionall(sig);
+    if (!jl_is_tuple_type(body))
+        return NULL;
+    size_t n = jl_nparams((jl_datatype_t*)body);
+    jl_svec_t *ps = NULL;
+    jl_value_t *res = NULL;
+    JL_GC_PUSH2(&ps, &res);
+    ps = jl_svec_copy(((jl_datatype_t*)body)->parameters);
+    int any = 0;
+    for (size_t i = 1; i < n; i++) {
+        jl_value_t *p = jl_svecref(ps, i);
+        if (jl_is_vararg(p)) {
+            jl_vararg_t *va = (jl_vararg_t*)p;
+            jl_value_t *t = va->T ? jl_unwrap_unionall(va->T) : NULL;
+            if (t && jl_is_datatype(t) && ((jl_datatype_t*)t)->name == tn) {
+                res = (jl_value_t*)jl_wrap_vararg(member, va->N, 1, 0);
+                jl_svecset(ps, i, res);
+                any = 1;
+            }
+            continue;
+        }
+        jl_value_t *pu = jl_unwrap_unionall(p);
+        if (jl_is_datatype(pu) && ((jl_datatype_t*)pu)->name == tn) {
+            jl_svecset(ps, i, member);
+            any = 1;
+        }
+    }
+    res = NULL;
+    if (any) {
+        res = (jl_value_t*)jl_apply_tuple_type(ps, 1);
+        res = jl_rewrap_unionall(res, sig);
+    }
+    JL_GC_POP();
+    return res;
+}
+
+// whether mX and mY are ambiguous at the call types `q` (the member in place of their sets):
+// Base.isambiguous's rule, at q. Both match q, neither is more specific than the other, and no
+// matching method more specific than both covers q.
+static int ambiguous_at(jl_methtable_t *mt, jl_method_t *mX, jl_method_t *mY, jl_value_t *q, size_t world)
+{
+    if (jl_method_morespecific(mX, mY) || jl_method_morespecific(mY, mX))
+        return 0;
+    size_t min_valid = 1, max_valid = ~(size_t)0;
+    int ambig = 0;
+    jl_value_t *res = ml_matches(mt, jl_method_table->cache, (jl_tupletype_t*)q, -1, 1, 1,
+                                 world, 0, &min_valid, &max_valid, &ambig);
+    if (!jl_is_array(res))
+        return 0;
+    JL_GC_PUSH1(&res);
+    int hasX = 0, hasY = 0, dominated = 0;
+    size_t l = jl_array_nrows((jl_array_t*)res);
+    for (size_t i = 0; i < l; i++) {
+        jl_method_t *m = ((jl_method_match_t*)jl_array_ptr_ref((jl_array_t*)res, i))->method;
+        if (m == mX)
+            hasX = 1;
+        else if (m == mY)
+            hasY = 1;
+        else if (jl_method_morespecific(m, mX) && jl_method_morespecific(m, mY) &&
+                 jl_subtype(q, (jl_value_t*)m->sig))
+            dominated = 1;
+    }
+    JL_GC_POP();
+    return hasX && hasY && !dominated;
 }
 
 JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t *set_instance,
@@ -6298,9 +6371,10 @@ JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t 
     if (!jl_is_datatype(member_core))
         return;
     jl_typename_t *mtn = ((jl_datatype_t*)member_core)->name;
-    // gc slots: 0 sets, 1 listX, 2 listY, 3 qsig (values held directly, see PUSHARGS)
+    // gc slots: 0 sets, 1 listX, 2 listY, 3 and 4 the query's parts, 5 the functions warned
+    // for the current pair of sets (values held directly)
     jl_value_t **gc;
-    JL_GC_PUSHARGS(gc, 4);
+    JL_GC_PUSHARGS(gc, 6);
     // sets = every set the member joins (§1's lists on the member's TypeName):
     // an entry (M, X) with member ⊆ M witnesses member ⊆ M ⊆ X. The svec stays
     // rooted through mtn across the allocations below (review sweep 7).
@@ -6344,8 +6418,9 @@ JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t 
                 gc[1] = gc[2] = NULL;
                 continue;
             }
-            int done = 0;
-            for (size_t x = 0; x < jl_array_nrows(listX) && !done; x++) {
+            // one warning per function and pair of sets
+            jl_array_t *warned = (jl_array_t*)(gc[5] = (jl_value_t*)jl_alloc_vec_any(0));
+            for (size_t x = 0; x < jl_array_nrows(listX); x++) {
                 jl_method_t *mX = (jl_method_t*)jl_array_ptr_ref(listX, x);
                 jl_methtable_t *mtX = jl_method_get_table(mX);
                 if (!jl_is_mtable(mtX))
@@ -6353,38 +6428,36 @@ JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t 
                 jl_value_t *mbX = jl_unwrap_unionall((jl_value_t*)mX->sig);
                 if (!jl_is_tuple_type(mbX) || jl_nparams((jl_datatype_t*)mbX) == 0)
                     continue;
-                for (size_t y = 0; y < jl_array_nrows(listY) && !done; y++) {
+                jl_value_t *fX = jl_tparam0((jl_datatype_t*)mbX); // the function's type
+                for (size_t y = 0; y < jl_array_nrows(listY); y++) {
                     jl_method_t *mY = (jl_method_t*)jl_array_ptr_ref(listY, y);
-                    if (jl_method_get_table(mY) != mtX)
+                    if (mY == mX || jl_method_get_table(mY) != mtX)
                         continue;
-                    done = 1; // warn once per (mt, X, Y)
+                    jl_value_t *mbY = jl_unwrap_unionall((jl_value_t*)mY->sig);
+                    if (!jl_is_tuple_type(mbY) || jl_nparams((jl_datatype_t*)mbY) == 0 ||
+                        !jl_egal(jl_tparam0((jl_datatype_t*)mbY), fX))
+                        continue; // another function
+                    int seen = 0;
+                    for (size_t w = 0; w < jl_array_nrows(warned) && !seen; w++)
+                        seen = jl_egal(jl_array_ptr_ref(warned, w), fX);
+                    if (seen)
+                        continue;
                     if (concrete) {
-                        // the authoritative query — the same predicate dispatch
-                        // itself uses, incl. the method-on-both and set-in-set
-                        // suppressions. world=entry_min_world — the single-bump
-                        // protocol has published the counter to min before the
-                        // report, so ml_matches' future guard (world > counter)
-                        // passes at equality (a world above the counter would
-                        // make it answer jl_nothing — a silently empty report);
-                        // cache_result=0 (the report must not leave a leaf entry
-                        // that stamps METHOD_SIG_LATEST_ONLY for §6 to trip on).
-                        // jl_nothing or an empty result means
-                        // the declaration resolves to no entry at the member.
-                        jl_svec_t *qp = jl_alloc_svec(2);
-                        gc[3] = (jl_value_t*)qp;
-                        jl_svecset(qp, 0, jl_tparam((jl_datatype_t*)mbX, 0));
-                        jl_svecset(qp, 1, member);
-                        gc[3] = (jl_value_t*)jl_apply_tuple_type(qp, 0);
-                        size_t min_valid = 1, max_valid = 0;
-                        int ambig = 0;
-                        jl_value_t *res = ml_matches(mtX, jl_method_table->cache,
-                                                     (jl_tupletype_t*)gc[3], -1, 1, 1,
-                                                     entry_min_world, 0, &min_valid, &max_valid, &ambig);
-                        if (res == jl_nothing ||
-                            (jl_is_array(res) && jl_array_nrows((jl_array_t*)res) == 0) ||
-                            ambig)
-                            membership_ambig_warn(mtX, X, Y, member);
-                        gc[3] = NULL;
+                        // the call types at which both methods apply to the member: each method's
+                        // signature with the member in place of its set, intersected (compiler §5.4).
+                        // Empty: no call reaches both. Else Base.isambiguous's rule at those types, in
+                        // the entry's world (the counter is published to it before the report).
+                        gc[3] = sig_at_member((jl_value_t*)mX->sig, tnX, member);
+                        gc[4] = sig_at_member((jl_value_t*)mY->sig, tnY, member);
+                        if (gc[3] != NULL && gc[4] != NULL) {
+                            gc[3] = jl_type_intersection(gc[3], gc[4]);
+                            if (gc[3] != jl_bottom_type &&
+                                ambiguous_at(mtX, mX, mY, gc[3], entry_min_world)) {
+                                membership_ambig_warn(mX, X, Y, member, gc[3]);
+                                jl_array_ptr_1d_push(warned, fX);
+                            }
+                        }
+                        gc[3] = gc[4] = NULL;
                     }
                     else {
                         // abstract/parametric member: no instance to ask. Suppress
@@ -6430,13 +6503,14 @@ JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t 
                             gc[3] = NULL;
                             JL_UNLOCK(&open_set_methods_lock);
                         }
-                        if (!suppressed)
-                            membership_ambig_warn(mtX, X, Y, member);
+                        if (!suppressed) {
+                            membership_ambig_warn(mX, X, Y, member, NULL);
+                            jl_array_ptr_1d_push(warned, fX);
+                        }
                     }
                 }
             }
-            gc[1] = NULL;
-            gc[2] = NULL;
+            gc[1] = gc[2] = gc[5] = NULL;
         }
     }
     JL_GC_POP();
