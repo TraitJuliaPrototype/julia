@@ -2112,6 +2112,8 @@ JL_CALLABLE(jl_f__primitivetype)
     return dt->name->wrapper;
 }
 
+static void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super);
+
 static void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super)
 {
     const char *error = NULL;
@@ -2131,6 +2133,11 @@ static void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super)
         error = "cannot add subtypes to Core.Builtin";
     else if (!jl_is_abstracttype(super))
         error = "can only subtype abstract types";
+    else if (tt->name->open_set && super != (jl_value_t*)jl_any_type &&
+             !((jl_datatype_t*)super)->name->open_set)
+        // a member of the set is then a subtype of super: a closed type's
+        // answers would change with memberships (compiler §4.1)
+        error = "a set's supertype must be Any or a set";
     if (error)
          jl_errorf("invalid subtyping in definition of %s: %s.", jl_symbol_name(tt->name->name), error);
     tt->super = (jl_datatype_t*)super;
@@ -2588,6 +2595,7 @@ void jl_init_primitives(void) JL_GC_DISABLED
             continue;
         jl_sym_t *sname = jl_symbol(jl_builtin_names[i]);
         jl_value_t *builtin = jl_new_generic_function_with_supertype(sname, jl_core_module, jl_builtin_type, 0);
+        ((jl_datatype_t*)jl_typeof(builtin))->name->never_member = 1; // compiler §4.1: never_member
         jl_set_initial_const(jl_core_module, sname, builtin, 0);
         jl_mk_builtin_func((jl_datatype_t*)jl_typeof(builtin), sname, jl_builtin_f_addrs[i]);
         jl_builtin_instances[i] = builtin;
@@ -2601,6 +2609,7 @@ void jl_init_primitives(void) JL_GC_DISABLED
     add_builtin("Nothing", (jl_value_t*)jl_nothing_type);
     add_builtin("nothing", (jl_value_t*)jl_nothing);
     add_builtin("TypeName", (jl_value_t*)jl_typename_type);
+    add_builtin("MembershipEntry", (jl_value_t*)jl_membership_type);
     add_builtin("DataType", (jl_value_t*)jl_datatype_type);
     add_builtin("TypeVar", (jl_value_t*)jl_tvar_type);
     add_builtin("UnionAll", (jl_value_t*)jl_unionall_type);

@@ -83,6 +83,8 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     tn->names = NULL;
     tn->hash = bitmix(bitmix(module ? module->build_id.lo : 0, name->hash), 0xa1ada1da);
     tn->_unused = 0;
+    tn->open_set = 0;
+    tn->never_member = 0;
     tn->abstract = abstract;
     tn->mutabl = mutabl;
     tn->mayinlinealloc = 0;
@@ -94,7 +96,245 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     jl_atomic_store_relaxed(&tn->cache_entry_count, 0);
     tn->constprop_heustic = 0;
     tn->concrete_only = 0;
+    jl_atomic_store_relaxed(&tn->memberships, jl_emptysvec);
+    jl_atomic_store_relaxed(&tn->contract, NULL);
     return tn;
+}
+
+// Sets and memberships (compiler §4) -------------------------------------------
+
+// Whether an open set occurs in v: as the type, a parameter, a union component or
+// a bound (compiler §4.8). A DataType's bit is final from its construction, since a
+// set is open from its declaration (§4.1), so the recursion stops there.
+static int open_set_witness(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    jl_value_t *uw = jl_is_unionall(v) ? jl_unwrap_unionall(v) : v;
+    if (jl_is_vararg(uw))
+        uw = ((jl_vararg_t*)uw)->T;
+    if (uw == NULL)
+        return 0;
+    if (jl_is_datatype(uw))
+        return ((jl_datatype_t*)uw)->has_open_set;
+    if (jl_is_uniontype(uw))
+        return open_set_witness(((jl_uniontype_t*)uw)->a) ||
+               open_set_witness(((jl_uniontype_t*)uw)->b);
+    if (jl_is_typevar(uw))
+        return open_set_witness(((jl_tvar_t*)uw)->ub);
+    return 0;
+}
+
+int jl_has_open_set_in(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    return open_set_witness(v);
+}
+
+extern _Atomic(int) allow_new_worlds; // gf.c
+
+// The TypeName an entry for this member pattern lives on: S's for a type value's
+// pattern Type{S} (compiler §4.10), else the pattern's own.
+static jl_typename_t *membership_home(jl_datatype_t *pattern)
+{
+    if (pattern->name == jl_type_typename && jl_nparams(pattern) == 1) {
+        jl_value_t *s = jl_unwrap_unionall(jl_tparam0(pattern));
+        if (jl_is_datatype(s))
+            return ((jl_datatype_t*)s)->name;
+        jl_error("a membership of a type value names its type: Type{S}");
+    }
+    return pattern->name;
+}
+
+// whether `v` names a type variable that is not one of the UnionAll variables of
+// `pattern` (an entry's instance shares the pattern's variables, compiler §4.2)
+static int names_foreign_var(jl_value_t *v, jl_value_t *pattern)
+{
+    jl_array_t *free = jl_find_free_typevars(v);
+    int foreign = 0;
+    JL_GC_PUSH1(&free);
+    for (size_t i = 0; i < jl_array_nrows(free) && !foreign; i++) {
+        jl_value_t *tv = jl_array_ptr_ref(free, i);
+        jl_value_t *p = pattern;
+        foreign = 1;
+        while (jl_is_unionall(p)) {
+            if ((jl_value_t*)((jl_unionall_t*)p)->var == tv) {
+                foreign = 0;
+                break;
+            }
+            p = ((jl_unionall_t*)p)->body;
+        }
+    }
+    JL_GC_POP();
+    return foreign;
+}
+
+// publish one entry onto `tn`, copy-on-write: readers take no lock and filter by
+// the entry's world range, so it stays invisible until the caller publishes `world`
+static jl_value_t *publish_entry(jl_typename_t *tn, jl_typename_t *setname, jl_value_t *member,
+                                 jl_value_t *set_instance, jl_value_t *declarer, jl_value_t *by,
+                                 jl_value_t *receiver, size_t world)
+{
+    jl_value_t *entry_v = jl_gc_alloc(jl_current_task->ptls, sizeof(jl_membership_t),
+                                      jl_membership_type);
+    jl_value_t *nd = NULL;
+    JL_GC_PUSH2(&entry_v, &nd);
+    jl_membership_t *entry = (jl_membership_t*)entry_v;
+    entry->set = setname;
+    entry->member = member;
+    entry->instance = set_instance;
+    entry->receiver = receiver;
+    entry->min_world = world;
+    jl_atomic_store_relaxed(&entry->max_world, ~(uint64_t)0);
+    entry->declarer = declarer;
+    entry->by = by;
+    jl_svec_t *old = jl_typename_memberships(tn);
+    nd = (jl_value_t*)jl_alloc_svec_uninit(jl_svec_len(old) + 1);
+    jl_svec_t *newsvec = (jl_svec_t*)nd;
+    for (size_t i = 0; i < jl_svec_len(old); i++)
+        jl_svecset(newsvec, i, jl_svecref(old, i));
+    jl_svecset(newsvec, jl_svec_len(old), entry_v);
+    jl_atomic_store_release(&tn->memberships, newsvec);
+    jl_gc_wb(tn, newsvec);
+    JL_GC_POP();
+    return entry_v;
+}
+
+// Declare `member` a member of the set `set_instance` names (compiler §4.2-§4.6).
+// The library checks ownership and the contract first; the runtime checks what
+// keeps subtyping sound: an open set, no cycle among sets, one instance per member.
+JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *set_instance,
+                                               jl_value_t *declarer, jl_value_t *by,
+                                               jl_value_t *receiver)
+{
+    if (!jl_is_type(member))
+        jl_error("a membership's member must be a type");
+    if (!jl_is_type(set_instance))
+        jl_error("a membership's set must be a type");
+    jl_value_t *pattern = jl_unwrap_unionall(member);
+    if (!jl_is_datatype(pattern))
+        jl_error("a membership's member must be a DataType, or a UnionAll over one");
+    jl_value_t *setuw = jl_unwrap_unionall(set_instance);
+    if (!jl_is_datatype(setuw))
+        jl_error("a membership's set must be a DataType, or a UnionAll over one");
+    jl_typename_t *setname = ((jl_datatype_t*)setuw)->name;
+    jl_typename_t *home = membership_home((jl_datatype_t*)pattern);
+    if (home->never_member || ((jl_datatype_t*)pattern)->name->never_member)
+        jl_errorf("%s can never be a member of a set", jl_symbol_name(home->name));
+    if (!setname->open_set)
+        jl_errorf("%s is not an open set", jl_symbol_name(setname->name));
+    if (home == setname)
+        jl_error("a set is not a member of itself");
+    if (!jl_is_symbol(receiver) || (receiver != (jl_value_t*)jl_symbol("self") &&
+                                    receiver != (jl_value_t*)jl_symbol("field") &&
+                                    receiver != (jl_value_t*)jl_symbol("none")))
+        jl_error("a membership's receiver is :self, :field or :none");
+    if ((receiver == (jl_value_t*)jl_symbol("field")) != jl_is_symbol(by))
+        jl_error("a membership's receiver is :field exactly when it names a forwarding field");
+    if (!jl_is_symbol(by) && by != jl_nothing)
+        jl_error("a membership's forwarding field is a Symbol or nothing");
+    if (names_foreign_var(set_instance, member))
+        jl_error("a membership's set instance names a type variable its member pattern does not");
+    JL_LOCK(&world_counter_lock);
+    if (!jl_atomic_load_relaxed(&allow_new_worlds)) {
+        JL_UNLOCK(&world_counter_lock);
+        jl_error("Membership changes have been disabled via a call to disable_new_worlds.");
+    }
+    size_t world = jl_atomic_load_relaxed(&jl_world_counter);
+    // a membership that would close a cycle among sets would make them equal: refused,
+    // by a walk over every path (compiler §4.4)
+    if (home->open_set && jl_typename_reaches(setname, home, world)) {
+        JL_UNLOCK(&world_counter_lock);
+        jl_errorf("the membership %s <: %s would close a cycle among sets",
+                  jl_symbol_name(home->name), jl_symbol_name(setname->name));
+    }
+    // one instance per member (compiler §4.6), exactly for a concrete member: a member
+    // of the set already must be a member of this instance, and then this is a
+    // redeclaration. A pattern is not checked yet (compiler C-27).
+    int redeclare = 0;
+    if (jl_is_concrete_type(member)) {
+        size_t mq = jl_set_membership_query_world(world);
+        int in_set = jl_subtype(member, setname->wrapper);
+        int in_instance = in_set && jl_subtype(member, set_instance);
+        jl_set_membership_query_world(mq);
+        if (in_set && !in_instance) {
+            JL_UNLOCK(&world_counter_lock);
+            jl_errorf("%s is a member of %s at another instance already",
+                      jl_symbol_name(home->name), jl_symbol_name(setname->name));
+        }
+        redeclare = in_instance;
+    }
+    size_t min_world = world + 1;
+    jl_value_t *entry = NULL;
+    JL_GC_PUSH1(&entry);
+    if (redeclare) {
+        // the old entry of the same pattern ends where the new one begins (§4.3)
+        jl_svec_t *list = jl_typename_memberships(home);
+        for (size_t i = 0; i < jl_svec_len(list); i++) {
+            jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
+            if (en->set == setname && jl_atomic_load_relaxed(&en->max_world) == ~(uint64_t)0 &&
+                jl_types_equal(en->member, member))
+                jl_atomic_store_release(&en->max_world, world);
+        }
+    }
+    entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world);
+    jl_atomic_store_release(&jl_world_counter, min_world);
+    JL_UNLOCK(&world_counter_lock);
+    JL_GC_POP();
+    return entry;
+}
+
+// Open a set (the library's @trait), before its binding is published: then no
+// other type can name it yet, and every type's has_open_set bit is right when it
+// is built (compiler §4.1). Does not advance the world.
+JL_DLLEXPORT void jl_set_open_set(jl_value_t *T)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->abstract)
+        jl_error("only an abstract type can be a set");
+    jl_datatype_t *dt = (jl_datatype_t*)uw;
+    jl_typename_t *tn = dt->name;
+    if (tn->never_member)
+        jl_error("Core's kinds cannot be sets");
+    if (tn->open_set)
+        return;
+    if (tn->module != NULL && jl_get_global(tn->module, tn->name) == tn->wrapper)
+        jl_errorf("%s is published already: a set is open from its declaration", jl_symbol_name(tn->name));
+    tn->open_set = 1;
+    dt->has_open_set = 1;
+    jl_svec_t *cache = jl_atomic_load_relaxed(&tn->cache);
+    for (size_t i = 0; i < jl_svec_len(cache); i++) {
+        jl_value_t *t = jl_svecref(cache, i);
+        if (jl_is_datatype(t))
+            ((jl_datatype_t*)t)->has_open_set = 1;
+    }
+    jl_svec_t *linear = jl_atomic_load_relaxed(&tn->linearcache);
+    for (size_t i = 0; i < jl_svec_len(linear); i++) {
+        jl_value_t *t = jl_svecref(linear, i);
+        if (jl_is_datatype(t))
+            ((jl_datatype_t*)t)->has_open_set = 1;
+    }
+}
+
+// Write a set's contract (compiler §4.1), once.
+JL_DLLEXPORT void jl_set_contract(jl_value_t *T, jl_value_t *contract)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->open_set)
+        jl_error("only a set has a contract");
+    jl_typename_t *tn = ((jl_datatype_t*)uw)->name;
+    jl_value_t *expected = NULL;
+    if (!jl_atomic_cmpswap(&tn->contract, &expected, contract))
+        jl_errorf("the contract of %s is written once", jl_symbol_name(tn->name));
+    jl_gc_wb(tn, contract);
+}
+
+JL_DLLEXPORT int jl_is_open_set(jl_value_t *T)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    return jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->open_set;
+}
+
+JL_DLLEXPORT int jl_has_open_set(jl_value_t *v)
+{
+    return jl_has_open_set_in(v);
 }
 
 // allocating DataTypes -----------------------------------------------------------
@@ -117,6 +357,7 @@ jl_datatype_t *jl_new_uninitialized_datatype(void)
     t->zeroinit = 0;
     t->has_concrete_subtype = 1;
     t->maybe_subtype_of_cache = 1;
+    t->has_open_set = 0;
     t->ismutationfree = 0;
     t->isidentityfree = 0;
     t->smalltag = 0;

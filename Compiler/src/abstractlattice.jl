@@ -109,7 +109,15 @@ function tmeet end
 
 function tmeet(::JLTypeLattice, @nospecialize(a::Type), @nospecialize(b::Type))
     ti = typeintersect(a, b)
-    valid_as_lattice(ti, true) || return Bottom
+    if ti === Bottom && negative_fold_blocked(a, b)
+        # the empty meet is a negative: refuse it (the join instead — wide but
+        # live) when a later world could inhabit the pair (compiler §4.8). Bottom is a
+        # valid lattice element, so this is the actual empty-meet test
+        return tmerge(JLTypeLattice(), a, b)
+    end
+    if !valid_as_lattice(ti, true)
+        return Bottom
+    end
     return ti
 end
 

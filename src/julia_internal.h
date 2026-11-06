@@ -895,6 +895,43 @@ JL_DLLEXPORT jl_value_t *jl_nth_union_component(jl_value_t *v JL_PROPAGATES_ROOT
 int jl_find_union_component(jl_value_t *haystack, jl_value_t *needle, unsigned *nth) JL_NOTSAFEPOINT;
 jl_datatype_t *jl_new_abstracttype(jl_value_t *name, jl_module_t *module,
                                    jl_datatype_t *super, jl_svec_t *parameters);
+// sets and memberships (compiler §4): entries (jl_membership_type, Core's) live on
+// the member's TypeName, published copy-on-write; an entry for a type value
+// (member pattern Type{S}) lives on S's TypeName.
+#define jl_typename_memberships(tn) jl_atomic_load_acquire(&(tn)->memberships)
+// declares `member` (a DataType, a UnionAll member pattern, Type{S}, or a set
+// instance) to be a member of the set named by set_instance (X, or an instance
+// X{...} sharing the pattern's variables). declarer is a Module; by the forwarding
+// field's name or nothing; receiver :self, :field or :none. Under the world counter's
+// lock: stamps min_world = counter + 1, publishes, advances the counter, replays
+// dispatch (the stopgap). The caller follows it with Expr(:latestworld).
+JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *set_instance,
+                                               jl_value_t *declarer, jl_value_t *by,
+                                               jl_value_t *receiver);
+int jl_has_open_set_in(jl_value_t *v) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_has_open_set(jl_value_t *v);
+JL_DLLEXPORT int jl_is_open_set(jl_value_t *T);
+JL_DLLEXPORT void jl_set_open_set(jl_value_t *T);
+JL_DLLEXPORT void jl_set_contract(jl_value_t *T, jl_value_t *contract);
+JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X);
+JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X);
+// x <: y at an explicit world
+int jl_membership_holds_at(jl_value_t *x, jl_value_t *y, size_t world);
+// whether the TypeName `from` reaches `to` along declared supertypes and the entries
+// live in `world` (0: every entry)
+int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world);
+JL_DLLEXPORT int jl_membership_flip_possible(jl_value_t *a, jl_value_t *b);
+// the query-world override for C-driven subtyping contexts (inference, the
+// declaration-time walks), whose task world is frozen below the runtime entries.
+// Set it (the call returns the previous value) for the query region; 0 clears it.
+// (compiler §4.11)
+JL_DLLEXPORT size_t jl_set_membership_query_world(size_t world) JL_NOTSAFEPOINT;
+JL_DLLEXPORT size_t jl_membership_query_world(void) JL_NOTSAFEPOINT;
+// subtyping by declared supertypes and parameters alone, for normal forms (compiler §4.9)
+JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b);
+// the world range over which the memberships a question about t can read are what
+// they are in `world`; returns whether t reaches any entry (*lo/*hi untouched if not)
+JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *lo, size_t *hi) JL_NOTSAFEPOINT;
 jl_datatype_t *jl_new_uninitialized_datatype(void);
 void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable);
 JL_DLLEXPORT jl_datatype_t *jl_wrap_Type(jl_value_t *t);  // x -> Type{x}
