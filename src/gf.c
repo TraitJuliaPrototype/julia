@@ -4287,6 +4287,148 @@ STATIC_INLINE int sig_match_fast(jl_value_t *arg1t, jl_value_t **args, jl_value_
 
 _Atomic(jl_typemap_entry_t*) call_cache[N_CALL_CACHE] JL_GLOBALLY_ROOTED;
 static _Atomic(uint8_t) pick_which[N_CALL_CACHE];
+
+// ---- a dispatch profiler (JULIA_DISPATCH_PROFILE=1) ----
+// Counts dynamic calls per callee method and per the path their lookup took (the per-call-site
+// cache, the leaf cache, the method cache's search, the full lookup), and per call site (the
+// calling code by its return address). Printed at exit, the most-called first;
+// `ccall(:jl_dispatch_profile_reset, Cvoid, ())` zeroes the counts, to profile one region of a run.
+// A tool for finding hot dynamic calls, off by default: one load and a branch per call.
+#define DP_SLOTS 4096
+#define DP_SITES 16384
+enum { DP_SITE = 0, DP_LEAF = 1, DP_ASSOC = 2, DP_FULL = 3 };
+typedef struct { _Atomic(jl_method_t*) m; _Atomic(uint64_t) n[4]; } dp_slot_t;
+typedef struct { _Atomic(void*) ip; _Atomic(jl_method_t*) m; _Atomic(uint64_t) n; } dp_site_t;
+static dp_slot_t dp_table[DP_SLOTS];
+static dp_site_t dp_sites[DP_SITES];
+static int dp_on = -1;
+static _Thread_local void *dp_ip = NULL;          // the dynamic call's return address (jl_apply_generic)
+JL_DLLEXPORT void jl_dispatch_profile_print(void);
+static int dp_enabled(void) JL_NOTSAFEPOINT
+{
+    if (dp_on < 0) {
+        const char *e = getenv("JULIA_DISPATCH_PROFILE");
+        int on = e && e[0] == '1';
+        static _Atomic(int) dp_registered = 0;
+        int expected = 0;
+        if (on && jl_atomic_cmpswap(&dp_registered, &expected, 1))
+            atexit(jl_dispatch_profile_print);
+        dp_on = on;
+    }
+    return dp_on;
+}
+static void dp_count_site(void *ip, jl_method_t *m) JL_NOTSAFEPOINT
+{
+    uintptr_t h = (((uintptr_t)ip >> 2) ^ ((uintptr_t)m >> 4)) * 0x9E3779B97F4A7C15ull;
+    for (size_t k = 0; k < 64; k++) {
+        dp_site_t *s = &dp_sites[(h + k) & (DP_SITES - 1)];
+        void *cur = jl_atomic_load_relaxed(&s->ip);
+        if (cur == NULL) {
+            void *expected = NULL;
+            if (!jl_atomic_cmpswap(&s->ip, &expected, ip) && expected != ip)
+                continue;
+            jl_atomic_store_relaxed(&s->m, m);
+            cur = ip;
+        }
+        if (cur == ip && jl_atomic_load_relaxed(&s->m) == m) {
+            jl_atomic_fetch_add_relaxed(&s->n, 1);
+            return;
+        }
+    }
+}
+static void dp_count(jl_method_instance_t *mfunc, int path) JL_NOTSAFEPOINT
+{
+    jl_method_t *m = jl_is_method(mfunc->def.method) ? mfunc->def.method : NULL;
+    if (m == NULL)
+        return;
+    uintptr_t h = ((uintptr_t)m >> 4) * 0x9E3779B97F4A7C15ull;
+    for (size_t k = 0; k < DP_SLOTS; k++) {
+        dp_slot_t *s = &dp_table[(h + k) & (DP_SLOTS - 1)];
+        jl_method_t *cur = jl_atomic_load_relaxed(&s->m);
+        if (cur == NULL) {
+            jl_method_t *expected = NULL;
+            if (!jl_atomic_cmpswap(&s->m, &expected, m) && expected != m)
+                continue;
+            cur = m;
+        }
+        if (cur == m) {
+            jl_atomic_fetch_add_relaxed(&s->n[path], 1);
+            if (dp_ip != NULL)
+                dp_count_site(dp_ip, m);
+            return;
+        }
+    }
+}
+JL_DLLEXPORT void jl_dispatch_profile_reset(void)
+{
+    for (size_t i = 0; i < DP_SLOTS; i++)
+        for (int p = 0; p < 4; p++)
+            jl_atomic_store_relaxed(&dp_table[i].n[p], 0);
+    for (size_t i = 0; i < DP_SITES; i++)
+        jl_atomic_store_relaxed(&dp_sites[i].n, 0);
+}
+JL_DLLEXPORT void jl_dispatch_profile_print(void)
+{
+    static size_t idx[DP_SLOTS], sidx[DP_SITES];
+    static uint64_t tot[DP_SLOTS];
+    size_t cnt = 0, scnt = 0;
+    for (size_t i = 0; i < DP_SLOTS; i++) {
+        if (jl_atomic_load_relaxed(&dp_table[i].m) == NULL)
+            continue;
+        uint64_t t = 0;
+        for (int p = 0; p < 4; p++)
+            t += jl_atomic_load_relaxed(&dp_table[i].n[p]);
+        tot[i] = t;
+        idx[cnt++] = i;
+    }
+    for (size_t a = 0; a < cnt && a < 40; a++)  // a selection of the top 40 by total
+        for (size_t b = a + 1; b < cnt; b++)
+            if (tot[idx[b]] > tot[idx[a]]) { size_t x = idx[a]; idx[a] = idx[b]; idx[b] = x; }
+    jl_safe_printf("\n-- dynamic calls by callee method (lookup path: site/leaf/assoc/full)\n");
+    for (size_t a = 0; a < cnt && a < 40; a++) {
+        dp_slot_t *s = &dp_table[idx[a]];
+        jl_method_t *m = jl_atomic_load_relaxed(&s->m);
+        jl_safe_printf("%12llu  %s.%s  %s:%d   %llu/%llu/%llu/%llu\n",
+            (unsigned long long)tot[idx[a]], jl_symbol_name(m->module->name), jl_symbol_name(m->name),
+            jl_symbol_name(m->file), (int)m->line,
+            (unsigned long long)jl_atomic_load_relaxed(&s->n[0]), (unsigned long long)jl_atomic_load_relaxed(&s->n[1]),
+            (unsigned long long)jl_atomic_load_relaxed(&s->n[2]), (unsigned long long)jl_atomic_load_relaxed(&s->n[3]));
+    }
+    // the call sites: where in the code the dynamic calls are made (innermost frame, with inlining)
+    for (size_t i = 0; i < DP_SITES; i++)
+        if (jl_atomic_load_relaxed(&dp_sites[i].ip) != NULL)
+            sidx[scnt++] = i;
+    for (size_t a = 0; a < scnt && a < 40; a++)
+        for (size_t b = a + 1; b < scnt; b++)
+            if (jl_atomic_load_relaxed(&dp_sites[sidx[b]].n) > jl_atomic_load_relaxed(&dp_sites[sidx[a]].n)) {
+                size_t x = sidx[a]; sidx[a] = sidx[b]; sidx[b] = x;
+            }
+    jl_safe_printf("\n-- dynamic calls by call site (the calling code, innermost frame first; the callee)\n");
+    for (size_t a = 0; a < scnt && a < 40; a++) {
+        dp_site_t *s = &dp_sites[sidx[a]];
+        jl_method_t *m = jl_atomic_load_relaxed(&s->m);
+        jl_frame_t *frames = NULL;
+        int nf = jl_getFunctionInfo(&frames, (uintptr_t)jl_atomic_load_relaxed(&s->ip) - 1, 0, 0);
+        jl_safe_printf("%12llu  ", (unsigned long long)jl_atomic_load_relaxed(&s->n));
+        if (nf > 0) {
+            jl_frame_t *f = &frames[nf - 1];
+            jl_safe_printf("%s at %s:%d", f->func_name ? f->func_name : "?", f->file_name ? f->file_name : "?", f->line);
+            if (nf > 1)
+                jl_safe_printf(" (in %s at %s:%d)", frames[0].func_name ? frames[0].func_name : "?",
+                               frames[0].file_name ? frames[0].file_name : "?", frames[0].line);
+        }
+        else {
+            jl_safe_printf("%p", jl_atomic_load_relaxed(&s->ip));
+        }
+        jl_safe_printf("  ->  %s.%s\n", m ? jl_symbol_name(m->module->name) : "?", m ? jl_symbol_name(m->name) : "?");
+        for (int k = 0; k < nf; k++) {
+            free(frames[k].func_name);
+            free(frames[k].file_name);
+        }
+        free(frames);
+    }
+}
+
 #ifdef JL_GF_PROFILE
 size_t ncalls;
 void call_cache_stats()
@@ -4341,6 +4483,7 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
     int i;
     jl_tupletype_t *tt = NULL;
     int64_t last_alloc = 0;
+    int dp_path = DP_SITE;                          // the dispatch profiler's path (above)
     // check each cache entry to see if it matches
     //#pragma unroll
     //for (i = 0; i < 4; i++) {
@@ -4374,8 +4517,10 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
             tt = lookup_arg_type_tuple(F, args, nargs);
             if (tt != NULL)
                 entry = lookup_leafcache(leafcache, (jl_value_t*)tt, world);
+            dp_path = DP_LEAF;
         }
         if (entry == NULL) {
+            dp_path = DP_ASSOC;
             jl_typemap_t *cache = jl_atomic_load_relaxed(&mc->cache); // XXX: gc root required?
             entry = jl_typemap_assoc_exact(cache, F, args, nargs, jl_cachearg_offset(), world);
             if (entry == NULL) {
@@ -4421,6 +4566,7 @@ have_entry:
     else {
         assert(tt);
         // cache miss case
+        dp_path = DP_FULL;
         jl_methcache_t *mc = jl_method_table->cache;
         mfunc = jl_mt_assoc_by_type(jl_method_table, mc, tt, world);
         if (jl_options.malloc_log)
@@ -4441,13 +4587,16 @@ have_entry:
     if (traceen)
         jl_printf(JL_STDOUT, " at %s:%d\n", jl_symbol_name(mfunc->def.method->file), mfunc->def.method->line);
 #endif
-
+    if (__unlikely(dp_on != 0) && dp_enabled())
+        dp_count(mfunc, dp_path);
     return mfunc;
 }
 
 JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t *F, jl_value_t **args, uint32_t nargs)
 {
     size_t world = jl_current_task->world_age;
+    if (__unlikely(dp_on > 0))
+        dp_ip = (void*)jl_return_address();
     jl_method_instance_t *mfunc = jl_lookup_generic_(F, args, nargs,
                                                      jl_int32hash_fast(jl_return_address()),
                                                      world);
