@@ -3795,7 +3795,7 @@ static int membership_shadow_visitor(jl_typemap_entry_t *def, void *closure0)
         if ((jl_value_t*)mi == jl_nothing)
             continue;
         if (!jl_has_free_typevars((jl_value_t*)mi->specTypes) &&
-            jl_membership_match_sig((jl_value_t*)mi->specTypes, msig, env->world, NULL)) {
+            jl_membership_holds_at((jl_value_t*)mi->specTypes, msig, env->world)) {
             // mirroring the substituted path's replaced_dispatch arm: bound the
             // CI chain below the declaring world (recurses into the callers'
             // backedges), drop the dispatch fast path, shadow the MI.
@@ -5406,8 +5406,7 @@ static int ml_matches_visitor(jl_typemap_entry_t *ml, struct typemap_intersectio
     // intersects it into sv.world.valid_worlds the way it does method worlds)
     if (jl_has_open_set((jl_value_t*)ml->sig)) {
         size_t lo = 1, hi = ~(size_t)0;
-        if (jl_membership_match_range((jl_value_t*)ml->sig, closure->match.ti,
-                                      closure->world, &lo, &hi)) {
+        if (jl_membership_world_range(closure->match.ti, closure->world, &lo, &hi)) {
             if (closure->match.min_valid < lo)
                 closure->match.min_valid = lo;
             if (closure->match.max_valid > hi)

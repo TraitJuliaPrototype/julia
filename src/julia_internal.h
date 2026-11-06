@@ -899,57 +899,41 @@ JL_DLLEXPORT jl_value_t *jl_nth_union_component(jl_value_t *v JL_PROPAGATES_ROOT
 int jl_find_union_component(jl_value_t *haystack, jl_value_t *needle, unsigned *nth) JL_NOTSAFEPOINT;
 jl_datatype_t *jl_new_abstracttype(jl_value_t *name, jl_module_t *module,
                                    jl_datatype_t *super, jl_svec_t *parameters);
-// membership in open sets (exploration §2.1-2.2): entries (jl_membership_type,
-// Core's) live on the member's TypeName, published copy-on-write; Keyed/Dynamic/
-// Compiled/Kept are Core types whose subtyping erases to parameter 1.
+// sets and memberships (compiler §4): entries (jl_membership_type, Core's) live on
+// the member's TypeName, published copy-on-write; an entry for a type value
+// (member pattern Type{S}) lives on S's TypeName.
 #define jl_typename_memberships(tn) jl_atomic_load_acquire(&(tn)->memberships)
-// declares `member` (a DataType, or a UnionAll member pattern) to be a member of
-// the set named by set_instance (X, or an instance X{...} sharing the pattern's
-// variables). key is a Keyed type or Nothing; declarer a Module; by a Symbol or
-// Nothing. Takes the world lock, stamps min_world, publishes, advances the world
-// counter (the jl_method_table_insert protocol). Returns the MembershipEntry.
+// declares `member` (a DataType, a UnionAll member pattern, Type{S}, or a set
+// instance) to be a member of the set named by set_instance (X, or an instance
+// X{...} sharing the pattern's variables). declarer is a Module; by the forwarding
+// field's name or nothing; receiver :self, :field or :none. Under the world counter's
+// lock: stamps min_world = counter + 1, publishes, advances the counter, replays
+// dispatch (the stopgap). The caller follows it with Expr(:latestworld).
 JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *set_instance,
-                                               jl_value_t *key, jl_value_t *declarer,
-                                               jl_value_t *by);
-// the validated, side-effect-free core: stamps min_world = `world` (the caller
-// owns publication and any world advance). builtins.c's jl_set_datatype_super
-// calls it for the `T <: X` supertype-membership final (min_world = the current
-// counter, no replay: a type being defined has no compiled callers yet).
-JL_DLLEXPORT jl_value_t *jl_declare_membership_world(jl_value_t *member, jl_value_t *set_instance,
-                                               jl_value_t *key, jl_value_t *declarer,
-                                               jl_value_t *by, size_t world);
-// review B2: generation counter for the memoized has_open_set bit — bumped on
-// every jl_set_open_set, no world advance; memos stamped with an older epoch are
-// recomputed structurally on read (datatype.c). Compared for INEQUALITY.
-extern _Atomic(uint16_t) jl_open_set_epoch;
+                                               jl_value_t *declarer, jl_value_t *by,
+                                               jl_value_t *receiver);
 int jl_has_open_set_in(jl_value_t *v) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_has_open_set(jl_value_t *v);
 JL_DLLEXPORT int jl_is_open_set(jl_value_t *T);
 JL_DLLEXPORT void jl_set_open_set(jl_value_t *T);
+JL_DLLEXPORT void jl_set_contract(jl_value_t *T, jl_value_t *contract);
 JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X);
 JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X);
-// the composed match a set method's typemap entry asks when the vanilla subtype
-// answer is false (typemap.c's by-type walk; see subtype.c). future_min (optional
-// out) receives the earliest world a currently-invisible entry could make the
-// match hold, when the match fails — the bound for the negative answer.
-int jl_membership_match_sig(jl_value_t *types, jl_value_t *sig, size_t world, size_t *future_min);
-// the chain question (x ∈ y through the entry chain) at an explicit world
+// x <: y at an explicit world
 int jl_membership_holds_at(jl_value_t *x, jl_value_t *y, size_t world);
-JL_DLLEXPORT int jl_lookup_membership(jl_value_t *x, jl_value_t *set_instance, size_t world);
+// whether the TypeName `from` reaches `to` along declared supertypes and the entries
+// live in `world` (0: every entry)
+int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world);
 JL_DLLEXPORT int jl_membership_flip_possible(jl_value_t *a, jl_value_t *b);
-// M2 §0: the query-world override for C-driven subtyping contexts (inference, the
+// the query-world override for C-driven subtyping contexts (inference, the
 // declaration-time walks), whose task world is frozen below the runtime entries.
-// Set it (raii-style: the call returns the previous value) for the query region;
-// 0 clears it back to "follow the task".
+// Set it (the call returns the previous value) for the query region; 0 clears it.
+// (compiler §4.11; W-99 carries the world in the query instead, the audit's A4)
 JL_DLLEXPORT size_t jl_set_membership_query_world(size_t world) JL_NOTSAFEPOINT;
-// the current override (0 = unset): lets a region tell whether an enclosing one
-// already set a world before layering its own
 JL_DLLEXPORT size_t jl_membership_query_world(void) JL_NOTSAFEPOINT;
-// world range of the membership chain that makes the intersection `ti` of a
-// dispatch query applicable to the signature `sig` (subtype.c; plan §6): 0 when no
-// position consults an entry, in which case *lo/*hi are left untouched.
-JL_DLLEXPORT int jl_membership_match_range(jl_value_t *sig, jl_value_t *ti, size_t world,
-                                           size_t *lo, size_t *hi);
+// the world range over which the memberships a question about t can read are what
+// they are in `world`; returns whether t reaches any entry (*lo/*hi untouched if not)
+JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *lo, size_t *hi) JL_NOTSAFEPOINT;
 // the declaration-time dispatch half (gf.c; plan §4.2, P6): replay "insert m with
 // the member substituted" for every method m at the set or a set the member joins,
 // and report the ambiguities the member's set-join creates. Calling convention

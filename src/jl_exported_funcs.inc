@@ -294,7 +294,6 @@
     XX(jl_load_dynamic_library) \
     XX(jl_load_file_string) \
     XX(jl_lookup_code_address) \
-    XX(jl_lookup_membership) \
     XX(jl_lower) \
     XX(jl_lseek) \
     XX(jl_lstat) \
@@ -409,6 +408,7 @@
     XX(jl_setaffinity) \
     XX(jl_set_ARGS) \
     XX(jl_set_const) \
+    XX(jl_set_contract) \
     XX(jl_set_errno) \
     XX(jl_set_global) \
     XX(jl_set_istopmod) \

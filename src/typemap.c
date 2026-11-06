@@ -541,52 +541,25 @@ static int jl_typemap_intersection_node_visitor(jl_typemap_entry_t *ml, struct t
             penv = &closure->env;
         }
         closure->ti = jl_type_intersection_env_s(closure->type, (jl_value_t*)ml->sig, penv, &closure->issubty);
-        // M2a fix round 2 (gate m2_dispatch_worlds): an entry-row that fails at
-        // this world — whether the intersection bottoms out or only misses the
-        // subtype filter — may hold at a later world once its entries are
-        // visible. Bound the world range of the answer this walk reports, so a
-        // cache entry made for the current (negative) answer is recomputed once
-        // the entry appears — §7 only lowers cache entries that existed when
-        // the declaration ran. Bit-identical without open sets (memoized bit).
+        // the answer at a method at a set holds while the memberships the query's
+        // types can read stay as they are in this world: bound the walk's range by
+        // them, so a cache entry made later for this answer (by a task in an older
+        // world) is not used once a membership changes it. The declaration's
+        // stopgap lowers only the cache entries that existed when it ran.
+        // Bit-identical without open sets (a memoized bit).
         if (jl_has_open_set_in((jl_value_t*)ml->sig)) {
-            size_t fmin = 0;
-            if (!jl_membership_match_sig(closure->type, (jl_value_t*)ml->sig, closure->world, &fmin) &&
-                fmin && closure->max_valid >= fmin)
-                closure->max_valid = fmin - 1;
+            size_t lo = closure->min_valid, hi = closure->max_valid;
+            if (jl_membership_world_range(closure->type, closure->world, &lo, &hi)) {
+                closure->min_valid = lo;
+                closure->max_valid = hi;
+            }
         }
         if (closure->ti != (jl_value_t*)jl_bottom_type) {
             // In some corner cases type intersection is conservative and returns something
             // for intersect(A, B) even though A is a dispatch tuple and !(A <: B).
             // For dispatch purposes in such a case we know there's no match. This check
             // fixes issue #30394.
-            // M2a fix round (gate m2_set_in_set's dispatch pin): issubty answers
-            // DIRECT membership entries now (subtype's chain-miss fallback, I1),
-            // so a dispatch tuple that reaches the set only through a composed
-            // entry chain would be discarded here. The intersection above already
-            // met the pair on the entry arms; ask the composed match at the entry
-            // — the same question, chain=1 — when the sig names an open set.
-            // Bit-identical for every other entry (memoized bit read; I3).
             int qualifies = closure->issubty || !jl_is_dispatch_tupletype(closure->type);
-            if (!qualifies && jl_has_open_set_in((jl_value_t*)ml->sig)) {
-                size_t fmin = 0;
-                qualifies = jl_membership_match_sig(closure->type, (jl_value_t*)ml->sig, closure->world, &fmin);
-                if (!qualifies && fmin && closure->max_valid >= fmin)
-                    // the entry below does not match at this world — but it will
-                    // at fmin, and could win from there. Bound the match result
-                    // this walk reports so a cache entry made for the current
-                    // answer is recomputed once the entry is visible (gate
-                    // m2_dispatch_worlds' r0→r1 flip through an already-primed
-                    // call site without §7 having seen it).
-                    closure->max_valid = fmin - 1;
-                // a composed match whose intersection is the whole query covers it
-                // exactly as a subtype match does: say so, so the match visitors
-                // (ml_matches_visitor's issubty row filter, the LATEST_ONLY stop in
-                // get_intersect_visitor — replay-guarded separately) treat the row
-                // as full. When ti is narrower than the query, issubty stays 0 and
-                // the row keeps its partial status.
-                if (qualifies && closure->ti == closure->type)
-                    closure->issubty = 1;
-            }
             if (qualifies)
                 if (!fptr(ml, closure))
                     return 0;
@@ -903,16 +876,6 @@ static jl_typemap_entry_t *jl_typemap_entry_assoc_by_type(
                 if (ismatch && search->env)
                     resetenv = 1;
             }
-
-            // M2a fix round (gate m2_set_in_set's dispatch pin): a set method is
-            // reached by a member whose chain does not name the set, through the
-            // transitive entry chain. The vanilla answers above are subtype-based
-            // and subtype answers direct entries only (I1), so the composed
-            // question is asked at the entry: with no open set in the sig this is
-            // one memoized bit read (I3), and a sig without one is exactly the
-            // vanilla behavior. Guards below still apply to the composed answer.
-            if (!ismatch && jl_has_open_set_in((jl_value_t*)ml->sig))
-                ismatch = jl_membership_match_sig(types, (jl_value_t*)ml->sig, search->world, NULL);
 
             if (ismatch) {
                 size_t i, l;

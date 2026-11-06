@@ -559,28 +559,31 @@ typedef struct {
     uint8_t mayinlinealloc:1;
     uint8_t open_set:1;       // this type is a set that may gain members after its definition
     uint8_t never_member:1;   // Core's kinds: can never receive a membership
-    uint8_t generic_wrapper:1; // Keyed/Dynamic/Compiled/Kept: subtyping erases to the first parameter
-    uint8_t _unused:2;
+    uint8_t _unused:3;
     _Atomic(uint8_t) cache_entry_count; // (approximate counter of TypeMapEntry for heuristics)
     uint8_t max_methods; // override for inference's max_methods setting (0 = no additional limit or relaxation)
     uint8_t constprop_heustic; // override for inference's constprop heuristic
     uint8_t concrete_only; // Bool: inference refuses to commit (records no backedge) at non-concrete call sites
     // list of MembershipEntry objects (SimpleVector, replaced copy-on-write),
-    // membership of this type in open sets; jl_emptysvec when none was declared
+    // membership of this type in open sets; jl_emptysvec when none was declared.
+    // An entry for the type value (member pattern Type{S}) is kept on S's TypeName.
     _Atomic(jl_svec_t*) memberships;
+    // a set's contract (compiler §4.1), written once by the library at the
+    // declaration and read without an edge; nothing until then
+    _Atomic(jl_value_t*) contract;
 } jl_typename_t;
 
-// one declared membership of a member type in an open set (exploration §2.1).
-// member/instance share the pattern's variables: for the member pattern
-// `S{T} where T`, the instance is the set applied to them, `X{T}`.
+// one declared membership of a member type in a set (compiler §4.2), kept on the
+// member's TypeName. member/instance share the pattern's variables: for the
+// member pattern `S{T} where T`, the instance is the set applied to them, `X{T}`.
 typedef struct {
     JL_DATA_TYPE
     jl_typename_t *JL_NONNULL set;   // the set's TypeName (X)
-    jl_value_t *JL_NONNULL member;   // the member pattern: S, or S{T} where T
+    jl_value_t *JL_NONNULL member;   // the member pattern: S, S{T} where T, Type{S}, a set instance
     jl_value_t *JL_NONNULL instance; // the set instance for the pattern
-    jl_value_t *JL_NONNULL key;      // Keyed{X,R,F} for the pattern, or Nothing
+    jl_value_t *JL_NONNULL receiver; // :self, :field (the forwarding field `by`) or :none
     uint64_t min_world;                // in this world range the entry is in force
-    uint64_t max_world;
+    _Atomic(uint64_t) max_world;       // lowered once, when the membership is redeclared
     jl_value_t *JL_NONNULL declarer; // Module: for ownership and the store's identity
     jl_value_t *JL_NONNULL by;       // the forwarding field name, or Nothing
 } jl_membership_t;
@@ -668,8 +671,8 @@ typedef struct _jl_datatype_t {
     uint32_t isprimitivetype:1; // whether this is declared with 'primitive type' keyword (sized, no fields, and immutable)
     uint32_t ismutationfree:1; // whether any mutable memory is reachable through this type (in the type or via fields)
     uint32_t isidentityfree:1; // whether this type or any object reachable through its fields has non-content-based identity
-    uint32_t has_open_set:1; // whether an open set (or a Keyed/Dynamic/Compiled/Kept wrapper) occurs structurally in this type, incl. via parameters and unions (review H3); when clear, no membership can ever affect a query about this type
-    uint32_t open_set_epoch:15; // generation tag of has_open_set (review B2): trusted only while it equals jl_open_set_epoch, else recomputed (datatype.c); with the flags above and smalltag this fills the word exactly (11+15+6)
+    uint32_t has_open_set:1; // whether an open set occurs structurally in this type, incl. via parameters and unions; when clear, no membership can ever affect a query about this type. A set is open from its declaration, so the bit is final when the type is built
+    uint32_t _unused_flags:15; // with the flags above and smalltag this fills the word (11+15+6)
     uint32_t smalltag:6; // whether this type has a small-tag optimization
 } jl_datatype_t;
 

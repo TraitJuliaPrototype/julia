@@ -2114,23 +2114,6 @@ JL_CALLABLE(jl_f__primitivetype)
 
 static void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super);
 
-// re-wrap `body` in the UnionAll chain of `pattern` (outermost-first, same
-// TypeVar objects). _setsuper! for a parametric definition passes the SUPER as
-// the free body over the type's own tvars (apply_type(A3, T)); the membership
-// instance must be the wrapper form so the parametric @implement rule's
-// positional chain pairing (jl_membership_lookup, equal depth) applies.
-static jl_value_t *jl_wrap_same_tvars(jl_value_t *body, jl_value_t *pattern)
-{
-    if (!jl_is_unionall(pattern))
-        return body;
-    jl_value_t *inner = jl_wrap_same_tvars(body, ((jl_unionall_t*)pattern)->body);
-    JL_GC_PUSH1(&inner);
-    jl_value_t *ua = (jl_value_t*)jl_new_struct(jl_unionall_type,
-                                                (jl_value_t*)((jl_unionall_t*)pattern)->var, inner);
-    JL_GC_POP();
-    return ua;
-}
-
 static void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super)
 {
     const char *error = NULL;
@@ -2150,35 +2133,15 @@ static void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super)
         error = "cannot add subtypes to Core.Builtin";
     else if (!jl_is_abstracttype(super))
         error = "can only subtype abstract types";
+    else if (tt->name->open_set && super != (jl_value_t*)jl_any_type &&
+             !((jl_datatype_t*)super)->name->open_set)
+        // a member of the set is then a subtype of super: a closed type's
+        // answers would change with memberships (compiler §4.1)
+        error = "a set's supertype must be Any or a set";
     if (error)
          jl_errorf("invalid subtyping in definition of %s: %s.", jl_symbol_name(tt->name->name), error);
     tt->super = (jl_datatype_t*)super;
     jl_gc_wb(tt, tt->super);
-    // `T <: X` with X an open set: a membership final as the supertype, declared
-    // with the type (exploration §2.1). Both `abstract type B <: A` and
-    // `struct S <: X` lower to _structtype/_abstracttype (super=NULL) plus this
-    // _setsuper!, so the hook has to sit here (M2a fix round: it previously sat
-    // in jl_new_datatype, which only ever saw the bootstrap calls). The wrapper
-    // gate skips mid-construction bootstrap callers; those have no open sets.
-    // min_world = counter + 1 (single-bump protocol): visible exactly from the
-    // world the type itself is born into. No replay: a type being defined has
-    // no compiled callers or leaf entries yet.
-    if (tt->name->wrapper != NULL && jl_membership_type &&
-        jl_is_datatype(super) && ((jl_datatype_t*)super)->name->open_set &&
-        ((jl_datatype_t*)super)->name != tt->name) {
-        // a parametric definition's super arrives as the free body over tt's own
-        // tvars (M2a fix round 2: `@trait B3{T} <: A3{T}` previously declared an
-        // instance no query could match — membership_instantiate refuses free
-        // bodies); pair it with the wrapper's chain like @implement's rule does.
-        jl_value_t *instance = jl_is_unionall((jl_value_t*)tt->name->wrapper)
-            ? jl_wrap_same_tvars(super, (jl_value_t*)tt->name->wrapper)
-            : super;
-        JL_GC_PUSH1(&instance); // the wrapped chain is freshly allocated
-        jl_declare_membership_world((jl_value_t*)tt->name->wrapper, instance,
-                                    jl_nothing, (jl_value_t*)tt->name->module, jl_nothing,
-                                    jl_atomic_load_relaxed(&jl_world_counter) + 1);
-        JL_GC_POP();
-    }
 }
 
 JL_CALLABLE(jl_f__setsuper)
@@ -2632,6 +2595,7 @@ void jl_init_primitives(void) JL_GC_DISABLED
             continue;
         jl_sym_t *sname = jl_symbol(jl_builtin_names[i]);
         jl_value_t *builtin = jl_new_generic_function_with_supertype(sname, jl_core_module, jl_builtin_type, 0);
+        ((jl_datatype_t*)jl_typeof(builtin))->name->never_member = 1; // compiler §4.1: never_member
         jl_set_initial_const(jl_core_module, sname, builtin, 0);
         jl_mk_builtin_func((jl_datatype_t*)jl_typeof(builtin), sname, jl_builtin_f_addrs[i]);
         jl_builtin_instances[i] = builtin;
@@ -2649,10 +2613,6 @@ void jl_init_primitives(void) JL_GC_DISABLED
     // bind the UnionAll wrappers, not the DEFTYPE DataTypes: every other
     // parameterized builtin does this (review M4 — the bare DataType made
     // `Dynamic{Int}` throw "expected UnionAll")
-    add_builtin("Keyed", (jl_value_t*)jl_keyed_type->name->wrapper);
-    add_builtin("Dynamic", (jl_value_t*)jl_dynamic_type->name->wrapper);
-    add_builtin("Compiled", (jl_value_t*)jl_compiled_type->name->wrapper);
-    add_builtin("Kept", (jl_value_t*)jl_kept_type->name->wrapper);
     add_builtin("DataType", (jl_value_t*)jl_datatype_type);
     add_builtin("TypeVar", (jl_value_t*)jl_tvar_type);
     add_builtin("UnionAll", (jl_value_t*)jl_unionall_type);

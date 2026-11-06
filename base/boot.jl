@@ -547,11 +547,6 @@ eval(Core, quote
     PartialOpaque(@nospecialize(typ), @nospecialize(env), parent::MethodInstance, source) = $(Expr(:new, :PartialOpaque, :typ, :env, :parent, :source))
     InterConditional(slot::Int, @nospecialize(thentype), @nospecialize(elsetype)) = $(Expr(:new, :InterConditional, :slot, :thentype, :elsetype))
     MethodMatch(@nospecialize(spec_types), sparams::SimpleVector, method::Method, fully_covers::Bool) = $(Expr(:new, :MethodMatch, :spec_types, :sparams, :method, :fully_covers))
-    # attribute wrappers (traits plan §2.6-2.7): constructible with their declared
-    # parameter; the Type{}-pattern keeps :new's type concrete in every method
-    (dy::Type{Dynamic{X}})(@nospecialize(obj)) where {X} = $(Expr(:new, :dy, :obj))
-    (cy::Type{Compiled{X}})(@nospecialize(obj)) where {X} = $(Expr(:new, :cy, :obj))
-    (ky::Type{Kept{X}})(@nospecialize(obj), compiled::Bool) where {X} = $(Expr(:new, :ky, :obj, :compiled))
 end)
 
 const NullDebugInfo = DebugInfo(:none)
