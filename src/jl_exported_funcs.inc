@@ -389,6 +389,7 @@
     XX(jl_match_cache_flags_current) \
     XX(jl_match_cache_flags) \
     XX(jl_membership_flip_possible) \
+    XX(jl_membership_stat) \
     XX(jl_read_verify_header) \
     XX(jl_realloc) \
     XX(jl_register_newmeth_tracer) \

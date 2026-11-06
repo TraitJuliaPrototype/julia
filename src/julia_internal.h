@@ -444,6 +444,10 @@ extern tracer_cb jl_newmeth_tracer;
 void jl_call_tracer(tracer_cb callback, jl_value_t *tracee);
 void print_func_loc(JL_STREAM *s, jl_method_t *m);
 extern jl_array_t *_jl_debug_method_invalidation JL_GLOBALLY_ROOTED;
+// the set->methods index (gf.c, compiler §5.1): a C global the stock and MMTk
+// collectors mark explicitly (JL_GLOBALLY_ROOTED is an annotation for the analyzer
+// only; marked alongside _jl_debug_method_invalidation)
+extern jl_array_t *open_set_methods JL_GLOBALLY_ROOTED;
 JL_DLLEXPORT extern arraylist_t jl_linkage_blobs; // external linkage: sysimg/pkgimages
 JL_DLLEXPORT extern arraylist_t jl_image_relocs;  // external linkage: sysimg/pkgimages
 JL_DLLEXPORT extern arraylist_t jl_top_mods;  // external linkage: sysimg/pkgimages
@@ -932,6 +936,18 @@ JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b);
 // the world range over which the memberships a question about t can read are what
 // they are in `world`; returns whether t reaches any entry (*lo/*hi untouched if not)
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *lo, size_t *hi) JL_NOTSAFEPOINT;
+// dispatch at a declaration (gf.c; compiler §5.4, §5.5): replay "insert m with the
+// member substituted" for every method m at the set or a set the member joins, and
+// report the ambiguities the member's set-join creates. Call under
+// world_counter_lock with the entry published and the counter already advanced to
+// entry_min_world: the walk runs at world == counter and does not bump the
+// counter; the caller sets the query world (compiler §4.11) to entry_min_world.
+JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *set_instance,
+                                              size_t entry_min_world);
+JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t *set_instance,
+                                                 size_t entry_min_world);
+// the walk's counters, by index (see jl_membership_stat in gf.c)
+JL_DLLEXPORT size_t jl_membership_stat(int which);
 jl_datatype_t *jl_new_uninitialized_datatype(void);
 void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable);
 JL_DLLEXPORT jl_datatype_t *jl_wrap_Type(jl_value_t *t);  // x -> Type{x}
@@ -1926,6 +1942,8 @@ struct typemap_intersection_env {
     jl_value_t *const type; // type to match
     jl_value_t *const va; // the tparam0 for the vararg in type, if applicable (or NULL)
     size_t search_slurp;
+    size_t world; // the query world for the walk: the membership arms ask the
+                  // entries at this world (compiler §5.3); every caller sets it
     // output values
     size_t min_valid;
     size_t max_valid;

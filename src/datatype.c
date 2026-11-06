@@ -276,6 +276,12 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     }
     entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world);
     jl_atomic_store_release(&jl_world_counter, min_world);
+    // the stopgap (compiler C-18): replay dispatch for the methods the member can now
+    // reach, then report the ambiguities, both at the entry's world
+    size_t mq = jl_set_membership_query_world(min_world);
+    jl_membership_dispatch_walk(member, set_instance, min_world);
+    jl_membership_ambiguity_report(member, set_instance, min_world);
+    jl_set_membership_query_world(mq);
     JL_UNLOCK(&world_counter_lock);
     JL_GC_POP();
     return entry;

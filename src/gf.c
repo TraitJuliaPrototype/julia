@@ -2095,6 +2095,7 @@ struct matches_env {
     jl_typemap_entry_t *newentry;
     jl_value_t *shadowed;
     jl_typemap_entry_t *replaced;
+    int replay; // §7: the "new entry" is a dummy standing for a membership, not an insertion
 };
 
 static int get_intersect_visitor(jl_typemap_entry_t *oldentry, struct typemap_intersection_env *closure0)
@@ -2102,11 +2103,15 @@ static int get_intersect_visitor(jl_typemap_entry_t *oldentry, struct typemap_in
     struct matches_env *closure = container_of(closure0, struct matches_env, match);
     jl_method_t *oldmethod = oldentry->func.method;
     assert(oldentry != closure->newentry && "entry already added");
+    if (closure->replay && jl_atomic_load_relaxed(&oldentry->max_world) != ~(size_t)0)
+        return 1; // a replay asks about the last pre-membership world, which dead
+                  // entries can still cover; their method cannot be selected in the
+                  // new world either, and the asserts below assume a live insertion
     assert(jl_atomic_load_relaxed(&oldentry->min_world) <= jl_atomic_load_relaxed(&closure->newentry->min_world) && "old method cannot be newer than new method");
     //assert(jl_atomic_load_relaxed(&oldentry->max_world) != jl_atomic_load_relaxed(&closure->newentry->min_world) && "method cannot be added at the same time as method deleted");
     assert((jl_atomic_load_relaxed(&oldentry->max_world) == ~(size_t)0));
     // don't need to consider other similar methods if this oldentry will always fully intersect with them and dominates all of them
-    if (closure->match.issubty // e.g. jl_subtype(closure->newentry.sig, oldentry->sig)
+    if (!closure->replay && closure->match.issubty // e.g. jl_subtype(closure->newentry.sig, oldentry->sig)
         && jl_subtype(oldmethod->sig, (jl_value_t*)closure->newentry->sig)) { // e.g. jl_type_equal(closure->newentry->sig, oldentry->sig)
         if (closure->replaced == NULL || jl_atomic_load_relaxed(&closure->replaced->min_world) < jl_atomic_load_relaxed(&oldentry->min_world))
             closure->replaced = oldentry; // must pick the newest insertion (both are still valid)
@@ -2118,7 +2123,12 @@ static int get_intersect_visitor(jl_typemap_entry_t *oldentry, struct typemap_in
     // since we can.
     if (closure->match.issubty) {
         int only = jl_atomic_load_relaxed(&oldmethod->dispatch_status) & METHOD_SIG_LATEST_ONLY;
-        if (only) {
+        if (only && !closure->replay) {
+            // replay (review M2a fix): the fast stop trusts LATEST_ONLY as
+            // computed pre-membership; at the replay's world the entry was not
+            // visible, and the walk must see the full intersect set — the
+            // shadowed methods the entry would swallow here are exactly the
+            // ones whose dispatch the declaration changes.
             size_t len = jl_array_nrows(closure->shadowed);
             if (len > 0)
                 jl_array_del_end((jl_array_t*)closure->shadowed, len);
@@ -2131,7 +2141,7 @@ static int get_intersect_visitor(jl_typemap_entry_t *oldentry, struct typemap_in
     return 1;
 }
 
-static jl_value_t *get_intersect_matches(jl_typemap_t *defs, jl_typemap_entry_t *newentry, jl_typemap_entry_t **replaced, size_t world)
+static jl_value_t *get_intersect_matches(jl_typemap_t *defs, jl_typemap_entry_t *newentry, jl_typemap_entry_t **replaced, size_t world, int replay)
 {
     jl_tupletype_t *type = newentry->sig;
     jl_tupletype_t *ttypes = (jl_tupletype_t*)jl_unwrap_unionall((jl_value_t*)type);
@@ -2146,9 +2156,10 @@ static jl_value_t *get_intersect_matches(jl_typemap_t *defs, jl_typemap_entry_t 
     }
     // search for all intersecting methods active in the previous world, to determine the changes needed to be made for the next world
     struct matches_env env = {{get_intersect_visitor, (jl_value_t*)type, va, /* .search_slurp = */ 0,
+            /* .world = */ world,
             /* .min_valid = */ world, /* .max_valid = */ world,
             /* .ti = */ NULL, /* .env = */ jl_emptysvec, /* .issubty = */ 0},
-        /* .newentry = */ newentry, /* .shadowed */ NULL, /* .replaced */ NULL};
+        /* .newentry = */ newentry, /* .shadowed */ NULL, /* .replaced */ NULL, /* .replay */ replay};
     JL_GC_PUSH3(&env.match.env, &env.match.ti, &env.shadowed);
     jl_typemap_intersection_visitor(defs, 0, &env.match);
     env.match.env = NULL;
@@ -2214,6 +2225,139 @@ static void update_max_args(jl_value_t *type)
     // update occurs inside global writelock
     if (na > jl_atomic_load_relaxed(&tn->max_args))
         jl_atomic_store_relaxed(&tn->max_args, na);
+}
+
+// the set->methods index (plan §4.2, review M10): the methods whose signatures name
+// an open set, so the declaration-time walk (§7) and the ambiguity report (§8) can
+// find them. rare (E-253: 131 across four ports), so a globally rooted flat vec of
+// (set typename, method) pairs with a linear scan is the whole design; pairs are
+// never removed, a stale one is filtered at use.
+// Review A-F1 (BLOCKER): rooted for real, not just for the analyzer —
+// JL_GLOBALLY_ROOTED is an annotation (support/analyzer_annotations.h); the stock
+// collector marks C globals explicitly in gc_mark_roots and this vec follows the
+// _jl_debug_method_invalidation pattern (non-static global, extern in
+// julia_internal.h, mark + heap-snapshot lines in gc-stock.c / gc-mmtk.c). Two
+// full GC sweeps used to sweep the vec itself, and the next push wrote a freed
+// array (m2r2A-b3/segv3 dumped core).
+jl_array_t *open_set_methods JL_GLOBALLY_ROOTED = NULL;
+static jl_mutex_t open_set_methods_lock; // zero-init, like world_counter_lock
+
+static void open_set_walk_names(jl_value_t *v, jl_method_t *m, int depth)
+{
+    // structural: register m under every open-set typename inside the sig
+    // (direct argument positions today; nested occurrences are indexed too, so
+    // the §7 walk can see them and choose its conservative path); depth caps at 8.
+    // review W2-1 (BLOCKER): a Vararg node is not a datatype — without this arm a
+    // `Tuple{typeof(f), Vararg{OpenSet}}` method indexed NOTHING, §7 never saw
+    // it, and stale dispatch persisted in the NEW world. Recurse into the
+    // element exactly like set_name_nested does.
+    v = jl_unwrap_unionall(v);
+    if (depth > 8)
+        return;
+    if (jl_is_vararg(v)) {
+        open_set_walk_names(jl_unwrap_vararg(v), m, depth + 1);
+        return;
+    }
+    if (jl_is_uniontype(v)) {
+        // review A (m2_future_min_worlds (A)): a set under a UNION names the set
+        // too — without this arm `Tuple{typeof(f), Union{Other, OpenSet}}`
+        // indexed nothing (Union is not a datatype), §7 never saw the method,
+        // and a caller compiled pre-declare kept its stale answer. Same class
+        // as the Vararg gap above; same fix shape as set_name_nested.
+        open_set_walk_names(((jl_uniontype_t*)v)->a, m, depth + 1);
+        open_set_walk_names(((jl_uniontype_t*)v)->b, m, depth + 1);
+        return;
+    }
+    if (!jl_is_datatype(v))
+        return;
+    jl_datatype_t *dt = (jl_datatype_t*)v;
+    if (dt->name->open_set) {
+        JL_LOCK(&open_set_methods_lock);
+        if (!open_set_methods)
+            open_set_methods = jl_alloc_vec_any(0);
+        jl_array_ptr_1d_push(open_set_methods, (jl_value_t*)dt->name);
+        jl_array_ptr_1d_push(open_set_methods, (jl_value_t*)m);
+        JL_UNLOCK(&open_set_methods_lock);
+    }
+    for (size_t i = 0; i < jl_nparams(dt); i++)
+        open_set_walk_names(jl_tparam(dt, i), m, depth + 1);
+}
+
+// called from jl_method_table_add. this is the only writer, and it runs before
+// insert takes world_counter_lock, so the lock stays the innermost nest (W4-10).
+static void jl_index_open_set_methods(jl_method_t *m)
+{
+    if (!jl_has_open_set((jl_value_t*)m->sig)) // one bit; false for every Base method (I3)
+        return;
+    open_set_walk_names((jl_value_t*)m->sig, m, 0);
+}
+
+// used by §7/§8: copy out the methods indexed under `tn`
+static jl_array_t *jl_methods_at_set(jl_typename_t *tn)
+{
+    jl_array_t *out = jl_alloc_vec_any(0);
+    JL_GC_PUSH1(&out);
+    JL_LOCK(&open_set_methods_lock);
+    if (open_set_methods) {
+        size_t i, l = jl_array_nrows(open_set_methods);
+        for (i = 0; i + 1 < l; i += 2)
+            if (jl_array_ptr_ref(open_set_methods, i) == (jl_value_t*)tn)
+                jl_array_ptr_1d_push(out, jl_array_ptr_ref(open_set_methods, i + 1));
+    }
+    JL_UNLOCK(&open_set_methods_lock);
+    JL_GC_POP();
+    return out;
+}
+
+// the walk's counters (plan §5.M2's log gate): what one declaration cost
+struct membership_stats {
+    size_t declares;
+    size_t replays;            // methods re-resolved as if re-inserted
+    size_t visits;             // intersecting methods examined
+    size_t morespec_skips;     // of those, skipped as more specific (C7's B << A)
+    size_t spec_invalidations; // dispatch-replacement EVENTS (review B F-B3): a
+                               // replay stamps every MI of every replaced spec it
+                               // reaches, so one declaration counts replays x MIs,
+                               // not distinct MethodInstances
+    size_t cache_lowerings;    // typemap entries whose max_world was lowered
+    size_t latest_only_clears; // METHOD_SIG_LATEST_ONLY fast paths cleared
+};
+static struct membership_stats membership_stats;
+
+// gates read these by index, in the order of the struct's fields
+JL_DLLEXPORT size_t jl_membership_stat(int which)
+{
+    switch (which) {
+    case 0: return membership_stats.declares;
+    case 1: return membership_stats.replays;
+    case 2: return membership_stats.visits;
+    case 3: return membership_stats.morespec_skips;
+    case 4: return membership_stats.spec_invalidations;
+    case 5: return membership_stats.cache_lowerings;
+    case 6: return membership_stats.latest_only_clears;
+    default: return 0;
+    }
+}
+
+static int membership_log_on = -1;
+
+// one line per declare on JULIA_MEMBERSHIP_LOG, method_overwrite's style
+static void jl_membership_log(jl_value_t *member, jl_value_t *set_instance, size_t max_world)
+{
+    if (membership_log_on == -1)
+        membership_log_on = getenv("JULIA_MEMBERSHIP_LOG") != NULL;
+    if (!membership_log_on)
+        return;
+    jl_printf(JL_STDERR, "membership ");
+    jl_static_show(JL_STDERR, member);
+    jl_printf(JL_STDERR, " in ");
+    jl_static_show(JL_STDERR, set_instance);
+    jl_printf(JL_STDERR, ": replays=%zu visits=%zu morespec_skips=%zu specs=%zu caches=%zu latest_only=%zu max_world=%zu\n",
+              membership_stats.replays, membership_stats.visits,
+              membership_stats.morespec_skips, membership_stats.spec_invalidations,
+              membership_stats.cache_lowerings, membership_stats.latest_only_clears,
+              max_world);
+    jl_uv_flush(JL_STDERR);
 }
 
 jl_array_t *_jl_debug_method_invalidation JL_GLOBALLY_ROOTED = NULL;
@@ -2546,6 +2690,9 @@ JL_DLLEXPORT void jl_method_table_add_backedge(jl_value_t *typ, jl_code_instance
 
 struct _typename_invalidate_backedge {
     jl_value_t *type;
+    jl_value_t *winsig; // M2a fix round (fix 4): the sig answering the winner
+                        // (more-specific) question against env->type — equal to it
+                        // for insertions, the method's ORIGINAL sig for a §7 replay
     jl_value_t **isect;
     jl_value_t **isect2;
     jl_method_t *const *d;
@@ -2560,6 +2707,7 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
     JL_GC_PROMISE_ROOTED(env->type);
     JL_GC_PROMISE_ROOTED(env->isect); // isJuliaType considers jl_value_t** to be a julia object too
     JL_GC_PROMISE_ROOTED(env->isect2); // isJuliaType considers jl_value_t** to be a julia object too
+    JL_GC_PROMISE_ROOTED(env->winsig); // set alongside type by every construction below
     jl_array_t *backedges = (jl_array_t*)jl_eqtable_get(jl_method_table->backedges, (jl_value_t*)tn, NULL);
     if (backedges == NULL)
         return;
@@ -2589,7 +2737,7 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
                 if (jl_subtype(*env->isect, m->sig) || (*env->isect2 && jl_subtype(*env->isect2, m->sig))) {
                     // We now know that there actually was a previous
                     // method for this part of the type intersection.
-                    if (!jl_type_morespecific(env->type, m->sig)) {
+                    if (!jl_type_morespecific(env->winsig, m->sig)) {
                         missing = 0;
                         break;
                     }
@@ -2633,6 +2781,7 @@ struct invalidate_mt_env {
     jl_typemap_entry_t *newentry;
     jl_array_t *shadowed;
     size_t max_world;
+    struct membership_stats *stats; // §7: non-NULL counts the lowerings (walk volume)
 };
 static int invalidate_mt_cache(jl_typemap_entry_t *oldentry, void *closure0)
 {
@@ -2674,6 +2823,8 @@ static int invalidate_mt_cache(jl_typemap_entry_t *oldentry, void *closure0)
                 JL_GC_POP();
             }
             jl_atomic_store_relaxed(&oldentry->max_world, env->max_world);
+            if (env->stats)
+                env->stats->cache_lowerings++;
         }
     }
     return 1;
@@ -2730,12 +2881,23 @@ static void _method_table_invalidate(jl_methcache_t *mc, void *env0)
 // Invalidate everything compiled against `replaced`. `deleted` is set when the
 // method is being removed outright rather than replaced by one with the same
 // signature.
-static void jl_method_table_invalidate(jl_method_t *replaced, size_t max_world, int deleted)
+//
+// Review W2-3 split: the core (backedges + caches) is separated from the
+// method-table entry protocol. jl_method_table_activate/delete keep the full
+// wrapper — including the precompile guard and the counter-equality debug
+// assert, which pins the INSERTION protocol (review B re-check: activate asserts
+// the method's world == counter + 1, walks and invalidates the prior-world table
+// while the counter still sits at max_world, and publishes the counter only
+// afterwards — so inside the wrapper counter == max_world holds; the round-1
+// wording "publishes its world first" had the order backwards). The §7
+// conservative path calls
+// the core directly: the single-bump declare protocol has already published
+// the counter to entry_min_world while max_world = entry_min_world - 1, so the
+// equality assert would abort every conservative declare in debug builds, and
+// the precompile jl_error would longjmp out of the held world_counter_lock.
+static void jl_method_invalidate_core(jl_method_t *replaced, size_t max_world, int deleted)
 {
-    if (jl_options.incremental && jl_generating_output())
-        jl_error("Method deletion is not possible during Module precompile.");
     assert(!replaced->is_for_opaque_closure);
-    assert(jl_atomic_load_relaxed(&jl_world_counter) == max_world);
     // Invalidate the backedges
     int invalidated = 0;
     jl_value_t *specializations = jl_atomic_load_relaxed(&replaced->specializations);
@@ -2761,7 +2923,7 @@ static void jl_method_table_invalidate(jl_method_t *replaced, size_t max_world, 
         JL_GC_PUSH2(&isect, &isect2);
         jl_methcache_t *mc = jl_method_table->cache;
         JL_LOCK(&mc->writelock);
-        struct _typename_invalidate_backedge typename_env = {(jl_value_t*)replaced->sig, &isect, &isect2, NULL, 0, max_world, 0};
+        struct _typename_invalidate_backedge typename_env = {(jl_value_t*)replaced->sig, (jl_value_t*)replaced->sig, &isect, &isect2, NULL, 0, max_world, 0};
         invalidate_missing_backedges(&typename_env);
         JL_UNLOCK(&mc->writelock);
         JL_GC_POP();
@@ -2775,6 +2937,14 @@ static void jl_method_table_invalidate(jl_method_t *replaced, size_t max_world, 
         jl_array_ptr_1d_push(_jl_debug_method_invalidation, loctag);
         JL_GC_POP();
     }
+}
+
+static void jl_method_table_invalidate(jl_method_t *replaced, size_t max_world, int deleted)
+{
+    if (jl_options.incremental && jl_generating_output())
+        jl_error("Method deletion is not possible during Module precompile.");
+    assert(jl_atomic_load_relaxed(&jl_world_counter) == max_world);
+    jl_method_invalidate_core(replaced, max_world, deleted);
 }
 
 static int erase_method_backedges(jl_typemap_entry_t *def, void *closure)
@@ -2859,6 +3029,9 @@ jl_typemap_entry_t *jl_method_table_add(jl_methtable_t *mt, jl_method_t *method,
     JL_LOCK(&mt->cache->writelock);
     newentry = jl_typemap_alloc((jl_tupletype_t*)method->sig, simpletype, jl_emptysvec, (jl_value_t*)method, ~(size_t)0, 1);
     jl_typemap_insert(&mt->defs, (jl_value_t*)mt, newentry, 0);
+
+    // index the methods whose signatures name an open set (review M10)
+    jl_index_open_set_methods(method);
 
     if (mt == jl_method_table)
         update_max_args(method->sig);
@@ -3020,6 +3193,155 @@ cleanup:
 }
 
 
+// The body of jl_method_table_activate's "not a replacement" branch, shared with
+// the membership walk's replay (§7): re-resolve the methods in d[] that intersect
+// `type` against the incoming `method` — update the specificity bookkeeping
+// (interferences, the LATEST_ONLY bits) and invalidate the specializations and the
+// callers whose selected method changed. Returns whether anything was invalidated.
+// *dispatch_bits and **interferences are the caller's in-place state; isect, isect2
+// and loctag are its rooted scratch slots.
+// replay is set by jl_membership_dispatch_walk: nothing is being inserted, so the
+// replayed method's own typemap entry is live and shows up in d[] (skip it), and the
+// dispatch_bits publish (which activate does at the end of an insertion) does not
+// run. stats, when non-NULL, counts the walk's volume for §5.M2's log.
+static int invalidate_intersecting(jl_value_t *type, jl_method_t *method,
+                                   jl_method_t *const *d, size_t n, char *morespec,
+                                   size_t max_world, jl_array_t *oldmi,
+                                   int replay, struct membership_stats *stats,
+                                   int *dispatch_bits, jl_genericmemory_t **interferences,
+                                   jl_value_t **isect, jl_value_t **isect2, jl_value_t **loctag)
+{
+    size_t j;
+    int invalidated = 0;
+    for (j = 0; j < n; j++) {
+        jl_method_t *m = d[j];
+        if (replay && m == method)
+            continue; // the replay's own entry is live in the table, unlike a real insertion
+        if (stats)
+            stats->visits++;
+        // Compute ambig state: is there an ambiguity between new method and old m?
+        // M2a fix round (fix 4): the new method's ORIGINAL sig answers this
+        // winner question — for a real insertion entry->sig == method->sig, so
+        // this is bit-identical there; for the §7 replay `type` is the
+        // substituted sig, which only drives the intersections below.
+        char ambig = !morespec[j] && !jl_type_morespecific((jl_value_t*)method->sig, m->sig);
+        // Compute updates to the dispatch state bits
+        int m_dispatch = jl_atomic_load_relaxed(&m->dispatch_status);
+        if (morespec[j] || ambig) {
+            // !morespecific(new, old)
+            *dispatch_bits &= ~METHOD_SIG_LATEST_ONLY;
+            // Add the old method to this interference set
+            ssize_t idx;
+            if (!has_key(*interferences, (jl_value_t*)m))
+                *interferences = jl_idset_put_key(*interferences, (jl_value_t*)m, &idx);
+        }
+        if (!morespec[j]) {
+            // !morespecific(old, new)
+            if (m_dispatch & METHOD_SIG_LATEST_ONLY) {
+                if (stats)
+                    stats->latest_only_clears++;
+            }
+            m_dispatch &= ~METHOD_SIG_LATEST_ONLY;
+            // Add the new method to its interference set
+            jl_genericmemory_t *m_interferences = jl_atomic_load_relaxed(&m->interferences);
+            ssize_t idx;
+            m_interferences = jl_idset_put_key(m_interferences, (jl_value_t*)method, &idx);
+            jl_atomic_store_release(&m->interferences, m_interferences);
+            jl_gc_wb(m, m_interferences);
+        }
+        // Add methods that intersect but are not more specific to interference list.
+        // A replay writes these too: probe 3's stale LATEST_ONLY on a chain-matched
+        // method is exactly what the membership walk has to clear.
+        jl_atomic_store_relaxed(&m->dispatch_status, m_dispatch);
+        if (morespec[j]) {
+            if (stats)
+                stats->morespec_skips++;
+            continue;
+        }
+
+        // Now examine if this caused any invalidations.
+        *loctag = jl_atomic_load_relaxed(&m->specializations); // use loctag for a gcroot
+        _Atomic(jl_method_instance_t*) *data;
+        size_t l;
+        if (jl_is_svec(*loctag)) {
+            data = (_Atomic(jl_method_instance_t*)*)jl_svec_data(*loctag);
+            l = jl_svec_len(*loctag);
+        }
+        else {
+            data = (_Atomic(jl_method_instance_t*)*)loctag;
+            l = 1;
+        }
+        for (size_t i = 0; i < l; i++) {
+            jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i]);
+            if ((jl_value_t*)mi == jl_nothing)
+                continue;
+            if (jl_type_intersection2(type, mi->specTypes, isect, isect2)) {
+                // Replacing a method--see if this really was the selected method previously
+                // over the intersection (not ambiguous) and the new method will be selected now (morespec).
+                // TODO: this only checks pair-wise for ambiguities, but the ambiguities could arise from the interaction of multiple methods
+                // and thus might miss a case where we introduce an ambiguity between`.u two existing methods
+                // We could instead work to sort this into 3 groups `morespecific .. ambiguous .. lesspecific`, with `type` in ambiguous,
+                // such that everything in `morespecific` dominates everything in `ambiguous`, and everything in `ambiguous` dominates everything in `lessspecific`
+                // And then compute where each isect falls, and whether it changed group--necessitating invalidation--or not.
+                int replaced_dispatch = is_replacing(ambig, type, m, d, n, *isect, *isect2, morespec);
+                // found that this specialization dispatch got replaced by m
+                // call invalidate_backedges(mi, max_world, "jl_method_table_insert");
+                // but ignore invoke-type edges
+                int invalidatedmi = _invalidate_dispatch_backedges(mi, type, m, d, n, replaced_dispatch, ambig, max_world, morespec);
+                if (replaced_dispatch) {
+                    if (stats)
+                        stats->spec_invalidations++;
+                    jl_atomic_store_relaxed(&mi->dispatch_status, 0);
+                    jl_array_ptr_1d_push(oldmi, (jl_value_t*)mi);
+                    if (replay) {
+                        // M2a fix round 2 (gate m2_dispatch_worlds): the answer at
+                        // specTypes flips at the entry's world. Lowering the mt-cache
+                        // entries (the walk's tail) bounds reachability but leaves
+                        // the CI chain's own range unbounded, and the world gates
+                        // pin it: the loser's CIs hold the pre-membership answer,
+                        // valid exactly through max_world = entry_min_world - 1.
+                        // A vanilla insertion (replay = 0) does NOT do this — there
+                        // the old CI stays valid for old worlds by the leaf-entry
+                        // bound alone; the §7 replay is the conservative walker and
+                        // bounds the range here. invalidate_code_instance recurses
+                        // into callers' backedges and is idempotent on already
+                        // lowered links (second branch asserts monotonicity).
+                        jl_code_instance_t *ci = jl_atomic_load_relaxed(&mi->cache);
+                        while (ci) {
+                            invalidate_code_instance(ci, max_world, 1);
+                            ci = jl_atomic_load_relaxed(&ci->next);
+                        }
+                    }
+                }
+                if (_jl_debug_method_invalidation && invalidatedmi) {
+                    jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)mi);
+                    *loctag = jl_cstr_to_string(replay ? "jl_membership_dispatch_walk" : "jl_method_table_insert");
+                    jl_array_ptr_1d_push(_jl_debug_method_invalidation, *loctag);
+                }
+                invalidated |= invalidatedmi;
+            }
+            // TODO: do we have any interesting cases left where isect3 is useful
+            //jl_value_t *isect3 = NULL;
+            //jl_value_t *isect4 = NULL;
+            //jl_value_t *isect5 = NULL;
+            //JL_GC_PUSH3(&isec3, &isect4, &isect5);
+            //isect3 = jl_type_intersection(m->sig, (jl_value_t*)mi->specTypes);
+            //jl_type_intersection2(type, isect3, &isect4, &isect5);
+            //if (!jl_types_equal(isect, isect4) && (!isect2 || !jl_types_equal(isect2, isect4)) &&
+            //    (!isect5 || (!jl_types_equal(isect, isect5) && (!isect2 || !jl_types_equal(isect2, isect5))))) {
+            //    jl_(type);
+            //    jl_(mi->specTypes);
+            //    jl_(m->sig);
+            //}
+            //JL_GC_POP();
+            *isect = NULL;
+            *isect2 = NULL;
+        }
+    }
+    return invalidated;
+}
+
+
 void jl_method_table_activate(jl_typemap_entry_t *newentry)
 {
     JL_TIMING(ADD_METHOD, ADD_METHOD);
@@ -3047,7 +3369,7 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     JL_GC_PUSH6(&oldvalue, &oldmi, &loctag, &isect, &isect2, &interferences);
     jl_typemap_entry_t *replaced = NULL;
     // Check what entries this intersects with in the prior world.
-    oldvalue = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), newentry, &replaced, max_world);
+    oldvalue = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), newentry, &replaced, max_world, 0);
     jl_method_t *const *d;
     size_t j, n;
     if (oldvalue == NULL) {
@@ -3141,99 +3463,15 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
             // Compute all morespec values upfront
             for (j = 0; j < n; j++)
                 morespec[j] = (char)jl_type_morespecific(d[j]->sig, type);
-            for (j = 0; j < n; j++) {
-                jl_method_t *m = d[j];
-                // Compute ambig state: is there an ambiguity between new method and old m?
-                char ambig = !morespec[j] && !jl_type_morespecific(type, m->sig);
-                // Compute updates to the dispatch state bits
-                int m_dispatch = jl_atomic_load_relaxed(&m->dispatch_status);
-                if (morespec[j] || ambig) {
-                    // !morespecific(new, old)
-                    dispatch_bits &= ~METHOD_SIG_LATEST_ONLY;
-                    // Add the old method to this interference set
-                    ssize_t idx;
-                    if (!has_key(interferences, (jl_value_t*)m))
-                        interferences = jl_idset_put_key(interferences, (jl_value_t*)m, &idx);
-                }
-                if (!morespec[j]) {
-                    // !morespecific(old, new)
-                    m_dispatch &= ~METHOD_SIG_LATEST_ONLY;
-                    // Add the new method to its interference set
-                    jl_genericmemory_t *m_interferences = jl_atomic_load_relaxed(&m->interferences);
-                    ssize_t idx;
-                    m_interferences = jl_idset_put_key(m_interferences, (jl_value_t*)method, &idx);
-                    jl_atomic_store_release(&m->interferences, m_interferences);
-                    jl_gc_wb(m, m_interferences);
-                }
-                // Add methods that intersect but are not more specific to interference list
-                jl_atomic_store_relaxed(&m->dispatch_status, m_dispatch);
-                if (morespec[j])
-                    continue;
-
-                // Now examine if this caused any invalidations.
-                loctag = jl_atomic_load_relaxed(&m->specializations); // use loctag for a gcroot
-                _Atomic(jl_method_instance_t*) *data;
-                size_t l;
-                if (jl_is_svec(loctag)) {
-                    data = (_Atomic(jl_method_instance_t*)*)jl_svec_data(loctag);
-                    l = jl_svec_len(loctag);
-                }
-                else {
-                    data = (_Atomic(jl_method_instance_t*)*) &loctag;
-                    l = 1;
-                }
-                for (size_t i = 0; i < l; i++) {
-                    jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i]);
-                    if ((jl_value_t*)mi == jl_nothing)
-                        continue;
-                    if (jl_type_intersection2(type, mi->specTypes, &isect, &isect2)) {
-                        // Replacing a method--see if this really was the selected method previously
-                        // over the intersection (not ambiguous) and the new method will be selected now (morespec).
-                        // TODO: this only checks pair-wise for ambiguities, but the ambiguities could arise from the interaction of multiple methods
-                        // and thus might miss a case where we introduce an ambiguity between`.u two existing methods
-                        // We could instead work to sort this into 3 groups `morespecific .. ambiguous .. lesspecific`, with `type` in ambiguous,
-                        // such that everything in `morespecific` dominates everything in `ambiguous`, and everything in `ambiguous` dominates everything in `lessspecific`
-                        // And then compute where each isect falls, and whether it changed group--necessitating invalidation--or not.
-                        int replaced_dispatch = is_replacing(ambig, type, m, d, n, isect, isect2, morespec);
-                        // found that this specialization dispatch got replaced by m
-                        // call invalidate_backedges(mi, max_world, "jl_method_table_insert");
-                        // but ignore invoke-type edges
-                        int invalidatedmi = _invalidate_dispatch_backedges(mi, type, m, d, n, replaced_dispatch, ambig, max_world, morespec);
-                        if (replaced_dispatch) {
-                            jl_atomic_store_relaxed(&mi->dispatch_status, 0);
-                            jl_array_ptr_1d_push(oldmi, (jl_value_t*)mi);
-                        }
-                        if (_jl_debug_method_invalidation && invalidatedmi) {
-                            jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)mi);
-                            loctag = jl_cstr_to_string("jl_method_table_insert");
-                            jl_array_ptr_1d_push(_jl_debug_method_invalidation, loctag);
-                        }
-                        invalidated |= invalidatedmi;
-                    }
-                    // TODO: do we have any interesting cases left where isect3 is useful
-                    //jl_value_t *isect3 = NULL;
-                    //jl_value_t *isect4 = NULL;
-                    //jl_value_t *isect5 = NULL;
-                    //JL_GC_PUSH3(&isec3, &isect4, &isect5);
-                    //isect3 = jl_type_intersection(m->sig, (jl_value_t*)mi->specTypes);
-                    //jl_type_intersection2(type, isect3, &isect4, &isect5);
-                    //if (!jl_types_equal(isect, isect4) && (!isect2 || !jl_types_equal(isect2, isect4)) &&
-                    //    (!isect5 || (!jl_types_equal(isect, isect5) && (!isect2 || !jl_types_equal(isect2, isect5))))) {
-                    //    jl_(type);
-                    //    jl_(mi->specTypes);
-                    //    jl_(m->sig);
-                    //}
-                    //JL_GC_POP();
-                    isect = NULL;
-                    isect2 = NULL;
-                }
-            }
+            invalidated |= invalidate_intersecting(type, method, d, n, morespec, max_world,
+                                                   oldmi, 0, NULL, &dispatch_bits,
+                                                   &interferences, &isect, &isect2, &loctag);
         }
     }
 
     jl_methcache_t *mc = jl_method_table->cache;
     JL_LOCK(&mc->writelock);
-    struct _typename_invalidate_backedge typename_env = {type, &isect, &isect2, d, n, max_world, invalidated};
+    struct _typename_invalidate_backedge typename_env = {type, type, &isect, &isect2, d, n, max_world, invalidated};
     invalidate_missing_backedges(&typename_env);
     invalidated |= typename_env.invalidated;
     if (oldmi && jl_array_nrows(oldmi)) {
@@ -3243,6 +3481,7 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
         mt_cache_env.max_world = max_world;
         mt_cache_env.shadowed = oldmi;
         mt_cache_env.newentry = newentry;
+        mt_cache_env.stats = NULL;
 
         jl_typemap_visitor(jl_atomic_load_relaxed(&mc->cache), invalidate_mt_cache, (void*)&mt_cache_env);
         jl_genericmemory_t *leafcache = jl_atomic_load_relaxed(&mc->leafcache);
@@ -3268,6 +3507,470 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     jl_atomic_store_relaxed(&method->dispatch_status, dispatch_bits); // TODO: this should be sequenced fully after the world counter store
     jl_atomic_store_release(&method->interferences, interferences);
     jl_gc_wb(method, interferences);
+    JL_GC_POP();
+}
+
+// §7 (plan §4.2 item 4, P6 stopgap + permanent cache walk, review H4/§3.2): the
+// declaration-time dispatch walk. For a new membership (`member` joins
+// `set_instance`, entry visible from entry_min_world), every method whose
+// signature names a set the member (transitively) joins is re-resolved as if
+// its sig, with the member substituted for the set, were inserted now — the
+// replay mode of the else-branch just extracted above. Calling convention
+// (single-bump protocol, review W3-F4): called under world_counter_lock with the
+// entry published and the counter ALREADY advanced to entry_min_world — the walk
+// runs at world == counter, so ml_matches' future guard passes and the
+// conservative path uses the counter-free jl_method_invalidate_core (W2-3);
+// §0's query-world override is set by the declaring call site for this whole
+// region (D1), and the declaring task is synced to entry_min_world (n3), so the
+// just-published entry is visible to the replay's intersections. The region is
+// written throw-free: a throw under JL_LOCK would leak world_counter_lock (and
+// the §0 override) — accepted with the OOM-class risk (D-M2-6).
+
+// sets to walk: set_instance plus its superset closure, over the §1 entry lists
+// on each visited set's own TypeName: an entry (M, Y) naming a visited S with
+// S <: M witnesses S ⊆ M ⊆ Y, so Y joins the walk too. Lists are tiny and
+// jl_declare_membership refuses set-in-set cycles (§1); seen-through-`sets`
+// dedup and the caps are belts.
+static void membership_superset_sets(jl_value_t *set_instance, size_t entry_min_world, jl_array_t *sets)
+{
+    jl_array_ptr_1d_push(sets, set_instance);
+    size_t i = 0;
+    while (i < jl_array_nrows(sets) && jl_array_nrows(sets) < 16) {
+        jl_value_t *S = jl_array_ptr_ref(sets, i++);
+        jl_value_t *Suw = jl_unwrap_unionall(S);
+        if (!jl_is_datatype(Suw))
+            continue;
+        jl_typename_t *tn = ((jl_datatype_t*)Suw)->name;
+        jl_svec_t *list = jl_typename_memberships(tn);
+        size_t l = jl_svec_len(list);
+        for (size_t j = 0; j < l; j++) {
+            jl_membership_t *en = (jl_membership_t*)jl_svecref(list, j);
+            if (en->min_world > entry_min_world)
+                continue; // not visible in the world this walk answers for
+            if (!jl_subtype(S, (jl_value_t*)en->member))
+                continue;
+            jl_value_t *Y = en->instance;
+            size_t k;
+            for (k = 0; k < jl_array_nrows(sets); k++)
+                if (jl_array_ptr_ref(sets, k) == Y)
+                    break;
+            if (k == jl_array_nrows(sets))
+                jl_array_ptr_1d_push(sets, Y);
+        }
+    }
+}
+
+// does the set's typename occur strictly below a signature position — inside
+// parameters, under Vararg, or in a TypeVar bound? Those shapes cannot take a
+// positional substitution; the §7 conservative path handles them.
+static int set_name_nested(jl_value_t *v, jl_typename_t *tn, int depth)
+{
+    v = jl_unwrap_unionall(v);
+    if (v == NULL || depth > 8)
+        return 0;
+    if (jl_is_uniontype(v))
+        return set_name_nested(((jl_uniontype_t*)v)->a, tn, depth + 1) ||
+               set_name_nested(((jl_uniontype_t*)v)->b, tn, depth + 1);
+    if (jl_is_vararg(v))
+        return set_name_nested(jl_unwrap_vararg(v), tn, depth + 1);
+    if (jl_is_typevar(v)) {
+        jl_tvar_t *tv = (jl_tvar_t*)v;
+        return set_name_nested(tv->lb, tn, depth + 1) ||
+               set_name_nested(tv->ub, tn, depth + 1);
+    }
+    if (jl_is_datatype(v)) {
+        jl_datatype_t *dt = (jl_datatype_t*)v;
+        if (dt->name == tn)
+            return 1;
+        for (size_t i = 0; i < jl_nparams(dt); i++)
+            if (set_name_nested(jl_tparam(dt, i), tn, depth + 1))
+                return 1;
+    }
+    return 0;
+}
+
+// the sig to replay for method m: m's signature with every direct positional
+// occurrence of a walked set instance replaced by the member pattern — the
+// member's core, re-wrapped over the sig's own UnionAll vars first and the
+// member's remaining vars outside them (family declarations share the tvar
+// objects, so a shared var binds exactly once — M1's pairing fix). *clean is
+// set to 0 when the shape resists substitution (a parametric or free-var
+// position of the set's family that the walked set is not a subtype of, or a
+// nested/Vararg occurrence); the caller then takes the conservative path.
+static jl_value_t *membership_subst_sig(jl_method_t *m, jl_array_t *sets,
+                                        jl_value_t *member, int *clean)
+{
+    jl_value_t *msig = (jl_value_t*)m->sig;
+    jl_value_t *mb = jl_unwrap_unionall(msig);
+    if (!jl_is_tuple_type(mb)) {
+        *clean = 0;
+        return NULL;
+    }
+    jl_value_t *memb = jl_unwrap_unionall(member);
+    if (!jl_is_datatype(memb)) {
+        *clean = 0;
+        return NULL;
+    }
+    jl_value_t *mvars[16]; size_t mvars_n = 0;
+    for (jl_value_t *t = msig; jl_is_unionall(t); t = ((jl_unionall_t*)t)->body) {
+        if (mvars_n == 16) {
+            *clean = 0;
+            return NULL;
+        }
+        mvars[mvars_n++] = (jl_value_t*)((jl_unionall_t*)t)->var;
+    }
+    jl_value_t *membvars[16]; size_t membvars_n = 0;
+    for (jl_value_t *t = member; jl_is_unionall(t); t = ((jl_unionall_t*)t)->body) {
+        if (membvars_n == 16) {
+            *clean = 0;
+            return NULL;
+        }
+        membvars[membvars_n++] = (jl_value_t*)((jl_unionall_t*)t)->var;
+    }
+    jl_datatype_t *mbd = (jl_datatype_t*)mb;
+    size_t n = jl_nparams(mbd);
+    jl_svec_t *newparams = jl_alloc_svec(n);
+    jl_datatype_t *tuple = NULL;
+    jl_value_t *res = NULL;
+    JL_GC_PUSH3(&newparams, &tuple, &res);
+    for (size_t i = 0; i < n; i++) {
+        jl_value_t *p = jl_tparam(mbd, i);
+        jl_value_t *uw = jl_is_vararg(p) ? jl_unwrap_vararg(p) : jl_unwrap_unionall(p);
+        int replaced = 0;
+        if (jl_is_datatype(uw)) {
+            jl_datatype_t *pd = (jl_datatype_t*)uw;
+            int named = 0;
+            for (size_t s = 0; s < jl_array_nrows(sets); s++) {
+                jl_value_t *Yuw = jl_unwrap_unionall(jl_array_ptr_ref(sets, s));
+                if (((jl_datatype_t*)Yuw)->name != pd->name)
+                    continue;
+                named = 1;
+                if (!jl_has_free_typevars(uw) &&
+                    (jl_egal(jl_array_ptr_ref(sets, s), uw) || jl_subtype(jl_array_ptr_ref(sets, s), uw))) {
+                    if (jl_is_vararg(p)) {
+                        // review W2-5c: substituting at a vararg position here would
+                        // write the BARE member and strip the Vararg — a malformed
+                        // dummy sig. Route to the conservative path instead (making
+                        // the driver's "set under Vararg is conservative" claim true).
+                        *clean = 0;
+                        JL_GC_POP();
+                        return NULL;
+                    }
+                    jl_svecset(newparams, i, memb);
+                    replaced = 1;
+                    break;
+                }
+            }
+            if (named && !replaced) { // a different instance of the family: conservative
+                *clean = 0;
+                JL_GC_POP();
+                return NULL;
+            }
+        }
+        if (!replaced) {
+            for (size_t s = 0; s < jl_array_nrows(sets); s++) {
+                jl_value_t *Yuw = jl_unwrap_unionall(jl_array_ptr_ref(sets, s));
+                if (set_name_nested(p, ((jl_datatype_t*)Yuw)->name, 1)) {
+                    *clean = 0;
+                    JL_GC_POP();
+                    return NULL;
+                }
+            }
+            jl_svecset(newparams, i, p);
+        }
+    }
+    // build: tuple, wrapped over m's vars, then the member's vars not already bound there
+    tuple = (jl_datatype_t*)jl_apply_tuple_type(newparams, 0);
+    res = (jl_value_t*)tuple; // each jl_new_struct below allocates across the previous step
+    for (size_t i = mvars_n; i-- > 0;) {
+        jl_unionall_t *na = (jl_unionall_t*)jl_new_struct(jl_unionall_type, mvars[i], res);
+        res = (jl_value_t*)na;
+    }
+    for (size_t i = membvars_n; i-- > 0;) {
+        int shared = 0;
+        for (size_t k = 0; k < mvars_n; k++)
+            if (membvars[i] == mvars[k])
+                shared = 1;
+        if (!shared) {
+            jl_unionall_t *na = (jl_unionall_t*)jl_new_struct(jl_unionall_type, membvars[i], res);
+            res = (jl_value_t*)na;
+        }
+    }
+    JL_GC_POP();
+    return res;
+}
+
+// collect all of a method's live MethodInstances (the svec or dense form) —
+// the conservative path pushes them all into oldmi, like activate's replaced
+// branch does for the method it replaces.
+static void membership_all_specializations(jl_method_t *m, jl_array_t *oldmi)
+{
+    jl_value_t *specs = (jl_value_t*)jl_atomic_load_relaxed(&m->specializations);
+    _Atomic(jl_method_instance_t*) *data;
+    size_t l;
+    if (jl_is_svec(specs)) {
+        data = (_Atomic(jl_method_instance_t*)*)jl_svec_data(specs);
+        l = jl_svec_len(specs);
+    }
+    else {
+        data = (_Atomic(jl_method_instance_t*)*)&m->specializations;
+        l = 1;
+    }
+    for (size_t i = 0; i < l; i++) {
+        jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i]);
+        if ((jl_value_t*)mi == jl_nothing)
+            continue;
+        jl_array_ptr_1d_push(oldmi, (jl_value_t*)mi);
+    }
+}
+
+// the conservative path has no substituted sig to consult invalidate_mt_cache's
+// intersection/guardsig keeps against — a stale cache entry for a member call
+// site need not intersect m's own sig at all — so every live mt-cache entry is
+// lowered instead. Rare-shape-only; strictly more conservative than the walk.
+static int invalidate_all_mt_cache(jl_typemap_entry_t *oldentry, void *closure0)
+{
+    struct invalidate_mt_env *env = (struct invalidate_mt_env*)closure0;
+    if (jl_atomic_load_relaxed(&oldentry->max_world) == ~(size_t)0) {
+        jl_atomic_store_relaxed(&oldentry->max_world, env->max_world);
+        if (env->stats)
+            env->stats->cache_lowerings++;
+    }
+    return 1;
+}
+
+// review W2-1 (second half): the conservative path's loser walk. A stale caller
+// CI (or MethodInstance) decided pre-declare against m is invisible to the core
+// invalidate (m has no specializations to walk) and unreachable by the
+// substituted path's intersection machinery (there is no substituted sig): the
+// specTypes that matter match m only once the membership is COMPOSED
+// (fvt(::Any,::Any) at (typeof,MVt,MVt) vs (typeof,Vararg{VAt})). So ask every
+// ground specialization of the table: if m's sig composed-matches (membership_-
+// MATCH_SIG at the entry's world) where that spec was decided, its winner
+// question changed — lower the CI chain (recursing into callers), clear the
+// dispatch status, and shadow it. May lower specs another method still wins
+// (recompute sooner) — conservative; rare shapes only.
+struct membership_shadow_env {
+    jl_method_t *m;          // the replayed set method
+    size_t world;            // the entry's world (match composed at it)
+    size_t max_world;        // last old world
+    jl_array_t *oldmi;
+    struct membership_stats *stats;
+    int invalidated;
+};
+static int membership_shadow_visitor(jl_typemap_entry_t *def, void *closure0)
+{
+    struct membership_shadow_env *env = (struct membership_shadow_env*)closure0;
+    // the driver keeps oldmi in its GC frame (gc[3]); the checker cannot see
+    // through the void* closure — promise what is true (AGENTS.md convention)
+    JL_GC_PROMISE_ROOTED(env->oldmi);
+    jl_method_t *m2 = def->func.method;
+    if (m2 == env->m || !jl_is_method((jl_value_t*)m2))
+        return 1;
+    // env->m is reachable from the globally rooted open_set_methods vec, and m2
+    // through the walked typemap; root local copies for the GC-able calls below
+    // (GCChecker cannot see either chain).
+    jl_value_t *msig = (jl_value_t*)env->m->sig;
+    jl_value_t *specs = (jl_value_t*)jl_atomic_load_relaxed(&m2->specializations);
+    JL_GC_PUSH2(&msig, &specs);
+    _Atomic(jl_method_instance_t*) *data;
+    size_t l;
+    if (jl_is_svec(specs)) {
+        data = (_Atomic(jl_method_instance_t*)*)jl_svec_data(specs);
+        l = jl_svec_len(specs);
+    }
+    else {
+        data = (_Atomic(jl_method_instance_t*)*)&m2->specializations;
+        l = 1;
+    }
+    for (size_t i = 0; i < l; i++) {
+        jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[i]);
+        if ((jl_value_t*)mi == jl_nothing)
+            continue;
+        if (!jl_has_free_typevars((jl_value_t*)mi->specTypes) &&
+            jl_membership_holds_at((jl_value_t*)mi->specTypes, msig, env->world)) {
+            // mirroring the substituted path's replaced_dispatch arm: bound the
+            // CI chain below the declaring world (recurses into the callers'
+            // backedges), drop the dispatch fast path, shadow the MI.
+            jl_code_instance_t *ci = jl_atomic_load_relaxed(&mi->cache);
+            while (ci) {
+                invalidate_code_instance(ci, env->max_world, 1);
+                ci = jl_atomic_load_relaxed(&ci->next);
+            }
+            jl_atomic_store_relaxed(&mi->dispatch_status, 0);
+            jl_array_ptr_1d_push(env->oldmi, (jl_value_t*)mi);
+            if (env->stats)
+                env->stats->spec_invalidations++;
+            env->invalidated = 1;
+        }
+    }
+    JL_GC_POP();
+    return 1;
+}
+
+JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *set_instance,
+                                              size_t entry_min_world)
+{
+    if (!jl_atomic_load_relaxed(&allow_new_worlds))
+        return; // entries land at package *execution*, not serialization (M6 replays them)
+    size_t max_world = entry_min_world - 1; // I5: align to entry visibility (n3 semantics), not the counter
+    // gc slots: 0 sets, 1 targets, 2 ms, 3 oldmi, 4 oldvalue, 5 dummy_sig, 6 dummy,
+    // 7 loctag, 8 isect, 9 isect2. JL_GC_PUSHARGS slots hold the values themselves,
+    // so the address-taking consumers below point at &gc[k] directly.
+    jl_value_t **gc;
+    JL_GC_PUSHARGS(gc, 10);
+    membership_stats.declares++;
+
+    jl_array_t *sets = (jl_array_t*)(gc[0] = (jl_value_t*)jl_alloc_vec_any(0));
+    membership_superset_sets(set_instance, entry_min_world, sets);
+    jl_array_t *targets = (jl_array_t*)(gc[1] = (jl_value_t*)jl_alloc_vec_any(0));
+    for (size_t s = 0; s < jl_array_nrows(sets); s++) {
+        jl_value_t *Yuw = jl_unwrap_unionall(jl_array_ptr_ref(sets, s));
+        jl_array_t *ms = (jl_array_t*)(gc[2] = (jl_value_t*)jl_methods_at_set(((jl_datatype_t*)Yuw)->name));
+        for (size_t i = 0; i < jl_array_nrows(ms); i++) {
+            jl_value_t *m = jl_array_ptr_ref(ms, i);
+            size_t k;
+            for (k = 0; k < jl_array_nrows(targets); k++)
+                if (jl_array_ptr_ref(targets, k) == m)
+                    break;
+            if (k == jl_array_nrows(targets))
+                jl_array_ptr_1d_push(targets, m);
+        }
+    }
+    gc[2] = NULL;
+
+    for (size_t i = 0; i < jl_array_nrows(targets); i++) {
+        jl_method_t *m = (jl_method_t*)jl_array_ptr_ref(targets, i);
+        jl_methtable_t *mt = jl_method_get_table(m);
+        if (!jl_is_mtable(mt))
+            continue;
+        membership_stats.replays++;
+        int invalidated = 0;
+        jl_value_t *type = NULL;
+        jl_method_t *const *d = NULL;
+        size_t j, n = 0;
+        int clean = 1;
+        jl_value_t *substsing = membership_subst_sig(m, sets, member, &clean);
+        jl_value_t *dummy_sig = NULL;
+        jl_typemap_entry_t *dummy = NULL;
+        jl_array_t *oldmi = NULL;
+        if (!clean || substsing == NULL) {
+            // rare shape (set inside a parameter, or under Vararg — the latter
+            // since review W2-5c made membership_subst_sig refuse vararg
+            // substitutions): conservative full pass over m. No substituted sig
+            // exists, so missing edges are pruned against m's own sig — with no
+            // d[] to cover them, every intersecting edge is treated as missing
+            // (never pruned). The invalidate CORE, not jl_method_table_invalidate:
+            // the single-bump declare protocol holds world_counter_lock with the
+            // counter already at min (review W2-3).
+            jl_method_invalidate_core(m, max_world, 0);
+            oldmi = (jl_array_t*)(gc[3] = (jl_value_t*)jl_alloc_vec_any(0));
+            membership_all_specializations(m, oldmi);
+            struct membership_shadow_env shadow_env = {m, entry_min_world, max_world, oldmi,
+                                                       &membership_stats, 0};
+            jl_typemap_visitor(jl_atomic_load_relaxed(&mt->defs), membership_shadow_visitor,
+                               (void*)&shadow_env);
+            invalidated |= shadow_env.invalidated;
+            jl_atomic_fetch_and_relaxed(&m->dispatch_status, ~(METHOD_SIG_LATEST_ONLY | METHOD_SIG_LATEST_WHICH));
+            type = (jl_value_t*)m->sig;
+        }
+        else {
+            dummy_sig = gc[5] = substsing;
+            // never inserted; get_intersect_matches' asserts pass (min ~0, max 1).
+            // this driver is the caller that roots it (review sweep 7).
+            dummy = (jl_typemap_entry_t*)(gc[6] = (jl_value_t*)jl_typemap_alloc((jl_tupletype_t*)dummy_sig, NULL, jl_emptysvec, (jl_value_t*)m, ~(size_t)0, 1));
+            jl_typemap_entry_t *replaced = NULL;
+            gc[4] = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), dummy, &replaced, max_world, 1);
+            assert(replaced == NULL); // a replay replaces nothing (its own entry is skipped, not equal)
+            (void)replaced;
+            if (gc[4] != NULL) {
+                assert(jl_is_array(gc[4]));
+                d = (jl_method_t**)jl_array_ptr_data((jl_array_t*)gc[4]);
+                n = jl_array_nrows((jl_array_t*)gc[4]);
+            }
+            oldmi = (jl_array_t*)(gc[3] = (jl_value_t*)jl_alloc_vec_any(0));
+            if (n > 0) {
+                char *morespec = (char*)alloca(n);
+                // M2a fix round (fix 4): the WINNER question compares the method's
+                // ORIGINAL sig — the substituted dummy is trivially more specific
+                // than every chain method (member <: chain type), which would let
+                // the replay install member routing shadowed by a closed method
+                // that C7 orders ABOVE the set. The substituted sig stays what
+                // drives the intersections (which decisions are affected).
+                for (j = 0; j < n; j++)
+                    morespec[j] = (char)jl_type_morespecific(d[j]->sig, (jl_value_t*)m->sig);
+                int dispatch_bits = 0; // replay discards these (activate-only publish)
+                // M2a fix round (fix 4): the idset is seeded from the method's own
+                // list, as activate's local is (gf.c:3343) — the has_key/put_key path
+                // in invalidate_intersecting runs whenever a method is ordered ABOVE
+                // the set method (morespec[j] = 1), which C7 now reaches at a replay;
+                // the NULL seed segfaulted once fix 4 made that branch executable.
+                // Published back below exactly as activate does: the additions are
+                // what an insertion in this world would have produced, and without
+                // the store the grown local copy would be a GC hazard.
+                jl_genericmemory_t *new_interferences =
+                    (jl_genericmemory_t*)jl_atomic_load_relaxed(&m->interferences);
+                invalidated = invalidate_intersecting(dummy_sig, m, d, n, morespec, max_world,
+                                                      oldmi, 1, &membership_stats, &dispatch_bits,
+                                                      &new_interferences, &gc[8], &gc[9], &gc[7]);
+                jl_atomic_store_release(&m->interferences, new_interferences);
+                jl_gc_wb(m, new_interferences);
+            }
+            // clear m's fast path (probe 3 abused the stale LATEST_ONLY bit)
+            jl_atomic_fetch_and_relaxed(&m->dispatch_status, ~(METHOD_SIG_LATEST_ONLY | METHOD_SIG_LATEST_WHICH));
+            type = dummy_sig;
+        }
+        // tail exactly as activate
+        jl_methcache_t *mc = jl_method_table->cache;
+        JL_LOCK(&mc->writelock);
+        // fix 4: intersections walk under the substituted sig, but the missing-edge
+        // winner question answers with m's original sig (identical on the
+        // conservative path, where type == m->sig already).
+        struct _typename_invalidate_backedge typename_env = {type, (jl_value_t*)m->sig, &gc[8], &gc[9], d, n, max_world, invalidated};
+        invalidate_missing_backedges(&typename_env);
+        invalidated |= typename_env.invalidated;
+        // the cache walk needs the shadowed list on the substituted path; the
+        // conservative path runs it unconditionally — its oldmi (all of m's own
+        // specializations) can be legitimately EMPTY (a set method that was never
+        // dispatched through) while stale mt/leaf entries for member call sites
+        // exist for exactly the reasons invalidate_all_mt_cache documents (review
+        // W2-1: this skip is what kept probe1's p2/p3 answering :old in the new
+        // world after the indexing fix finally made the walk reach the method).
+        if ((oldmi && jl_array_nrows(oldmi)) || !dummy) {
+            struct invalidate_mt_env mt_cache_env;
+            mt_cache_env.max_world = max_world;
+            mt_cache_env.shadowed = oldmi;
+            mt_cache_env.newentry = dummy;
+            mt_cache_env.stats = &membership_stats;
+            if (dummy)
+                jl_typemap_visitor(jl_atomic_load_relaxed(&mc->cache), invalidate_mt_cache, (void*)&mt_cache_env);
+            else
+                jl_typemap_visitor(jl_atomic_load_relaxed(&mc->cache), invalidate_all_mt_cache, (void*)&mt_cache_env);
+            jl_genericmemory_t *leafcache = jl_atomic_load_relaxed(&mc->leafcache);
+            size_t li, ll = leafcache->length;
+            for (li = 1; li < ll; li += 2) {
+                jl_value_t *entry = jl_genericmemory_ptr_ref(leafcache, li);
+                if (entry) {
+                    while (entry != jl_nothing) {
+                        jl_atomic_store_relaxed(&((jl_typemap_entry_t*)entry)->max_world, max_world);
+                        entry = (jl_value_t*)jl_atomic_load_relaxed(&((jl_typemap_entry_t*)entry)->next);
+                    }
+                }
+            }
+            jl_atomic_store_relaxed(&mc->leafcache, (jl_genericmemory_t*)jl_an_empty_memory_any);
+        }
+        JL_UNLOCK(&mc->writelock);
+        if (invalidated && _jl_debug_method_invalidation) {
+            jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)m);
+            gc[7] = (jl_value_t*)jl_cstr_to_string("jl_membership_dispatch_walk");
+            jl_array_ptr_1d_push(_jl_debug_method_invalidation, gc[7]);
+        }
+        gc[3] = NULL;
+        gc[4] = NULL;
+        gc[5] = NULL;
+        gc[6] = NULL;
+    }
+    jl_membership_log(member, set_instance, max_world);
     JL_GC_POP();
 }
 
@@ -4916,6 +5619,18 @@ static int ml_matches_visitor(jl_typemap_entry_t *ml, struct typemap_intersectio
         }
         closure->lim--;
     }
+    // a match that holds only through membership entries is valid only while
+    // those entries live (I2: this is the dispatch-side world bound — inference
+    // intersects it into sv.world.valid_worlds the way it does method worlds)
+    if (jl_has_open_set((jl_value_t*)ml->sig)) {
+        size_t lo = 1, hi = ~(size_t)0;
+        if (jl_membership_world_range(closure->match.ti, closure->world, &lo, &hi)) {
+            if (closure->match.min_valid < lo)
+                closure->match.min_valid = lo;
+            if (closure->match.max_valid > hi)
+                closure->match.max_valid = hi;
+        }
+    }
     closure->matc = make_method_match((jl_tupletype_t*)closure->match.ti,
         closure->match.env, meth,
         closure->match.issubty ? FULLY_COVERS : NOT_FULLY_COVERS);
@@ -5247,6 +5962,7 @@ static jl_value_t *ml_matches_i(jl_methtable_t *mt, jl_methcache_t *mc,
 
             /* temporaries */
             /* .search_slurp = */ 0,
+            /* .world = */ world,
 
             /* outputs */
             /* .min_valid = */ *min_valid,
@@ -5547,6 +6263,183 @@ static jl_value_t *ml_matches_i(jl_methtable_t *mt, jl_methcache_t *mc,
     if (lim >= 0 && len > lim)
         return jl_nothing;
     return env.t;
+}
+
+// §8 (exploration §2.3, review M10): the order-independent ambiguity report at a
+// membership declaration. A member of X and Y with a function holding a method
+// at both and nothing more specific is a real ambiguity at that member: Julia's
+// own dispatch raises it at the call; we warn now, at the declaration, where the
+// whole picture exists. WARN-ONLY contract (W4-10): this runs under
+// world_counter_lock — nothing here may throw; jl_printf/jl_static_show only.
+static void membership_ambig_warn(jl_methtable_t *mt, jl_value_t *X, jl_value_t *Y,
+                                  jl_value_t *member)
+{
+    jl_printf(JL_STDERR, "WARNING: method ");
+    if (mt && mt->name)
+        jl_printf(JL_STDERR, "%s", jl_symbol_name(mt->name));
+    else
+        jl_printf(JL_STDERR, "<unknown>");
+    jl_printf(JL_STDERR, " at ");
+    jl_static_show(JL_STDERR, X);
+    jl_printf(JL_STDERR, " and ");
+    jl_static_show(JL_STDERR, Y);
+    jl_printf(JL_STDERR, " is ambiguous for ");
+    jl_static_show(JL_STDERR, member);
+    jl_printf(JL_STDERR, ", a member of both sets\n");
+}
+
+JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t *set_instance,
+                                                 size_t entry_min_world)
+{
+    (void)set_instance; // published by the caller, so it is in the member's own TypeName list below
+    if (!jl_atomic_load_relaxed(&allow_new_worlds))
+        return;
+    jl_value_t *member_core = jl_unwrap_unionall(member);
+    if (!jl_is_datatype(member_core))
+        return;
+    jl_typename_t *mtn = ((jl_datatype_t*)member_core)->name;
+    // gc slots: 0 sets, 1 listX, 2 listY, 3 qsig (values held directly, see PUSHARGS)
+    jl_value_t **gc;
+    JL_GC_PUSHARGS(gc, 4);
+    // sets = every set the member joins (§1's lists on the member's TypeName):
+    // an entry (M, X) with member ⊆ M witnesses member ⊆ M ⊆ X. The svec stays
+    // rooted through mtn across the allocations below (review sweep 7).
+    jl_array_t *sets = (jl_array_t*)(gc[0] = (jl_value_t*)jl_alloc_vec_any(0));
+    int member_ground = !jl_has_free_typevars(member);
+    jl_svec_t *list = jl_typename_memberships(mtn);
+    for (size_t i = 0; i < (size_t)jl_svec_len(list) && jl_array_nrows(sets) < 16; i++) {
+        jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
+        if (en->min_world > entry_min_world)
+            continue;
+        int joins = member_ground ? jl_subtype(member, (jl_value_t*)en->member)
+                                  : jl_egal(member, (jl_value_t*)en->member);
+        if (!joins)
+            continue;
+        jl_value_t *Y = en->instance;
+        // review W2-4 (=W3-1): whole-family/parametric instances are UnionAlls —
+        // the raw ->name read handed out the typevar pointer as a bogus TypeName
+        // key (pointer-compared, never dereferenced), so the pair was silently
+        // dropped and a genuinely ambiguous parametric declaration never warned.
+        jl_typename_t *yn = ((jl_datatype_t*)jl_unwrap_unionall(Y))->name;
+        size_t k;
+        for (k = 0; k < jl_array_nrows(sets); k++)
+            if (((jl_datatype_t*)jl_unwrap_unionall(jl_array_ptr_ref(sets, k)))->name == yn)
+                break;
+        if (k == jl_array_nrows(sets))
+            jl_array_ptr_1d_push(sets, Y);
+    }
+    size_t ns = jl_array_nrows(sets);
+    int concrete = jl_is_concrete_type(member_core);
+    for (size_t a = 0; a < ns; a++) { // pairs, once each
+        for (size_t b = a + 1; b < ns; b++) {
+            jl_value_t *X = jl_array_ptr_ref(sets, a);
+            jl_value_t *Y = jl_array_ptr_ref(sets, b);
+            jl_typename_t *tnX = ((jl_datatype_t*)jl_unwrap_unionall(X))->name; // W2-4: UnionAll instances
+            jl_typename_t *tnY = ((jl_datatype_t*)jl_unwrap_unionall(Y))->name;
+            if (tnX == tnY)
+                continue;
+            jl_array_t *listX = (jl_array_t*)(gc[1] = (jl_value_t*)jl_methods_at_set(tnX));
+            jl_array_t *listY = (jl_array_t*)(gc[2] = (jl_value_t*)jl_methods_at_set(tnY));
+            if (jl_array_nrows(listX) == 0 || jl_array_nrows(listY) == 0) {
+                gc[1] = gc[2] = NULL;
+                continue;
+            }
+            int done = 0;
+            for (size_t x = 0; x < jl_array_nrows(listX) && !done; x++) {
+                jl_method_t *mX = (jl_method_t*)jl_array_ptr_ref(listX, x);
+                jl_methtable_t *mtX = jl_method_get_table(mX);
+                if (!jl_is_mtable(mtX))
+                    continue;
+                jl_value_t *mbX = jl_unwrap_unionall((jl_value_t*)mX->sig);
+                if (!jl_is_tuple_type(mbX) || jl_nparams((jl_datatype_t*)mbX) == 0)
+                    continue;
+                for (size_t y = 0; y < jl_array_nrows(listY) && !done; y++) {
+                    jl_method_t *mY = (jl_method_t*)jl_array_ptr_ref(listY, y);
+                    if (jl_method_get_table(mY) != mtX)
+                        continue;
+                    done = 1; // warn once per (mt, X, Y)
+                    if (concrete) {
+                        // the authoritative query — the same predicate dispatch
+                        // itself uses, incl. the method-on-both and set-in-set
+                        // suppressions. world=entry_min_world — the single-bump
+                        // protocol has published the counter to min before the
+                        // report, so ml_matches' future guard (world > counter)
+                        // passes at equality (a world above the counter would
+                        // make it answer jl_nothing — a silently empty report);
+                        // cache_result=0 (the report must not leave a leaf entry
+                        // that stamps METHOD_SIG_LATEST_ONLY for §6 to trip on).
+                        // jl_nothing or an empty result means
+                        // the declaration resolves to no entry at the member.
+                        jl_svec_t *qp = jl_alloc_svec(2);
+                        gc[3] = (jl_value_t*)qp;
+                        jl_svecset(qp, 0, jl_tparam((jl_datatype_t*)mbX, 0));
+                        jl_svecset(qp, 1, member);
+                        gc[3] = (jl_value_t*)jl_apply_tuple_type(qp, 0);
+                        size_t min_valid = 1, max_valid = 0;
+                        int ambig = 0;
+                        jl_value_t *res = ml_matches(mtX, jl_method_table->cache,
+                                                     (jl_tupletype_t*)gc[3], -1, 1, 1,
+                                                     entry_min_world, 0, &min_valid, &max_valid, &ambig);
+                        if (res == jl_nothing ||
+                            (jl_is_array(res) && jl_array_nrows((jl_array_t*)res) == 0) ||
+                            ambig)
+                            membership_ambig_warn(mtX, X, Y, member);
+                        gc[3] = NULL;
+                    }
+                    else {
+                        // abstract/parametric member: no instance to ask. Suppress
+                        // when some indexed method is more specific than both sides.
+                        // The candidates are the two sets' own lists AND the methods
+                        // indexed under any open set Q that itself joins X or Y by
+                        // the entry chain (M2a fix round 2, gate m2_ambiguity_report:
+                        // the set-in-set method g(::ZB), ZB ∈ XB ∧ ZB ∈ YB, resolves
+                        // the pair for every member of ZB — it is indexed under ZB,
+                        // so the exact-name lists alone missed it and over-warned).
+                        // A closed method on both sides not among these is missed —
+                        // over-warn (deviations.md).
+                        int suppressed = 0;
+                        for (int l = 0; l < 2 && !suppressed; l++) {
+                            jl_array_t *l3 = l == 0 ? listX : listY;
+                            for (size_t z = 0; z < jl_array_nrows(l3) && !suppressed; z++) {
+                                jl_method_t *m3 = (jl_method_t*)jl_array_ptr_ref(l3, z);
+                                if (m3 == mX || m3 == mY)
+                                    continue;
+                                if (jl_type_morespecific((jl_value_t*)m3->sig, (jl_value_t*)mX->sig) &&
+                                    jl_type_morespecific((jl_value_t*)m3->sig, (jl_value_t*)mY->sig))
+                                    suppressed = 1;
+                            }
+                        }
+                        if (!suppressed) {
+                            JL_LOCK(&open_set_methods_lock);
+                            size_t ml_ = open_set_methods ? jl_array_nrows(open_set_methods) : 0;
+                            for (size_t i = 0; i + 1 < ml_ && !suppressed; i += 2) {
+                                jl_typename_t *qn = (jl_typename_t*)jl_array_ptr_ref(open_set_methods, i);
+                                if (qn == tnX || qn == tnY || !qn->wrapper)
+                                    continue;
+                                jl_method_t *m3 = (jl_method_t*)jl_array_ptr_ref(open_set_methods, i + 1);
+                                if (m3 == mX || m3 == mY || jl_method_get_table(m3) != mtX)
+                                    continue;
+                                gc[3] = (jl_value_t*)m3; // keep the pair rooted across the tests below
+                                if (!(jl_membership_holds_at((jl_value_t*)qn->wrapper, X, entry_min_world) ||
+                                      jl_membership_holds_at((jl_value_t*)qn->wrapper, Y, entry_min_world)))
+                                    continue;
+                                if (jl_type_morespecific((jl_value_t*)m3->sig, (jl_value_t*)mX->sig) &&
+                                    jl_type_morespecific((jl_value_t*)m3->sig, (jl_value_t*)mY->sig))
+                                    suppressed = 1;
+                            }
+                            gc[3] = NULL;
+                            JL_UNLOCK(&open_set_methods_lock);
+                        }
+                        if (!suppressed)
+                            membership_ambig_warn(mtX, X, Y, member);
+                    }
+                }
+            }
+            gc[1] = NULL;
+            gc[2] = NULL;
+        }
+    }
+    JL_GC_POP();
 }
 
 // see if it might be possible to construct an instance of `typ`
