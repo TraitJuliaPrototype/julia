@@ -124,9 +124,17 @@ end
 # result, which the trait's method carries with the flag that it covers every member (§6.8). Each
 # such method the call's types fall under bounds the result, so the result is their intersection.
 # `nothing` where no argument is typed by a set, or no such method applies.
-function declared_operation_result(interp::AbstractInterpreter, @nospecialize(atype))
+function declared_operation_result(interp::AbstractInterpreter, argtypes::Vector{Any}, @nospecialize(atype))
     tt = unwrap_unionall(atype)
     (tt isa DataType && length(tt.parameters) >= 2) || return nothing
+    # a declared field read at a value typed by its set: its declared type
+    if length(argtypes) == 3 && argtypes[1] === Const(Base.getproperty)
+        name = argtypes[3]
+        if name isa Const && name.val isa Symbol
+            dft = declared_field_type(widenconst(argtypes[2]), name.val::Symbol)
+            dft === nothing || return dft
+        end
+    end
     atset = false
     for i = 2:length(tt.parameters)
         p = tt.parameters[i]
@@ -149,6 +157,35 @@ function declared_operation_result(interp::AbstractInterpreter, @nospecialize(at
         rt = rt === nothing ? r : typeintersect(rt, r)
     end
     return rt
+end
+
+# The declared type of field `name` of a value of type `X`, typed by a set or an intersection and
+# not by a concrete member (compiler §7.1): from the set's declared fields, or a supertrait's,
+# instantiated at `X`'s parameters; `nothing` where none declares it.
+function declared_field_type(@nospecialize(X), name::Symbol)
+    (isconcretetype(X) || ccall(:jl_has_open_set, Cint, (Any,), X) == 0) && return nothing
+    u = unwrap_unionall(X)
+    u isa DataType || return nothing
+    comps = u.name === (unwrap_unionall(Core.All)::DataType).name ? (u.parameters[1]::DataType).parameters : Any[u]
+    for c in comps
+        c = unwrap_unionall(c)
+        while c isa DataType && c !== Any
+            tn = c.name
+            if isdefined(tn, :declared_fields)
+                df = tn.declared_fields::SimpleVector
+                names = df[1]::SimpleVector
+                for k in 1:length(names)
+                    names[k] === name || continue
+                    T = df[2][k]
+                    has_free_typevars(T) || return T
+                    T = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), T, tn.wrapper, c.parameters)
+                    return has_free_typevars(T) ? rewrap_unionall(T, X) : T
+                end
+            end
+            c = c.super
+        end
+    end
+    return nothing
 end
 
 const MAX_OPERATION_SPLITS = 4
@@ -210,7 +247,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
     end
     # an operation of a set at a receiver typed by the set (compiler §7.1, §7.2)
-    drt = declared_operation_result(interp, atype)
+    drt = declared_operation_result(interp, argtypes, atype)
     if drt !== nothing
         split = operation_split_type(atype)
         split === nothing && return Future(CallMeta(drt, Any, Effects(), DeclaredResultInfo(drt)))

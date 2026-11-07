@@ -98,6 +98,7 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     tn->concrete_only = 0;
     jl_atomic_store_relaxed(&tn->memberships, jl_emptysvec);
     jl_atomic_store_relaxed(&tn->contract, NULL);
+    jl_atomic_store_relaxed(&tn->declared_fields, NULL);
     return tn;
 }
 
@@ -429,6 +430,27 @@ JL_DLLEXPORT void jl_set_open_set(jl_value_t *T)
         if (jl_is_datatype(t))
             ((jl_datatype_t*)t)->has_open_set = 1;
     }
+}
+
+// Write a set's declared fields (compiler §7.1), once: their names and types, the types in the
+// variables of the set's wrapper.
+JL_DLLEXPORT void jl_set_declared_fields(jl_value_t *T, jl_value_t *names, jl_value_t *types)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->open_set)
+        jl_error("only a set has declared fields");
+    if (!jl_is_svec(names) || !jl_is_svec(types) || jl_svec_len(names) != jl_svec_len(types))
+        jl_error("declared fields: an svec of names and an svec of types of the same length");
+    jl_typename_t *tn = ((jl_datatype_t*)uw)->name;
+    jl_value_t *df = (jl_value_t*)jl_svec2(names, types);
+    JL_GC_PUSH1(&df);
+    jl_value_t *expected = NULL;
+    if (!jl_atomic_cmpswap(&tn->declared_fields, &expected, df)) {
+        JL_GC_POP();
+        jl_errorf("the declared fields of %s are written once", jl_symbol_name(tn->name));
+    }
+    jl_gc_wb(tn, df);
+    JL_GC_POP();
 }
 
 // Write a set's contract (compiler §4.1), once.

@@ -575,6 +575,9 @@ typedef struct {
     // a set's contract (compiler §4.1), written once by the library at the
     // declaration and read without an edge; nothing until then
     _Atomic(jl_value_t*) contract;
+    // a set's declared fields, svec(names, types), the types in the wrapper's variables:
+    // written once by the library, read by inference (compiler §7.1); nothing until then
+    _Atomic(jl_value_t*) declared_fields;
 } jl_typename_t;
 
 // one declared membership of a member type in a set (compiler §4.2), kept on the
