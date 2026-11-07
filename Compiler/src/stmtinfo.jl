@@ -58,6 +58,29 @@ getsplit_impl(info::AttributedCallInfo, idx::Int) = getsplit(info.info, idx)
 getresult_impl(info::AttributedCallInfo, idx::Int) = getresult(info.info, idx)
 
 """
+    info::GuardedCallInfo <: CallInfo
+
+A call that a later membership could change (compiler §5.6): its argument's type could join a set at
+which another method of the function would then be selected. `cells` are the membership cells its
+guard reads: while each is closed (`min_world == typemax`), the call runs the method `info` selects;
+once one opens, the call dispatches when it runs. A membership invalidates no code.
+"""
+struct GuardedCallInfo <: CallInfo
+    info::CallInfo
+    cells::Vector{Any}
+end
+function add_edges_impl(edges::Vector{Any}, info::GuardedCallInfo)
+    add_edges!(edges, info.info)
+    for c in info.cells
+        any(x -> x === c, edges) || push!(edges, c)
+    end
+    return nothing
+end
+nsplit_impl(info::GuardedCallInfo) = nsplit(info.info)
+getsplit_impl(info::GuardedCallInfo, idx::Int) = getsplit(info.info, idx)
+getresult_impl(info::GuardedCallInfo, idx::Int) = getresult(info.info, idx)
+
+"""
     info::KeepInfo <: CallInfo
 
 `Core.keep(x)` resolved where the instance is compiled (compiler §6.9): `T` is `Dynamic{X}` where the

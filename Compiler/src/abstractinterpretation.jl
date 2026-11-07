@@ -284,6 +284,8 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
 
     (; valid_worlds, applicable) = matches
     update_valid_age!(sv, valid_worlds) # need to record the negative world now, since even if we don't generate any useful information, inlining might want to add an invoke edge and it won't have this information anymore
+    # the guard of a call a later membership could change (compiler §5.6)
+    gcells, grt = call_shadows(matches)
     sv isa InferenceState && record_match_memberships!(sv, applicable)
     # Concrete-only functions refuse to commit (and record no backedge) when any
     # applicable match has a non-concrete signature, regardless of scope. This is the
@@ -502,7 +504,15 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
             infercalls2(interp, sv) || push!(sv.tasks, infercalls2)
         end
 
-        gfresult[] = CallMeta(state.rettype, state.exctype, state.all_effects,
+        rettype, exctype, effects = state.rettype, state.exctype, state.all_effects
+        if !isempty(gcells)
+            # a guarded call: the selected method's result or a shadowing method's (compiler §5.6)
+            retinfo = GuardedCallInfo(retinfo, gcells)
+            rettype = rettype ⊔ₚ grt
+            exctype = Any
+            effects = Effects()
+        end
+        gfresult[] = CallMeta(rettype, exctype, effects,
                               attributed_info(retinfo, amask, adyn, acast, adispatch), state.slotrefinements)
         return true
     end # function infercalls
@@ -628,6 +638,35 @@ function attributed_matches(m::UnionSplitMethodMatches, mask::UInt32, dyn::UInt3
     end
     changed || return (m, dispatch)
     return (UnionSplitMethodMatches(applicable, m.applicable_argtypes, UnionSplitInfo(infos), m.valid_worlds), dispatch)
+end
+
+# The shadows of a call (compiler §5.6): for each signature the call is inferred at, the membership
+# cells of the arguments whose type could join a set at which another method would then be selected,
+# and those methods' declared results.
+function call_shadows(matches::Union{MethodMatches,UnionSplitMethodMatches})
+    infos = matches isa MethodMatches ? MethodMatchInfo[matches.info] : matches.info.split
+    cells = Any[]
+    rt = Bottom
+    for info in infos
+        m0 = nothing
+        for m in info.results.matches
+            if (m::MethodMatch).fully_covers
+                m0 = m.method
+                break
+            end
+        end
+        sh = ccall(:jl_call_shadows, Any, (Any, Any), info.atype, m0)::SimpleVector
+        isempty(sh) && continue
+        cs = sh[1]::SimpleVector
+        rs = sh[2]::SimpleVector
+        for i = 1:length(cs)
+            c = cs[i]
+            any(x -> x === c, cells) || push!(cells, c)
+            r = rs[i]
+            rt = isa(r, Type) ? tmerge(JLTypeLattice(), rt, r) : Any
+        end
+    end
+    return cells, rt
 end
 
 attributed_info(@nospecialize(info::CallInfo), mask::UInt32, dyn::UInt32, cast::Bool, dispatch::Bool) =

@@ -741,9 +741,10 @@ function Base.iterate(it::ForwardToBackedgeIterator, i::Int = 1)
             continue
         elseif isa(item, Core.Binding)
             return ((nothing, item), i + 1)
-        elseif isa(item, Core.MembershipEntry)
+        elseif isa(item, Core.MembershipEntry) || isa(item, Core.MembershipCell)
             # a positive membership the code folded (compiler §3.1): it never ends while the
-            # code is valid (§4.3), so it takes no backedge
+            # code is valid (§4.3), so it takes no backedge; a membership cell (§5.6) is read by the
+            # code's guard, which a membership never invalidates
             i += 1
             continue
         end
