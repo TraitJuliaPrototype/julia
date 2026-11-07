@@ -15,6 +15,8 @@
     XX(jl_apply_array_type) \
     XX(jl_apply_cmpswap_type) \
     XX(jl_apply_generic) \
+    XX(jl_apply_generic_facts) \
+    XX(jl_apply_generic_plain) \
     XX(jl_apply_tuple_type) \
     XX(jl_apply_tuple_type_v) \
     XX(jl_apply_type) \
@@ -252,6 +254,8 @@
     XX(jl_intersect_types) \
     XX(jl_intrinsic_name) \
     XX(jl_invoke) \
+    XX(jl_invoke_facts) \
+    XX(jl_invoke_plain) \
     XX(jl_invoke_api) \
     XX(jl_in_threaded_region) \
     XX(jl_iolock_begin) \

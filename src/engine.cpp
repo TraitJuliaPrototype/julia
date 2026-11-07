@@ -16,9 +16,12 @@ struct ReservationInfo {
     jl_code_instance_t *ci = nullptr;
 };
 
+// An inference is reserved per MethodInstance, owner and policy (compiler §2.3): Julia's own owner
+// infers a method that takes the policy of the code reaching it once per policy.
 struct InferKey {
     jl_method_instance_t *mi = nullptr;
     jl_value_t *owner = nullptr;
+    int facts = 0;
 };
 
 template<> struct llvm::DenseMapInfo<InferKey> {
@@ -27,21 +30,22 @@ template<> struct llvm::DenseMapInfo<InferKey> {
 
   static inline InferKey getEmptyKey() {
     return InferKey{FirstInfo::getEmptyKey(),
-                    SecondInfo::getEmptyKey()};
+                    SecondInfo::getEmptyKey(), 0};
   }
 
   static inline InferKey getTombstoneKey() {
     return InferKey{FirstInfo::getTombstoneKey(),
-                    SecondInfo::getTombstoneKey()};
+                    SecondInfo::getTombstoneKey(), 0};
   }
 
   static unsigned getHashValue(const InferKey& PairVal) {
-    return detail::combineHashValue(FirstInfo::getHashValue(PairVal.mi),
-                                    SecondInfo::getHashValue(PairVal.owner));
+    return detail::combineHashValue(detail::combineHashValue(FirstInfo::getHashValue(PairVal.mi),
+                                                             SecondInfo::getHashValue(PairVal.owner)),
+                                    (unsigned)PairVal.facts);
   }
 
   static bool isEqual(const InferKey &LHS, const InferKey &RHS) {
-    return LHS.mi == RHS.mi && LHS.owner == RHS.owner;
+    return LHS.mi == RHS.mi && LHS.owner == RHS.owner && LHS.facts == RHS.facts;
   }
 };
 
@@ -57,16 +61,32 @@ static SmallVector<InferKey, 0> Awaiting; // (this could be merged into ptls als
 extern "C" {
 #endif
 
+// the policy a reservation is for: the one asked for, for Julia's own owner only
+static int reserve_facts(jl_method_instance_t *m, jl_value_t *owner, int facts) JL_NOTSAFEPOINT
+{
+    if (owner != jl_nothing)
+        return 0;
+    return facts < 0 ? jl_mi_policy_at(m, JL_REACH_RUNTIME) : facts != 0;
+}
+
 jl_code_instance_t *jl_engine_reserve(jl_method_instance_t *m, jl_value_t *owner)
+{
+    return jl_engine_reserve_policy(m, owner, -1);
+}
+
+// `facts` is 0 plain, 1 facts, or -1 for the policy the runtime reaches `m` with
+JL_DLLEXPORT jl_code_instance_t *jl_engine_reserve_policy(jl_method_instance_t *m, jl_value_t *owner, int facts)
 {
     jl_task_t *ct = jl_current_task;
     ct->ptls->engine_nqueued++; // disables finalizers until inference is finished on this method graph
+    facts = reserve_facts(m, owner, facts);
     jl_code_instance_t *ci = jl_new_codeinst_uninit(m, owner); // allocate a placeholder
+    jl_ci_set_policy(ci, facts);
     JL_GC_PUSH1(&ci);
     auto tid = jl_atomic_load_relaxed(&ct->tid);
-    if (([tid, m, owner, ci] () -> bool { // necessary scope block / lambda for unique_lock
+    if (([tid, m, owner, ci, facts] () -> bool { // necessary scope block / lambda for unique_lock
             jl_unique_gcsafe_lock lock(engine_lock);
-            InferKey key{m, owner};
+            InferKey key{m, owner, facts};
             if ((signed)Awaiting.size() < tid + 1)
                 Awaiting.resize(tid + 1);
             while (1) {
@@ -105,8 +125,13 @@ jl_code_instance_t *jl_engine_reserve(jl_method_instance_t *m, jl_value_t *owner
 
 int jl_engine_hasreserved(jl_method_instance_t *m, jl_value_t *owner)
 {
+    return jl_engine_hasreserved_policy(m, owner, -1);
+}
+
+int jl_engine_hasreserved_policy(jl_method_instance_t *m, jl_value_t *owner, int facts)
+{
     jl_task_t *ct = jl_current_task;
-    InferKey key = {m, owner};
+    InferKey key = {m, owner, reserve_facts(m, owner, facts)};
     std::unique_lock lock(engine_lock);
     auto record = Reservations.find(key);
     return record != Reservations.end() && record->second.tid == jl_atomic_load_relaxed(&ct->tid);
@@ -139,7 +164,8 @@ void jl_engine_fulfill(jl_code_instance_t *ci, jl_code_info_t *src)
 {
     jl_task_t *ct = jl_current_task;
     std::unique_lock lock(engine_lock);
-    auto record = Reservations.find(InferKey{jl_get_ci_mi(ci), ci->owner});
+    int facts = ci->owner == jl_nothing && (jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_FACTS) != 0;
+    auto record = Reservations.find(InferKey{jl_get_ci_mi(ci), ci->owner, facts});
     if (record == Reservations.end() || record->second.ci != ci)
         return;
     assert(jl_atomic_load_relaxed(&ct->tid) == record->second.tid);

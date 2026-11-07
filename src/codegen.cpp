@@ -962,6 +962,27 @@ static const auto jlinvoke_func = new JuliaFunction<>{
     get_func2_sig,
     get_func_attrs,
 };
+// the entries of compiled code of each policy (compiler §2.4)
+static const auto jlapplygeneric_plain_func = new JuliaFunction<>{
+    XSTR(jl_apply_generic_plain),
+    get_func_sig,
+    get_func_attrs,
+};
+static const auto jlapplygeneric_facts_func = new JuliaFunction<>{
+    XSTR(jl_apply_generic_facts),
+    get_func_sig,
+    get_func_attrs,
+};
+static const auto jlinvoke_plain_func = new JuliaFunction<>{
+    XSTR(jl_invoke_plain),
+    get_func2_sig,
+    get_func_attrs,
+};
+static const auto jlinvoke_facts_func = new JuliaFunction<>{
+    XSTR(jl_invoke_facts),
+    get_func2_sig,
+    get_func_attrs,
+};
 static const auto jlinvokeoc_func = new JuliaFunction<>{
     XSTR(jl_invoke_oc),
     get_func2_sig,
@@ -1565,6 +1586,22 @@ static const auto &builtin_func_map() {
     return *builtins;
 }
 
+// The builtins that call a function, for compiled code of each policy (compiler §2.4).
+static const auto mk_reach_builtin_map() {
+    auto m = new DenseMap<jl_value_t*, std::pair<JuliaFunction<>*, JuliaFunction<>*>>();
+#define REACH_BUILTIN_MAP(cname) \
+    (*m)[BUILTIN(cname)] = {new JuliaFunction<>{XSTR(jl_f_##cname##_plain), get_func_sig, get_func_attrs}, \
+                            new JuliaFunction<>{XSTR(jl_f_##cname##_facts), get_func_sig, get_func_attrs}};
+    JL_REACH_BUILTINS(REACH_BUILTIN_MAP)
+#undef REACH_BUILTIN_MAP
+    return m;
+}
+
+static const auto &reach_builtin_map() {
+    static auto builtins = mk_reach_builtin_map();
+    return *builtins;
+}
+
 static _Atomic(uint64_t) globalUniqueGeneratedNames{1};
 
 // --- code generation ---
@@ -2115,6 +2152,45 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
 static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayRef<jl_cgval_t> argv, size_t nargs, jl_value_t *rt, bool always_inline);
 
 static Value *literal_pointer_val(jl_codectx_t &ctx, jl_value_t *p);
+
+// The policy this code's calls reach with (compiler §2.3, §2.4): its CodeInstance's. Code of another
+// owner, or with no CodeInstance, calls the runtime's own entries.
+static int code_reach(jl_codectx_t &ctx)
+{
+    if (!ctx.codeinst || ctx.codeinst->owner != jl_nothing)
+        return JL_REACH_RUNTIME;
+    return (jl_atomic_load_relaxed(&ctx.codeinst->flags) & JL_CI_FLAGS_FACTS) ? JL_REACH_FACTS : JL_REACH_PLAIN;
+}
+static JuliaFunction<> *applygeneric_for(jl_codectx_t &ctx)
+{
+    int reach = code_reach(ctx);
+    return reach == JL_REACH_FACTS ? jlapplygeneric_facts_func :
+           reach == JL_REACH_PLAIN ? jlapplygeneric_plain_func : jlapplygeneric_func;
+}
+static JuliaFunction<> *invoke_for(jl_codectx_t &ctx)
+{
+    int reach = code_reach(ctx);
+    return reach == JL_REACH_FACTS ? jlinvoke_facts_func :
+           reach == JL_REACH_PLAIN ? jlinvoke_plain_func : jlinvoke_func;
+}
+// calling a given CodeInstance's method instance through jl_invoke: the code of its policy
+static JuliaFunction<> *invoke_for_ci(jl_code_instance_t *codeinst) JL_NOTSAFEPOINT
+{
+    if (codeinst->owner != jl_nothing)
+        return jlinvoke_func;
+    return (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FACTS) ? jlinvoke_facts_func : jlinvoke_plain_func;
+}
+// a builtin that calls a function passes this code's policy on
+static JuliaFunction<> *builtin_func_for(jl_codectx_t &ctx, jl_value_t *f, JuliaFunction<> *dflt)
+{
+    int reach = code_reach(ctx);
+    if (reach == JL_REACH_RUNTIME)
+        return dflt;
+    auto it = reach_builtin_map().find(f);
+    if (it == reach_builtin_map().end())
+        return dflt;
+    return reach == JL_REACH_FACTS ? it->second.second : it->second.first;
+}
 static unsigned julia_alignment(jl_value_t *jt);
 static void recombine_value(jl_codectx_t &ctx, const jl_cgval_t &x, Value *dst, jl_aliasinfo_t const &dst_ai, Align alignment, bool isVolatile);
 
@@ -4261,7 +4337,7 @@ static bool emit_builtin_call(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
                     nva = ctx.builder.CreateTrunc(nva, getInt32Ty(ctx.builder.getContext()));
 #endif
                     Value *theArgs = emit_ptrgep(ctx, ctx.argArray, ctx.nReqArgs * sizeof(jl_value_t*));
-                    Value *r = ctx.builder.CreateCall(prepare_call(jlapplygeneric_func), { theF, theArgs, nva });
+                    Value *r = ctx.builder.CreateCall(prepare_call(applygeneric_for(ctx)), { theF, theArgs, nva });
                     *ret = mark_julia_type(ctx, r, true, jl_any_type);
                     return true;
                 }
@@ -4278,7 +4354,7 @@ static bool emit_builtin_call(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
 #endif
             Value *svec_data = emit_ptrgep(ctx, emit_pointer_from_objref(ctx, svec_val), ctx.types().sizeof_ptr);
             OperandBundleDef OpBundle("jl_roots", svec_val);
-            Value *r = ctx.builder.CreateCall(prepare_call(jlapplygeneric_func), { theF, svec_data, svec_len }, OpBundle);
+            Value *r = ctx.builder.CreateCall(prepare_call(applygeneric_for(ctx)), { theF, svec_data, svec_len }, OpBundle);
             *ret = mark_julia_type(ctx, r, true, jl_any_type);
             return true;
         }
@@ -4315,7 +4391,7 @@ static bool emit_builtin_call(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
         }
         Value *new_age = ctx.builder.CreateSelect(not_pure, target_world, last_age);
         emit_tls_world_age_store(ctx, new_age);
-        Value *r = emit_jlcall(ctx, jlapplygeneric_func, nullptr, argv.drop_front(fidx), nargs - fidx + 1, julia_call);
+        Value *r = emit_jlcall(ctx, applygeneric_for(ctx), nullptr, argv.drop_front(fidx), nargs - fidx + 1, julia_call);
         emit_tls_world_age_store(ctx, last_age);
         *ret = mark_julia_type(ctx, r, true, rt);
         return true;
@@ -5504,7 +5580,7 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayR
                     bool specsig, needsparams;
                     std::tie(specsig, needsparams) = uses_specsig(get_ci_abi(codeinst), mi, codeinst->rettype, ctx.params->prefer_specsig);
                     if (needsparams) {
-                        Value *r = emit_jlcall(ctx, jlinvoke_func, track_pjlvalue(ctx, literal_pointer_val(ctx, (jl_value_t*)mi)), argv, nargs, julia_call2);
+                        Value *r = emit_jlcall(ctx, invoke_for_ci(codeinst), track_pjlvalue(ctx, literal_pointer_val(ctx, (jl_value_t*)mi)), argv, nargs, julia_call2);
                         result = mark_julia_type(ctx, r, true, rt);
                     }
                     else {
@@ -5574,7 +5650,7 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayR
         }
     }
     if (!handled) {
-        Value *r = emit_jlcall(ctx, jlinvoke_func, boxed(ctx, lival), argv, nargs, julia_call2);
+        Value *r = emit_jlcall(ctx, invoke_for(ctx), boxed(ctx, lival), argv, nargs, julia_call2);
         result = mark_julia_type(ctx, r, true, rt);
     }
     if (result.typ == jl_bottom_type) {
@@ -5634,7 +5710,7 @@ static jl_cgval_t emit_invoke_modify(jl_codectx_t &ctx, jl_expr_t *ex, jl_value_
         }
     }
     // emit function and arguments
-    Value *callval = emit_jlcall(ctx, jlapplygeneric_func, nullptr, argv, nargs, julia_call);
+    Value *callval = emit_jlcall(ctx, applygeneric_for(ctx), nullptr, argv, nargs, julia_call);
     return mark_julia_type(ctx, callval, true, rt);
 }
 
@@ -5707,7 +5783,7 @@ static jl_cgval_t emit_call(jl_codectx_t &ctx, jl_expr_t *ex, jl_value_t *rt, bo
             return result;
         auto it = builtin_func_map().find(f.constant);
         if (it != builtin_func_map().end()) {
-            Value *ret = emit_jlcall(ctx, it->second, Constant::getNullValue(ctx.types().T_prjlvalue), ArrayRef<jl_cgval_t>(argv).drop_front(), nargs - 1, julia_call);
+            Value *ret = emit_jlcall(ctx, builtin_func_for(ctx, f.constant, it->second), Constant::getNullValue(ctx.types().T_prjlvalue), ArrayRef<jl_cgval_t>(argv).drop_front(), nargs - 1, julia_call);
             setName(ctx.emission_context, ret, it->second->name + "_ret");
             return mark_julia_type(ctx, ret, true, rt);
         }
@@ -5729,7 +5805,7 @@ static jl_cgval_t emit_call(jl_codectx_t &ctx, jl_expr_t *ex, jl_value_t *rt, bo
         }
     }
     // emit function and arguments
-    Value *callval = emit_jlcall(ctx, jlapplygeneric_func, nullptr, argv, n_generic_args, julia_call);
+    Value *callval = emit_jlcall(ctx, applygeneric_for(ctx), nullptr, argv, n_generic_args, julia_call);
     return mark_julia_type(ctx, callval, true, rt);
 }
 
@@ -7160,7 +7236,7 @@ Function *emit_tojlinvoke(jl_code_instance_t *codeinst, Value *theFunc, Module *
     else {
         jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
         bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure;
-        theFunc = prepare_call(is_opaque_closure ? jlinvokeoc_func : jlinvoke_func);
+        theFunc = prepare_call(is_opaque_closure ? jlinvokeoc_func : invoke_for_ci(codeinst));
         theFarg = literal_pointer_val(ctx, (jl_value_t*)mi);
     }
     theFarg = track_pjlvalue(ctx, theFarg);
@@ -10394,6 +10470,15 @@ static void init_jit_functions(void)
         add_named_global(jl_builtin_f_names[i], jl_builtin_f_addrs[i]);
     add_named_global(jlapplygeneric_func, &jl_apply_generic);
     add_named_global(jlinvoke_func, &jl_invoke);
+    add_named_global(jlapplygeneric_plain_func, &jl_apply_generic_plain);
+    add_named_global(jlapplygeneric_facts_func, &jl_apply_generic_facts);
+    add_named_global(jlinvoke_plain_func, &jl_invoke_plain);
+    add_named_global(jlinvoke_facts_func, &jl_invoke_facts);
+#define REACH_BUILTIN_GLOBALS(cname) \
+    add_named_global(XSTR(jl_f_##cname##_plain), &jl_f_##cname##_plain); \
+    add_named_global(XSTR(jl_f_##cname##_facts), &jl_f_##cname##_facts);
+    JL_REACH_BUILTINS(REACH_BUILTIN_GLOBALS)
+#undef REACH_BUILTIN_GLOBALS
     add_named_global(jltopeval_func, &jl_toplevel_eval);
     add_named_global(jlcopyast_func, &jl_copy_ast);
     //add_named_global(jlnsvec_func, &jl_svec);

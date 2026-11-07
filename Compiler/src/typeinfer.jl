@@ -1037,6 +1037,7 @@ function codeinst_as_edge(interp::AbstractInterpreter, sv::InferenceState, @nosp
     end
     ci = CodeInstance(mi, cache_owner(interp), Any, Any, nothing, nothing, zero(Int32),
         min_world, max_world, zero(UInt32), nothing, nothing, edges)
+    set_code_policy!(ci, interp)
     if max_world == typemax(UInt)
         # if we can record all of the backedges in the global reverse-cache,
         # we can now widen our applicability in the global cache too
@@ -1049,9 +1050,10 @@ end
 # compute (and cache) an inferred AST and return the current best estimate of the result type
 function typeinf_edge(interp::AbstractInterpreter, method::Method, @nospecialize(atype), sparams::SimpleVector, caller::AbsIntState, edgecycle::Bool, edgelimited::Bool)
     mi = specialize_method(method, atype, sparams)
-    # a callee of the other policy: an inference of its own (compiler §2.4); `return_type`'s run-time
+    # a callee of the other policy: an inference of its own (compiler §2.4); a callee that takes the
+    # policy of the code reaching it is inferred under the caller's; `return_type`'s run-time
     # interpreter infers every method plainly (§1.4)
-    if interp isa NativeInterpreter && !interp.plainrt && method_policy_facts(method) != interp.facts
+    if interp isa NativeInterpreter && !interp.plainrt && other_policy(method_policy(method), interp.facts)
         return typeinf_other_policy(interp, method, mi, caller, edgecycle, edgelimited)
     end
     cache_mode = CACHE_MODE_GLOBAL # cache edge targets globally by default
@@ -1647,9 +1649,13 @@ end
 
 # This is a bridge for the C code calling `jl_typeinf_func()` on a single Method match
 function typeinf_ext_toplevel(mi::MethodInstance, world::UInt, source_mode::UInt8, trim_mode::UInt8)
+    return typeinf_ext_toplevel(mi, world, source_mode, trim_mode, mi_policy_facts(mi))
+end
+# the same, for code of a policy (compiler §2.3): the runtime asks for the policy of the code that
+# reaches `mi`
+function typeinf_ext_toplevel(mi::MethodInstance, world::UInt, source_mode::UInt8, trim_mode::UInt8, facts::Bool)
     inf_params = InferenceParams(; force_enable_inference = trim_mode != TRIM_NO)
-    # an inference of a method instance runs under its method's policy (compiler §2.3)
-    interp = NativeInterpreter(world; inf_params, facts = mi_policy_facts(mi))
+    interp = NativeInterpreter(world; inf_params, facts)
     return typeinf_ext_toplevel(interp, mi, source_mode)
 end
 

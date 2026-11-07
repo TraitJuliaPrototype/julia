@@ -754,6 +754,35 @@ JL_DLLEXPORT int8_t jl_get_precompile_keep_ir(void);
 JL_DLLEXPORT void jl_set_precompile_keep_ir(int8_t v);
 JL_DLLEXPORT jl_code_info_t *jl_gdbcodetyped1(jl_method_instance_t *mi, size_t world);
 JL_DLLEXPORT jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *meth JL_PROPAGATES_ROOT, size_t world);
+
+// The policy of a method's code (compiler §2.3): plain, facts, or the policy of the code that
+// reaches it (a boundary; under the test bed, a neutral method).
+#define JL_POLICY_PLAIN 0
+#define JL_POLICY_FACTS 1
+#define JL_POLICY_CALLER 2
+// What reaches code (compiler §2.3): compiled code or the interpreter running code of a policy, or
+// the runtime's own entries, which reach with the setting's default.
+#define JL_REACH_PLAIN 0
+#define JL_REACH_FACTS 1
+#define JL_REACH_RUNTIME 2
+JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_compile_by_facts_all(void) JL_NOTSAFEPOINT;
+// whether the code of `mi` reached with `reach` is compiled by facts
+JL_DLLEXPORT int jl_mi_policy_at(jl_method_instance_t *mi, int reach) JL_NOTSAFEPOINT;
+JL_DLLEXPORT void jl_ci_set_policy(jl_code_instance_t *ci, int facts) JL_NOTSAFEPOINT;
+jl_code_instance_t *jl_type_infer_policy(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world, uint8_t source_mode, uint8_t trim_mode, int facts);
+jl_code_instance_t *jl_compile_method_internal_policy(jl_method_instance_t *meth JL_PROPAGATES_ROOT, size_t world, int facts);
+jl_code_instance_t *jl_method_compiled_policy(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world, int facts) JL_NOTSAFEPOINT;
+JL_DLLEXPORT jl_code_instance_t *jl_engine_reserve_policy(jl_method_instance_t *m, jl_value_t *owner, int facts);
+JL_DLLEXPORT jl_value_t *jl_rettype_inferred_policy(jl_value_t *owner, jl_method_instance_t *mi, size_t min_world, size_t max_world, int policy) JL_NOTSAFEPOINT;
+int jl_engine_hasreserved_policy(jl_method_instance_t *m, jl_value_t *owner, int facts) JL_NOTSAFEPOINT;
+// dispatch with the policy of the code that dispatches (compiler §2.4)
+JL_DLLEXPORT jl_value_t *jl_apply_generic_reach(jl_value_t *F, jl_value_t **args, uint32_t nargs, int reach);
+JL_DLLEXPORT jl_value_t *jl_invoke_reach(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc, int reach);
+jl_value_t *jl_gf_invoke_by_method_reach(jl_method_t *method, jl_value_t *gf, jl_value_t **args, size_t nargs, int reach);
+jl_value_t *jl_gf_invoke_reach(jl_value_t *types, jl_value_t *f, jl_value_t **args, size_t nargs, int reach);
+// a call the interpreter makes: a builtin that calls a function gets the interpreted code's policy
+jl_value_t *jl_apply_reach(jl_value_t **args, uint32_t nargs, int reach);
 JL_DLLEXPORT jl_code_instance_t *jl_get_method_inferred(
         jl_method_instance_t *mi JL_PROPAGATES_ROOT, jl_value_t *rettype,
         size_t min_world, size_t max_world, jl_debuginfo_t *di, jl_svec_t *edges);
@@ -813,6 +842,10 @@ JL_DLLEXPORT void jl_add_binding_backedge(jl_binding_t *b, jl_value_t *edge);
 static const uint8_t MI_FLAG_BACKEDGES_INUSE = 0b0100;
 static const uint8_t MI_FLAG_BACKEDGES_DIRTY = 0b1000;
 static const uint8_t MI_FLAG_BACKEDGES_ALL = 0b1100;
+// the policy of a method instance's code (compiler §2.3), cached at its first use: 0 not yet read,
+// else the policy + 1. An image does not keep it, since the setting is the session's.
+static const uint8_t MI_FLAG_POLICY_MASK = 0b110000;
+static const int MI_FLAG_POLICY_SHIFT = 4;
 
 STATIC_INLINE jl_array_t *jl_mi_get_backedges_mutate(jl_method_instance_t *mi JL_PROPAGATES_ROOT, uint8_t *flags) {
     *flags = jl_atomic_load_relaxed(&mi->flags) & (MI_FLAG_BACKEDGES_ALL);

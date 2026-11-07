@@ -24,7 +24,14 @@ typedef struct {
     size_t ip; // Leak the currently-evaluating statement index to backtrace capture
     int preevaluation; // use special rules for pre-evaluating expressions (deprecated--only for ccall handling)
     int continue_at; // statement index to jump to after leaving exception handler (0 if none)
+    int reach; // the policy its calls reach with (compiler §2.4): the code's own, or the runtime's
 } interpreter_state;
+
+// the policy top-level code of module `m` reaches with: its module's (compiler §2.3)
+static int module_reach(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    return m->facts == 1 ? JL_REACH_FACTS : m->facts == 2 ? JL_REACH_PLAIN : JL_REACH_RUNTIME;
+}
 
 
 // general alloca rules are incompatible on C and C++, so define a macro that deals with the difference
@@ -120,7 +127,7 @@ static jl_value_t *do_call(jl_value_t **args, size_t nargs, interpreter_state *s
     size_t i;
     for (i = 0; i < nargs; i++)
         argv[i] = eval_value(args[i], s);
-    jl_value_t *result = jl_apply(argv, nargs);
+    jl_value_t *result = jl_apply_reach(argv, nargs, s->reach);
     JL_GC_POP();
     return result;
 }
@@ -152,10 +159,11 @@ static jl_value_t *do_invoke(jl_value_t **args, size_t nargs, interpreter_state 
             if (codeinst->owner != jl_nothing) {
                 jl_error("Failed to invoke or compile external codeinst");
             }
-            result = jl_invoke(argv[0], nargs == 2 ? NULL : &argv[1], nargs - 2, jl_get_ci_mi(codeinst));
+            int ci_reach = (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FACTS) ? JL_REACH_FACTS : JL_REACH_PLAIN;
+            result = jl_invoke_reach(argv[0], nargs == 2 ? NULL : &argv[1], nargs - 2, jl_get_ci_mi(codeinst), ci_reach);
         }
     } else {
-        result = jl_invoke(argv[0], nargs == 2 ? NULL : &argv[1], nargs - 2, (jl_method_instance_t*)c);
+        result = jl_invoke_reach(argv[0], nargs == 2 ? NULL : &argv[1], nargs - 2, (jl_method_instance_t*)c, s->reach);
     }
     JL_GC_POP();
     return result;
@@ -810,6 +818,7 @@ jl_value_t *NOINLINE jl_fptr_interpret_call(jl_value_t *f, jl_value_t **args, ui
     s->continue_at = 0;
     s->mi = mi;
     s->ci = ci;
+    s->reach = codeinst->owner == jl_nothing && (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FACTS) ? JL_REACH_FACTS : JL_REACH_PLAIN;
     JL_GC_ENABLEFRAME(s);
     jl_value_t *r = eval_body(stmts, s, 0, 0);
     JL_GC_POP();
@@ -860,6 +869,7 @@ jl_value_t *jl_interpret_opaque_closure(jl_opaque_closure_t *oc, jl_value_t **ar
     s->continue_at = 0;
     s->mi = NULL;
     s->ci = NULL;
+    s->reach = JL_REACH_RUNTIME;
     size_t defargs = source->nargs;
     int isva = source->isva;
     assert(isva ? nargs + 2 >= defargs : nargs + 1 == defargs);
@@ -892,6 +902,7 @@ jl_value_t *NOINLINE jl_interpret_toplevel_thunk(jl_module_t *m, jl_code_info_t 
     s->continue_at = 0;
     s->mi = NULL;
     s->ci = NULL;
+    s->reach = module_reach(m);
     JL_GC_ENABLEFRAME(s);
     jl_value_t *r = eval_body(stmts, s, 0, 1);
     JL_GC_POP();
@@ -914,6 +925,7 @@ jl_value_t *NOINLINE jl_interpret_toplevel_expr_in(jl_module_t *m, jl_value_t *e
     s->continue_at = 0;
     s->mi = NULL;
     s->ci = NULL;
+    s->reach = module_reach(m);
     JL_GC_ENABLEFRAME(s);
     jl_value_t *v = eval_value(e, s);
     assert(v);

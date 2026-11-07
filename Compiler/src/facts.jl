@@ -120,10 +120,18 @@ function facts_find_method_matches(interp::AbstractInterpreter, argtypes::Vector
     return find_simple_method_matches(interp, atype, max_methods)
 end
 
-# The policy per method (compiler §2.3): a method compiled by facts by itself; a boundary and a
-# neutral method plain (C-44, C-45).
-method_policy_facts(m::Method) = ccall(:jl_method_is_facts, Cint, (Any,), m) != 0
-mi_policy_facts(mi::MethodInstance) = (def = mi.def; def isa Method && method_policy_facts(def))
+# The policy per method (compiler §2.3): plain, facts, or the policy of the code that reaches it (a
+# boundary; under the test bed, a neutral method).
+const POLICY_PLAIN = Cint(0)
+const POLICY_FACTS = Cint(1)
+const POLICY_CALLER = Cint(2)
+const REACH_RUNTIME = Cint(2)
+method_policy(m::Method) = ccall(:jl_method_policy, Cint, (Any,), m)
+method_policy_facts(m::Method) = method_policy(m) === POLICY_FACTS
+"Whether the code of `mi` is compiled by facts where the runtime reaches it (a compile request)."
+mi_policy_facts(mi::MethodInstance) = ccall(:jl_mi_policy_at, Cint, (Any, Cint), mi, REACH_RUNTIME) != 0
+"Whether a callee of policy `p` is inferred under the other policy than the caller's `facts`."
+other_policy(p::Cint, facts::Bool) = p !== POLICY_CALLER && (p === POLICY_FACTS) !== facts
 
 "The native interpreter of the other policy, in the same world and with the same parameters, one crossing further."
 policy_interp(interp::NativeInterpreter, facts::Bool) =

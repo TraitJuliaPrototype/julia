@@ -742,9 +742,8 @@ JL_DLLEXPORT int jl_get_module_facts(jl_module_t *m)
 {
     return m->facts;
 }
-// whether a method's code is compiled by facts by itself (compiler §2.3): always, or in a module of
-// flag 1 and not a boundary; a boundary takes the policy of the code that reaches it
-// the test bed (compiler §2.5): with JULIA_COMPILE_BY_FACTS=1 every neutral method is compiled by facts
+// The test bed (compiler §2.5): with JULIA_COMPILE_BY_FACTS=1 a neutral method takes the policy of
+// the code that reaches it, and the runtime's own entries reach with facts.
 static int compile_by_facts_all = -1;
 static int facts_all(void) JL_NOTSAFEPOINT
 {
@@ -758,12 +757,36 @@ JL_DLLEXPORT int jl_compile_by_facts_all(void) JL_NOTSAFEPOINT
 {
     return facts_all();
 }
+// A builtin's (or intrinsic's) method: its one CodeInstance is the runtime's, and every caller runs it.
+static int method_is_builtin(jl_method_t *m) JL_NOTSAFEPOINT
+{
+    jl_value_t *sig = jl_unwrap_unionall(m->sig);
+    if (!jl_is_tuple_type(sig) || jl_nparams(sig) == 0)
+        return 0;
+    jl_value_t *ft = jl_tparam0(sig);
+    return jl_is_datatype(ft) && ((jl_datatype_t*)ft)->super == jl_builtin_type;
+}
+// The policy of a method's code (compiler §2.3): the method's flag, then its module's: always facts;
+// a boundary takes the policy of the code that reaches it; a module of flag 1 facts, of flag 2 (the
+// compiler) plain; a neutral method plain, and under the test bed the policy of the code that
+// reaches it. A builtin is plain.
+JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT
+{
+    if (m->facts == 2)
+        return JL_POLICY_FACTS;
+    if (m->facts == 1)
+        return JL_POLICY_CALLER;
+    int8_t mf = m->module->facts;
+    if (mf == 1)
+        return JL_POLICY_FACTS;
+    if (mf == 2 || !facts_all() || method_is_builtin(m))
+        return JL_POLICY_PLAIN;
+    return JL_POLICY_CALLER;
+}
+// whether a method's code is compiled by facts whoever reaches it
 JL_DLLEXPORT int jl_method_is_facts(jl_method_t *m) JL_NOTSAFEPOINT
 {
-    if (m->facts != 0)
-        return m->facts == 2;
-    int8_t mf = m->module->facts;
-    return mf == 1 || (mf == 0 && facts_all());
+    return jl_method_policy(m) == JL_POLICY_FACTS;
 }
 // The trait language's scope options (compiler §2.1), as bits: 1 bounded, 2 no_pirates, 4 dynamic,
 // 8 first_seen.

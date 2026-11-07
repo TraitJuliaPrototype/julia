@@ -9,7 +9,10 @@ ranges. This struct abstracts over access to this cache.
 """
 struct InternalCodeCache
     owner::Any # `jl_egal` is used for comparison
+    # the policy of the code (compiler §2.3): 0 plain, 1 facts, -1 the one the runtime reaches it with
+    policy::Cint
 end
+InternalCodeCache(@nospecialize owner) = InternalCodeCache(owner, Cint(-1))
 
 function setindex!(cache::InternalCodeCache, ci::CodeInstance, mi::MethodInstance)
     @assert ci.owner === cache.owner
@@ -64,11 +67,11 @@ WorldView(wvc::WorldView, wr::WorldRange) = WorldView(wvc.cache, wr)
 WorldView(wvc::WorldView, args...) = WorldView(wvc.cache, args...)
 
 function haskey(wvc::WorldView{InternalCodeCache}, mi::MethodInstance)
-    return ccall(:jl_rettype_inferred, Any, (Any, Any, UInt, UInt), wvc.cache.owner, mi, first(wvc.worlds), last(wvc.worlds)) !== nothing
+    return ccall(:jl_rettype_inferred_policy, Any, (Any, Any, UInt, UInt, Cint), wvc.cache.owner, mi, first(wvc.worlds), last(wvc.worlds), wvc.cache.policy) !== nothing
 end
 
 function get(wvc::WorldView{InternalCodeCache}, mi::MethodInstance, default)
-    r = ccall(:jl_rettype_inferred, Any, (Any, Any, UInt, UInt), wvc.cache.owner, mi, first(wvc.worlds), last(wvc.worlds))
+    r = ccall(:jl_rettype_inferred_policy, Any, (Any, Any, UInt, UInt, Cint), wvc.cache.owner, mi, first(wvc.worlds), last(wvc.worlds), wvc.cache.policy)
     if r === nothing
         return default
     end

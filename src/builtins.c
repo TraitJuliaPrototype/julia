@@ -666,7 +666,35 @@ static jl_value_t *jl_arrayref(jl_array_t *a, size_t i)
     return jl_memoryrefget(jl_memoryrefindex(a->ref, i), 0);
 }
 
-JL_CALLABLE(jl_f__apply_iterate)
+// The builtins that call a function, for the policy of the code that calls them (compiler §2.4).
+static jl_value_t *apply_iterate_reach(jl_value_t **args, uint32_t nargs, int reach);
+static jl_value_t *invokelatest_reach(jl_value_t **args, uint32_t nargs, int reach);
+static jl_value_t *invoke_in_world_reach(jl_value_t **args, uint32_t nargs, int reach);
+static jl_value_t *call_in_world_total_reach(jl_value_t **args, uint32_t nargs, int reach);
+static jl_value_t *invoke_reach(jl_value_t **args, uint32_t nargs, int reach);
+
+// A call made for code of a policy (a splat, the interpreter): a builtin that calls a function
+// passes the policy on; any other function is dispatched with it.
+jl_value_t *jl_apply_reach(jl_value_t **args, uint32_t nargs, int reach)
+{
+    jl_value_t *f = args[0];
+    if (reach != JL_REACH_RUNTIME) {
+        if (f == BUILTIN(_apply_iterate))
+            return apply_iterate_reach(&args[1], nargs - 1, reach);
+        if (f == BUILTIN(invokelatest))
+            return invokelatest_reach(&args[1], nargs - 1, reach);
+        if (f == BUILTIN(invoke_in_world))
+            return invoke_in_world_reach(&args[1], nargs - 1, reach);
+        if (f == BUILTIN(_call_in_world_total))
+            return call_in_world_total_reach(&args[1], nargs - 1, reach);
+        if (f == BUILTIN(invoke))
+            return invoke_reach(&args[1], nargs - 1, reach);
+    }
+    return jl_apply_generic_reach(f, &args[1], nargs - 1, reach);
+}
+
+// a splat dispatches with the policy of the code that calls it (compiler §2.4)
+static jl_value_t *apply_iterate_reach(jl_value_t **args, uint32_t nargs, int reach)
 {
     JL_NARGSV(_apply_iterate, 2);
     jl_value_t *iterate = args[0];
@@ -709,7 +737,7 @@ JL_CALLABLE(jl_f__apply_iterate)
         }
         // optimization for `f(svec...)`
         if (jl_is_svec(args[1]))
-            return jl_apply_generic(f, jl_svec_data(args[1]), jl_svec_len(args[1]));
+            return jl_apply_generic_reach(f, jl_svec_data(args[1]), jl_svec_len(args[1]), reach);
     }
     // estimate how many real arguments we appear to have
     size_t precount = 1;
@@ -846,7 +874,7 @@ JL_CALLABLE(jl_f__apply_iterate)
             assert(extra > 0);
             jl_value_t *args[2];
             args[0] = ai;
-            jl_value_t *next = jl_apply_generic(iterate, args, 1);
+            jl_value_t *next = jl_apply_generic_reach(iterate, args, 1, reach);
             while (next != jl_nothing) {
                 roots[stackalloc] = next;
                 jl_value_t *value = jl_get_nth_field_checked(next, 0);
@@ -861,7 +889,7 @@ JL_CALLABLE(jl_f__apply_iterate)
                 roots[stackalloc + 1] = NULL;
                 JL_GC_ASSERT_LIVE(state);
                 args[1] = state;
-                next = jl_apply_generic(iterate, args, 2);
+                next = jl_apply_generic_reach(iterate, args, 2, reach);
             }
             roots[stackalloc] = NULL;
             extra -= 1;
@@ -873,27 +901,53 @@ JL_CALLABLE(jl_f__apply_iterate)
         ((void**)roots)[-2] = (void*)JL_GC_ENCODE_PUSHARGS(1);
 #endif
     }
-    jl_value_t *result = jl_apply(newargs, n);
+    jl_value_t *result = jl_apply_reach(newargs, n, reach);
     JL_GC_POP();
     return result;
 }
 
+JL_CALLABLE(jl_f__apply_iterate)
+{
+    return apply_iterate_reach(args, nargs, JL_REACH_RUNTIME);
+}
+JL_CALLABLE(jl_f__apply_iterate_plain)
+{
+    return apply_iterate_reach(args, nargs, JL_REACH_PLAIN);
+}
+JL_CALLABLE(jl_f__apply_iterate_facts)
+{
+    return apply_iterate_reach(args, nargs, JL_REACH_FACTS);
+}
+
 // this is like a regular call, but always runs in the newest world
-JL_CALLABLE(jl_f_invokelatest)
+static jl_value_t *invokelatest_reach(jl_value_t **args, uint32_t nargs, int reach)
 {
     JL_NARGSV(invokelatest, 1);
     jl_task_t *ct = jl_current_task;
     size_t last_age = ct->world_age;
     if (!ct->ptls->in_pure_callback)
         ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
-    jl_value_t *ret = jl_apply(args, nargs);
+    jl_value_t *ret = jl_apply_reach(args, nargs, reach);
     ct->world_age = last_age;
     return ret;
 }
 
+JL_CALLABLE(jl_f_invokelatest)
+{
+    return invokelatest_reach(args, nargs, JL_REACH_RUNTIME);
+}
+JL_CALLABLE(jl_f_invokelatest_plain)
+{
+    return invokelatest_reach(args, nargs, JL_REACH_PLAIN);
+}
+JL_CALLABLE(jl_f_invokelatest_facts)
+{
+    return invokelatest_reach(args, nargs, JL_REACH_FACTS);
+}
+
 // Like invokelatest, but runs in the specified world.
 // If world > jl_atomic_load_acquire(&jl_world_counter), run in the latest world.
-JL_CALLABLE(jl_f_invoke_in_world)
+static jl_value_t *invoke_in_world_reach(jl_value_t **args, uint32_t nargs, int reach)
 {
     JL_NARGSV(invoke_in_world, 2);
     jl_task_t *ct = jl_current_task;
@@ -905,12 +959,25 @@ JL_CALLABLE(jl_f_invoke_in_world)
         if (ct->world_age > world)
             ct->world_age = world;
     }
-    jl_value_t *ret = jl_apply(&args[1], nargs - 1);
+    jl_value_t *ret = jl_apply_reach(&args[1], nargs - 1, reach);
     ct->world_age = last_age;
     return ret;
 }
 
-JL_CALLABLE(jl_f__call_in_world_total)
+JL_CALLABLE(jl_f_invoke_in_world)
+{
+    return invoke_in_world_reach(args, nargs, JL_REACH_RUNTIME);
+}
+JL_CALLABLE(jl_f_invoke_in_world_plain)
+{
+    return invoke_in_world_reach(args, nargs, JL_REACH_PLAIN);
+}
+JL_CALLABLE(jl_f_invoke_in_world_facts)
+{
+    return invoke_in_world_reach(args, nargs, JL_REACH_FACTS);
+}
+
+static jl_value_t *call_in_world_total_reach(jl_value_t **args, uint32_t nargs, int reach)
 {
     JL_NARGSV(_call_in_world_total, 2);
     JL_TYPECHK(_call_in_world_total, ulong, args[0]);
@@ -924,7 +991,7 @@ JL_CALLABLE(jl_f__call_in_world_total)
         ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
         if (ct->world_age > world)
             ct->world_age = world;
-        ret = jl_apply(&args[1], nargs - 1);
+        ret = jl_apply_reach(&args[1], nargs - 1, reach);
         ct->world_age = last_age;
         ct->ptls->in_pure_callback = last_in;
     }
@@ -933,6 +1000,19 @@ JL_CALLABLE(jl_f__call_in_world_total)
         jl_rethrow();
     }
     return ret;
+}
+
+JL_CALLABLE(jl_f__call_in_world_total)
+{
+    return call_in_world_total_reach(args, nargs, JL_REACH_RUNTIME);
+}
+JL_CALLABLE(jl_f__call_in_world_total_plain)
+{
+    return call_in_world_total_reach(args, nargs, JL_REACH_PLAIN);
+}
+JL_CALLABLE(jl_f__call_in_world_total_facts)
+{
+    return call_in_world_total_reach(args, nargs, JL_REACH_FACTS);
 }
 
 // tuples ---------------------------------------------------------------------
@@ -1684,7 +1764,7 @@ JL_CALLABLE(jl_f_applicable)
     return jl_method_lookup(args, nargs, world) != NULL ? jl_true : jl_false;
 }
 
-JL_CALLABLE(jl_f_invoke)
+static jl_value_t *invoke_reach(jl_value_t **args, uint32_t nargs, int reach)
 {
     JL_NARGSV(invoke, 2);
     jl_value_t *argtypes = args[1];
@@ -1692,7 +1772,7 @@ JL_CALLABLE(jl_f_invoke)
         jl_method_t *m = (jl_method_t*)argtypes;
         if (!jl_tuple1_isa(args[0], &args[2], nargs - 1, (jl_datatype_t*)m->sig))
             jl_type_error("invoke: argument type error", argtypes, arg_tuple(args[0], &args[2], nargs - 1));
-        return jl_gf_invoke_by_method(m, args[0], &args[2], nargs - 1);
+        return jl_gf_invoke_by_method_reach(m, args[0], &args[2], nargs - 1, reach);
     } else if (jl_is_code_instance(argtypes)) {
         jl_code_instance_t *codeinst = (jl_code_instance_t*)args[1];
         jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
@@ -1723,14 +1803,29 @@ JL_CALLABLE(jl_f_invoke)
             if (codeinst->owner != jl_nothing) {
                 jl_error("Failed to invoke or compile external codeinst");
             }
-            return jl_invoke(args[0], &args[2], nargs - 1, mi);
+            // the code instance named is of a policy: its method instance runs code of that policy
+            int ci_reach = (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FACTS) ? JL_REACH_FACTS : JL_REACH_PLAIN;
+            return jl_invoke_reach(args[0], &args[2], nargs - 1, mi, ci_reach);
         }
     }
     if (!jl_is_tuple_type(jl_unwrap_unionall(argtypes)))
         jl_type_error("invoke", (jl_value_t*)jl_anytuple_type_type, argtypes);
     if (!jl_tuple_isa(&args[2], nargs - 2, (jl_datatype_t*)argtypes))
         jl_type_error("invoke: argument type error", argtypes, jl_f_tuple(NULL, &args[2], nargs - 2));
-    return jl_gf_invoke(argtypes, args[0], &args[2], nargs - 1);
+    return jl_gf_invoke_reach(argtypes, args[0], &args[2], nargs - 1, reach);
+}
+
+JL_CALLABLE(jl_f_invoke)
+{
+    return invoke_reach(args, nargs, JL_REACH_RUNTIME);
+}
+JL_CALLABLE(jl_f_invoke_plain)
+{
+    return invoke_reach(args, nargs, JL_REACH_PLAIN);
+}
+JL_CALLABLE(jl_f_invoke_facts)
+{
+    return invoke_reach(args, nargs, JL_REACH_FACTS);
 }
 
 // Expr constructor for internal use ------------------------------------------

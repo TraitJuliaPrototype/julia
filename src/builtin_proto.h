@@ -82,6 +82,20 @@ extern "C" {
 JL_BUILTIN_FUNCTIONS(DECLARE_BUILTIN)
 #undef DECLARE_BUILTIN
 
+// The builtins that call a function, for compiled code of each policy (compiler §2.4): each passes
+// the policy of the code that calls it on to the dispatch it makes.
+#define JL_REACH_BUILTINS(XX) \
+    XX(_apply_iterate) \
+    XX(invokelatest) \
+    XX(invoke_in_world) \
+    XX(_call_in_world_total) \
+    XX(invoke)
+#define DECLARE_REACH_BUILTIN(cname) \
+    JL_CALLABLE(jl_f_##cname##_plain); \
+    JL_CALLABLE(jl_f_##cname##_facts);
+JL_REACH_BUILTINS(DECLARE_REACH_BUILTIN)
+#undef DECLARE_REACH_BUILTIN
+
 #define BUILTIN(cname) (jl_builtin_instances[jl_builtin_id_##cname])
 
 enum jl_builtin_ids {

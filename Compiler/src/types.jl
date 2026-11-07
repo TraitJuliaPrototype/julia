@@ -428,8 +428,21 @@ get_inference_cache(interp::NativeInterpreter) = interp.inf_cache
 # `return_type`'s run-time answers under one of their own (§1.4)
 cache_owner(interp::NativeInterpreter) = interp.plainrt ? :plain_rt : nothing
 
-engine_reserve(interp::AbstractInterpreter, mi::MethodInstance) = engine_reserve(mi, cache_owner(interp))
+# the policy of the code an interpreter makes and looks up under Julia's own owner (compiler §2.3): 0
+# plain, 1 facts, -1 the policy the runtime reaches a method with
+code_policy(::AbstractInterpreter) = Cint(-1)
+code_policy(interp::NativeInterpreter) = interp.plainrt ? Cint(-1) : Cint(interp.facts)
+"A CodeInstance records the policy it is compiled in, before it is published (compiler §2.3)."
+function set_code_policy!(ci::CodeInstance, interp::AbstractInterpreter)
+    p = code_policy(interp)
+    p >= 0 && ccall(:jl_ci_set_policy, Cvoid, (Any, Cint), ci, p)
+    return ci
+end
+
+engine_reserve(interp::AbstractInterpreter, mi::MethodInstance) = engine_reserve(mi, cache_owner(interp), code_policy(interp))
 engine_reserve(mi::MethodInstance, @nospecialize owner) = ccall(:jl_engine_reserve, Any, (Any, Any), mi, owner)::CodeInstance
+engine_reserve(mi::MethodInstance, @nospecialize(owner), policy::Cint) =
+    ccall(:jl_engine_reserve_policy, Any, (Any, Any, Cint), mi, owner, policy)::CodeInstance
 # engine_fulfill(::AbstractInterpreter, ci::CodeInstance, src::CodeInfo) = ccall(:jl_engine_fulfill, Cvoid, (Any, Any), ci, src) # currently the same as engine_reject, so just use that one
 engine_reject(::AbstractInterpreter, ci::CodeInstance) = ccall(:jl_engine_fulfill, Cvoid, (Any, Ptr{Cvoid}), ci, C_NULL)
 
@@ -508,7 +521,7 @@ ipo_lattice(::AbstractInterpreter) = InferenceLattice(IPOResultLattice.instance)
 optimizer_lattice(::AbstractInterpreter) = SimpleInferenceLattice.instance
 
 function code_cache(interp::AbstractInterpreter)
-  cache = InternalCodeCache(cache_owner(interp))
+  cache = InternalCodeCache(cache_owner(interp), code_policy(interp))
   worlds = WorldRange(get_inference_world(interp))
   return WorldView(cache, worlds)
 end
