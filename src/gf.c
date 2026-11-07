@@ -2346,6 +2346,12 @@ JL_DLLEXPORT void *jl_split_table_ptr(jl_value_t *tbl, jl_value_t *T)
     return jl_unbox_voidpointer(fp);
 }
 
+// G2 as a predicate (compiler §3.2): set once a CodeInstance's record is finished and satisfies it.
+JL_DLLEXPORT void jl_ci_set_g2(jl_code_instance_t *ci)
+{
+    jl_atomic_fetch_or_relaxed(&ci->flags, JL_CI_FLAGS_G2);
+}
+
 // A method's declared result (compiler §6.8). The library sets it on a trait's method for an
 // operation, with `covers` set: each member's serving method is checked to infer within it.
 JL_DLLEXPORT void jl_method_set_declared_result(jl_method_t *m, jl_value_t *rt, int covers)
@@ -4519,7 +4525,7 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
                     jl_atomic_store_relaxed(&codeinst->invoke, invoke);
                     // unspec is probably not specsig, but might be using specptr
                     jl_atomic_store_relaxed(&codeinst->flags, (specsigflags & JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR) |
-                        (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FACTS)); // the policy stays
+                        (jl_atomic_load_relaxed(&codeinst->flags) & (JL_CI_FLAGS_FACTS | JL_CI_FLAGS_G2))); // the policy and G2 stay
                     jl_mi_cache_insert(mi, codeinst);
                     record_precompile_statement(mi, 0, 0);
                     return codeinst;
@@ -4635,7 +4641,7 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
         jl_atomic_store_relaxed(&codeinst->specptr.fptr, fptr);
         jl_atomic_store_relaxed(&codeinst->invoke, invoke);
         jl_atomic_store_relaxed(&codeinst->flags, (specsigflags & JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR) |
-                        (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FACTS)); // the policy stays
+                        (jl_atomic_load_relaxed(&codeinst->flags) & (JL_CI_FLAGS_FACTS | JL_CI_FLAGS_G2))); // the policy and G2 stay
         jl_mi_cache_insert(mi, codeinst);
     }
     jl_atomic_store_relaxed(&codeinst->precompile, 1);

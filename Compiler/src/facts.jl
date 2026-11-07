@@ -152,3 +152,22 @@ function typeinf_other_policy(interp::NativeInterpreter, method::Method, mi::Met
         return Future(MethodCallResult(interp, caller, method, Any, Any, unedged_effects(interp), nothing, edgecycle, edgelimited))
     return return_cached_result(interp, method, codeinst, caller, edgecycle, edgelimited)
 end
+
+"""
+Whether a record satisfies G2 (compiler §3.2): every dispatch edge is at a fact signature. An invoke
+at a declared signature is not gated; a binding edge is not a dispatch. (Whether an inlined callee's
+own record satisfies it: C-46.)
+"""
+function edges_satisfy_g2(edges::SimpleVector)
+    for (invokesig, item) in ForwardToBackedgeIterator(edges)
+        if item isa Core.Binding
+            continue
+        elseif item isa MethodTable
+            is_fact_sig(invokesig) || return false
+        elseif item isa MethodInstance
+            invokesig === nothing || continue
+            is_fact_sig(item.specTypes) || return false
+        end
+    end
+    return true
+end
