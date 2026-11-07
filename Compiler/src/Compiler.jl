@@ -37,6 +37,9 @@ else
 
 using Core.Intrinsics, Core.IR
 
+# the compiler's own code is never compiled by facts, under any setting (compiler §2.1)
+ccall(:jl_set_module_facts_never, Core.Nothing, (Core.Any,), Compiler)
+
 using Core: ABIOverride, Builtin, CodeInstance, IntrinsicFunction, MethodInstance, MethodMatch,
     MethodTable, MethodCache, PartialOpaque, SimpleVector, TypeofVararg,
     _apply_iterate, apply_type, compilerbarrier, donotdelete, memoryref_isassigned,

@@ -733,15 +733,37 @@ JL_DLLEXPORT void jl_set_module_facts(jl_module_t *self, int value)
 {
     self->facts = value == 2 ? 2 : value != 0;
 }
+// the compiler's own modules: never compiled by facts (callable before Base's C types exist)
+JL_DLLEXPORT void jl_set_module_facts_never(jl_module_t *self)
+{
+    self->facts = 2;
+}
 JL_DLLEXPORT int jl_get_module_facts(jl_module_t *m)
 {
     return m->facts;
 }
 // whether a method's code is compiled by facts by itself (compiler §2.3): always, or in a module of
 // flag 1 and not a boundary; a boundary takes the policy of the code that reaches it
+// the test bed (compiler §2.5): with JULIA_COMPILE_BY_FACTS=1 every neutral method is compiled by facts
+static int compile_by_facts_all = -1;
+static int facts_all(void) JL_NOTSAFEPOINT
+{
+    if (compile_by_facts_all < 0) {
+        const char *e = getenv("JULIA_COMPILE_BY_FACTS");
+        compile_by_facts_all = e != NULL && e[0] == '1' && e[1] == '\0' && !jl_generating_output();
+    }
+    return compile_by_facts_all;
+}
+JL_DLLEXPORT int jl_compile_by_facts_all(void) JL_NOTSAFEPOINT
+{
+    return facts_all();
+}
 JL_DLLEXPORT int jl_method_is_facts(jl_method_t *m) JL_NOTSAFEPOINT
 {
-    return m->facts == 2 || (m->facts == 0 && m->module->facts == 1);
+    if (m->facts != 0)
+        return m->facts == 2;
+    int8_t mf = m->module->facts;
+    return mf == 1 || (mf == 0 && facts_all());
 }
 // The trait language's scope options (compiler §2.1), as bits: 1 bounded, 2 no_pirates, 4 dynamic,
 // 8 first_seen.
