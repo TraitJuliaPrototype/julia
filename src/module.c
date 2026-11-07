@@ -766,20 +766,22 @@ static int method_is_builtin(jl_method_t *m) JL_NOTSAFEPOINT
     jl_value_t *ft = jl_tparam0(sig);
     return jl_is_datatype(ft) && ((jl_datatype_t*)ft)->super == jl_builtin_type;
 }
-// The policy of a method's code (compiler §2.3): the method's flag, then its module's: always facts;
-// a boundary takes the policy of the code that reaches it; a module of flag 1 facts, of flag 2 (the
-// compiler) plain; a neutral method plain, and under the test bed the policy of the code that
-// reaches it. A builtin is plain.
+// The policy of a method's code (compiler §2.3): the compiler's own code (a module of flag 2) plain,
+// whatever its methods' flags say (facts §6.4); then the method's flag: always facts, or a boundary,
+// which takes the policy of the code that reaches it; then its module's: flag 1 facts; a neutral
+// method plain, and under the test bed the policy of the code that reaches it. A builtin is plain.
 JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT
 {
+    int8_t mf = m->module->facts;
+    if (mf == 2)
+        return JL_POLICY_PLAIN;
     if (m->facts == 2)
         return JL_POLICY_FACTS;
     if (m->facts == 1)
         return JL_POLICY_CALLER;
-    int8_t mf = m->module->facts;
     if (mf == 1)
         return JL_POLICY_FACTS;
-    if (mf == 2 || !facts_all() || method_is_builtin(m))
+    if (!facts_all() || method_is_builtin(m))
         return JL_POLICY_PLAIN;
     return JL_POLICY_CALLER;
 }
