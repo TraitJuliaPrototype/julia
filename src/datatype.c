@@ -249,6 +249,113 @@ JL_DLLEXPORT jl_value_t *jl_candidates_of(jl_value_t *set)
     return r ? r : (jl_value_t*)jl_alloc_vec_any(0);
 }
 
+// Membership cells (compiler §5.6), each set's TypeName to a list of its cells (a SimpleVector,
+// replaced, never mutated). A guard reads a cell's world; a membership that makes the cell's member
+// a member of the set, or of a set that joins it, writes it once.
+jl_genericmemory_t *jl_set_cells JL_GLOBALLY_ROOTED = NULL;
+static jl_mutex_t cells_lock;
+
+// whether `member` is a member of the set `setname` in `world`, at any instance of it
+static int cell_holds(jl_value_t *member, jl_typename_t *setname, size_t world)
+{
+    return jl_membership_holds_at(member, setname->wrapper, world);
+}
+
+static void cells_list_add(jl_typename_t *setname, jl_value_t *cell)
+{
+    jl_svec_t *old = jl_set_cells ? (jl_svec_t*)jl_eqtable_get(jl_set_cells, (jl_value_t*)setname, NULL) : NULL;
+    size_t n = old ? jl_svec_len(old) : 0;
+    jl_svec_t *nw = jl_alloc_svec_uninit(n + 1);
+    JL_GC_PUSH1(&nw);
+    for (size_t i = 0; i < n; i++)
+        jl_svecset(nw, i, jl_svecref(old, i));
+    jl_svecset(nw, n, cell);
+    if (jl_set_cells == NULL)
+        jl_set_cells = jl_alloc_memory_any(16);
+    jl_set_cells = jl_eqtable_put(jl_set_cells, (jl_value_t*)setname, (jl_value_t*)nw, NULL);
+    JL_GC_POP();
+}
+
+// The cell of the member type `member` and the set `set` (a set, or its TypeName): one per pair in a
+// session, made on demand. Its world is the membership's where `member` is a member already.
+JL_DLLEXPORT jl_value_t *jl_membership_cell(jl_value_t *member, jl_value_t *set)
+{
+    jl_typename_t *setname;
+    if (jl_is_typename(set))
+        setname = (jl_typename_t*)set;
+    else {
+        jl_value_t *u = jl_unwrap_unionall(set);
+        if (!jl_is_datatype(u) || !((jl_datatype_t*)u)->name->open_set)
+            jl_error("a membership cell is of a set");
+        setname = ((jl_datatype_t*)u)->name;
+    }
+    jl_value_t *cell = NULL;
+    JL_GC_PUSH1(&cell);
+    JL_LOCK(&cells_lock);
+    jl_svec_t *list = jl_set_cells ? (jl_svec_t*)jl_eqtable_get(jl_set_cells, (jl_value_t*)setname, NULL) : NULL;
+    for (size_t i = 0; list != NULL && i < jl_svec_len(list); i++) {
+        jl_membership_cell_t *c = (jl_membership_cell_t*)jl_svecref(list, i);
+        if (c->member == member || jl_types_equal(c->member, member)) {
+            cell = (jl_value_t*)c;
+            break;
+        }
+    }
+    if (cell == NULL) {
+        cell = jl_gc_alloc(jl_current_task->ptls, sizeof(jl_membership_cell_t), jl_membership_cell_type);
+        jl_membership_cell_t *c = (jl_membership_cell_t*)cell;
+        c->member = member;
+        c->set = (jl_value_t*)setname;
+        size_t world = jl_atomic_load_acquire(&jl_world_counter);
+        jl_atomic_store_relaxed(&c->min_world, cell_holds(member, setname, world) ? (uint64_t)world : ~(uint64_t)0);
+        cells_list_add(setname, cell);
+    }
+    JL_UNLOCK(&cells_lock);
+    JL_GC_POP();
+    return cell;
+}
+
+// A cell an image brings (compiler §9): registered with this session's cells, its world this session's.
+void jl_membership_cell_register(jl_membership_cell_t *cell)
+{
+    JL_LOCK(&cells_lock);
+    jl_typename_t *setname = (jl_typename_t*)cell->set;
+    size_t world = jl_atomic_load_acquire(&jl_world_counter);
+    jl_atomic_store_release(&cell->min_world,
+        cell_holds(cell->member, setname, world) ? (uint64_t)world : ~(uint64_t)0);
+    cells_list_add(setname, (jl_value_t*)cell);
+    JL_UNLOCK(&cells_lock);
+}
+
+// After a membership in `set_instance` is published in `world`: the cells of that set, and of every
+// set it joins, whose member is now a member, hold from `world`. Called under the world counter's lock.
+void jl_membership_update_cells(jl_value_t *set_instance, size_t world)
+{
+    jl_value_t *u = jl_unwrap_unionall(set_instance);
+    if (!jl_is_datatype(u) || jl_set_cells == NULL)
+        return;
+    jl_typename_t *from = ((jl_datatype_t*)u)->name;
+    JL_LOCK(&cells_lock);
+    jl_genericmemory_t *table = jl_set_cells;
+    for (size_t k = 0; k + 1 < table->length; k += 2) {
+        jl_value_t *key = jl_genericmemory_ptr_ref(table, k);
+        jl_value_t *val = jl_genericmemory_ptr_ref(table, k + 1);
+        if (key == NULL || val == NULL)
+            continue;
+        jl_typename_t *setname = (jl_typename_t*)key;
+        if (setname != from && !jl_typename_reaches(from, setname, world))
+            continue;
+        jl_svec_t *list = (jl_svec_t*)val;
+        for (size_t i = 0; i < jl_svec_len(list); i++) {
+            jl_membership_cell_t *c = (jl_membership_cell_t*)jl_svecref(list, i);
+            if (jl_atomic_load_relaxed(&c->min_world) != ~(uint64_t)0)
+                continue;
+            if (cell_holds(c->member, setname, world))
+                jl_atomic_store_release(&c->min_world, (uint64_t)world);
+        }
+    }
+    JL_UNLOCK(&cells_lock);
+}
+
 // The memberships declared in this session, as [home TypeName, entry, ...]. A package image
 // keeps those its own modules declared and activates them at load (compiler §9).
 jl_array_t *jl_declared_memberships JL_GLOBALLY_ROOTED = NULL;
@@ -299,6 +406,7 @@ void jl_memberships_activated(jl_array_t *list, size_t world)
         jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i + 1);
         if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
             continue;
+        jl_membership_update_cells(en->instance, world);
         jl_membership_dispatch_walk(en->member, en->instance, world);
         jl_membership_ambiguity_report(en->member, en->instance, world);
     }
@@ -393,6 +501,7 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     // the stopgap (compiler C-18): replay dispatch for the methods the member can now
     // reach, then report the ambiguities, both at the entry's world
     size_t mq = jl_set_membership_query_world(min_world);
+    jl_membership_update_cells(set_instance, min_world);
     jl_membership_dispatch_walk(member, set_instance, min_world);
     jl_membership_ambiguity_report(member, set_instance, min_world);
     jl_set_membership_query_world(mq);

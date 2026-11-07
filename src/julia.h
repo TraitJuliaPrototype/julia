@@ -603,6 +603,16 @@ typedef struct {
     jl_value_t *JL_NONNULL by;       // the forwarding field name, or Nothing
 } jl_membership_t;
 
+// a membership cell (compiler §5.6): whether `member` has joined the set, read by the guards of
+// compiled calls that a membership of `member` in the set could change. `min_world` is ~0 until an
+// entry makes `member` a member of the set, then the world it holds from.
+typedef struct {
+    JL_DATA_TYPE
+    jl_value_t *JL_NONNULL member;   // the member type: a concrete type
+    jl_value_t *JL_NONNULL set;      // the set's TypeName
+    _Atomic(uint64_t) min_world;
+} jl_membership_cell_t;
+
 typedef struct {
     JL_DATA_TYPE
     jl_value_t *JL_NONNULL a;

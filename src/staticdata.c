@@ -1701,6 +1701,14 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                     jl_atomic_store_relaxed(&newentry->max_world, 0);
                 }
             }
+            else if (s->incremental && jl_typetagis(v, jl_membership_cell_type)) {
+                // a membership cell (compiler §5.6, §9) joins the loading session's cells, with its
+                // world: listed to be registered at load
+                assert(f == s->s);
+                jl_membership_cell_t *nc = (jl_membership_cell_t*)&s->s->buf[reloc_offset];
+                jl_atomic_store_relaxed(&nc->min_world, ~(uint64_t)0);
+                arraylist_push(&s->fixup_objs, (void*)reloc_offset);
+            }
             else if (s->incremental && jl_typetagis(v, jl_membership_type)) {
                 // an entry the image's modules declared is in force from the world it is activated
                 // in at load (compiler §9); one superseded while the image was built never is
@@ -4257,6 +4265,9 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         if (jl_typetagis(obj, jl_typemap_entry_type) || jl_is_method(obj) || jl_is_code_instance(obj)) {
             jl_array_ptr_1d_push(*internal_methods, obj);
             assert(s.incremental);
+        }
+        else if (jl_typetagis(obj, jl_membership_cell_type)) {
+            jl_membership_cell_register((jl_membership_cell_t*)obj);
         }
         else if (jl_is_method_instance(obj)) {
             jl_method_instance_t *newobj = jl_specializations_get_or_insert((jl_method_instance_t*)obj);

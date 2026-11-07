@@ -459,6 +459,13 @@ void jl_call_module_end_hook(jl_module_t *m);
 extern jl_array_t *jl_declared_memberships JL_GLOBALLY_ROOTED; // this session's, for images (datatype.c)
 extern jl_genericmemory_t *jl_set_candidates JL_GLOBALLY_ROOTED; // the sets' candidates (datatype.c)
 extern jl_genericmemory_t *jl_attributed_cache JL_GLOBALLY_ROOTED; // Core.attributed_call's cache (builtins.c)
+extern jl_genericmemory_t *jl_set_cells JL_GLOBALLY_ROOTED; // each set's membership cells (datatype.c)
+extern jl_genericmemory_t *jl_func_set_methods JL_GLOBALLY_ROOTED; // each function's methods at sets (gf.c)
+JL_DLLEXPORT jl_value_t *jl_call_shadows(jl_value_t *tt, jl_value_t *m0);
+// membership cells (compiler §5.6, datatype.c)
+JL_DLLEXPORT jl_value_t *jl_membership_cell(jl_value_t *member, jl_value_t *set);
+void jl_membership_cell_register(jl_membership_cell_t *cell);
+void jl_membership_update_cells(jl_value_t *set_instance, size_t world);
 void jl_activate_memberships(jl_array_t *list, size_t world);
 void jl_memberships_activated(jl_array_t *list, size_t world);
 JL_DLLEXPORT extern arraylist_t jl_linkage_blobs; // external linkage: sysimg/pkgimages

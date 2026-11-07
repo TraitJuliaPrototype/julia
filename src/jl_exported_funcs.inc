@@ -353,6 +353,9 @@
     XX(jl_next_from_addrinfo) \
     XX(jl_normalize_to_compilable_sig) \
     XX(jl_attribute_sig) \
+    XX(jl_call_shadows) \
+    XX(jl_set_membership_walk_invalidates) \
+    XX(jl_membership_cell) \
     XX(jl_is_trait_arg_type) \
     XX(jl_attribute_dynamic_bits) \
     XX(jl_trait_arg_bits) \
