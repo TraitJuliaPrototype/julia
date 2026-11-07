@@ -2907,11 +2907,12 @@ static void _invalidate_backedges(jl_method_instance_t *replaced_mi, jl_code_ins
 
 // The code slot (compiler §3.3): its switch, its counts, and the record of result edges.
 static struct {
-    size_t marks;       // callers marked for revalidation
-    size_t kept;        // marked callers made valid again
-    size_t final_marks; // marks that became invalidations
-    size_t misses;      // slot misses resolved by the runtime
+    _Atomic(size_t) marks;       // callers marked for revalidation
+    _Atomic(size_t) kept;        // marked callers made valid again
+    _Atomic(size_t) final_marks; // marks that became invalidations
+    _Atomic(size_t) misses;      // slot misses resolved by the runtime
 } code_slot_stats;
+#define CODE_SLOT_COUNT(f) jl_atomic_fetch_add_relaxed(&code_slot_stats.f, 1)
 
 static int code_slot_on = -1;
 JL_DLLEXPORT int jl_code_slot_on(void) JL_NOTSAFEPOINT
@@ -2926,10 +2927,10 @@ JL_DLLEXPORT int jl_code_slot_on(void) JL_NOTSAFEPOINT
 JL_DLLEXPORT size_t jl_code_slot_stat(int which) JL_NOTSAFEPOINT
 {
     switch (which) {
-    case 0: return code_slot_stats.marks;
-    case 1: return code_slot_stats.kept;
-    case 2: return code_slot_stats.final_marks;
-    case 3: return code_slot_stats.misses;
+    case 0: return jl_atomic_load_relaxed(&code_slot_stats.marks);
+    case 1: return jl_atomic_load_relaxed(&code_slot_stats.kept);
+    case 2: return jl_atomic_load_relaxed(&code_slot_stats.final_marks);
+    case 3: return jl_atomic_load_relaxed(&code_slot_stats.misses);
     }
     return 0;
 }
@@ -2943,11 +2944,13 @@ static jl_value_t *ptr_field(jl_value_t *v, size_t k) JL_NOTSAFEPOINT
     return *(jl_value_t**)((char*)v + jl_field_offset(t, k));
 }
 
+// a struct of the compiler's (module `Compiler`), by its name and number of fields
 static int is_named_struct(jl_value_t *v, const char *name, size_t nfields) JL_NOTSAFEPOINT
 {
     jl_datatype_t *t = (jl_datatype_t*)jl_typeof(v);
     return jl_is_datatype(t) && jl_datatype_nfields(t) == nfields &&
-        strcmp(jl_symbol_name(t->name->name), name) == 0;
+        strcmp(jl_symbol_name(t->name->name), name) == 0 &&
+        strcmp(jl_symbol_name(t->name->module->name), "Compiler") == 0;
 }
 
 // the compiler's `ResultEdges` on the CodeInstance's analysis results: the MethodInstances it reaches
@@ -2999,7 +3002,7 @@ static void invalidate_code_instance(jl_code_instance_t *replaced, size_t max_wo
     // were walked when it was marked
     if (jl_atomic_load_relaxed(&replaced->flags) & JL_CI_FLAGS_MARKED) {
         jl_atomic_fetch_and_relaxed(&replaced->flags, (uint8_t)~JL_CI_FLAGS_MARKED);
-        code_slot_stats.final_marks++;
+        CODE_SLOT_COUNT(final_marks);
     }
     if (replacedmaxworld == ~(size_t)0) {
         assert(jl_atomic_load_relaxed(&replaced->min_world) - 1 <= max_world && "attempting to set illogical world constraints (probable race condition)");
@@ -3036,7 +3039,7 @@ static void mark_code_instance(jl_code_instance_t *ci, size_t max_world, int dep
     if (jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0) {
         jl_atomic_fetch_or_relaxed(&ci->flags, JL_CI_FLAGS_MARKED);
         jl_atomic_store_release(&ci->max_world, max_world);
-        code_slot_stats.marks++;
+        CODE_SLOT_COUNT(marks);
         _invalidate_backedges(mi, ci, max_world, depth + 1);
     }
     JL_UNLOCK(&mi->def.method->writelock);
@@ -5370,6 +5373,17 @@ static int revalidate_code_instance(jl_code_instance_t *ci, size_t world, arrayl
         JL_LOCK(&m->writelock);
     int still_marked = (jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_MARKED) &&
         jl_atomic_load_relaxed(&ci->max_world) == maxw;
+    // every callee CodeInstance the revalidation accepted is still valid here: an invalidation
+    // without a new world (image validation on another thread) may have come since the walk
+    if (ok && same_world && still_marked) {
+        jl_svec_t *final = newedges != NULL ? newedges : edges;
+        for (size_t j = 0; ok && j < jl_svec_len(final); j++) {
+            jl_value_t *x = jl_svecref(final, j);
+            if (jl_is_code_instance(x) && x != (jl_value_t*)ci &&
+                    jl_atomic_load_relaxed(&((jl_code_instance_t*)x)->max_world) < world)
+                ok = 0;
+        }
+    }
     if (ok && same_world && still_marked) {
         if (newedges != NULL) {
             jl_atomic_store_release(&ci->edges, newedges);
@@ -5377,12 +5391,12 @@ static int revalidate_code_instance(jl_code_instance_t *ci, size_t world, arrayl
         }
         jl_atomic_fetch_and_relaxed(&ci->flags, (uint8_t)~JL_CI_FLAGS_MARKED);
         jl_atomic_store_release(&ci->max_world, ~(size_t)0);
-        code_slot_stats.kept++;
+        CODE_SLOT_COUNT(kept);
     }
     else {
         if (same_world && still_marked) {
             jl_atomic_fetch_and_relaxed(&ci->flags, (uint8_t)~JL_CI_FLAGS_MARKED);
-            code_slot_stats.final_marks++;
+            CODE_SLOT_COUNT(final_marks);
         }
         ok = 0;
     }
@@ -5424,9 +5438,16 @@ static jl_code_instance_t *jl_revalidate_policy(jl_method_instance_t *mi JL_PROP
 
 // inference's cache miss (compiler §3.3): a marked CodeInstance made valid again serves as the
 // cached result, so code that calls it does not infer it again
+// nonzero while this thread revalidates: a revalidation's own inference infers afresh
+static _Thread_local int code_slot_revalidating = 0;
+
 JL_DLLEXPORT jl_value_t *jl_revalidate_for_inference(jl_method_instance_t *mi, size_t world, int facts)
 {
+    if (code_slot_revalidating)
+        return jl_nothing;
+    code_slot_revalidating = 1;
     jl_code_instance_t *ci = revalidate_marked(mi, world, facts, 0);
+    code_slot_revalidating = 0;
     return ci != NULL ? (jl_value_t*)ci : jl_nothing;
 }
 
@@ -5473,7 +5494,7 @@ JL_DLLEXPORT jl_code_instance_t *jl_code_slot_resolve(_Atomic(jl_code_instance_t
 {
     int specsig = flags & 1;
     int facts = (flags & 2) != 0;
-    code_slot_stats.misses++;
+    CODE_SLOT_COUNT(misses);
     jl_code_instance_t *ci = NULL;
     if (target != NULL && jl_atomic_load_relaxed(&target->min_world) <= world &&
             world <= jl_atomic_load_relaxed(&target->max_world)) {
