@@ -59,9 +59,10 @@ struct UnionSplit
     cases::Vector{InliningCase}
     bbs::Vector{Int}
     fallback_rt::Any # an operation's split (compiler §7.2): its declared result, else nothing
+    table::Any       # and the table of its last branch (§7.3), or nothing for the dynamic call
     UnionSplit(handled_all_cases::Bool, fully_covered::Bool, atype::DataType, cases::Vector{InliningCase},
-               @nospecialize(fallback_rt = nothing)) =
-        new(handled_all_cases, fully_covered, atype, cases, Int[], fallback_rt)
+               @nospecialize(fallback_rt = nothing), @nospecialize(table = nothing)) =
+        new(handled_all_cases, fully_covered, atype, cases, Int[], fallback_rt, table)
 end
 
 struct InliningEdgeTracker
@@ -468,6 +469,45 @@ function fix_va_argexprs!(insert_node!::Inserter, inline_target::Union{IRCode, I
 end
 
 """
+The table for the last branch of an operation's split at `sig` (the call `f(x, args...)`) with
+declared result `rt` (compiler §7.3): `nothing` where the call takes Julia's dynamic dispatch instead
+(a function of a type not concrete, more than `MAX_SPLIT_TABLE_ARGS` arguments, a trimmed program).
+"""
+function split_fallback_table(sig::Signature, @nospecialize(rt))
+    JLOptions().trim == 0 || return nothing
+    ats = sig.argtypes
+    length(ats) >= 2 || return nothing
+    n = length(ats) - 2
+    n <= MAX_SPLIT_TABLE_ARGS || return nothing
+    F = widenconst(ats[1])
+    (isconcretetype(F) && !iskindtype(F)) || return nothing
+    A = Any[split_table_type(widenconst(ats[i])) for i in 3:length(ats)]
+    for a in A
+        isvarargtype(a) && return nothing
+    end
+    R = rt === nothing ? Any : split_table_type(rt)
+    return split_table(F, Tuple{A...}, R)
+end
+
+"""
+The last branch of a split through its table (`SplitTable`): `typeof(x)`, the pointer for it
+(`jl_split_table_ptr`: one probe, or the pointer made at the first miss), and the call through it,
+typed as `split_ccall_type` says. `argexprs` are the call's: `f`, `x`, the other arguments.
+"""
+function split_table_call!(compact::IncrementalCompact, argexprs::Vector{Any}, table::SplitTable, line)
+    T = insert_node_here!(compact, NewInstruction(Expr(:call, GlobalRef(Core, :typeof), argexprs[2]), DataType, line))
+    fp = insert_node_here!(compact, NewInstruction(Expr(:foreigncall, Expr(:tuple, QuoteNode(:jl_split_table_ptr)), Ptr{Cvoid},
+        svec(Any, Any), 0, QuoteNode(:ccall), table, T), Ptr{Cvoid}, line))
+    ats = Any[Any, Any]
+    for A in (table.args::DataType).parameters
+        push!(ats, split_ccall_type(A))
+    end
+    rt = split_ccall_rt(table.rt)
+    return insert_node_here!(compact, NewInstruction(Expr(:foreigncall, fp, rt, svec(ats...), 0, QuoteNode(:ccall), argexprs...),
+        rt, line))
+end
+
+"""
     ir_inline_unionsplit!
 
 The primary purpose of this function is to emulate the dispatch behavior by generating flat
@@ -528,7 +568,7 @@ assuming their order stays the same post-discovery in `ml_matches`.
 function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::Vector{Any},
                                union_split::UnionSplit, boundscheck::Symbol,
                                todo_bbs::Vector{Tuple{Int,Int}}, interp::AbstractInterpreter)
-    (; handled_all_cases, fully_covered, atype, cases, bbs, fallback_rt) = union_split
+    (; handled_all_cases, fully_covered, atype, cases, bbs, fallback_rt, table) = union_split
     stmt, typ, line = compact.result[idx][:stmt], compact.result[idx][:type], compact.result[idx][:line]
     join_bb = bbs[end]
     pn = PhiNode()
@@ -611,7 +651,12 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
     bb += 1
     # We're now in the fall through block, decide what to do
     if !handled_all_cases
-        ssa = insert_node_here!(compact, NewInstruction(stmt, fallback_rt === nothing ? typ : Any, line))
+        if table !== nothing
+            # the split's last branch: the pointer for the value's type from the table of the call's signature
+            ssa = split_table_call!(compact, argexprs, table::SplitTable, line)
+        else
+            ssa = insert_node_here!(compact, NewInstruction(stmt, fallback_rt === nothing ? typ : Any, line))
+        end
         if fallback_rt !== nothing
             # the split's last branch: the dynamic call, its result asserted to the declared result
             ssa = insert_node_here!(compact, NewInstruction(
@@ -1474,8 +1519,9 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
         handle_declared_result!(ir, idx, stmt, DeclaredResultInfo(fallback_rt))
         return nothing
     end
+    table = fallback_rt === nothing ? nothing : split_fallback_table(sig, fallback_rt)
     handle_cases!(todo, ir, idx, stmt, atype, cases, fallback_rt === nothing ? handled_all_cases : false,
-                  fallback_rt === nothing ? fully_covered : false, joint_effects, fallback_rt)
+                  fallback_rt === nothing ? fully_covered : false, joint_effects, fallback_rt, table)
 end
 
 function handle_match!(cases::Vector{InliningCase},
@@ -1559,7 +1605,7 @@ end
 
 function handle_cases!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::Int, stmt::Expr,
     @nospecialize(atype), cases::Vector{InliningCase}, handled_all_cases::Bool, fully_covered::Bool,
-    joint_effects::Effects, @nospecialize(fallback_rt = nothing))
+    joint_effects::Effects, @nospecialize(fallback_rt = nothing), @nospecialize(table = nothing))
     # If we only have one case and that case is fully covered, we may either
     # be able to do the inlining now (for constant cases), or push it directly
     # onto the todo list
@@ -1570,7 +1616,7 @@ function handle_cases!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::Int, stmt::
         for case in cases
             isa(case.sig, DataType) || return nothing
         end
-        push!(todo, idx=>UnionSplit(handled_all_cases, fully_covered, atype, cases, fallback_rt))
+        push!(todo, idx=>UnionSplit(handled_all_cases, fully_covered, atype, cases, fallback_rt, table))
     else
         add_flag!(ir[SSAValue(idx)], flags_for_effects(joint_effects))
     end
