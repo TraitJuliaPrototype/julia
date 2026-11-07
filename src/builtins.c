@@ -1035,7 +1035,7 @@ JL_CALLABLE(jl_f_with_dynamic)
 // Lowering makes it from casts written at a call, the optimizer from a run-time site that passes on
 // a trait argument of code compiled once. A cache of its own, by the call's types and the bits,
 // answers in the world it was filled in.
-static jl_genericmemory_t *attributed_cache JL_GLOBALLY_ROOTED = NULL;
+jl_genericmemory_t *jl_attributed_cache JL_GLOBALLY_ROOTED = NULL; // rooted by the collectors (gc-stock.c)
 static jl_mutex_t attributed_cache_lock;
 
 static jl_value_t *attributed_call_reach(jl_value_t **args, uint32_t nargs, int reach)
@@ -1054,8 +1054,8 @@ static jl_value_t *attributed_call_reach(jl_value_t **args, uint32_t nargs, int 
     JL_GC_PUSH4(&tt, &list, &nl, &mi);
     tt = (jl_value_t*)jl_inst_arg_tuple_type(cargs[0], &cargs[1], cnargs, 1);
     JL_LOCK(&attributed_cache_lock);
-    if (attributed_cache != NULL) {
-        list = jl_eqtable_get(attributed_cache, tt, NULL);
+    if (jl_attributed_cache != NULL) {
+        list = jl_eqtable_get(jl_attributed_cache, tt, NULL);
         for (size_t i = 0; list != NULL && i + 2 < jl_svec_len(list); i += 3) {
             if ((uint64_t)jl_unbox_long(jl_svecref(list, i)) == bits &&
                     jl_unbox_ulong(jl_svecref(list, i + 2)) == world) {
@@ -1073,9 +1073,9 @@ static jl_value_t *attributed_call_reach(jl_value_t **args, uint32_t nargs, int 
         }
         nl = (jl_value_t*)jl_svec(3, args[0], (jl_value_t*)mi, jl_box_ulong(world));
         JL_LOCK(&attributed_cache_lock);
-        if (attributed_cache == NULL)
-            attributed_cache = jl_alloc_memory_any(16);
-        list = jl_eqtable_get(attributed_cache, tt, NULL);
+        if (jl_attributed_cache == NULL)
+            jl_attributed_cache = jl_alloc_memory_any(16);
+        list = jl_eqtable_get(jl_attributed_cache, tt, NULL);
         if (list != NULL) {
             // keep the entries of other bits and worlds before this one: a short list per call type
             size_t n = jl_svec_len(list) < 3 * 7 ? jl_svec_len(list) : 3 * 7;
@@ -1086,7 +1086,7 @@ static jl_value_t *attributed_call_reach(jl_value_t **args, uint32_t nargs, int 
                 jl_svecset(both, i + 3, jl_svecref(list, i));
             nl = (jl_value_t*)both;
         }
-        attributed_cache = jl_eqtable_put(attributed_cache, tt, nl, NULL);
+        jl_attributed_cache = jl_eqtable_put(jl_attributed_cache, tt, nl, NULL);
         JL_UNLOCK(&attributed_cache_lock);
     }
     jl_value_t *r = jl_invoke_reach(cargs[0], &cargs[1], cnargs - 1, mi, reach);

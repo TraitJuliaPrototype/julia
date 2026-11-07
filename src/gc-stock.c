@@ -2919,6 +2919,7 @@ static void gc_mark_roots(jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT
     gc_heap_snapshot_record_gc_roots(jl_module_end_hook, "module_end_hook");
     gc_try_claim_and_push(mq, jl_declared_memberships, NULL); // this session's memberships (datatype.c)
     gc_try_claim_and_push(mq, jl_set_candidates, NULL); // the sets' candidates (datatype.c)
+    gc_try_claim_and_push(mq, jl_attributed_cache, NULL); // Core.attributed_call's cache (builtins.c)
     gc_heap_snapshot_record_gc_roots((jl_value_t*)jl_declared_memberships, "declared_memberships");
     // constants
     gc_try_claim_and_push(mq, jl_emptytuple_type, NULL);
