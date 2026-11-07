@@ -3233,12 +3233,14 @@ function abstract_applicable(interp::AbstractInterpreter, argtypes::Vector{Any},
     isvarargtype(argtypes[2]) && return Future(CallMeta(Bool, ArgumentError, EFFECTS_THROWS, NoCallInfo()))
     argtypes = argtypes[2:end]
     atype = argtypes_to_type(argtypes)
+    info = NoCallInfo()
     if atype === Union{}
-        rt = Union{} # accidentally unreachable code
+        # accidentally unreachable code where an argument's type is `Union{}`; otherwise (a type
+        # with a free variable) the answer is not known
+        rt = any(@nospecialize(a) -> a === Union{}, argtypes) ? Union{} : Bool
     else
         max_methods = get_max_methods(interp, max_methods_callee(singleton_type(argtypes[1]), argtypes), sv)
         matches = find_method_matches(interp, argtypes, atype; max_methods)
-        info = NoCallInfo()
         if isa(matches, FailedMethodMatch)
             rt = Bool # too many matches to analyze
         else
