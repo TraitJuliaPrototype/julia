@@ -3012,10 +3012,17 @@ static int has_key(jl_genericmemory_t *keys, jl_value_t *key)
     return 0;
 }
 
-// Check if m2 is in m1's interferences set, which means !morespecific(m1, m2)
+// Check if m2 is in m1's interferences set, which means !morespecific(m1, m2).
+// The set is recorded when a method is inserted. A pair at open sets is asked again in the
+// query's world: a later membership can order two sets (compiler §5.2), and memberships only
+// grow, so the recorded set over-states such a pair's ambiguity and never under-states it.
 static int method_in_interferences(jl_method_t *m2, jl_method_t *m1)
 {
-    return has_key(jl_atomic_load_relaxed(&m1->interferences), (jl_value_t*)m2);
+    if (!has_key(jl_atomic_load_relaxed(&m1->interferences), (jl_value_t*)m2))
+        return 0;
+    if (jl_has_open_set((jl_value_t*)m1->sig) && jl_has_open_set((jl_value_t*)m2->sig))
+        return !jl_method_morespecific(m1, m2);
+    return 1;
 }
 
 // Find the index of a method in the method match array
@@ -6510,7 +6517,10 @@ JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t 
                             gc[3] = jl_type_intersection(gc[3], gc[4]);
                             if (gc[3] != jl_bottom_type &&
                                 ambiguous_at(mtX, mX, mY, gc[3], entry_min_world)) {
-                                membership_ambig_warn(mX, X, Y, member, gc[3]);
+                                // the joint method: the two signatures' intersection, where the
+                                // two sets meet as All{X, Y} (§4.9); at the member where it is empty
+                                gc[4] = jl_type_intersection((jl_value_t*)mX->sig, (jl_value_t*)mY->sig);
+                                membership_ambig_warn(mX, X, Y, member, gc[4] != jl_bottom_type ? gc[4] : gc[3]);
                                 jl_array_ptr_1d_push(warned, fX);
                             }
                         }

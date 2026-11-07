@@ -965,6 +965,17 @@ static size_t jl_static_show_x_(JL_STREAM *out, jl_value_t *v, jl_datatype_t *vt
         // Types are printed as a fully qualified name, with parameters, e.g.
         // `Base.Set{Int}`, and function types are printed as e.g. `typeof(Main.f)`
         jl_datatype_t *dv = (jl_datatype_t*)v;
+        if (jl_is_all_type(v) && jl_is_tuple_type(jl_tparam0(v))) {
+            // an intersection prints as written, All{X, Y} (compiler §4.9)
+            jl_value_t *tup = jl_tparam0(v);
+            n += jl_printf(out, "All{");
+            for (size_t i = 0; i < jl_nparams(tup); i++) {
+                if (i > 0)
+                    n += jl_printf(out, ", ");
+                n += jl_static_show_x(out, jl_tparam(tup, i), depth, ctx);
+            }
+            return n + jl_printf(out, "}");
+        }
         if (dv->name == jl_tuple_typename) {
             if (dv == jl_tuple_type)
                 return jl_printf(out, "Tuple");

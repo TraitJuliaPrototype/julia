@@ -6212,6 +6212,40 @@ int tuple_cmp_typeofbottom(jl_datatype_t *a, jl_datatype_t *b)
     newenv.val = (jl_value_t*)(intptr_t)count_occurs(ub->body, ub->var); \
     return type_morespecific_(a, ub->body, a0, b0, invariant, &newenv)
 
+// a component at least as specific as t: the same type, or more specific
+static int all_component_covers(jl_value_t *c, jl_value_t *t, jl_value_t *a0, jl_value_t *b0, jl_typeenv_t *env)
+{
+    return c == t || eq_msp(c, t, a0, b0, env) || type_morespecific_(c, t, a0, b0, 0, env);
+}
+
+// a at least as specific as b where either is an intersection (compiler §5.2): an
+// intersection is as specific as b when one of its components is; a type is as specific as
+// an intersection when it is as specific as each component. So an intersection is more
+// specific than each component, and one with a closed component ranks as closed against an
+// open set, by the rule for closed and open types at each component.
+static int all_covers(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_value_t *b0, jl_typeenv_t *env)
+{
+    if (jl_is_all_type(b)) {
+        jl_value_t *tb = jl_tparam0(b);
+        if (!jl_is_datatype(tb))
+            return 0;
+        for (size_t j = 0; j < jl_nparams(tb); j++)
+            if (!all_covers(a, jl_tparam(tb, j), a0, b0, env))
+                return 0;
+        return 1;
+    }
+    if (jl_is_all_type(a)) {
+        jl_value_t *ta = jl_tparam0(a);
+        if (!jl_is_datatype(ta))
+            return 0;
+        for (size_t i = 0; i < jl_nparams(ta); i++)
+            if (all_component_covers(jl_tparam(ta, i), b, a0, b0, env))
+                return 1;
+        return 0;
+    }
+    return all_component_covers(a, b, a0, b0, env);
+}
+
 static int type_morespecific_(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_value_t *b0, int invariant, jl_typeenv_t *env)
 {
     if (a == b)
@@ -6294,6 +6328,10 @@ static int type_morespecific_(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_v
             return !type_morespecific_(b, a, b0, a0, invariant, env);
         return 0;
     }
+
+    if (!invariant && (jl_is_all_type(a) || jl_is_all_type(b)) &&
+        (jl_is_datatype(a) || jl_is_typevar(a)) && (jl_is_datatype(b) || jl_is_typevar(b)))
+        return all_covers(a, b, a0, b0, env) && !all_covers(b, a, b0, a0, env);
 
     if (jl_is_datatype(a) && jl_is_datatype(b)) {
         jl_datatype_t *tta = (jl_datatype_t*)a, *ttb = (jl_datatype_t*)b;

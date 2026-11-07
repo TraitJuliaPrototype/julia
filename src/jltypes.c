@@ -660,6 +660,23 @@ static _Thread_local int all_building = 0;
 // itself; none is Any.
 JL_DLLEXPORT jl_value_t *jl_type_all(jl_value_t **ts, size_t n)
 {
+    // a component that is an intersection under a UnionAll is flattened and the result
+    // rewrapped: All{(All{T, X} where T), Y} is All{T, X, Y} where T (compiler §4.9)
+    for (size_t i = 0; i < n; i++) {
+        jl_value_t *t = ts[i];
+        if (jl_is_unionall(t) && jl_is_all_type(jl_unwrap_unionall(t))) {
+            jl_value_t **c2;
+            JL_GC_PUSHARGS(c2, n + 2);
+            c2[n + 1] = t = jl_rename_unionall((jl_unionall_t*)t);  // no capture of a variable outside
+            for (size_t k = 0; k < n; k++)
+                c2[k] = ts[k];
+            c2[i] = jl_unwrap_unionall(t);
+            c2[n] = jl_type_all(c2, n);
+            jl_value_t *r = jl_rewrap_unionall(c2[n], t);
+            JL_GC_POP();
+            return r;
+        }
+    }
     size_t cnt = 0;
     for (size_t i = 0; i < n; i++) {
         jl_value_t *t = ts[i];
