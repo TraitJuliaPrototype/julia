@@ -572,7 +572,9 @@ function adjust_effects(sv::InferenceState)
     # override the analyzed effects using manually annotated effect settings
     def = sv.linfo.def
     if isa(def, Method)
-        ipo_effects = adjust_effects(ipo_effects, def)
+        # under the facts mode, no asserted effect applies to a frame that holds a run-time site,
+        # itself or in a callee (compiler §1.5)
+        (facts_mode(sv.interp) && !is_nortsite(ipo_effects)) || (ipo_effects = adjust_effects(ipo_effects, def))
     end
 
     return ipo_effects

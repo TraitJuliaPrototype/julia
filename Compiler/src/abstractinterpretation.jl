@@ -244,7 +244,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     argtypes = arginfo.argtypes
     if si.saw_latestworld
         add_remark!(interp, sv, "Cannot infer call, because we previously saw :latestworld")
-        return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+        return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
     end
     # an operation of a set at a receiver typed by the set (compiler §7.1, §7.2)
     drt = declared_operation_result(interp, argtypes, atype)
@@ -262,7 +262,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     matches = find_method_matches(interp, argtypes, atype; max_methods)
     if isa(matches, FailedMethodMatch)
         add_remark!(interp, sv, matches.reason)
-        return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+        return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
     end
 
     (; valid_worlds, applicable) = matches
@@ -274,7 +274,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         for i = 1:length(applicable)
             if !isdispatchtuple(applicable[i].match.spec_types)
                 add_remark!(interp, sv, "Refusing to infer non-concrete call site for concrete-only function")
-                return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+                return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
             end
         end
     end
@@ -285,7 +285,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
             if !isdispatchtuple(sig)
                 # only infer fully concrete call sites in top-level expressions (ignoring even isa_compileable_sig matches)
                 add_remark!(interp, sv, "Refusing to infer non-concrete call site in top-level expression")
-                return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+                return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
             end
         end
     end
@@ -495,6 +495,8 @@ end
 function find_method_matches(interp::AbstractInterpreter, argtypes::Vector{Any}, @nospecialize(atype);
                              max_union_splitting::Int = InferenceParams(interp).max_union_splitting,
                              max_methods::Int = InferenceParams(interp).max_methods)
+    # under the facts mode, a call is inferred only at a fact signature (compiler §1.2)
+    facts_mode(interp) && return facts_find_method_matches(interp, argtypes, atype, max_union_splitting, max_methods)
     if is_union_split_eligible(typeinf_lattice(interp), argtypes, max_union_splitting)
         return find_union_split_method_matches(interp, argtypes, max_methods)
     end
@@ -1937,7 +1939,7 @@ function abstract_apply(interp::AbstractInterpreter, argtypes::Vector{Any}, si::
             add_remark!(interp, sv, "Core._apply_iterate called on a function of a non-concrete type")
             # bail now, since it seems unlikely that abstract_call will be able to do any better after splitting
             # this also ensures we don't call abstract_call_gf_by_type below on an IntrinsicFunction or Builtin
-            return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+            return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
         end
     end
     res = Union{}
@@ -2473,13 +2475,13 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
             argtype = argtypes_to_type(pushfirst!(argtype_tail(argtypes, 4), ft))
             nargtype = typeintersect(lookupsig, argtype)
             nargtype === Bottom && return Future(CallMeta(Bottom, TypeError, EFFECTS_THROWS, NoCallInfo()))
-            nargtype isa DataType || return Future(CallMeta(Any, Any, Effects(), NoCallInfo())) # other cases are not implemented below
+            nargtype isa DataType || return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo())) # other cases are not implemented below
             # Fall through to generic invoke handling
         end
     else
-        hasintersect(widenconst(types), Union{Method, CodeInstance}) && return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+        hasintersect(widenconst(types), Union{Method, CodeInstance}) && return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
         types, isexact, _, _ = instanceof_tfunc(argtype_by_index(argtypes, 3), false)
-        isexact || return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+        isexact || return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
         unwrapped = unwrap_unionall(types)
         types === Bottom && return Future(CallMeta(Bottom, Any, EFFECTS_THROWS, NoCallInfo()))
         if !(unwrapped isa DataType && unwrapped.name === Tuple.name)
@@ -2488,14 +2490,14 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
         argtype = argtypes_to_type(argtype_tail(argtypes, 4))
         nargtype = typeintersect(types, argtype)
         nargtype === Bottom && return Future(CallMeta(Bottom, TypeError, EFFECTS_THROWS, NoCallInfo()))
-        nargtype isa DataType || return Future(CallMeta(Any, Any, Effects(), NoCallInfo())) # other cases are not implemented below
-        isdispatchelem(ft) || return Future(CallMeta(Any, Any, Effects(), NoCallInfo())) # check that we might not have a subtype of `ft` at runtime, before doing supertype lookup below
+        nargtype isa DataType || return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo())) # other cases are not implemented below
+        isdispatchelem(ft) || return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo())) # check that we might not have a subtype of `ft` at runtime, before doing supertype lookup below
         ft = ft::DataType
         lookupsig = rewrap_unionall(Tuple{ft, unwrapped.parameters...}, types)::Type
         nargtype = Tuple{ft, nargtype.parameters...}
         argtype = Tuple{ft, argtype.parameters...}
         matched, valid_worlds = findsup(lookupsig, method_table(interp))
-        matched === nothing && return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+        matched === nothing && return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
         update_valid_age!(sv, valid_worlds)
         method = matched.method
     end
@@ -3018,7 +3020,7 @@ function abstract_call_opaque_closure(interp::AbstractInterpreter,
     tt = closure.typ
     ocargsig = rewrap_unionall((unwrap_unionall(tt)::DataType).parameters[1], tt)
     ocargsig′ = unwrap_unionall(ocargsig)
-    ocargsig′ isa DataType || return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+    ocargsig′ isa DataType || return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
     ocsig = rewrap_unionall(Tuple{Tuple, ocargsig′.parameters...}, ocargsig)
     hasintersect(sig, ocsig) || return Future(CallMeta(Union{}, Union{MethodError,TypeError}, EFFECTS_THROWS, NoCallInfo()))
     ocmethod = closure.source::Method
@@ -3028,7 +3030,7 @@ function abstract_call_opaque_closure(interp::AbstractInterpreter,
         if isa(ocrt, DataType)
             return Future(CallMeta(ocrt, Any, Effects(), NoCallInfo()))
         end
-        return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+        return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
     end
     match = MethodMatch(sig, Core.svec(), ocmethod, sig <: ocsig)
     mresult = abstract_call_method(interp, ocmethod, sig, Core.svec(), false, si, sv)
@@ -3091,13 +3093,13 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
     wft = widenconst(ft)
     if hasintersect(wft, Builtin)
         add_remark!(interp, sv, "Could not identify method table for call")
-        return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+        return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
     elseif hasintersect(wft, Core.OpaqueClosure)
         uft = unwrap_unionall(wft)
         if isa(uft, DataType)
             return Future(CallMeta(rewrap_unionall(uft.parameters[2], wft), Any, Effects(), NoCallInfo()))
         end
-        return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+        return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
     end
     # non-constant function, but the number of arguments is known and the `f` is not a builtin or intrinsic
     atype = argtypes_to_type(arginfo.argtypes)
@@ -3762,8 +3764,11 @@ function merge_override_effects!(interp::AbstractInterpreter, effects::Effects, 
     # N.B.: This only applies to the effects of the statement itself.
     # It is possible for arguments (GlobalRef/:static_parameter) to throw,
     # but these will be recomputed during SSA construction later.
-    override = decode_statement_effects_override(sv)
-    effects = override_effects(effects, override)
+    # under the facts mode, no assertion applies over a call that holds a run-time site (§1.5)
+    if !(facts_mode(interp) && !is_nortsite(effects))
+        override = decode_statement_effects_override(sv)
+        effects = override_effects(effects, override)
+    end
     set_curr_ssaflag!(sv, flags_for_effects(effects), IR_FLAGS_EFFECTS)
     merge_effects!(interp, sv, effects)
     return effects
