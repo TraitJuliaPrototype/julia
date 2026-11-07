@@ -246,6 +246,8 @@ static jl_value_t *jl_eval_module_expr(jl_module_t *parent_module, jl_expr_t *ex
     jl_module_t *newm = jl_begin_new_module(parent_module, name, std_imports, filename, lineno);
     JL_GC_PROMISE_ROOTED(newm); // Rooted in jl_current_modules
     jl_eval_toplevel_stmts(newm, stmts, 1, 0, toplevel_filename, toplevel_lineno);
+    // the library's module-end hook (compiler §10.1), before the module's __init__
+    jl_call_module_end_hook(newm);
     jl_end_new_module(newm);
 
     return (jl_value_t*)newm;

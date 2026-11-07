@@ -5221,6 +5221,107 @@ JL_DLLEXPORT void jl_set_member_hook(jl_value_t *hook)
     jl_member_hook = hook == jl_nothing ? NULL : hook;
 }
 
+// The library's definition, image and module-end hooks (compiler §10.1). Each runs in the latest
+// world, outside the world counter's lock, not for a definition a hook makes, and not while the
+// system image is built. They are rooted for the collectors.
+jl_value_t *jl_method_definition_hook JL_GLOBALLY_ROOTED = NULL;
+jl_value_t *jl_image_methods_hook JL_GLOBALLY_ROOTED = NULL;
+jl_value_t *jl_module_end_hook JL_GLOBALLY_ROOTED = NULL;
+JL_DLLEXPORT void jl_set_method_definition_hook(jl_value_t *hook)
+{
+    jl_method_definition_hook = hook == jl_nothing ? NULL : hook;
+}
+JL_DLLEXPORT void jl_set_image_methods_hook(jl_value_t *hook)
+{
+    jl_image_methods_hook = hook == jl_nothing ? NULL : hook;
+}
+JL_DLLEXPORT void jl_set_module_end_hook(jl_value_t *hook)
+{
+    jl_module_end_hook = hook == jl_nothing ? NULL : hook;
+}
+
+static _Thread_local int library_hook_depth = 0;
+
+// args[0] is the hook; returns its result, or NULL where it does not run
+static jl_value_t *call_library_hook(jl_value_t **args, int nargs)
+{
+    if (args[0] == NULL || library_hook_depth > 0 || (jl_generating_output() && !jl_options.incremental))
+        return NULL;
+    jl_task_t *ct = jl_current_task;
+    size_t last_age = ct->world_age;
+    ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
+    library_hook_depth++;
+    jl_value_t *r = NULL;
+    JL_TRY {
+        r = jl_apply(args, nargs);
+    }
+    JL_CATCH {
+        library_hook_depth--;
+        ct->world_age = last_age;
+        jl_rethrow();
+    }
+    library_hook_depth--;
+    ct->world_age = last_age;
+    return r;
+}
+
+// before a method enters its table (it may throw to refuse it), and once it is visible
+void jl_call_definition_hook(jl_method_t *m, int after)
+{
+    if (jl_method_definition_hook == NULL)
+        return;
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 3);
+    args[0] = jl_method_definition_hook;
+    args[1] = (jl_value_t*)m;
+    args[2] = after ? jl_true : jl_false;
+    call_library_hook(args, 3);
+    JL_GC_POP();
+}
+
+// once per package image, with its methods for other modules' functions, before any is activated:
+// the methods the hook returns stay inactive. Returns the methods to activate.
+jl_array_t *jl_call_image_methods_hook(jl_array_t *ms, const char *pkgname)
+{
+    if (jl_image_methods_hook == NULL || jl_array_nrows(ms) == 0)
+        return ms;
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 4);
+    args[0] = jl_image_methods_hook;
+    args[1] = (jl_value_t*)ms;
+    args[2] = jl_cstr_to_string(pkgname ? pkgname : "");
+    args[3] = call_library_hook(args, 3);
+    jl_array_t *keep = ms;
+    if (args[3] != NULL && jl_is_array(args[3]) && jl_array_nrows((jl_array_t*)args[3]) > 0) {
+        jl_array_t *drop = (jl_array_t*)args[3];
+        keep = jl_alloc_vec_any(0);
+        args[1] = (jl_value_t*)keep;
+        for (size_t i = 0; i < jl_array_nrows(ms); i++) {
+            jl_value_t *m = jl_array_ptr_ref(ms, i);
+            int dropped = 0;
+            for (size_t j = 0; j < jl_array_nrows(drop) && !dropped; j++)
+                dropped = jl_array_ptr_ref(drop, j) == m;
+            if (!dropped)
+                jl_array_ptr_1d_push(keep, m);
+        }
+    }
+    JL_GC_POP();
+    return keep;
+}
+
+// when a module's definition ends, before its __init__ runs
+void jl_call_module_end_hook(jl_module_t *m)
+{
+    if (jl_module_end_hook == NULL)
+        return;
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 2);
+    args[0] = jl_module_end_hook;
+    args[1] = (jl_value_t*)m;
+    call_library_hook(args, 2);
+    JL_GC_POP();
+}
+
 // whether a type or a type on its supertype chain holds membership entries
 static int chain_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT
 {

@@ -450,6 +450,15 @@ extern jl_array_t *_jl_debug_method_invalidation JL_GLOBALLY_ROOTED;
 extern jl_array_t *open_set_methods JL_GLOBALLY_ROOTED;
 // the member hook (gf.c, compiler §10.4), rooted alongside it
 extern jl_value_t *jl_member_hook JL_GLOBALLY_ROOTED;
+extern jl_value_t *jl_method_definition_hook JL_GLOBALLY_ROOTED; // the library's hooks (gf.c, compiler §10.1)
+extern jl_value_t *jl_image_methods_hook JL_GLOBALLY_ROOTED;
+extern jl_value_t *jl_module_end_hook JL_GLOBALLY_ROOTED;
+void jl_call_definition_hook(jl_method_t *m, int after);
+jl_array_t *jl_call_image_methods_hook(jl_array_t *ms, const char *pkgname);
+void jl_call_module_end_hook(jl_module_t *m);
+extern jl_array_t *jl_declared_memberships JL_GLOBALLY_ROOTED; // this session's, for images (datatype.c)
+void jl_activate_memberships(jl_array_t *list, size_t world);
+void jl_memberships_activated(jl_array_t *list, size_t world);
 JL_DLLEXPORT extern arraylist_t jl_linkage_blobs; // external linkage: sysimg/pkgimages
 JL_DLLEXPORT extern arraylist_t jl_image_relocs;  // external linkage: sysimg/pkgimages
 JL_DLLEXPORT extern arraylist_t jl_top_mods;  // external linkage: sysimg/pkgimages

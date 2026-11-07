@@ -197,6 +197,56 @@ static jl_value_t *publish_entry(jl_typename_t *tn, jl_typename_t *setname, jl_v
     return entry_v;
 }
 
+// The memberships declared in this session, as [home TypeName, entry, ...]. A package image
+// keeps those its own modules declared and activates them at load (compiler §9).
+jl_array_t *jl_declared_memberships JL_GLOBALLY_ROOTED = NULL;
+
+// Activate an image's memberships, [home TypeName, entry, ...] (compiler §9), under the world
+// counter's lock and before the image's code is validated: each entry the image wrote live is in
+// force from `world`, and one on another module's TypeName joins that TypeName's list.
+void jl_activate_memberships(jl_array_t *list, size_t world)
+{
+    size_t n = jl_array_nrows(list);
+    jl_value_t *nd = NULL;
+    JL_GC_PUSH1(&nd);
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        jl_typename_t *home = (jl_typename_t*)jl_array_ptr_ref(list, i);
+        jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i + 1);
+        if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
+            continue;   // superseded while the image was built: never in force
+        en->min_world = world;
+        jl_svec_t *old = jl_typename_memberships(home);
+        int present = 0;
+        for (size_t k = 0; k < jl_svec_len(old) && !present; k++)
+            present = jl_svecref(old, k) == (jl_value_t*)en;
+        if (present)
+            continue;
+        nd = (jl_value_t*)jl_alloc_svec_uninit(jl_svec_len(old) + 1);
+        for (size_t k = 0; k < jl_svec_len(old); k++)
+            jl_svecset(nd, k, jl_svecref(old, k));
+        jl_svecset(nd, jl_svec_len(old), (jl_value_t*)en);
+        jl_atomic_store_release(&home->memberships, (jl_svec_t*)nd);
+        jl_gc_wb(home, nd);
+    }
+    JL_GC_POP();
+}
+
+// Once `world` is published: the stopgap's walk and the ambiguity report for each activated
+// entry, as at a declaration (compiler C-18, §5.4), still under the world counter's lock.
+void jl_memberships_activated(jl_array_t *list, size_t world)
+{
+    size_t n = jl_array_nrows(list);
+    size_t mq = jl_set_membership_query_world(world);
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i + 1);
+        if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
+            continue;
+        jl_membership_dispatch_walk(en->member, en->instance, world);
+        jl_membership_ambiguity_report(en->member, en->instance, world);
+    }
+    jl_set_membership_query_world(mq);
+}
+
 // Declare `member` a member of the set `set_instance` names (compiler §4.2-§4.6).
 // The library checks ownership and the contract first; the runtime checks what
 // keeps subtyping sound: an open set, no cycle among sets, one instance per member.
@@ -275,6 +325,10 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         }
     }
     entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world);
+    if (jl_declared_memberships == NULL)
+        jl_declared_memberships = jl_alloc_vec_any(0);
+    jl_array_ptr_1d_push(jl_declared_memberships, (jl_value_t*)home);
+    jl_array_ptr_1d_push(jl_declared_memberships, entry);
     jl_atomic_store_release(&jl_world_counter, min_world);
     // the stopgap (compiler C-18): replay dispatch for the methods the member can now
     // reach, then report the ambiguities, both at the entry's world

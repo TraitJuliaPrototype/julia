@@ -1385,7 +1385,10 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
     m->line = line;
     jl_method_set_source(m, f);
 
+    // the library's definition hook (compiler §10.1): it may refuse the method before it is visible
+    jl_call_definition_hook(m, 0);
     jl_method_table_insert(mt, m, NULL);
+    jl_call_definition_hook(m, 1);
     if (jl_newmeth_tracer)
         jl_call_tracer(jl_newmeth_tracer, (jl_value_t*)m);
     JL_GC_POP();
