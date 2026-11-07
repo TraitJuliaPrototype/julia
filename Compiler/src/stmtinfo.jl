@@ -25,6 +25,17 @@ struct NoCallInfo <: CallInfo end
 add_edges_impl(::Vector{Any}, ::NoCallInfo) = nothing
 
 """
+    info::DeclaredResultInfo <: CallInfo
+
+A call of an operation of a set at a receiver typed by the set (compiler §7.1): inferred as the
+operation's declared result `rt`. The call stays a dynamic call and its result is asserted to `rt`.
+"""
+struct DeclaredResultInfo <: CallInfo
+    rt::Any
+end
+add_edges_impl(::Vector{Any}, ::DeclaredResultInfo) = nothing
+
+"""
     info::MethodMatchInfo <: CallInfo
 
 Captures the essential arguments and result of a `:jl_matching_methods` lookup

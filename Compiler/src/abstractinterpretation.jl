@@ -119,6 +119,52 @@ mutable struct CallInferenceState
     end
 end
 
+# A call of an operation of a set whose receiver's type is the set, or a set or intersection
+# below it, and not a concrete member (compiler §7.1): its result is the operation's declared
+# result, which the trait's method carries with the flag that it covers every member (§6.8). Each
+# such method the call's types fall under bounds the result, so the result is their intersection.
+# `nothing` where no argument is typed by a set, or no such method applies.
+function declared_operation_result(interp::AbstractInterpreter, @nospecialize(atype))
+    tt = unwrap_unionall(atype)
+    (tt isa DataType && length(tt.parameters) >= 2) || return nothing
+    atset = false
+    for i = 2:length(tt.parameters)
+        p = tt.parameters[i]
+        isvarargtype(p) && break
+        if !isconcretetype(p) && ccall(:jl_has_open_set, Cint, (Any,), p) != 0
+            atset = true
+            break
+        end
+    end
+    atset || return nothing
+    ms = ccall(:jl_declared_methods_of, Any, (Any,), tt.parameters[1])::Vector{Any}
+    isempty(ms) && return nothing
+    world = get_inference_world(interp)
+    rt = nothing
+    for m in ms
+        m = m::Method
+        m.primary_world <= world || continue
+        atype <: m.sig || continue
+        r = declared_result_at(m, atype)
+        rt = rt === nothing ? r : typeintersect(rt, r)
+    end
+    return rt
+end
+
+# the method's declared result at the call's types: its variables instantiated where the call
+# fixes them, else bounded by their bounds
+function declared_result_at(m::Method, @nospecialize(atype))
+    rt = m.declared_result
+    has_free_typevars(rt) || return rt
+    env = ccall(:jl_type_intersection_with_env, Any, (Any, Any), atype, m.sig)::SimpleVector
+    vals = env[2]::SimpleVector
+    if all(v -> !isa(v, TypeVar), vals)
+        rt = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), rt, m.sig, vals)
+        has_free_typevars(rt) || return rt
+    end
+    return rewrap_unionall(rt, m.sig)
+end
+
 function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(func),
                                   arginfo::ArgInfo, si::StmtInfo, @nospecialize(atype),
                                   sv::AbsIntState, max_methods::Int)
@@ -128,6 +174,11 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     if si.saw_latestworld
         add_remark!(interp, sv, "Cannot infer call, because we previously saw :latestworld")
         return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+    end
+    # an operation of a set at a receiver typed by the set (compiler §7.1)
+    drt = declared_operation_result(interp, atype)
+    if drt !== nothing
+        return Future(CallMeta(drt, Any, Effects(), DeclaredResultInfo(drt)))
     end
     matches = find_method_matches(interp, argtypes, atype; max_methods)
     if isa(matches, FailedMethodMatch)

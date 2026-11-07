@@ -1681,6 +1681,10 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
             # Inference determined this couldn't be analyzed. Don't question it.
             continue
         end
+        if isa(info, DeclaredResultInfo)
+            handle_declared_result!(ir, idx, stmt, info)
+            continue
+        end
 
         # handle special cased builtins
         if isa(info, OpaqueClosureCallInfo)
@@ -1698,6 +1702,17 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
     end
 
     return todo
+end
+
+# An operation's call at a receiver typed by its set (compiler §7.1): the dynamic call, its result
+# asserted to the declared result, which inference took as the call's type.
+function handle_declared_result!(ir::IRCode, idx::Int, stmt::Expr, info::DeclaredResultInfo)
+    inst = ir[SSAValue(idx)]
+    call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], nothing))
+    inst[:stmt] = Expr(:call, GlobalRef(Core, :typeassert), call, info.rt)
+    inst[:info] = NoCallInfo()
+    inst[:flag] = IR_FLAG_NULL
+    return nothing
 end
 
 function linear_inline_eligible(ir::IRCode)

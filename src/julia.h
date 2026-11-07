@@ -386,6 +386,10 @@ typedef struct _jl_method_t {
     // Override the conclusions of inter-procedural effect analysis,
     // forcing the conclusion to always true.
     _jl_purity_overrides_t purity;
+    // a declared result (compiler §6.8): an upper bound of what the method returns, or NULL; and
+    // whether it covers every member of the sets the method is at (a trait's method for an operation)
+    jl_value_t *declared_result;
+    uint8_t declared_covers;
 
 // hidden fields:
     jl_mutex_t writelock;

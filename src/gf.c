@@ -2269,6 +2269,42 @@ static jl_array_t *jl_methods_at_set(jl_typename_t *tn)
     return out;
 }
 
+// A method's declared result (compiler §6.8). The library sets it on a trait's method for an
+// operation, with `covers` set: each member's serving method is checked to infer within it.
+JL_DLLEXPORT void jl_method_set_declared_result(jl_method_t *m, jl_value_t *rt, int covers)
+{
+    if (!jl_is_type(rt) && !jl_is_typevar(rt))
+        jl_type_error("declared result", (jl_value_t*)jl_type_type, rt);
+    m->declared_result = rt;
+    jl_gc_wb(m, rt);
+    m->declared_covers = covers != 0;
+}
+
+// The methods at open sets of the function type `ft` that carry a declared result covering
+// every member: what inference reads at a receiver typed by a set (compiler §7.1). A method
+// appears once per set its signature names.
+JL_DLLEXPORT jl_value_t *jl_declared_methods_of(jl_value_t *ft)
+{
+    jl_array_t *out = jl_alloc_vec_any(0);
+    JL_GC_PUSH1(&out);
+    JL_LOCK(&open_set_methods_lock);
+    if (open_set_methods) {
+        size_t i, l = jl_array_nrows(open_set_methods);
+        for (i = 0; i + 1 < l; i += 2) {
+            jl_method_t *m = (jl_method_t*)jl_array_ptr_ref(open_set_methods, i + 1);
+            if (!m->declared_covers || m->declared_result == NULL)
+                continue;
+            jl_value_t *sig = jl_unwrap_unionall(m->sig);
+            if (!jl_is_tuple_type(sig) || jl_nparams(sig) == 0 || !jl_egal(jl_tparam0(sig), ft))
+                continue;
+            jl_array_ptr_1d_push(out, (jl_value_t*)m);
+        }
+    }
+    JL_UNLOCK(&open_set_methods_lock);
+    JL_GC_POP();
+    return (jl_value_t*)out;
+}
+
 // the walk's counters (plan §5.M2's log gate): what one declaration cost
 struct membership_stats {
     size_t declares;
@@ -5280,29 +5316,39 @@ void jl_call_definition_hook(jl_method_t *m, int after)
 }
 
 // once per package image, with its methods for other modules' functions, before any is activated:
-// the methods the hook returns stay inactive. Returns the methods to activate.
-jl_array_t *jl_call_image_methods_hook(jl_array_t *ms, const char *pkgname)
+// the methods the hook returns stay inactive. `entries` holds the image's typemap entries for
+// them (jl_add_methods made them); returns the entries to activate.
+static jl_value_t *entry_method(jl_value_t *e) JL_NOTSAFEPOINT
 {
-    if (jl_image_methods_hook == NULL || jl_array_nrows(ms) == 0)
-        return ms;
+    return jl_typetagis(e, jl_typemap_entry_type) ? (jl_value_t*)((jl_typemap_entry_t*)e)->func.method : e;
+}
+jl_array_t *jl_call_image_methods_hook(jl_array_t *entries, const char *pkgname)
+{
+    if (jl_image_methods_hook == NULL || jl_array_nrows(entries) == 0)
+        return entries;
     jl_value_t **args;
-    JL_GC_PUSHARGS(args, 4);
+    JL_GC_PUSHARGS(args, 5);
+    jl_array_t *ms = jl_alloc_vec_any(0);
+    args[4] = (jl_value_t*)ms;
+    for (size_t i = 0; i < jl_array_nrows(entries); i++)
+        jl_array_ptr_1d_push(ms, entry_method(jl_array_ptr_ref(entries, i)));
     args[0] = jl_image_methods_hook;
     args[1] = (jl_value_t*)ms;
     args[2] = jl_cstr_to_string(pkgname ? pkgname : "");
     args[3] = call_library_hook(args, 3);
-    jl_array_t *keep = ms;
+    jl_array_t *keep = entries;
     if (args[3] != NULL && jl_is_array(args[3]) && jl_array_nrows((jl_array_t*)args[3]) > 0) {
         jl_array_t *drop = (jl_array_t*)args[3];
         keep = jl_alloc_vec_any(0);
         args[1] = (jl_value_t*)keep;
-        for (size_t i = 0; i < jl_array_nrows(ms); i++) {
-            jl_value_t *m = jl_array_ptr_ref(ms, i);
+        for (size_t i = 0; i < jl_array_nrows(entries); i++) {
+            jl_value_t *e = jl_array_ptr_ref(entries, i);
+            jl_value_t *m = entry_method(e);
             int dropped = 0;
             for (size_t j = 0; j < jl_array_nrows(drop) && !dropped; j++)
                 dropped = jl_array_ptr_ref(drop, j) == m;
             if (!dropped)
-                jl_array_ptr_1d_push(keep, m);
+                jl_array_ptr_1d_push(keep, e);
         }
     }
     JL_GC_POP();
