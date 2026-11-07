@@ -4513,7 +4513,10 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
             jl_typemap_visitor(jl_atomic_load_relaxed(&mt->defs), membership_shadow_visitor,
                                (void*)&shadow_env);
             invalidated |= shadow_env.invalidated;
-            jl_atomic_fetch_and_relaxed(&m->dispatch_status, ~(METHOD_SIG_LATEST_ONLY | METHOD_SIG_LATEST_WHICH));
+            // a member's own methods now meet m's signature, so m is no longer the only method there;
+            // `which(m.sig)` is still m (a membership adds no method): LATEST_WHICH stays, or validation
+            // would read m as deleted and an image would drop its code
+            jl_atomic_fetch_and_relaxed(&m->dispatch_status, ~METHOD_SIG_LATEST_ONLY);
             type = (jl_value_t*)m->sig;
         }
         else {
@@ -4558,8 +4561,8 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
                 jl_atomic_store_release(&m->interferences, new_interferences);
                 jl_gc_wb(m, new_interferences);
             }
-            // clear m's fast path (probe 3 abused the stale LATEST_ONLY bit)
-            jl_atomic_fetch_and_relaxed(&m->dispatch_status, ~(METHOD_SIG_LATEST_ONLY | METHOD_SIG_LATEST_WHICH));
+            // clear m's fast path (probe 3 abused the stale LATEST_ONLY bit); LATEST_WHICH stays, as above
+            jl_atomic_fetch_and_relaxed(&m->dispatch_status, ~METHOD_SIG_LATEST_ONLY);
             type = dummy_sig;
         }
         // tail exactly as activate
