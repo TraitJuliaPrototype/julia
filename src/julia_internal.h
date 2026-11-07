@@ -457,6 +457,7 @@ void jl_call_definition_hook(jl_method_t *m, int after);
 jl_array_t *jl_call_image_methods_hook(jl_array_t *ms, const char *pkgname);
 void jl_call_module_end_hook(jl_module_t *m);
 extern jl_array_t *jl_declared_memberships JL_GLOBALLY_ROOTED; // this session's, for images (datatype.c)
+extern jl_genericmemory_t *jl_set_candidates JL_GLOBALLY_ROOTED; // the sets' candidates (datatype.c)
 void jl_activate_memberships(jl_array_t *list, size_t world);
 void jl_memberships_activated(jl_array_t *list, size_t world);
 JL_DLLEXPORT extern arraylist_t jl_linkage_blobs; // external linkage: sysimg/pkgimages

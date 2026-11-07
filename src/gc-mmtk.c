@@ -545,6 +545,7 @@ JL_DLLEXPORT void jl_gc_scan_vm_specific_roots(RootsWorkClosure* closure)
     add_node_to_roots_buffer(closure, &buf, &len, jl_image_methods_hook);
     add_node_to_roots_buffer(closure, &buf, &len, jl_module_end_hook);
     add_node_to_roots_buffer(closure, &buf, &len, jl_declared_memberships); // this session's memberships (datatype.c)
+    add_node_to_roots_buffer(closure, &buf, &len, jl_set_candidates); // the sets' candidates (datatype.c)
 
     // constants
     add_node_to_roots_buffer(closure, &buf, &len, jl_emptytuple_type);

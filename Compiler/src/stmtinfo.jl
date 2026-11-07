@@ -36,6 +36,23 @@ end
 add_edges_impl(::Vector{Any}, ::DeclaredResultInfo) = nothing
 
 """
+    info::SplitCallInfo <: CallInfo
+
+A call of an operation of a set at a receiver typed by the set, split over the set's first
+candidates (compiler §7.2): `info` is the call at the receiver narrowed to their union. The
+inliner branches over them; the last branch is the dynamic call. Each branch's result not known to
+be a `rt`, the declared result, is asserted to it.
+"""
+struct SplitCallInfo <: CallInfo
+    info::CallInfo
+    rt::Any
+end
+add_edges_impl(edges::Vector{Any}, info::SplitCallInfo) = add_edges!(edges, info.info)
+nsplit_impl(info::SplitCallInfo) = nsplit(info.info)
+getsplit_impl(info::SplitCallInfo, idx::Int) = getsplit(info.info, idx)
+getresult_impl(info::SplitCallInfo, idx::Int) = getresult(info.info, idx)
+
+"""
     info::MethodMatchInfo <: CallInfo
 
 Captures the essential arguments and result of a `:jl_matching_methods` lookup

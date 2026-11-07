@@ -197,6 +197,56 @@ static jl_value_t *publish_entry(jl_typename_t *tn, jl_typename_t *setname, jl_v
     return entry_v;
 }
 
+// The candidates of each set (compiler §7.2): its concrete members in declaration order, a set's
+// TypeName to a Vector{Any} of types. A list is replaced, never mutated, on each registration.
+jl_genericmemory_t *jl_set_candidates JL_GLOBALLY_ROOTED = NULL;
+static jl_mutex_t candidates_lock;
+
+static void register_candidate(jl_typename_t *set, jl_value_t *T)
+{
+    jl_array_t *nw = NULL;
+    JL_GC_PUSH1(&nw);
+    JL_LOCK(&candidates_lock);
+    if (jl_set_candidates == NULL)
+        jl_set_candidates = jl_alloc_memory_any(16);
+    jl_array_t *old = (jl_array_t*)jl_eqtable_get(jl_set_candidates, (jl_value_t*)set, NULL);
+    size_t n = old ? jl_array_nrows(old) : 0;
+    int seen = 0;
+    for (size_t i = 0; i < n && !seen; i++)
+        seen = jl_array_ptr_ref(old, i) == T;
+    if (!seen) {
+        nw = jl_alloc_vec_any(n + 1);
+        for (size_t i = 0; i < n; i++)
+            jl_array_ptr_set(nw, i, jl_array_ptr_ref(old, i));
+        jl_array_ptr_set(nw, n, T);
+        jl_set_candidates = jl_eqtable_put(jl_set_candidates, (jl_value_t*)set, (jl_value_t*)nw, NULL);
+    }
+    JL_UNLOCK(&candidates_lock);
+    JL_GC_POP();
+}
+
+// a member of a pattern joins its set's candidates at its first use (the library, compiler §10.4)
+JL_DLLEXPORT void jl_register_candidate(jl_value_t *set, jl_value_t *T)
+{
+    jl_value_t *uw = jl_unwrap_unionall(set);
+    if (jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->open_set && jl_is_concrete_type(T))
+        register_candidate(((jl_datatype_t*)uw)->name, T);
+}
+
+// the set's candidates now, in declaration order (a list never mutated; empty where none)
+JL_DLLEXPORT jl_value_t *jl_candidates_of(jl_value_t *set)
+{
+    jl_value_t *uw = jl_unwrap_unionall(set);
+    jl_value_t *r = NULL;
+    if (jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->open_set) {
+        JL_LOCK(&candidates_lock);
+        if (jl_set_candidates != NULL)
+            r = jl_eqtable_get(jl_set_candidates, (jl_value_t*)((jl_datatype_t*)uw)->name, NULL);
+        JL_UNLOCK(&candidates_lock);
+    }
+    return r ? r : (jl_value_t*)jl_alloc_vec_any(0);
+}
+
 // The memberships declared in this session, as [home TypeName, entry, ...]. A package image
 // keeps those its own modules declared and activates them at load (compiler §9).
 jl_array_t *jl_declared_memberships JL_GLOBALLY_ROOTED = NULL;
@@ -227,6 +277,12 @@ void jl_activate_memberships(jl_array_t *list, size_t world)
         jl_svecset(nd, jl_svec_len(old), (jl_value_t*)en);
         jl_atomic_store_release(&home->memberships, (jl_svec_t*)nd);
         jl_gc_wb(home, nd);
+    }
+    nd = NULL;
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i + 1);
+        if (jl_atomic_load_relaxed(&en->max_world) == ~(uint64_t)0 && jl_is_concrete_type(en->member))
+            register_candidate(en->set, en->member);
     }
     JL_GC_POP();
 }
@@ -325,6 +381,8 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         }
     }
     entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world);
+    if (jl_is_concrete_type(member))
+        register_candidate(setname, member);
     if (jl_declared_memberships == NULL)
         jl_declared_memberships = jl_alloc_vec_any(0);
     jl_array_ptr_1d_push(jl_declared_memberships, (jl_value_t*)home);

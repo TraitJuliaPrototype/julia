@@ -151,6 +151,40 @@ function declared_operation_result(interp::AbstractInterpreter, @nospecialize(at
     return rt
 end
 
+const MAX_OPERATION_SPLITS = 4
+
+# The split of an operation's call (compiler §7.2): the first argument typed by a set instance or an
+# intersection, and the union of the first `MAX_OPERATION_SPLITS` candidates of its set that are of
+# that type (at an intersection, the first component's candidates that are members of all). The
+# candidates are read without an edge: a member registered later reaches the fallback.
+function operation_split_type(@nospecialize(atype))
+    tt = unwrap_unionall(atype)::DataType
+    for i = 2:length(tt.parameters)
+        p = tt.parameters[i]
+        isvarargtype(p) && break
+        (isconcretetype(p) || has_free_typevars(p)) && continue
+        u = unwrap_unionall(p)
+        u isa DataType || continue
+        X = u
+        if u.name === (unwrap_unionall(Core.All)::DataType).name
+            X = (u.parameters[1]::DataType).parameters[1]
+        end
+        ccall(:jl_is_open_set, Cint, (Any,), X) != 0 || continue
+        cands = ccall(:jl_candidates_of, Any, (Any,), X)::Vector{Any}
+        U = Union{}
+        n = 0
+        for C in cands
+            n >= MAX_OPERATION_SPLITS && break
+            C <: p || continue
+            U = Union{U, C}
+            n += 1
+        end
+        n == 0 && return nothing
+        return (i, U)
+    end
+    return nothing
+end
+
 # the method's declared result at the call's types: its variables instantiated where the call
 # fixes them, else bounded by their bounds
 function declared_result_at(m::Method, @nospecialize(atype))
@@ -175,10 +209,18 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         add_remark!(interp, sv, "Cannot infer call, because we previously saw :latestworld")
         return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
     end
-    # an operation of a set at a receiver typed by the set (compiler §7.1)
+    # an operation of a set at a receiver typed by the set (compiler §7.1, §7.2)
     drt = declared_operation_result(interp, atype)
     if drt !== nothing
-        return Future(CallMeta(drt, Any, Effects(), DeclaredResultInfo(drt)))
+        split = operation_split_type(atype)
+        split === nothing && return Future(CallMeta(drt, Any, Effects(), DeclaredResultInfo(drt)))
+        i, U = split
+        newargs = copy(argtypes)
+        newargs[i] = U
+        call = abstract_call(interp, ArgInfo(nothing, newargs), si, sv)::Future
+        return Future{CallMeta}(call, interp, sv) do call, _, _
+            CallMeta(drt, Any, Effects(), SplitCallInfo(call.info, drt))
+        end
     end
     matches = find_method_matches(interp, argtypes, atype; max_methods)
     if isa(matches, FailedMethodMatch)
