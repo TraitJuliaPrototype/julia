@@ -2083,6 +2083,10 @@ JL_DLLEXPORT int jl_isabspath(const char *in) JL_NOTSAFEPOINT;
     XX(loopinfo_sym) \
     XX(macrocall_sym) \
     XX(max_methods_sym) \
+    XX(facts_sym) \
+    XX(facts_boundary_sym) \
+    XX(facts_always_sym) \
+    XX(trait_option_sym) \
     XX(meta_sym) \
     XX(method_sym) \
     XX(module_sym) \

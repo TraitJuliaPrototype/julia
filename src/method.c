@@ -955,7 +955,22 @@ JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src)
         jl_value_t *st = jl_array_ptr_ref(stmts, i);
         if (jl_is_expr(st) && ((jl_expr_t*)st)->head == jl_meta_sym) {
             size_t nargs = jl_expr_nargs(st);
-            if (nargs >= 1 && jl_exprarg(st, 0) == (jl_value_t*)jl_nospecialize_sym) {
+            if (nargs > 1) {
+                // a policy marker merged into another meta (`pushmeta!`, as `@inline` does): the meta stays
+                for (size_t k = 0; k < nargs; k++) {
+                    if (jl_exprarg(st, k) == (jl_value_t*)jl_facts_boundary_sym)
+                        m->facts = 1;
+                    else if (jl_exprarg(st, k) == (jl_value_t*)jl_facts_always_sym)
+                        m->facts = 2;
+                }
+            }
+            if (nargs == 1 && (jl_exprarg(st, 0) == (jl_value_t*)jl_facts_boundary_sym ||
+                               jl_exprarg(st, 0) == (jl_value_t*)jl_facts_always_sym)) {
+                // the method's policy (compiler §2.2): a boundary, or always facts
+                m->facts = jl_exprarg(st, 0) == (jl_value_t*)jl_facts_always_sym ? 2 : 1;
+                st = jl_nothing;
+            }
+            else if (nargs >= 1 && jl_exprarg(st, 0) == (jl_value_t*)jl_nospecialize_sym) {
                 if (nargs == 1) // bare `@nospecialize` is special: it prevents specialization on all args
                     m->nospecialize = -1;
                 size_t j;
@@ -1089,6 +1104,7 @@ JL_DLLEXPORT jl_method_t *jl_new_method_uninit(jl_module_t *module)
     m->max_varargs = UINT8_MAX;
     m->declared_result = NULL;
     m->declared_covers = 0;
+    m->facts = 0;
     JL_MUTEX_INIT(&m->writelock, "method->writelock");
     return m;
 }

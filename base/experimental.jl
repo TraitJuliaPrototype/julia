@@ -163,7 +163,7 @@ macro max_methods(n::Int, fdef::Expr)
 end
 
 """
-    Experimental.@compiler_options optimize={0,1,2,3} compile={yes,no,all,min} infer={true,false} max_methods={default,1,2,3,4}
+    Experimental.@compiler_options optimize={0,1,2,3} compile={yes,no,all,min} infer={true,false} max_methods={default,1,2,3,4} facts={true,false} bounded={true,false} no_pirates={true,false} dynamic={true,false} first_seen={true,false}
 
 Set compiler options for code in the enclosing module. Options correspond directly to
 command-line options with the same name, where applicable. The following options
@@ -174,6 +174,10 @@ are currently supported:
     requests the minimum possible amount of compilation.
   * `infer`: Enable or disable type inference. If disabled, implies [`@nospecialize`](@ref).
   * `max_methods`: Maximum number of matching methods considered when running type inference.
+  * `facts`: Compile the module's methods by facts: their calls are inferred, with their edges,
+    only at fact signatures; every other call is dispatched when it runs.
+  * `bounded`, `no_pirates`, `dynamic`, `first_seen`: the trait language's scope options, which a
+    trait library reads.
 """
 macro compiler_options(args...)
     opts = Expr(:block)
@@ -199,6 +203,17 @@ macro compiler_options(args...)
                   a isa Int ? ((1 <= a <= 4) ? a : error("We must have that `1 <= max_methods <= 4`, but `max_methods = $a`.")) :
                   error("invalid argument to \"max_methods\" option")
                 push!(opts.args, Expr(:meta, :max_methods, a))
+            elseif ex.args[1] === :facts
+                a = ex.args[2]
+                a = a === false || a === :no  ? 0 :
+                    a === true  || a === :yes ? 1 : error("invalid argument to \"facts\" option")
+                push!(opts.args, Expr(:meta, :facts, a))
+            elseif ex.args[1] in (:bounded, :no_pirates, :dynamic, :first_seen)
+                bit = ex.args[1] === :bounded ? 1 : ex.args[1] === :no_pirates ? 2 : ex.args[1] === :dynamic ? 4 : 8
+                a = ex.args[2]
+                a = a === false || a === :no  ? 0 :
+                    a === true  || a === :yes ? 1 : error("invalid argument to \"$(ex.args[1])\" option")
+                push!(opts.args, Expr(:meta, :trait_option, bit << 1 | a))
             else
                 error("unknown option \"$(ex.args[1])\"")
             end

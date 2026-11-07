@@ -390,6 +390,8 @@ typedef struct _jl_method_t {
     // whether it covers every member of the sets the method is at (a trait's method for an operation)
     jl_value_t *declared_result;
     uint8_t declared_covers;
+    // the policy flag (compiler §2.2): 0 as its module says, 1 a boundary, 2 always facts
+    uint8_t facts;
 
 // hidden fields:
     jl_mutex_t writelock;
@@ -891,6 +893,10 @@ typedef struct _jl_module_t {
     int8_t infer;
     uint8_t istopmod;
     int8_t max_methods;
+    // compiled by facts (compiler §2.1): 0 plain, 1 facts, 2 never (the compiler's own modules)
+    int8_t facts;
+    // the trait language's scope options (compiler §2.1): JL_TRAIT_OPTION_* bits
+    uint8_t trait_options;
     // If cleared no binding partition in this module has PARTITION_FLAG_EXPORTED and min_world > jl_require_world.
     _Atomic(int8_t) export_set_changed_since_require_world;
     jl_mutex_t lock;

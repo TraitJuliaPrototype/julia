@@ -521,6 +521,9 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
     m->compile = -1;
     m->infer = -1;
     m->max_methods = -1;
+    // a submodule takes its parent's policy and options (compiler §2.1)
+    m->facts = parent != NULL && parent != m ? parent->facts : 0;
+    m->trait_options = parent != NULL && parent != m ? parent->trait_options : 0;
     m->file = jl_empty_sym;
     m->line = 0;
     m->hash = parent == NULL ? bitmix(name->hash, jl_module_type->hash) :
@@ -723,6 +726,35 @@ JL_DLLEXPORT int jl_get_module_infer(jl_module_t *m)
         value = m->infer;
     }
     return value;
+}
+
+// The facts policy (compiler §2.1): 0 plain, 1 facts, 2 never by facts (the compiler's own modules).
+JL_DLLEXPORT void jl_set_module_facts(jl_module_t *self, int value)
+{
+    self->facts = value == 2 ? 2 : value != 0;
+}
+JL_DLLEXPORT int jl_get_module_facts(jl_module_t *m)
+{
+    return m->facts;
+}
+// whether a method's code is compiled by facts by itself (compiler §2.3): always, or in a module of
+// flag 1 and not a boundary; a boundary takes the policy of the code that reaches it
+JL_DLLEXPORT int jl_method_is_facts(jl_method_t *m) JL_NOTSAFEPOINT
+{
+    return m->facts == 2 || (m->facts == 0 && m->module->facts == 1);
+}
+// The trait language's scope options (compiler §2.1), as bits: 1 bounded, 2 no_pirates, 4 dynamic,
+// 8 first_seen.
+JL_DLLEXPORT void jl_set_module_trait_option(jl_module_t *self, int bit, int value)
+{
+    if (value)
+        self->trait_options |= (uint8_t)bit;
+    else
+        self->trait_options &= (uint8_t)~bit;
+}
+JL_DLLEXPORT int jl_get_module_trait_options(jl_module_t *m)
+{
+    return m->trait_options;
 }
 
 JL_DLLEXPORT void jl_set_module_max_methods(jl_module_t *self, int value)

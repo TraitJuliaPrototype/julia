@@ -669,6 +669,18 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, size_t ip,
                                 jl_set_module_max_methods(s->module, jl_unbox_long(jl_exprarg(stmt, 1)));
                             }
                         }
+                        else if (jl_exprarg(stmt, 0) == (jl_value_t*)jl_facts_sym) {
+                            if (jl_is_long(jl_exprarg(stmt, 1))) {
+                                jl_set_module_facts(s->module, jl_unbox_long(jl_exprarg(stmt, 1)));
+                            }
+                        }
+                        else if (jl_exprarg(stmt, 0) == (jl_value_t*)jl_trait_option_sym) {
+                            // a trait option's bit and value as one integer: bit << 1 | value
+                            if (jl_is_long(jl_exprarg(stmt, 1))) {
+                                long v = jl_unbox_long(jl_exprarg(stmt, 1));
+                                jl_set_module_trait_option(s->module, (int)(v >> 1), (int)(v & 1));
+                            }
+                        }
                     }
                 }
                 else {
