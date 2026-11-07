@@ -550,6 +550,8 @@ int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
         return 1;
     if (jl_is_unionall(a)) a = jl_unwrap_unionall(a);
     if (jl_is_unionall(b)) b = jl_unwrap_unionall(b);
+    if (jl_is_all_type(a) || jl_is_all_type(b))
+        return 0; // an intersection meets what each component meets (compiler §4.9)
     if (jl_is_uniontype(a))
         return obviously_disjoint(((jl_uniontype_t *)a)->a, b, specificity) &&
                obviously_disjoint(((jl_uniontype_t *)a)->b, b, specificity);
@@ -2050,6 +2052,39 @@ static int has_existential_typevar(jl_value_t *x, jl_stenv_t *e) JL_NOTSAFEPOINT
 // (as opposed to being outside any type constructor, or comparing variable bounds).
 // this is used to record the positions where type variables occur for the
 // diagonal rule (record_var_occurrence).
+// x <: All{Z, W}: x is a subtype of each component, in the same environment (compiler §4.9)
+static int subtype_all_right(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
+{
+    jl_value_t *tup = jl_tparam0(y);
+    if (!jl_is_datatype(tup))
+        return 0; // All{T} with T a variable: no components to ask
+    for (size_t i = 0; i < jl_nparams(tup); i++)
+        if (!subtype(x, jl_tparam(tup, i), e, param))
+            return 0;
+    return 1;
+}
+
+// All{X, Y} <: y: some component is a subtype of y (compiler §4.9). Each try starts from the
+// environment the call began with.
+static int subtype_all_left(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
+{
+    jl_value_t *tup = jl_tparam0(x);
+    if (!jl_is_datatype(tup))
+        return 0;
+    size_t n = jl_nparams(tup);
+    jl_savedenv_t se;
+    save_env(e, &se, 1);
+    for (size_t i = 0; i < n; i++) {
+        if (subtype(jl_tparam(tup, i), y, e, param)) {
+            free_env(&se);
+            return 1;
+        }
+        restore_env(e, &se, 1);
+    }
+    free_env(&se);
+    return 0;
+}
+
 static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
 {
     if (jl_is_uniontype(x)) {
@@ -2158,7 +2193,7 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
     jl_value_t *ux = jl_unwrap_unionall(x);
     jl_value_t *uy = jl_unwrap_unionall(y);
     if ((x != ux || y != uy) && y != (jl_value_t*)jl_any_type && jl_is_datatype(ux) && jl_is_datatype(uy) &&
-        !jl_is_type_type(ux)) {
+        !jl_is_type_type(ux) && !jl_is_all_type(ux) && !jl_is_all_type(uy)) {
         assert(ux);
         if (uy == (jl_value_t*)jl_any_type)
             return 1;
@@ -2181,6 +2216,13 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
     if (jl_is_datatype(x) && jl_is_datatype(y)) {
         if (x == y) return 1;
         if (y == (jl_value_t*)jl_any_type) return 1;
+        // intersections (compiler §4.9): x <: All{Z, W} when x is a subtype of each component,
+        // checked in the same environment as a tuple's parameters are; All{X, Y} <: y when some
+        // component is a subtype of y
+        if (jl_is_all_type(y))
+            return subtype_all_right(x, y, e, param);
+        if (jl_is_all_type(x))
+            return subtype_all_left(x, y, e, param);
         jl_datatype_t *xd = (jl_datatype_t*)x, *yd = (jl_datatype_t*)y;
         if (jl_is_type_type(x) && !jl_is_type_type(y)) {
             jl_value_t *tp0 = jl_tparam0(xd);
@@ -2615,6 +2657,8 @@ static int obvious_subtype(jl_value_t *x, jl_value_t *y, jl_value_t *y0, int *su
         *subtype = 1;
         return 1;
     }
+    if (jl_is_all_type(jl_unwrap_unionall(x)) || jl_is_all_type(jl_unwrap_unionall(y)))
+        return 0; // intersections take the full walk (compiler §4.9)
     while (jl_is_unionall(x)) {
         if (!jl_is_unionall(y)) {
             if (obvious_subtype(jl_unwrap_unionall(x), y, y0, subtype) && !*subtype)

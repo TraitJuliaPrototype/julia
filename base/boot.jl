@@ -335,6 +335,11 @@ macro _boundscheck() Expr(:boundscheck) end
 TypeVar(@nospecialize(n)) = _typevar(n::Symbol, Union{}, Any)
 TypeVar(@nospecialize(n), @nospecialize(ub)) = _typevar(n::Symbol, Union{}, ub)
 TypeVar(@nospecialize(n), @nospecialize(lb), @nospecialize(ub)) = _typevar(n::Symbol, lb, ub)
+
+# intersections (compiler §4.9): All{X, Y} is the type of the values that are members of each
+# component; the runtime builds it in its normal form as All{Tuple{X, Y}}
+abstract type All{T<:Tuple} end
+
 UnionAll(@nospecialize(v), @nospecialize(t)) = ccall(:jl_type_unionall, Any, (Any, Any), v::TypeVar, t)
 
 const Memory{T} = GenericMemory{:not_atomic, T, CPU}

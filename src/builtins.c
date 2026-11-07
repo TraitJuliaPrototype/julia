@@ -1642,6 +1642,10 @@ JL_CALLABLE(jl_f_apply_type)
         // substituting typevars (a valid_type_param check here isn't sufficient).
         return (jl_value_t*)jl_type_union(&args[1], nargs-1);
     }
+    else if (jl_all_type != NULL && args[0] == (jl_value_t*)jl_all_type) {
+        // an intersection, in its normal form (compiler §4.9)
+        return jl_type_all(&args[1], nargs-1);
+    }
     else if (jl_is_vararg(args[0])) {
         jl_vararg_t *vm = (jl_vararg_t*)args[0];
         if (!vm->T) {

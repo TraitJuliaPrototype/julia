@@ -1137,6 +1137,18 @@ end
 
 function show_datatype(io::IO, x::DataType, wheres::Vector{TypeVar}=TypeVar[])
     parameters = x.parameters::SimpleVector
+    # an intersection prints as written: All{X, Y} (Core.All{Tuple{X, Y}} in its normal form)
+    if x.name === typename(Core.All) && length(parameters) == 1 && parameters[1] isa DataType &&
+            (parameters[1]::DataType).name === Tuple.name
+        print(io, "All{")
+        comps = (parameters[1]::DataType).parameters
+        for i in 1:length(comps)
+            i > 1 && print(io, ", ")
+            show(io, comps[i])
+        end
+        print(io, "}")
+        return
+    end
     istuple = x.name === Tuple.name
     isnamedtuple = x.name === typename(NamedTuple)
     kwsnt = maybe_kws_nt(x)

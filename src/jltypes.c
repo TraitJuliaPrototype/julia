@@ -648,6 +648,91 @@ STATIC_INLINE void merge_vararg_unions(jl_value_t **temp, size_t nt)
     }
 }
 
+// The intersection of the types ts (compiler §4.9), in its normal form: nested intersections
+// flattened, Any dropped, duplicates removed, sorted as Union sorts. A component that is a subtype
+// of another by declared supertypes alone (two closed types without free variables) absorbs it,
+// and two closed types with nothing in common give Union{}. A membership never absorbs, so a type
+// expression gives the same type in every world. One component is itself; none is Any.
+JL_DLLEXPORT jl_value_t *jl_type_all(jl_value_t **ts, size_t n)
+{
+    size_t cnt = 0;
+    for (size_t i = 0; i < n; i++) {
+        jl_value_t *t = ts[i];
+        if (jl_is_all_type(t))
+            cnt += jl_nparams(jl_tparam0(t));
+        else if (jl_is_type(t) || jl_is_typevar(t))
+            cnt++;
+        else
+            jl_type_error("All", (jl_value_t*)jl_type_type, t);
+    }
+    jl_value_t **c;
+    JL_GC_PUSHARGS(c, cnt + 1);
+    size_t m = 0;
+    for (size_t i = 0; i < n; i++) {
+        jl_value_t *t = ts[i];
+        if (jl_is_all_type(t)) {
+            jl_value_t *tup = jl_tparam0(t);
+            for (size_t k = 0; k < jl_nparams(tup); k++)
+                c[m++] = jl_tparam(tup, k);
+        }
+        else {
+            c[m++] = t;
+        }
+    }
+    size_t j = 0;
+    for (size_t i = 0; i < m; i++) {
+        jl_value_t *t = c[i];
+        if (t == jl_bottom_type) {
+            JL_GC_POP();
+            return jl_bottom_type;
+        }
+        if (t == (jl_value_t*)jl_any_type)
+            continue;
+        int dup = 0;
+        for (size_t k = 0; k < j && !dup; k++)
+            dup = jl_egal(c[k], t);
+        if (!dup)
+            c[j++] = t;
+    }
+    m = j;
+    for (size_t a = 0; a < m; a++) {
+        for (size_t b = 0; b < m; b++) {
+            if (a == b || c[a] == NULL || c[b] == NULL)
+                continue;
+            jl_value_t *x = c[a], *y = c[b];
+            if (jl_is_typevar(x) || jl_is_typevar(y) || jl_has_free_typevars(x) || jl_has_free_typevars(y) ||
+                jl_has_open_set(x) || jl_has_open_set(y))
+                continue;
+            if (jl_subtype(x, y)) {
+                c[b] = NULL;                        // the narrower absorbs the wider
+            }
+            else if (a < b && jl_has_empty_intersection(x, y)) {
+                JL_GC_POP();
+                return jl_bottom_type;
+            }
+        }
+    }
+    j = 0;
+    for (size_t i = 0; i < m; i++)
+        if (c[i] != NULL)
+            c[j++] = c[i];
+    m = j;
+    if (m == 0) {
+        JL_GC_POP();
+        return (jl_value_t*)jl_any_type;
+    }
+    if (m == 1) {
+        jl_value_t *r = c[0];
+        JL_GC_POP();
+        return r;
+    }
+    isort_union(c, m);
+    c[m] = (jl_value_t*)jl_apply_tuple_type_v(c, m);
+    jl_value_t *r = jl_apply_type1((jl_value_t*)jl_all_type, c[m]);
+    JL_GC_POP();
+    return r;
+}
+
 JL_DLLEXPORT jl_value_t *jl_type_union(jl_value_t **ts, size_t n)
 {
     if (n == 0)
@@ -3977,6 +4062,7 @@ static jl_value_t *core(const char *name)
 // fetch references to things defined in boot.jl
 void post_boot_hooks(void)
 {
+    jl_all_type = (jl_unionall_t*)core("All");
     jl_char_type    = (jl_datatype_t*)core("Char");
     XX(char);
     jl_int8_type    = (jl_datatype_t*)core("Int8");

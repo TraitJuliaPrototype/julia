@@ -939,6 +939,13 @@ JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b);
 // they are in `world`; returns whether t reaches any entry (*lo/*hi untouched if not)
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *lo, size_t *hi) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
+// intersections (compiler §4.9): All{X, Y} is Core.All{Tuple{X, Y}}, built in its normal form
+STATIC_INLINE int jl_is_all_type(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    return jl_all_type != NULL && jl_is_datatype(v) &&
+           ((jl_datatype_t*)v)->name == ((jl_datatype_t*)((jl_unionall_t*)jl_all_type)->body)->name;
+}
+JL_DLLEXPORT jl_value_t *jl_type_all(jl_value_t **ts, size_t n);
 // dispatch at a declaration (gf.c; compiler §5.4, §5.5): replay "insert m with the
 // member substituted" for every method m at the set or a set the member joins, and
 // report the ambiguities the member's set-join creates. Call under
