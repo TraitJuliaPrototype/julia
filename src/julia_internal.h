@@ -779,6 +779,8 @@ int jl_engine_hasreserved_policy(jl_method_instance_t *m, jl_value_t *owner, int
 // dispatch with the policy of the code that dispatches (compiler §2.4)
 JL_DLLEXPORT jl_value_t *jl_apply_generic_reach(jl_value_t *F, jl_value_t **args, uint32_t nargs, int reach);
 JL_DLLEXPORT jl_value_t *jl_invoke_reach(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc, int reach);
+// the method instance of a call with attribute bits (compiler §6.3, §6.9), or NULL
+JL_DLLEXPORT jl_method_instance_t *jl_attributed_mi(jl_tupletype_t *tt, uint32_t mask, uint32_t dyn, size_t world);
 jl_value_t *jl_gf_invoke_by_method_reach(jl_method_t *method, jl_value_t *gf, jl_value_t **args, size_t nargs, int reach);
 jl_value_t *jl_gf_invoke_reach(jl_value_t *types, jl_value_t *f, jl_value_t **args, size_t nargs, int reach);
 // a call the interpreter makes: a builtin that calls a function gets the interpreted code's policy

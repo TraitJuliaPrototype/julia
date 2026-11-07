@@ -84,6 +84,7 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     tn->hash = bitmix(bitmix(module ? module->build_id.lo : 0, name->hash), 0xa1ada1da);
     tn->_unused = 0;
     tn->open_set = 0;
+    tn->default_attribute = 0;
     tn->never_member = 0;
     tn->abstract = abstract;
     tn->mutabl = mutabl;
@@ -464,6 +465,23 @@ JL_DLLEXPORT void jl_set_contract(jl_value_t *T, jl_value_t *contract)
     if (!jl_atomic_cmpswap(&tn->contract, &expected, contract))
         jl_errorf("the contract of %s is written once", jl_symbol_name(tn->name));
     jl_gc_wb(tn, contract);
+}
+
+// A set's default attribute (compiler §6.3, step 4; traits §4.6), written by the library at the
+// declaration: 0 none, 1 `Compiled`, 2 `Dynamic`.
+JL_DLLEXPORT void jl_set_default_attribute(jl_value_t *T, int attr)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->open_set)
+        jl_error("only a set has a default attribute");
+    if (attr < 0 || attr > 2)
+        jl_error("a default attribute is 0 (none), 1 (Compiled) or 2 (Dynamic)");
+    ((jl_datatype_t*)uw)->name->default_attribute = attr;
+}
+JL_DLLEXPORT int jl_get_default_attribute(jl_value_t *T)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    return jl_is_datatype(uw) ? ((jl_datatype_t*)uw)->name->default_attribute : 0;
 }
 
 JL_DLLEXPORT int jl_is_open_set(jl_value_t *T)

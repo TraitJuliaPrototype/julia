@@ -392,6 +392,9 @@ typedef struct _jl_method_t {
     uint8_t declared_covers;
     // the policy flag (compiler §2.2): 0 as its module says, 1 a boundary, 2 always facts
     uint8_t facts;
+    // bit flags: the arguments written `@specialize`; at an argument typed by a set, the attribute
+    // `Compiled` (compiler §6.3, step 3), as a `nospecialize` bit there gives `Dynamic`
+    uint32_t specialize;
 
 // hidden fields:
     jl_mutex_t writelock;
@@ -567,7 +570,8 @@ typedef struct {
     uint8_t mayinlinealloc:1;
     uint8_t open_set:1;       // this type is a set that may gain members after its definition
     uint8_t never_member:1;   // Core's kinds: can never receive a membership
-    uint8_t _unused:3;
+    uint8_t default_attribute:2; // a set's default attribute (compiler §6.3, step 4): 0 none, 1 Compiled, 2 Dynamic
+    uint8_t _unused:1;
     _Atomic(uint8_t) cache_entry_count; // (approximate counter of TypeMapEntry for heuristics)
     uint8_t max_methods; // override for inference's max_methods setting (0 = no additional limit or relaxation)
     uint8_t constprop_heustic; // override for inference's constprop heuristic

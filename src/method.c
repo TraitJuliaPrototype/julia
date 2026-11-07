@@ -995,8 +995,10 @@ JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src)
                 st = jl_nothing;
             }
             else if (nargs >= 1 && jl_exprarg(st, 0) == (jl_value_t*)jl_specialize_sym) {
-                if (nargs == 1) // bare `@specialize` is special: it causes specialization on all args
+                if (nargs == 1) { // bare `@specialize` is special: it causes specialization on all args
                     m->nospecialize = 0;
+                    m->specialize = ~(uint32_t)0;
+                }
                 for (j = 1; j < nargs; j++) {
                     jl_value_t *aj = jl_exprarg(st, j);
                     if (!jl_is_slotnumber(aj) && !jl_is_argument(aj))
@@ -1014,6 +1016,7 @@ JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src)
                         continue;
                     }
                     m->nospecialize &= ~(1 << sn);
+                    m->specialize |= (1u << sn); // at a trait argument: `Compiled` (compiler §6.3)
                 }
                 st = jl_nothing;
             }
@@ -1105,6 +1108,7 @@ JL_DLLEXPORT jl_method_t *jl_new_method_uninit(jl_module_t *module)
     m->declared_result = NULL;
     m->declared_covers = 0;
     m->facts = 0;
+    m->specialize = 0;
     JL_MUTEX_INIT(&m->writelock, "method->writelock");
     return m;
 }

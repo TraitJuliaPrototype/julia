@@ -672,6 +672,7 @@ static jl_value_t *invokelatest_reach(jl_value_t **args, uint32_t nargs, int rea
 static jl_value_t *invoke_in_world_reach(jl_value_t **args, uint32_t nargs, int reach);
 static jl_value_t *call_in_world_total_reach(jl_value_t **args, uint32_t nargs, int reach);
 static jl_value_t *invoke_reach(jl_value_t **args, uint32_t nargs, int reach);
+static jl_value_t *attributed_call_reach(jl_value_t **args, uint32_t nargs, int reach);
 
 // A call made for code of a policy (a splat, the interpreter): a builtin that calls a function
 // passes the policy on; any other function is dispatched with it.
@@ -689,6 +690,8 @@ jl_value_t *jl_apply_reach(jl_value_t **args, uint32_t nargs, int reach)
             return call_in_world_total_reach(&args[1], nargs - 1, reach);
         if (f == BUILTIN(invoke))
             return invoke_reach(&args[1], nargs - 1, reach);
+        if (f == BUILTIN(attributed_call))
+            return attributed_call_reach(&args[1], nargs - 1, reach);
     }
     return jl_apply_generic_reach(f, &args[1], nargs - 1, reach);
 }
@@ -1013,6 +1016,95 @@ JL_CALLABLE(jl_f__call_in_world_total_plain)
 JL_CALLABLE(jl_f__call_in_world_total_facts)
 {
     return call_in_world_total_reach(args, nargs, JL_REACH_FACTS);
+}
+
+// the casts (compiler §6.9): reserved names, written as an argument of the call they decide, which
+// lowering turns into `attributed_call`; called by name, they raise
+JL_CALLABLE(jl_f_compiled_for)
+{
+    jl_error("compiled_for(x) is written as an argument of the call it decides");
+}
+JL_CALLABLE(jl_f_with_dynamic)
+{
+    jl_error("with_dynamic(x) is written as an argument of the call it decides");
+}
+
+// Core.attributed_call(bits, f, args...) (compiler §6.3, §6.9): the call f(args...), dispatched by
+// the arguments' types, with the attributes `bits` gives its trait arguments: the low 32 bits name
+// the arguments decided, the high 32 those of them that are `Dynamic` (bit k - 1 for argument k).
+// Lowering makes it from casts written at a call, the optimizer from a run-time site that passes on
+// a trait argument of code compiled once. A cache of its own, by the call's types and the bits,
+// answers in the world it was filled in.
+static jl_genericmemory_t *attributed_cache JL_GLOBALLY_ROOTED = NULL;
+static jl_mutex_t attributed_cache_lock;
+
+static jl_value_t *attributed_call_reach(jl_value_t **args, uint32_t nargs, int reach)
+{
+    JL_NARGSV(attributed_call, 2);
+    JL_TYPECHK(attributed_call, long, args[0]);
+    uint64_t bits = (uint64_t)jl_unbox_long(args[0]);
+    uint32_t mask = (uint32_t)bits, dyn = (uint32_t)(bits >> 32) & mask;
+    jl_value_t **cargs = &args[1];
+    uint32_t cnargs = nargs - 1;
+    if (mask == 0 || jl_isa(cargs[0], (jl_value_t*)jl_builtin_type))
+        return jl_apply_reach(cargs, cnargs, reach);
+    size_t world = jl_current_task->world_age;
+    jl_value_t *tt = NULL, *list = NULL, *nl = NULL;
+    jl_method_instance_t *mi = NULL;
+    JL_GC_PUSH4(&tt, &list, &nl, &mi);
+    tt = (jl_value_t*)jl_inst_arg_tuple_type(cargs[0], &cargs[1], cnargs, 1);
+    JL_LOCK(&attributed_cache_lock);
+    if (attributed_cache != NULL) {
+        list = jl_eqtable_get(attributed_cache, tt, NULL);
+        for (size_t i = 0; list != NULL && i + 2 < jl_svec_len(list); i += 3) {
+            if ((uint64_t)jl_unbox_long(jl_svecref(list, i)) == bits &&
+                    jl_unbox_ulong(jl_svecref(list, i + 2)) == world) {
+                mi = (jl_method_instance_t*)jl_svecref(list, i + 1);
+                break;
+            }
+        }
+    }
+    JL_UNLOCK(&attributed_cache_lock);
+    if (mi == NULL) {
+        mi = jl_attributed_mi((jl_tupletype_t*)tt, mask, dyn, world);
+        if (mi == NULL) {
+            JL_GC_POP();
+            return jl_apply_reach(cargs, cnargs, reach); // no single method: dispatch says why
+        }
+        nl = (jl_value_t*)jl_svec(3, args[0], (jl_value_t*)mi, jl_box_ulong(world));
+        JL_LOCK(&attributed_cache_lock);
+        if (attributed_cache == NULL)
+            attributed_cache = jl_alloc_memory_any(16);
+        list = jl_eqtable_get(attributed_cache, tt, NULL);
+        if (list != NULL) {
+            // keep the entries of other bits and worlds before this one: a short list per call type
+            size_t n = jl_svec_len(list) < 3 * 7 ? jl_svec_len(list) : 3 * 7;
+            jl_svec_t *both = jl_alloc_svec(n + 3);
+            for (size_t i = 0; i < 3; i++)
+                jl_svecset(both, i, jl_svecref(nl, i));
+            for (size_t i = 0; i < n; i++)
+                jl_svecset(both, i + 3, jl_svecref(list, i));
+            nl = (jl_value_t*)both;
+        }
+        attributed_cache = jl_eqtable_put(attributed_cache, tt, nl, NULL);
+        JL_UNLOCK(&attributed_cache_lock);
+    }
+    jl_value_t *r = jl_invoke_reach(cargs[0], &cargs[1], cnargs - 1, mi, reach);
+    JL_GC_POP();
+    return r;
+}
+
+JL_CALLABLE(jl_f_attributed_call)
+{
+    return attributed_call_reach(args, nargs, JL_REACH_RUNTIME);
+}
+JL_CALLABLE(jl_f_attributed_call_plain)
+{
+    return attributed_call_reach(args, nargs, JL_REACH_PLAIN);
+}
+JL_CALLABLE(jl_f_attributed_call_facts)
+{
+    return attributed_call_reach(args, nargs, JL_REACH_FACTS);
 }
 
 // tuples ---------------------------------------------------------------------

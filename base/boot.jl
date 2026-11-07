@@ -435,6 +435,25 @@ end
 struct ArgumentError <: Exception
     msg::AbstractString
 end
+
+# A member of the set `X` kept with the attribute `Dynamic` (compiler §6.9; traits §7.7): an ordinary
+# struct with no rule of subtyping. The library declares its memberships and defines its methods.
+struct Dynamic{X}
+    object::X
+    function Dynamic{X}(@nospecialize(x)) where {X}
+        X isa UnionAll && throw(ArgumentError("Dynamic{X} needs the trait's parameters"))
+        isa(x, Dynamic) && (x = getfield(x, :object))
+        isa(x, X) || throw(TypeError(:Dynamic, "", X, x))
+        return new{X}(x)
+    end
+end
+# The casts `compiled_for` and `with_dynamic` (compiler §6.9) are builtins that raise: written as an
+# argument of the call they decide, lowering turns them into `attributed_call`.
+# a cast to `Compiled` passes a `Dynamic{X}`'s object
+_cast_compiled(@nospecialize(x)) = isa(x, Dynamic) ? getfield(x, :object) : x
+# `keep(x)` (compiler §6.9) for an argument at a set: `Dynamic{X}(x)` where the code is compiled once
+# for it, `x` otherwise; inference resolves it, and where the code is not compiled it is `x`
+keep(@nospecialize(x)) = x
 struct UndefKeywordError <: Exception
     var::Symbol
 end
