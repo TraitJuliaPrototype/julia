@@ -648,25 +648,35 @@ STATIC_INLINE void merge_vararg_unions(jl_value_t **temp, size_t nt)
     }
 }
 
+// While the normal form builds its result, applying Core.All to it must not normalize again.
+static _Thread_local int all_building = 0;
+
 // The intersection of the types ts (compiler §4.9), in its normal form: nested intersections
 // flattened, Any dropped, duplicates removed, sorted as Union sorts. A component that is a subtype
-// of another by declared supertypes alone (two closed types without free variables) absorbs it,
-// and two closed types with nothing in common give Union{}. A membership never absorbs, so a type
-// expression gives the same type in every world. One component is itself; none is Any.
+// of another by declared supertypes and parameters alone absorbs it (a membership never does, so a
+// type expression gives the same type in every world). Two closed components whose intersection
+// Julia computes exactly are replaced by it, and give Union{} when it is empty. A Union component
+// distributes, so that unions stay outside, where Julia's machinery reads them. One component is
+// itself; none is Any.
 JL_DLLEXPORT jl_value_t *jl_type_all(jl_value_t **ts, size_t n)
 {
     size_t cnt = 0;
     for (size_t i = 0; i < n; i++) {
         jl_value_t *t = ts[i];
-        if (jl_is_all_type(t))
+        if (jl_is_all_type(t)) {
+            if (!jl_is_tuple_type(jl_tparam0(t)))
+                jl_type_error("All", (jl_value_t*)jl_type_type, t);
             cnt += jl_nparams(jl_tparam0(t));
-        else if (jl_is_type(t) || jl_is_typevar(t))
+        }
+        else if (jl_is_type(t) || jl_is_typevar(t)) {
             cnt++;
-        else
+        }
+        else {
             jl_type_error("All", (jl_value_t*)jl_type_type, t);
+        }
     }
     jl_value_t **c;
-    JL_GC_PUSHARGS(c, cnt + 1);
+    JL_GC_PUSHARGS(c, cnt + 2);
     size_t m = 0;
     for (size_t i = 0; i < n; i++) {
         jl_value_t *t = ts[i];
@@ -677,6 +687,22 @@ JL_DLLEXPORT jl_value_t *jl_type_all(jl_value_t **ts, size_t n)
         }
         else {
             c[m++] = t;
+        }
+    }
+    // a Union component distributes: All{Union{A, B}, Y} is Union{All{A, Y}, All{B, Y}}
+    for (size_t i = 0; i < m; i++) {
+        if (jl_is_uniontype(c[i])) {
+            jl_value_t *u = c[i];
+            c[cnt] = u;                             // rooted while the arms are built
+            c[i] = ((jl_uniontype_t*)u)->a;
+            jl_value_t *ra = jl_type_all(c, m);
+            c[cnt + 1] = ra;
+            c[i] = ((jl_uniontype_t*)u)->b;
+            jl_value_t *rb = jl_type_all(c, m);
+            jl_value_t *uargs[2] = {c[cnt + 1], rb};
+            jl_value_t *r = jl_type_union(uargs, 2);
+            JL_GC_POP();
+            return r;
         }
     }
     size_t j = 0;
@@ -695,28 +721,42 @@ JL_DLLEXPORT jl_value_t *jl_type_all(jl_value_t **ts, size_t n)
             c[j++] = t;
     }
     m = j;
-    for (size_t a = 0; a < m; a++) {
-        for (size_t b = 0; b < m; b++) {
-            if (a == b || c[a] == NULL || c[b] == NULL)
-                continue;
-            jl_value_t *x = c[a], *y = c[b];
-            if (jl_is_typevar(x) || jl_is_typevar(y) || jl_has_free_typevars(x) || jl_has_free_typevars(y) ||
-                jl_has_open_set(x) || jl_has_open_set(y))
-                continue;
-            if (jl_subtype(x, y)) {
-                c[b] = NULL;                        // the narrower absorbs the wider
-            }
-            else if (a < b && jl_has_empty_intersection(x, y)) {
-                JL_GC_POP();
-                return jl_bottom_type;
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (size_t a = 0; a < m && !changed; a++) {
+            for (size_t b = 0; b < m && !changed; b++) {
+                if (a == b || c[a] == NULL || c[b] == NULL)
+                    continue;
+                jl_value_t *x = c[a], *y = c[b];
+                if (jl_is_typevar(x) || jl_is_typevar(y) || jl_has_free_typevars(x) || jl_has_free_typevars(y))
+                    continue;
+                if (jl_subtype_declared(x, y)) {
+                    c[b] = NULL;                    // the narrower absorbs the wider
+                    changed = 1;
+                }
+                else if (a < b && !jl_has_open_set(x) && !jl_has_open_set(y)) {
+                    // two closed types: their intersection, where Julia computes it exactly
+                    jl_value_t *r = jl_type_intersection(x, y);
+                    if (r == jl_bottom_type) {
+                        JL_GC_POP();
+                        return jl_bottom_type;
+                    }
+                    c[cnt] = r;
+                    if (jl_subtype(r, x) && jl_subtype(r, y)) {
+                        c[a] = r;
+                        c[b] = NULL;
+                        changed = 1;
+                    }
+                }
             }
         }
+        j = 0;
+        for (size_t i = 0; i < m; i++)
+            if (c[i] != NULL)
+                c[j++] = c[i];
+        m = j;
     }
-    j = 0;
-    for (size_t i = 0; i < m; i++)
-        if (c[i] != NULL)
-            c[j++] = c[i];
-    m = j;
     if (m == 0) {
         JL_GC_POP();
         return (jl_value_t*)jl_any_type;
@@ -727,10 +767,27 @@ JL_DLLEXPORT jl_value_t *jl_type_all(jl_value_t **ts, size_t n)
         return r;
     }
     isort_union(c, m);
-    c[m] = (jl_value_t*)jl_apply_tuple_type_v(c, m);
-    jl_value_t *r = jl_apply_type1((jl_value_t*)jl_all_type, c[m]);
+    c[cnt] = (jl_value_t*)jl_apply_tuple_type_v(c, m);
+    all_building++;
+    jl_value_t *r = NULL;
+    JL_TRY {
+        r = jl_apply_type1((jl_value_t*)jl_all_type, c[cnt]);
+    }
+    JL_CATCH {
+        all_building--;
+        jl_rethrow();
+    }
+    all_building--;
     JL_GC_POP();
     return r;
+}
+
+// Core.All applied to a Tuple of components from C (jl_apply_type): the normal form, unless the
+// normal form itself is applying it
+static int all_apply_normalizes(jl_value_t *tc, jl_value_t **params, size_t n) JL_NOTSAFEPOINT
+{
+    return jl_all_type != NULL && tc == (jl_value_t*)jl_all_type && !all_building &&
+           n == 1 && jl_is_tuple_type(params[0]) && !jl_is_va_tuple((jl_datatype_t*)params[0]);
 }
 
 JL_DLLEXPORT jl_value_t *jl_type_union(jl_value_t **ts, size_t n)
@@ -1505,6 +1562,9 @@ static jl_value_t *inst_datatype_env(jl_value_t *dt, jl_svec_t *p, jl_value_t **
 
 jl_value_t *jl_apply_type(jl_value_t *tc, jl_value_t **params, size_t n)
 {
+    // Core.All{Tuple{X, Y}} applied from C is the intersection, in its normal form (compiler §4.9)
+    if (all_apply_normalizes(tc, params, n))
+        return jl_type_all(jl_svec_data(((jl_datatype_t*)params[0])->parameters), jl_nparams(params[0]));
     if (tc == (jl_value_t*)jl_anytuple_type)
         return jl_apply_tuple_type_v(params, n);
     if (tc == (jl_value_t*)jl_uniontype_type)
@@ -1935,7 +1995,8 @@ void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable)
     // own name first, so a recursive bound reading this bit mid-loop sees it.
     // A set is open from its declaration, before any type can name it, so the bit
     // is final here (compiler §4.1)
-    dt->has_open_set = dt->name->open_set;
+    // an intersection is routed and gated as a set is (compiler §4.9)
+    dt->has_open_set = dt->name->open_set || (jl_all_type != NULL && dt->name == ((jl_datatype_t*)jl_all_type->body)->name);
     dt->isconcretetype = !dt->name->abstract;
     dt->isdispatchtuple = istuple;
     size_t i, l = jl_nparams(dt);
@@ -2826,6 +2887,39 @@ static jl_value_t *inst_type_w_(jl_value_t *t, jl_typeenv_t *env, jl_typestack_t
     jl_typename_t *tn = tt->name;
     if (tn == jl_tuple_typename)
         return inst_tuple_w_(t, env, stack, check, nothrow);
+    if (jl_is_all_type(t) && jl_is_tuple_type(jl_tparam0(t))) {
+        // an intersection: its components instantiated, then its normal form (compiler §4.9)
+        jl_value_t *tup = jl_tparam0(t);
+        size_t nc = jl_nparams(tup);
+        jl_value_t **cs;
+        JL_GC_PUSHARGS(cs, nc);
+        int changed = 0;
+        for (i = 0; i < nc; i++) {
+            jl_value_t *ci = jl_tparam(tup, i);
+            jl_value_t *ii = inst_type_w_(ci, env, stack, check, nothrow);
+            if (ii == NULL || (nothrow && !(jl_is_typevar(ii) || jl_is_type(ii)))) {
+                JL_GC_POP();
+                return nothrow == 1 ? NULL : jl_bottom_type;
+            }
+            cs[i] = ii;
+            changed |= ii != ci;
+        }
+        if (changed) {
+            if (nothrow) {
+                JL_TRY {
+                    t = jl_type_all(cs, nc);
+                }
+                JL_CATCH {
+                    t = nothrow == 1 ? NULL : jl_bottom_type;
+                }
+            }
+            else {
+                t = jl_type_all(cs, nc);
+            }
+        }
+        JL_GC_POP();
+        return t;
+    }
     size_t ntp = jl_svec_len(tp);
     jl_value_t **iparams;
     JL_GC_PUSHARGS(iparams, ntp);

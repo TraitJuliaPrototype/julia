@@ -1643,7 +1643,10 @@ JL_CALLABLE(jl_f_apply_type)
         return (jl_value_t*)jl_type_union(&args[1], nargs-1);
     }
     else if (jl_all_type != NULL && args[0] == (jl_value_t*)jl_all_type) {
-        // an intersection, in its normal form (compiler §4.9)
+        // an intersection, in its normal form (compiler §4.9); its encoding, Core.All{Tuple{X, Y}},
+        // written so, is the same type
+        if (nargs == 2 && jl_is_tuple_type(args[1]) && !jl_is_va_tuple((jl_datatype_t*)args[1]))
+            return jl_type_all(jl_svec_data(((jl_datatype_t*)args[1])->parameters), jl_nparams(args[1]));
         return jl_type_all(&args[1], nargs-1);
     }
     else if (jl_is_vararg(args[0])) {
