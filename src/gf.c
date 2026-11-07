@@ -2898,6 +2898,78 @@ JL_DLLEXPORT jl_value_t *jl_debug_method_invalidation(int state)
 
 static void _invalidate_backedges(jl_method_instance_t *replaced_mi, jl_code_instance_t *replaced_ci, size_t max_world, int depth);
 
+// The code slot (compiler §3.3): its switch, its counts, and the record of result edges.
+static struct {
+    size_t marks;       // callers marked for revalidation
+    size_t kept;        // marked callers made valid again
+    size_t final_marks; // marks that became invalidations
+    size_t misses;      // slot misses resolved by the runtime
+} code_slot_stats;
+
+static int code_slot_on = -1;
+JL_DLLEXPORT int jl_code_slot_on(void) JL_NOTSAFEPOINT
+{
+    if (code_slot_on == -1) {
+        const char *e = getenv("JULIA_CODE_SLOT");
+        code_slot_on = !(e && strcmp(e, "0") == 0);
+    }
+    return code_slot_on;
+}
+
+JL_DLLEXPORT size_t jl_code_slot_stat(int which) JL_NOTSAFEPOINT
+{
+    switch (which) {
+    case 0: return code_slot_stats.marks;
+    case 1: return code_slot_stats.kept;
+    case 2: return code_slot_stats.final_marks;
+    case 3: return code_slot_stats.misses;
+    }
+    return 0;
+}
+
+// the field `k` of a struct whose fields are references, or NULL
+static jl_value_t *ptr_field(jl_value_t *v, size_t k) JL_NOTSAFEPOINT
+{
+    jl_datatype_t *t = (jl_datatype_t*)jl_typeof(v);
+    if (!jl_is_datatype(t) || t->layout == NULL || k >= jl_datatype_nfields(t) || !jl_field_isptr(t, k))
+        return NULL;
+    return *(jl_value_t**)((char*)v + jl_field_offset(t, k));
+}
+
+static int is_named_struct(jl_value_t *v, const char *name, size_t nfields) JL_NOTSAFEPOINT
+{
+    jl_datatype_t *t = (jl_datatype_t*)jl_typeof(v);
+    return jl_is_datatype(t) && jl_datatype_nfields(t) == nfields &&
+        strcmp(jl_symbol_name(t->name->name), name) == 0;
+}
+
+// the compiler's `ResultEdges` on the CodeInstance's analysis results: the MethodInstances it reaches
+// only by `:invoke`s typed by their results, which its code calls through slots
+static jl_svec_t *ci_result_edges(jl_code_instance_t *ci) JL_NOTSAFEPOINT
+{
+    jl_value_t *ar = ci->analysis_results;
+    while (ar != NULL && is_named_struct(ar, "AnalysisResults", 2)) {
+        jl_value_t *r = ptr_field(ar, 0);
+        if (r != NULL && is_named_struct(r, "ResultEdges", 1)) {
+            jl_value_t *mis = ptr_field(r, 0);
+            return mis != NULL && jl_is_svec(mis) ? (jl_svec_t*)mis : NULL;
+        }
+        ar = ptr_field(ar, 1);
+    }
+    return NULL;
+}
+
+JL_DLLEXPORT int jl_ci_has_result_edge(jl_code_instance_t *ci, jl_method_instance_t *mi) JL_NOTSAFEPOINT
+{
+    jl_svec_t *mis = ci_result_edges(ci);
+    if (mis == NULL)
+        return 0;
+    for (size_t i = 0; i < jl_svec_len(mis); i++)
+        if (jl_svecref(mis, i) == (jl_value_t*)mi)
+            return 1;
+    return 0;
+}
+
 // recursively invalidate cached methods that had an edge to a replaced method
 static void invalidate_code_instance(jl_code_instance_t *replaced, size_t max_world, int depth)
 {
@@ -2916,6 +2988,12 @@ static void invalidate_code_instance(jl_code_instance_t *replaced, size_t max_wo
         return; // shouldn't happen, but better to be safe
     JL_LOCK(&replaced_mi->def.method->writelock);
     size_t replacedmaxworld = jl_atomic_load_relaxed(&replaced->max_world);
+    // an invalidation of a marked CodeInstance makes the mark final (compiler §3.3): its callers
+    // were walked when it was marked
+    if (jl_atomic_load_relaxed(&replaced->flags) & JL_CI_FLAGS_MARKED) {
+        jl_atomic_fetch_and_relaxed(&replaced->flags, (uint8_t)~JL_CI_FLAGS_MARKED);
+        code_slot_stats.final_marks++;
+    }
     if (replacedmaxworld == ~(size_t)0) {
         assert(jl_atomic_load_relaxed(&replaced->min_world) - 1 <= max_world && "attempting to set illogical world constraints (probable race condition)");
         jl_atomic_store_release(&replaced->max_world, max_world);
@@ -2927,6 +3005,34 @@ static void invalidate_code_instance(jl_code_instance_t *replaced, size_t max_wo
         assert(jl_atomic_load_relaxed(&replaced->max_world) <= max_world);
     }
     JL_UNLOCK(&replaced_mi->def.method->writelock);
+}
+
+// Marks a caller for revalidation instead of invalidating it (compiler §3.3): its max_world is
+// lowered as an invalidation's, so every cache that checks worlds misses it, and the flag says that
+// its next lookup in the latest world may compare its result edges and make it valid again. The walk
+// goes on from it as from an invalidated one. Logged as an invalidation.
+static void mark_code_instance(jl_code_instance_t *ci, size_t max_world, int depth)
+{
+    jl_timing_counter_inc(JL_TIMING_COUNTER_Invalidations, 1);
+    if (_jl_debug_method_invalidation) {
+        jl_value_t *boxeddepth = NULL;
+        JL_GC_PUSH1(&boxeddepth);
+        jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)ci->def);
+        boxeddepth = jl_box_int32(depth);
+        jl_array_ptr_1d_push(_jl_debug_method_invalidation, boxeddepth);
+        JL_GC_POP();
+    }
+    jl_method_instance_t *mi = jl_get_ci_mi(ci);
+    if (!jl_is_method(mi->def.method))
+        return;
+    JL_LOCK(&mi->def.method->writelock);
+    if (jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0) {
+        jl_atomic_fetch_or_relaxed(&ci->flags, JL_CI_FLAGS_MARKED);
+        jl_atomic_store_release(&ci->max_world, max_world);
+        code_slot_stats.marks++;
+        _invalidate_backedges(mi, ci, max_world, depth + 1);
+    }
+    JL_UNLOCK(&mi->def.method->writelock);
 }
 
 JL_DLLEXPORT void jl_invalidate_code_instance(jl_code_instance_t *replaced, size_t max_world)
@@ -2975,14 +3081,28 @@ static void _invalidate_backedges(jl_method_instance_t *replaced_mi, jl_code_ins
             // If we're invalidating a particular codeinstance, only invalidate
             // this backedge it actually has an edge for our codeinstance.
             jl_svec_t *edges = jl_atomic_load_relaxed(&replaced->edges);
+            int result_edge = 0;
             for (size_t j = 0; j < jl_svec_len(edges); ++j) {
                 jl_value_t *edge = jl_svecref(edges, j);
-                if (edge == (jl_value_t*)replaced_mi || edge == (jl_value_t*)replaced_ci)
+                if (edge == (jl_value_t*)replaced_mi || edge == (jl_value_t*)replaced_ci) {
+                    // the callee was invalidated through its own edges: a caller whose only edge to
+                    // it is a result edge calls it through a slot, and is marked (compiler §3.3)
+                    result_edge = edge == (jl_value_t*)replaced_ci && invokesig == NULL &&
+                        jl_code_slot_on() && jl_ci_has_result_edge(replaced, replaced_mi);
                     goto found;
+                }
             }
             ins = set_next_edge(backedges, ins, invokesig, replaced);
             continue;
         found:;
+            if (result_edge) {
+                // the caller keeps its backedge: revalidation names the callee's new CodeInstance
+                ins = set_next_edge(backedges, ins, invokesig, replaced);
+                mark_code_instance(replaced, max_world, depth);
+                if (!replaced_mi->backedges)
+                    break;
+                continue;
+            }
             ins = clear_next_edge(backedges, ins, invokesig, replaced);
             jl_atomic_fetch_or(&replaced_mi->flags, MI_FLAG_BACKEDGES_DIRTY);
             /* fallthrough */
@@ -5118,6 +5238,269 @@ JL_DLLEXPORT int jl_method_is_macro(jl_method_t *m)
     return jl_symbol_name(m->name)[0] == '@';
 }
 
+// ---- The code slot's revalidation (compiler §3.3) ----
+
+// whether a callee's new CodeInstance has the result its caller used: return type, exception type,
+// constant and effects
+static int ci_result_equal(jl_code_instance_t *a, jl_code_instance_t *b) JL_NOTSAFEPOINT
+{
+    if (!jl_egal(a->rettype, b->rettype) || !jl_egal(a->exctype, b->exctype))
+        return 0;
+    if ((a->rettype_const == NULL) != (b->rettype_const == NULL))
+        return 0;
+    if (a->rettype_const != NULL && !jl_egal(a->rettype_const, b->rettype_const))
+        return 0;
+    if ((jl_atomic_load_relaxed(&a->invoke) == jl_fptr_const_return) != (jl_atomic_load_relaxed(&b->invoke) == jl_fptr_const_return))
+        return 0;
+    return jl_atomic_load_relaxed(&a->ipo_purity_bits) == jl_atomic_load_relaxed(&b->ipo_purity_bits);
+}
+
+static int revalidate_code_instance(jl_code_instance_t *ci, size_t world, arraylist_t *stack);
+
+static int ci_valid_in(jl_code_instance_t *ci, size_t world, arraylist_t *stack)
+{
+    if (jl_atomic_load_acquire(&ci->max_world) >= world)
+        return jl_atomic_load_relaxed(&ci->min_world) <= world;
+    return revalidate_code_instance(ci, world, stack);
+}
+
+static int edge_is_single(jl_value_t *e) JL_NOTSAFEPOINT
+{
+    return jl_is_method_instance(e) || jl_is_method(e) || jl_is_binding(e) ||
+        jl_typetagis(e, jl_membership_cell_type) || jl_typetagis(e, jl_membership_type);
+}
+
+// Revalidates a marked CodeInstance in the latest world `world`, depth first; a cycle fails. Each of
+// its edges to a CodeInstance not valid there: a marked one is revalidated first; for a result edge,
+// the callee is inferred again and must have an equal result, valid from the world of the mark on.
+// Every other edge is unchanged since the mark, or the mark would have become final. On success the
+// edges name the callees' new CodeInstances, and max_world is restored; on failure the mark becomes
+// an invalidation.
+static int revalidate_code_instance(jl_code_instance_t *ci, size_t world, arraylist_t *stack)
+{
+    size_t maxw = jl_atomic_load_acquire(&ci->max_world);
+    if (maxw >= world)
+        return 1;
+    if (!(jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_MARKED))
+        return 0;
+    size_t markworld = maxw + 1;
+    for (size_t k = 0; k < stack->len; k++)
+        if (stack->items[k] == (void*)ci)
+            return 0;
+    arraylist_push(stack, (void*)ci);
+    jl_svec_t *edges = jl_atomic_load_acquire(&ci->edges);
+    jl_svec_t *redges = ci_result_edges(ci);
+    jl_svec_t *newedges = NULL;
+    jl_code_instance_t *e2 = NULL;
+    JL_GC_PUSH4(&edges, &redges, &newedges, &e2);
+    int ok = 1;
+    size_t n = jl_svec_len(edges), i = 0;
+    while (ok && i < n) {
+        jl_value_t *e = jl_svecref(edges, i);
+        if (jl_is_long(e)) {            // a match list: count, signature, its targets
+            long k = jl_unbox_long(e);
+            size_t m = (size_t)(k < 0 ? -k : k);
+            for (size_t j = i + 2; ok && j < i + 2 + m && j < n; j++) {
+                jl_value_t *x = jl_svecref(edges, j);
+                if (jl_is_code_instance(x) && !ci_valid_in((jl_code_instance_t*)x, world, stack))
+                    ok = 0;
+            }
+            i += 2 + m;
+            continue;
+        }
+        if (jl_is_code_instance(e)) {
+            jl_code_instance_t *ce = (jl_code_instance_t*)e;
+            if (!ci_valid_in(ce, world, stack)) {
+                jl_method_instance_t *emi = jl_get_ci_mi(ce);
+                int is_result = 0;
+                for (size_t j = 0; redges != NULL && j < jl_svec_len(redges); j++)
+                    is_result |= jl_svecref(redges, j) == (jl_value_t*)emi;
+                if (!is_result || ce->owner != jl_nothing) {
+                    ok = 0;
+                    break;
+                }
+                e2 = jl_type_infer_policy(emi, world, SOURCE_MODE_NOT_REQUIRED, jl_options.trim, ci_policy_facts(ce));
+                if (e2 == NULL || !ci_result_equal(ce, e2) ||
+                        jl_atomic_load_relaxed(&e2->min_world) > markworld ||
+                        jl_atomic_load_relaxed(&e2->max_world) < world) {
+                    ok = 0;
+                    break;
+                }
+                if (newedges == NULL)
+                    newedges = jl_svec_copy(edges);
+                jl_svecset(newedges, i, (jl_value_t*)e2);
+            }
+            i++;
+            continue;
+        }
+        if (edge_is_single(e)) {
+            i++;
+            continue;
+        }
+        // a pair: an `invoke` edge, or a signature and its method table
+        if (i + 1 < n) {
+            jl_value_t *x = jl_svecref(edges, i + 1);
+            if (jl_is_code_instance(x) && !ci_valid_in((jl_code_instance_t*)x, world, stack))
+                ok = 0;
+        }
+        i += 2;
+    }
+    arraylist_pop(stack);
+    // commit in the world the comparison was made in
+    jl_method_t *m = jl_get_ci_mi(ci)->def.method;
+    JL_LOCK(&world_counter_lock);
+    int same_world = jl_atomic_load_relaxed(&jl_world_counter) == world;
+    if (jl_is_method(m))
+        JL_LOCK(&m->writelock);
+    int still_marked = (jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_MARKED) &&
+        jl_atomic_load_relaxed(&ci->max_world) == maxw;
+    if (ok && same_world && still_marked) {
+        if (newedges != NULL) {
+            jl_atomic_store_release(&ci->edges, newedges);
+            jl_gc_wb(ci, newedges);
+        }
+        jl_atomic_fetch_and_relaxed(&ci->flags, (uint8_t)~JL_CI_FLAGS_MARKED);
+        jl_atomic_store_release(&ci->max_world, ~(size_t)0);
+        code_slot_stats.kept++;
+    }
+    else {
+        if (same_world && still_marked) {
+            jl_atomic_fetch_and_relaxed(&ci->flags, (uint8_t)~JL_CI_FLAGS_MARKED);
+            code_slot_stats.final_marks++;
+        }
+        ok = 0;
+    }
+    if (jl_is_method(m))
+        JL_UNLOCK(&m->writelock);
+    JL_UNLOCK(&world_counter_lock);
+    JL_GC_POP();
+    return ok;
+}
+
+// a marked CodeInstance of `mi` and the policy (compiled, where `compiled`) made valid again in the
+// latest world
+static jl_code_instance_t *revalidate_marked(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world, int facts, int compiled)
+{
+    if (!jl_code_slot_on() || world != jl_atomic_load_acquire(&jl_world_counter))
+        return NULL;
+    jl_code_instance_t *ci = jl_atomic_load_relaxed(&mi->cache);
+    for (; ci; ci = jl_atomic_load_relaxed(&ci->next)) {
+        if (ci->owner != jl_nothing || !ci_policy_is(ci, facts) ||
+                !(jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_MARKED) ||
+                (compiled && jl_atomic_load_relaxed(&ci->invoke) == NULL) ||
+                jl_atomic_load_relaxed(&ci->inferred) == NULL ||
+                jl_atomic_load_relaxed(&ci->min_world) > world)
+            continue;
+        arraylist_t stack;
+        arraylist_new(&stack, 0);
+        int ok = revalidate_code_instance(ci, world, &stack);
+        arraylist_free(&stack);
+        if (ok)
+            return ci;
+    }
+    return NULL;
+}
+
+static jl_code_instance_t *jl_revalidate_policy(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world, int facts)
+{
+    return revalidate_marked(mi, world, facts, 1);
+}
+
+// inference's cache miss (compiler §3.3): a marked CodeInstance made valid again serves as the
+// cached result, so code that calls it does not infer it again
+JL_DLLEXPORT jl_value_t *jl_revalidate_for_inference(jl_method_instance_t *mi, size_t world, int facts)
+{
+    jl_code_instance_t *ci = revalidate_marked(mi, world, facts, 0);
+    return ci != NULL ? (jl_value_t*)ci : jl_nothing;
+}
+
+// whether the CodeInstance has the entry a slot calls: the specialized signature, or the generic one
+static int code_slot_entry(jl_code_instance_t *ci, int specsig)
+{
+    uint8_t specsigflags;
+    jl_callptr_t invoke;
+    void *fptr;
+    jl_read_codeinst_invoke(ci, &specsigflags, &invoke, &fptr, 1);
+    if (invoke == NULL || invoke == jl_fptr_const_return)
+        return 0;
+    return specsig ? (specsigflags & JL_CI_FLAGS_SPECPTR_SPECIALIZED) && fptr != NULL : 1;
+}
+
+// a CodeInstance of `mi` and the policy, valid in `world`, with the result type the caller was compiled
+// against and the entry its call needs
+static jl_code_instance_t *code_slot_find(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world, int facts, jl_value_t *rettype, int specsig)
+{
+    jl_code_instance_t *ci = jl_atomic_load_relaxed(&mi->cache);
+    for (; ci; ci = jl_atomic_load_relaxed(&ci->next)) {
+        if (ci->owner == jl_nothing && ci_policy_is(ci, facts) &&
+                jl_atomic_load_relaxed(&ci->min_world) <= world && world <= jl_atomic_load_relaxed(&ci->max_world) &&
+                jl_egal(ci->rettype, rettype) && code_slot_entry(ci, specsig))
+            return ci;
+    }
+    return NULL;
+}
+
+static void code_slot_show(jl_code_instance_t *ci) JL_NOTSAFEPOINT
+{
+    jl_printf(JL_STDERR, "  CodeInstance worlds [%zu, %zu] flags 0x%x invoke %p specptr %p rettype ",
+              jl_atomic_load_relaxed(&ci->min_world), jl_atomic_load_relaxed(&ci->max_world),
+              (unsigned)jl_atomic_load_relaxed(&ci->flags), (void*)jl_atomic_load_relaxed(&ci->invoke),
+              jl_atomic_load_relaxed(&ci->specptr.fptr));
+    jl_static_show(JL_STDERR, ci->rettype);
+    jl_printf(JL_STDERR, "\n");
+}
+
+// A slot's miss (compiler §3.3): the code of `mi` and the policy valid in `world`, revalidated or
+// compiled as needed, with the result type the caller was compiled against, put in the slot.
+// `target` is the CodeInstance the call was compiled against, where codegen knows it (the JIT).
+JL_DLLEXPORT jl_code_instance_t *jl_code_slot_resolve(_Atomic(jl_code_instance_t*) *slot, jl_method_instance_t *mi, jl_value_t *rettype, size_t world, uint32_t flags, jl_code_instance_t *target)
+{
+    int specsig = flags & 1;
+    int facts = (flags & 2) != 0;
+    code_slot_stats.misses++;
+    jl_code_instance_t *ci = NULL;
+    if (target != NULL && jl_atomic_load_relaxed(&target->min_world) <= world &&
+            world <= jl_atomic_load_relaxed(&target->max_world)) {
+        // the code the call was compiled against, valid here: compiled now if the JIT has it only
+        // emitted (a slot links nothing to it)
+        if (!jl_is_compiled_codeinst(target))
+            jl_compile_codeinst(target);
+        if (code_slot_entry(target, specsig))
+            ci = target;
+    }
+    if (ci == NULL)
+        ci = code_slot_find(mi, world, facts, rettype, specsig);
+    if (ci == NULL && jl_revalidate_policy(mi, world, facts) != NULL)
+        ci = code_slot_find(mi, world, facts, rettype, specsig);
+    JL_GC_PUSH1(&ci);
+    if (ci == NULL) {
+        jl_code_instance_t *ci2 = jl_type_infer_policy(mi, world, SOURCE_MODE_ABI, jl_options.trim, facts);
+        if (ci2 != NULL && !jl_is_compiled_codeinst(ci2)) {
+            ci = ci2;
+            jl_compile_codeinst(ci2);
+        }
+        ci = code_slot_find(mi, world, facts, rettype, specsig);
+    }
+    if (ci == NULL) {
+        jl_printf(JL_STDERR, "code slot: no code with the caller's result for ");
+        jl_static_show(JL_STDERR, (jl_value_t*)mi);
+        jl_printf(JL_STDERR, " in world %zu (expected ", world);
+        jl_static_show(JL_STDERR, rettype);
+        jl_printf(JL_STDERR, ", %s, %s)\n", specsig ? "specsig" : "boxed", facts ? "facts" : "plain");
+        if (target != NULL) {
+            jl_printf(JL_STDERR, " the target:\n");
+            code_slot_show(target);
+        }
+        jl_printf(JL_STDERR, " the cache:\n");
+        for (jl_code_instance_t *c = jl_atomic_load_relaxed(&mi->cache); c; c = jl_atomic_load_relaxed(&c->next))
+            code_slot_show(c);
+        jl_error("code slot: the callee's code does not match its caller");
+    }
+    jl_atomic_store_release(slot, ci);
+    JL_GC_POP();
+    return ci;
+}
+
 jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t world)
 {
     return jl_compile_method_internal_policy(mi, world, mi_policy_facts_at(mi, JL_REACH_RUNTIME));
@@ -5128,6 +5511,10 @@ jl_code_instance_t *jl_compile_method_internal_policy(jl_method_instance_t *mi, 
 {
     // quick check if we already have a compiled result
     jl_code_instance_t *codeinst = jl_method_compiled_policy(mi, world, facts);
+    if (codeinst)
+        return codeinst;
+    // or a marked one, made valid again (compiler §3.3)
+    codeinst = jl_revalidate_policy(mi, world, facts);
     if (codeinst)
         return codeinst;
 

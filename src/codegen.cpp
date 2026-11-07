@@ -1382,6 +1382,15 @@ static const auto jlgetabiconverter_func = new JuliaFunction<TypeFnContextAndSiz
     },
     nullptr,
 };
+// the code slot's miss (compiler §3.3): the callee's code valid in the task's world, put in the slot
+static const auto jlcodeslotresolve_func = new JuliaFunction<TypeFnContextAndSizeT>{
+    XSTR(jl_code_slot_resolve),
+    [](LLVMContext &C, Type *T_size) {
+        Type *T_ptr = getPointerTy(C);
+        return FunctionType::get(T_ptr, {T_ptr, T_ptr, T_ptr, T_size, getInt32Ty(C), T_ptr}, false);
+    },
+    nullptr,
+};
 static const auto diff_gc_total_bytes_func = new JuliaFunction<>{
     XSTR(jl_gc_diff_total_bytes),
     [](LLVMContext &C) { return FunctionType::get(getInt64Ty(C), false); },
@@ -5512,6 +5521,79 @@ static jl_cgval_t emit_call_specfun_boxed(jl_codectx_t &ctx, jl_value_t *jlretty
     return update_julia_type(ctx, mark_julia_type(ctx, ret, true, jlretty), inferred_retty);
 }
 
+// The code slot (compiler §3.3): a call that holds only a result edge to its callee loads the
+// callee's CodeInstance from a slot of its own, and calls its entry where the task's world is in the
+// CodeInstance's range. On a miss the runtime finds the callee's code valid in that world, revalidating
+// a marked CodeInstance and compiling as needed, and puts it in the slot. Nothing else writes a slot.
+static Value *emit_code_slot(jl_codectx_t &ctx, jl_code_instance_t *target, jl_method_instance_t *mi, jl_value_t *rettype, bool specsig, bool facts)
+{
+    LLVMContext &C = ctx.builder.getContext();
+    PointerType *T_ptr = ctx.types().T_ptr;
+    Type *T_size = ctx.types().T_size;
+    GlobalVariable *slot = new GlobalVariable(*jl_Module, T_ptr, false, GlobalVariable::PrivateLinkage,
+            ConstantPointerNull::get(T_ptr), "jl_code_slot");
+    slot->setAlignment(Align(sizeof(void*)));
+    Value *world = get_tls_world_age(ctx);
+    LoadInst *ci0 = ctx.builder.CreateAlignedLoad(T_ptr, slot, Align(sizeof(void*)));
+    ci0->setOrdering(AtomicOrdering::Acquire);
+    BasicBlock *checkBB = BasicBlock::Create(C, "slot_check", ctx.f);
+    BasicBlock *missBB = BasicBlock::Create(C, "slot_miss", ctx.f);
+    BasicBlock *callBB = BasicBlock::Create(C, "slot_call", ctx.f);
+    MDBuilder MDB(C);
+    ctx.builder.CreateCondBr(ctx.builder.CreateIsNull(ci0), missBB, checkBB, MDB.createBranchWeights(1, 1000));
+    ctx.builder.SetInsertPoint(checkBB);
+    LoadInst *minw = ctx.builder.CreateAlignedLoad(T_size,
+            ctx.builder.CreateConstInBoundsGEP1_32(getInt8Ty(C), ci0, offsetof(jl_code_instance_t, min_world)),
+            Align(sizeof(size_t)));
+    minw->setOrdering(AtomicOrdering::Monotonic);
+    LoadInst *maxw = ctx.builder.CreateAlignedLoad(T_size,
+            ctx.builder.CreateConstInBoundsGEP1_32(getInt8Ty(C), ci0, offsetof(jl_code_instance_t, max_world)),
+            Align(sizeof(size_t)));
+    maxw->setOrdering(AtomicOrdering::Monotonic);
+    Value *inrange = ctx.builder.CreateAnd(ctx.builder.CreateICmpULE(minw, world), ctx.builder.CreateICmpULE(world, maxw));
+    ctx.builder.CreateCondBr(inrange, callBB, missBB, MDB.createBranchWeights(1000, 1));
+    ctx.builder.SetInsertPoint(missBB);
+    Value *ci1 = ctx.builder.CreateCall(prepare_call(jlcodeslotresolve_func),
+            {slot, literal_pointer_val(ctx, (jl_value_t*)mi), literal_pointer_val(ctx, rettype), world,
+             ConstantInt::get(getInt32Ty(C), (specsig ? 1 : 0) | (facts ? 2 : 0)),
+             // the CodeInstance the call was compiled against: in the JIT only, an image names none
+             ctx.emission_context.imaging_mode ? (Value*)ConstantPointerNull::get(T_ptr) :
+                 (Value*)literal_static_pointer_val((void*)target, T_ptr)});
+    ctx.builder.CreateBr(callBB);
+    ctx.builder.SetInsertPoint(callBB);
+    PHINode *ci = ctx.builder.CreatePHI(T_ptr, 2);
+    ci->addIncoming(ci0, checkBB);
+    ci->addIncoming(ci1, missBB);
+    return ci;
+}
+
+static jl_cgval_t emit_slot_call(jl_codectx_t &ctx, jl_code_instance_t *codeinst, jl_method_instance_t *mi, bool specsig,
+                                 ArrayRef<jl_cgval_t> argv, size_t nargs, jl_value_t *rt)
+{
+    LLVMContext &C = ctx.builder.getContext();
+    PointerType *T_ptr = ctx.types().T_ptr;
+    bool facts = (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FACTS) != 0;
+    Value *ci = emit_code_slot(ctx, codeinst, mi, codeinst->rettype, specsig, facts);
+    if (specsig) {
+        LoadInst *fptr = ctx.builder.CreateAlignedLoad(T_ptr,
+                ctx.builder.CreateConstInBoundsGEP1_32(getInt8Ty(C), ci, offsetof(jl_code_instance_t, specptr)),
+                Align(sizeof(void*)));
+        fptr->setOrdering(AtomicOrdering::Acquire);
+        bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure;
+        jl_returninfo_t::CallingConv cc = jl_returninfo_t::CallingConv::Boxed;
+        unsigned return_roots = 0;
+        return emit_call_specfun_other(ctx, is_opaque_closure, get_ci_abi(codeinst), codeinst->rettype, fptr, "", nullptr,
+                                       argv, nargs, &cc, &return_roots, rt);
+    }
+    // the generic entry, `invoke(f, args, nargs, ci)`, has julia.call2's shape
+    LoadInst *fptr = ctx.builder.CreateAlignedLoad(T_ptr,
+            ctx.builder.CreateConstInBoundsGEP1_32(getInt8Ty(C), ci, offsetof(jl_code_instance_t, invoke)),
+            Align(sizeof(void*)));
+    fptr->setOrdering(AtomicOrdering::Acquire);
+    Value *r = emit_jlcall(ctx, fptr, track_pjlvalue(ctx, ci), argv, nargs, julia_call2);
+    return update_julia_type(ctx, mark_julia_type(ctx, r, true, codeinst->rettype), rt);
+}
+
 static jl_cgval_t emit_invoke(jl_codectx_t &ctx, jl_expr_t *ex, jl_value_t *rt)
 {
     jl_value_t **args = jl_array_data(ex->args, jl_value_t*);
@@ -5582,6 +5664,10 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayR
                     if (needsparams) {
                         Value *r = emit_jlcall(ctx, invoke_for_ci(codeinst), track_pjlvalue(ctx, literal_pointer_val(ctx, (jl_value_t*)mi)), argv, nargs, julia_call2);
                         result = mark_julia_type(ctx, r, true, rt);
+                    }
+                    else if (ctx.codeinst && jl_ci_has_result_edge(ctx.codeinst, mi)) {
+                        // a result edge: through the code slot (compiler §3.3)
+                        result = emit_slot_call(ctx, codeinst, mi, specsig, argv, nargs, rt);
                     }
                     else {
                         std::string name;
@@ -10520,6 +10606,7 @@ static void init_jit_functions(void)
     add_named_global(jllockfield_func, &jl_lock_field);
     add_named_global(jlunlockfield_func, &jl_unlock_field);
     add_named_global(jlgetabiconverter_func, &jl_get_abi_converter);
+    add_named_global(jlcodeslotresolve_func, &jl_code_slot_resolve);
 
 #ifdef _OS_WINDOWS_
 #if defined(_CPU_X86_64_)

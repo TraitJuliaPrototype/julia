@@ -101,6 +101,164 @@ function result_edges(::AbstractInterpreter, caller::InferenceState)
     end
 end
 
+"""
+    ResultEdges(mis::SimpleVector)
+
+The callees a CodeInstance's code reaches only by an emitted `:invoke` whose statement type is the
+callee's result (compiler §3.1, §3.3): its result edges, by MethodInstance. Codegen calls each through
+a slot; when such a callee is recompiled, the caller is marked for revalidation instead of
+invalidated, and stays valid where the callee's result is unchanged. Kept on the CodeInstance's
+analysis results; the runtime finds it by the type's name.
+"""
+struct ResultEdges
+    mis::SimpleVector
+end
+
+# a call's info whose edges stay result edges where the call is emitted as an `:invoke`: dispatch
+# alone, with no constant result used in place of the callee's own
+function plain_call_info(@nospecialize info)
+    while info isa SplitCallInfo || info isa GuardedCallInfo || info isa AttributedCallInfo
+        info = info.info
+    end
+    info isa MethodMatchInfo && return true
+    info isa UnionSplitInfo && return true
+    # a volatile result is the callee's own inference, handed to the inliner: no constant
+    info isa ConstCallInfo && return all(r -> r === nothing || r isa VolatileInferenceResult, info.results)
+    return false
+end
+
+function inlined_defs!(defs::IdSet{Any}, edges)
+    for e in edges
+        e isa DebugInfo || continue
+        def = e.def
+        (def isa MethodInstance || def isa Method) && push!(defs, def)
+        inlined_defs!(defs, e.edges)
+    end
+    return defs
+end
+
+edge_mi(@nospecialize e) = e isa CodeInstance ? get_ci_mi(e) : e isa MethodInstance ? e : nothing
+
+"""
+    slot_result_edges(caller, src, edges) -> Union{Nothing, SimpleVector}
+
+The result edges of the code `src` that `caller` produced (compiler §3.1): each callee whose every
+`:invoke` has the callee's result as its type, that no statement inlines, evaluates concretely or
+propagates constants into, and that `edges` names once, as its CodeInstance alone.
+"""
+# a callee codegen calls through a slot: Julia's own owner, its own ABI, no opaque closure, and in
+# its MethodInstance's cache, where a slot's miss finds it
+function slot_callee(t::CodeInstance)
+    t.owner === nothing || return false
+    mi = t.def
+    mi isa MethodInstance || return false
+    m = mi.def
+    m isa Method && m.is_for_opaque_closure && return false
+    return ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), mi, t) != 0
+end
+
+function slot_result_edges(caller::InferenceState, @nospecialize(src), edges::SimpleVector)
+    # the compiler compiling itself binds every call (its targets need not be cached)
+    (bootstrapping_compiler || ccall(:jl_code_slot_on, Cint, ()) == 0) && return nothing
+    code = types = di = nothing
+    if src isa OptimizationState
+        optresult = src.optresult
+        if optresult !== nothing
+            ir = optresult.ir
+            code, types, di = ir.stmts.stmt, ir.stmts.type, ir.debuginfo.edges
+        else
+            src = src.src
+        end
+    end
+    if src isa CodeInfo
+        code, types, di = src.code, src.ssavaluetypes, src.debuginfo.edges
+    end
+    (code === nothing || !(types isa Vector{Any})) && return nothing
+    candidates = IdDict{MethodInstance,CodeInstance}()
+    bad = IdSet{Any}()
+    for i in 1:length(code)
+        stmt = code[i]
+        isa(stmt, Expr) || continue
+        if stmt.head === :invoke || stmt.head === :invoke_modify
+            t = stmt.args[1]
+            mi = edge_mi(t)
+            mi === nothing && continue
+            if stmt.head === :invoke && t isa CodeInstance && slot_callee(t) && types[i] === t.rettype &&
+                    get(candidates, mi, t) === t
+                candidates[mi] = t
+            else
+                push!(bad, mi)
+            end
+        end
+    end
+    isempty(candidates) && return nothing
+    defs = inlined_defs!(IdSet{Any}(), di)
+    for (mi, _) in candidates
+        (mi in defs || mi.def in defs) && push!(bad, mi)
+    end
+    tmp = Any[]
+    for info in caller.stmt_info
+        plain_call_info(info) && continue
+        empty!(tmp)
+        add_edges!(tmp, info)
+        for e in tmp
+            mi = edge_mi(e)
+            mi === nothing || push!(bad, mi)
+        end
+    end
+    count = IdDict{MethodInstance,Int}()
+    i = 1
+    n = length(edges)
+    while i <= n
+        e = edges[i]
+        if e isa Int                    # a match list: count, signature, its targets
+            for j in (i + 2):min(n, i + 1 + abs(e))
+                mi = edge_mi(edges[j])
+                mi === nothing || push!(bad, mi)
+            end
+            i += 2 + abs(e)
+            continue
+        elseif e isa Type && i < n      # an `invoke` edge, or a signature and its method table
+            mi = edge_mi(edges[i + 1])
+            mi === nothing || push!(bad, mi)
+            i += 2
+            continue
+        elseif e isa CodeInstance
+            mi = get_ci_mi(e)
+            if get(candidates, mi, nothing) === e
+                count[mi] = get(count, mi, 0) + 1
+            else
+                push!(bad, mi)
+            end
+        elseif e isa MethodInstance
+            push!(bad, e)
+        end
+        i += 1
+    end
+    mis = Any[]
+    for (mi, _) in candidates
+        (mi in bad || get(count, mi, 0) != 1) && continue
+        push!(mis, mi)
+    end
+    return isempty(mis) ? nothing : Core.svec(mis...)
+end
+
+ci_result_edges(ci::CodeInstance) =
+    traverse_analysis_results(@nospecialize(r) -> r isa ResultEdges ? r.mis : nothing, ci)
+
+# whether `src`, compiled as `a`'s code, makes the calls `a`'s record names as result edges through
+# slots: the code compiled for a CodeInstance is the source of an equivalent one only where both
+# record the same result edges
+function same_result_edges(a::CodeInstance, b::CodeInstance)
+    ea, eb = ci_result_edges(a), ci_result_edges(b)
+    ea === eb && return true
+    (ea === nothing || eb === nothing || length(ea) != length(eb)) && return false
+    for x in ea
+        any(y -> y === x, eb) || return false
+    end
+    return true
+end
+
 function finish!(interp::AbstractInterpreter, caller::InferenceState, validation_world::UInt, time_before::UInt64)
     result = caller.result
     edges = result_edges(interp, caller)
@@ -159,6 +317,13 @@ function finish!(interp::AbstractInterpreter, caller::InferenceState, validation
         time_now = _time_ns()
         time_self_ns = caller.time_self_ns + (time_now - time_before)
         time_total = (time_now - caller.time_start - caller.time_paused) * 1e-9
+        # the result edges, which codegen calls through slots (compiler §3.3)
+        if !const_flag && ci.owner === nothing
+            redges = slot_result_edges(caller, uncompressed, edges)
+            if redges !== nothing
+                result.analysis_results = AnalysisResults(ResultEdges(redges), result.analysis_results)
+            end
+        end
         ccall(:jl_update_codeinst, Cvoid, (Any, Any, Int32, UInt, UInt, UInt32, Any, Float64, Float64, Float64, Any, Any),
             ci, inferred_result, const_flag, min_world, max_world, ipo_effects,
             result.analysis_results, time_total, caller.time_caches, time_self_ns * 1e-9, debuginfo, edges)
@@ -1084,6 +1249,12 @@ function typeinf_edge(interp::AbstractInterpreter, method::Method, @nospecialize
                 @assert codeinst.def === mi "MethodInstance for cached edge does not match"
                 return return_cached_result(interp, method, codeinst, caller, edgecycle, edgelimited)
             end
+        elseif interp isa NativeInterpreter && !force_inline
+            # a marked CodeInstance, made valid again, serves as the cached one (compiler §3.3)
+            codeinst = ccall(:jl_revalidate_for_inference, Any, (Any, UInt, Cint), mi, get_inference_world(interp), interp.facts)
+            if codeinst isa CodeInstance
+                return return_cached_result(interp, method, codeinst, caller, edgecycle, edgelimited)
+            end
         end
     end
     if !InferenceParams(interp).force_enable_inference && ccall(:jl_get_module_infer, Cint, (Any,), method.module) == 0
@@ -1638,7 +1809,7 @@ function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UIn
         collectinvokes!(workqueue, src, sptypes)
         if iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), mi, callee))
             cached = ccall(:jl_get_ci_equiv, Any, (Any, UInt), callee, get_inference_world(workqueue.interp))::CodeInstance
-            if cached === callee
+            if cached === callee || !same_result_edges(cached, callee)
                 # make sure callee is gc-rooted and cached, as required by jl_add_codeinst_to_jit
                 code_cache(workqueue.interp)[mi] = callee
             else
@@ -1733,7 +1904,7 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
                 # try to reuse an existing CodeInstance from before to avoid making duplicates in the cache
                 if iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), mi, callee))
                     cached = ccall(:jl_get_ci_equiv, Any, (Any, UInt), callee, world)::CodeInstance
-                    if cached === callee
+                    if cached === callee || !same_result_edges(cached, callee)
                         code_cache(interp)[mi] = callee
                     else
                         # Use an existing CI from the cache, if there is available one that is compatible

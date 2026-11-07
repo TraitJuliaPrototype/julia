@@ -785,6 +785,10 @@ JL_DLLEXPORT int jl_mi_policy_at(jl_method_instance_t *mi, int reach) JL_NOTSAFE
 JL_DLLEXPORT void jl_ci_set_policy(jl_code_instance_t *ci, int facts) JL_NOTSAFEPOINT;
 jl_code_instance_t *jl_type_infer_policy(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world, uint8_t source_mode, uint8_t trim_mode, int facts);
 jl_code_instance_t *jl_compile_method_internal_policy(jl_method_instance_t *meth JL_PROPAGATES_ROOT, size_t world, int facts);
+// the code slot (compiler §3.3)
+JL_DLLEXPORT int jl_code_slot_on(void) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_ci_has_result_edge(jl_code_instance_t *ci, jl_method_instance_t *mi) JL_NOTSAFEPOINT;
+JL_DLLEXPORT jl_code_instance_t *jl_code_slot_resolve(_Atomic(jl_code_instance_t*) *slot, jl_method_instance_t *mi, jl_value_t *rettype, size_t world, uint32_t flags, jl_code_instance_t *target);
 jl_code_instance_t *jl_method_compiled_policy(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world, int facts) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_code_instance_t *jl_engine_reserve_policy(jl_method_instance_t *m, jl_value_t *owner, int facts);
 JL_DLLEXPORT jl_value_t *jl_rettype_inferred_policy(jl_value_t *owner, jl_method_instance_t *mi, size_t min_world, size_t max_world, int policy) JL_NOTSAFEPOINT;
