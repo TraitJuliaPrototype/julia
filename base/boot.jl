@@ -339,6 +339,10 @@ TypeVar(@nospecialize(n), @nospecialize(lb), @nospecialize(ub)) = _typevar(n::Sy
 # intersections (compiler §4.9): All{X, Y} is the type of the values that are members of each
 # component; the runtime builds it in its normal form as All{Tuple{X, Y}}
 abstract type All{T<:Tuple} end
+# `Callable{A, S}` (compiler §7.4): the functions with a method for a call at the argument types `A`,
+# returning an `S` (checked on return). A set whose memberships the functions' methods decide;
+# the runtime opens it when Core is built.
+abstract type Callable{A<:Tuple, S} end
 
 UnionAll(@nospecialize(v), @nospecialize(t)) = ccall(:jl_type_unionall, Any, (Any, Any), v::TypeVar, t)
 

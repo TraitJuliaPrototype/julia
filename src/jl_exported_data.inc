@@ -86,6 +86,7 @@
     XX(membership_type, jl_datatype_t*) \
     XX(membership_cell_type, jl_datatype_t*) \
     XX(all_type, jl_unionall_t*) \
+    XX(callable_type, jl_unionall_t*) \
     XX(methoderror_type, jl_datatype_t*) \
     XX(method_instance_type, jl_datatype_t*) \
     XX(method_match_type, jl_datatype_t*) \

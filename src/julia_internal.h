@@ -466,6 +466,7 @@ JL_DLLEXPORT jl_value_t *jl_call_shadows(jl_value_t *tt, jl_value_t *m0);
 JL_DLLEXPORT jl_value_t *jl_membership_cell(jl_value_t *member, jl_value_t *set);
 void jl_membership_cell_register(jl_membership_cell_t *cell);
 void jl_membership_update_cells(jl_value_t *set_instance, size_t world);
+void jl_membership_update_callable_cells(jl_value_t *f, size_t world);
 void jl_activate_memberships(jl_array_t *list, size_t world);
 void jl_memberships_activated(jl_array_t *list, size_t world);
 JL_DLLEXPORT extern arraylist_t jl_linkage_blobs; // external linkage: sysimg/pkgimages

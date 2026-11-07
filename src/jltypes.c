@@ -4192,6 +4192,14 @@ static jl_value_t *core(const char *name)
 void post_boot_hooks(void)
 {
     jl_all_type = (jl_unionall_t*)core("All");
+    // Callable{A, S} (compiler §7.4): an open set from Core's build, compiled once by default (§6.3)
+    jl_callable_type = (jl_unionall_t*)core("Callable");
+    {
+        jl_datatype_t *cb = (jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type);
+        cb->name->open_set = 1;
+        cb->name->default_attribute = 2;
+        cb->has_open_set = 1;
+    }
     // an intersection carries the open-set bit, so the bit gates the test for one (julia_internal.h)
     ((jl_datatype_t*)jl_all_type->body)->has_open_set = 1;
     jl_char_type    = (jl_datatype_t*)core("Char");

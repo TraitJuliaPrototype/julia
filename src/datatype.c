@@ -314,6 +314,27 @@ JL_DLLEXPORT jl_value_t *jl_membership_cell(jl_value_t *member, jl_value_t *set)
     return cell;
 }
 
+// After a method of the callable type `f` is activated in `world`: Callable's cells of `f` whose
+// membership the method begins open (compiler §5.6, §7.4). Called under the world counter's lock.
+void jl_membership_update_callable_cells(jl_value_t *f, size_t world)
+{
+    if (jl_set_cells == NULL || jl_callable_type == NULL)
+        return;
+    jl_typename_t *cname = ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type))->name;
+    JL_LOCK(&cells_lock);
+    jl_svec_t *list = (jl_svec_t*)jl_eqtable_get(jl_set_cells, (jl_value_t*)cname, NULL);
+    for (size_t i = 0; list != NULL && i < jl_svec_len(list); i++) {
+        jl_membership_cell_t *c = (jl_membership_cell_t*)jl_svecref(list, i);
+        if (jl_atomic_load_relaxed(&c->min_world) != ~(uint64_t)0)
+            continue;
+        if (c->member != f && !jl_types_equal(c->member, f))
+            continue;
+        if (cell_holds(c->member, cname, world))
+            jl_atomic_store_release(&c->min_world, (uint64_t)world);
+    }
+    JL_UNLOCK(&cells_lock);
+}
+
 // A cell an image brings (compiler §9): registered with this session's cells, its world this session's.
 void jl_membership_cell_register(jl_membership_cell_t *cell)
 {

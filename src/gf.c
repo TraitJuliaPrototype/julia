@@ -3483,6 +3483,71 @@ JL_DLLEXPORT void jl_disable_new_worlds(void)
     JL_GC_POP();
 }
 
+// A method of the callable type `f` deleted can end its membership in Callable (compiler §7.4): the
+// dispatch cache entries that selected a method at Callable for `f` are lowered, so the next call
+// looks up again. Under the world counter's lock.
+struct lower_callable_env {
+    jl_value_t *f;
+    size_t max_world;
+    jl_typename_t *cname;
+};
+static int cache_entry_through_callable(jl_typemap_entry_t *e, struct lower_callable_env *env)
+{
+    jl_value_t *v = e->func.value;
+    jl_method_t *m = jl_is_method_instance(v) ? ((jl_method_instance_t*)v)->def.method :
+                     jl_is_method(v) ? (jl_method_t*)v : NULL;
+    if (m == NULL || !jl_is_method(m) || !jl_has_open_set_in(m->sig))
+        return 0;
+    jl_value_t *sv = jl_unwrap_unionall((jl_value_t*)e->sig), *d = jl_unwrap_unionall(m->sig);
+    if (!jl_is_datatype(sv) || !jl_is_datatype(d))
+        return 0;
+    int hit = 0;
+    for (size_t i = 1; i < jl_nparams(sv) && !hit; i++) {
+        if (jl_tparam(sv, i) != env->f)
+            continue;
+        jl_value_t *di = sig_arg(d, i, m->isva);
+        arraylist_t names;
+        arraylist_new(&names, 0);
+        set_names_in(di, &names, 0);
+        for (size_t k = 0; k < names.len; k++)
+            hit |= names.items[k] == env->cname;
+        arraylist_free(&names);
+    }
+    return hit;
+}
+static int lower_callable_entry(jl_typemap_entry_t *e, void *closure0)
+{
+    struct lower_callable_env *env = (struct lower_callable_env*)closure0;
+    if (jl_atomic_load_relaxed(&e->max_world) > env->max_world && cache_entry_through_callable(e, env))
+        jl_atomic_store_relaxed(&e->max_world, env->max_world);
+    return 1;
+}
+static void lower_callable_dispatch(jl_method_t *method, size_t max_world)
+{
+    if (jl_callable_type == NULL)
+        return;
+    jl_value_t *msig = jl_unwrap_unionall(method->sig);
+    if (!jl_is_datatype(msig) || jl_nparams(msig) == 0)
+        return;
+    jl_value_t *f = jl_tparam0(msig);
+    if (!jl_is_concrete_type(f))
+        return;
+    struct lower_callable_env env = {f, max_world,
+        ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type))->name};
+    jl_methcache_t *mc = jl_method_table->cache;
+    JL_LOCK(&mc->writelock);
+    jl_typemap_visitor(jl_atomic_load_relaxed(&mc->cache), lower_callable_entry, (void*)&env);
+    jl_genericmemory_t *leafcache = jl_atomic_load_relaxed(&mc->leafcache);
+    for (size_t i = 1; i < leafcache->length; i += 2) {
+        jl_value_t *entry = jl_genericmemory_ptr_ref(leafcache, i);
+        while (entry != NULL && entry != jl_nothing) {
+            lower_callable_entry((jl_typemap_entry_t*)entry, (void*)&env);
+            entry = (jl_value_t*)jl_atomic_load_relaxed(&((jl_typemap_entry_t*)entry)->next);
+        }
+    }
+    JL_UNLOCK(&mc->writelock);
+}
+
 JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
 {
     jl_methtable_t *mt = jl_method_get_table(method);
@@ -3499,6 +3564,7 @@ JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
         assert(jl_atomic_load_relaxed(&methodentry->max_world) == ~(size_t)0);
         jl_atomic_store_relaxed(&methodentry->max_world, world);
         jl_method_table_invalidate(method, world, 1);
+        lower_callable_dispatch(method, world);
         jl_atomic_store_release(&jl_world_counter, world + 1);
     }
     JL_UNLOCK(&world_counter_lock);
@@ -4043,6 +4109,12 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     invalidated |= typename_env.invalidated;
     if (jl_has_open_set_in((jl_value_t*)method->sig))
         invalidate_unguarded_callers(method, world, max_world);
+    // a method of a callable type can begin its membership in Callable (compiler §7.4)
+    {
+        jl_value_t *msig = jl_unwrap_unionall((jl_value_t*)method->sig);
+        if (jl_is_datatype(msig) && jl_nparams(msig) > 0)
+            jl_membership_update_callable_cells(jl_tparam0(msig), world);
+    }
     if (oldmi && jl_array_nrows(oldmi)) {
         // drop leafcache and search mc->cache and drop anything that might overlap with the new method
         // this is very cheap, so we don't mind being very conservative at over-approximating this

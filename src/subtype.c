@@ -116,6 +116,10 @@ typedef struct jl_stenv_t {
     // Used to represent the length difference between 2 vararg.
     // intersect(X, Y) ==> X = Y + Loffset
     int Loffset;
+    // Callable's questions in progress on this path (compiler §7.4): a question that reaches itself
+    // answers no within the query, which gives the least fixed point
+    jl_value_t *callable_asked[8];
+    int ncallable_asked;
 } jl_stenv_t;
 
 // state manipulation utilities
@@ -1233,6 +1237,10 @@ static int list_may_reach(jl_svec_t *list, int value, jl_typename_t *yname, size
 
 static int membership_may_reach(jl_datatype_t *x, jl_typename_t *yname)
 {
+    // a concrete callable type is a member of Callable by its methods, not by entries (compiler §7.4)
+    if (jl_callable_type != NULL && yname == ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type))->name &&
+            !x->name->never_member && (jl_is_concrete_type((jl_value_t*)x) || jl_is_type_type((jl_value_t*)x)))
+        return 1;
     size_t world = jl_membership_world();
     if (!membership_prune || world == 0)
         return 1;
@@ -1321,6 +1329,57 @@ static int subtype_entry(jl_value_t *x, jl_value_t *pat, jl_value_t *inst, jl_va
     return ans;
 }
 
+// Callable{A, S}'s memberships (compiler §7.4): the methods of the callable type `f` visible in `world`,
+// read from the method table as entries are read from a TypeName. Each is a choice of the walk.
+struct callable_methods_env {
+    struct typemap_intersection_env match;
+    arraylist_t *out;
+};
+static int callable_method_visitor(jl_typemap_entry_t *ml, struct typemap_intersection_env *closure0)
+{
+    struct callable_methods_env *closure = container_of(closure0, struct callable_methods_env, match);
+    if (closure0->ti != (jl_value_t*)jl_bottom_type && jl_is_method(ml->func.value))
+        arraylist_push(closure->out, ml->func.value);
+    return 1;
+}
+static void callable_methods(jl_value_t *f, size_t world, arraylist_t *out)
+{
+    jl_value_t *tt = NULL;
+    JL_GC_PUSH1(&tt);
+    tt = (jl_value_t*)jl_svec2(f, jl_wrap_vararg((jl_value_t*)jl_any_type, NULL, 1, 0));
+    tt = (jl_value_t*)jl_apply_tuple_type((jl_svec_t*)tt, 1);
+    struct callable_methods_env env = {{callable_method_visitor, tt, (jl_value_t*)jl_any_type, 0, world,
+                                        world, world, NULL, NULL, 0}, out};
+    jl_typemap_intersection_visitor(jl_atomic_load_relaxed(&jl_method_table->defs), 0, &env.match);
+    JL_GC_POP();
+}
+
+// f <: Callable{A, S} through the method `m`: a call of f at A is a call `m` covers (S takes no part)
+static int subtype_callable_method(jl_value_t *f, jl_value_t *yu, jl_method_t *m, jl_stenv_t *e, int param)
+{
+    jl_value_t *a = jl_nparams(yu) > 0 ? jl_tparam0(yu) : NULL;
+    if (a == NULL || jl_is_typevar(a) || !jl_is_tuple_type(a))
+        return 1; // Callable with its signature open: any method
+    for (int i = 0; i < e->ncallable_asked; i++)
+        if (e->callable_asked[i] == f)
+            return 0; // the question reaches itself: no, within this query
+    if (e->ncallable_asked >= 8)
+        return 0;
+    jl_value_t *tt = NULL;
+    JL_GC_PUSH1(&tt);
+    size_t n = jl_nparams(a);
+    tt = (jl_value_t*)jl_alloc_svec(n + 1);
+    jl_svecset(tt, 0, f);
+    for (size_t i = 0; i < n; i++)
+        jl_svecset(tt, i + 1, jl_tparam(a, i));
+    tt = (jl_value_t*)jl_apply_tuple_type((jl_svec_t*)tt, 1);
+    e->callable_asked[e->ncallable_asked++] = f;
+    int ans = subtype(tt, m->sig, e, param);
+    e->ncallable_asked--;
+    JL_GC_POP();
+    return ans;
+}
+
 // x <: y for an open set y, after x's supertype chain missed it: x has one more
 // supertype per live entry of its TypeName and of each type on its chain. Which
 // one leads to y is an existential choice, made as the choice among a union's
@@ -1346,11 +1405,31 @@ static int subtype_membership(jl_datatype_t *x, jl_value_t *y, jl_stenv_t *e, in
         for (size_t i = 0; i < jl_svec_len(list); i++)
             n += entry_counts((jl_membership_t*)jl_svecref(list, i), 0, yname, world);
     }
-    if (n == 0)
+    // Callable's memberships are its members' methods (compiler §7.4), choices beside the entries
+    arraylist_t cms;
+    arraylist_new(&cms, 0);
+    // a function's own type, a closure's, a callable struct's, or a type value: a concrete callable;
+    // an abstract type is a member only by an entry (every subtype would need the method)
+    if (jl_callable_type != NULL && yname == ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type))->name &&
+            !x->name->never_member && !jl_has_free_typevars((jl_value_t*)x) &&
+            (jl_is_concrete_type((jl_value_t*)x) || jl_is_type_type((jl_value_t*)x)))
+        callable_methods((jl_value_t*)x, world != 0 ? world : jl_atomic_load_acquire(&jl_world_counter), &cms);
+    size_t ncm = cms.len;
+    if (n + ncm == 0) {
+        arraylist_free(&cms);
         return 0;
+    }
     int k = 0;
-    while (k < n - 1 && pick_union_decision(e, 1))
+    while (k < (int)(n + ncm) - 1 && pick_union_decision(e, 1))
         k++;
+    if (k < (int)ncm) {
+        jl_method_t *m = (jl_method_t*)cms.items[k];
+        arraylist_free(&cms);
+        JL_GC_PROMISE_ROOTED(m); // in the method table
+        return subtype_callable_method((jl_value_t*)x, yu, m, e, param);
+    }
+    k -= (int)ncm;
+    arraylist_free(&cms);
     if (value) {
         jl_svec_t *list = jl_typename_memberships(vhome);
         for (size_t i = 0; i < jl_svec_len(list); i++) {
@@ -2722,6 +2801,7 @@ static void init_stenv(jl_stenv_t *e, jl_value_t **env, int envsz)
     e->emptiness_only = 0;
     e->triangular = 0;
     e->Loffset = 0;
+    e->ncallable_asked = 0;
     e->Lunions.depth = 0;      e->Runions.depth = 0;
     e->Lunions.more = 0;       e->Runions.more = 0;
     e->Lunions.used = 0;       e->Runions.used = 0;
