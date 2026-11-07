@@ -1725,6 +1725,51 @@ function inline_const_if_inlineable!(inst::Instruction)
     return false
 end
 
+# A call with attributes for its trait arguments (compiler §6.3, §6.9). A cast's call
+# (`Core.attributed_call(bits, f, args...)`) runs the instance its attributes select, never inlined, or
+# stays the builtin's dynamic call. A call whose arguments carry their attributes is handled as any
+# call, its matches inferred at the instances that run; left dynamic, it passes them on.
+function handle_attributed_call!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::Int, stmt::Expr,
+                                 info::AttributedCallInfo, flag::UInt32, sig::Signature,
+                                 state::InliningState)
+    inner = info.info
+    if info.dispatch
+        # an argument `Compiled` where the call does not know its type: the call dispatches on it when it
+        # runs; a cast's call stays the builtin's
+        cur = ir[SSAValue(idx)][:stmt]
+        if !info.cast && info.mask != 0 && isexpr(cur, :call)
+            bits = Int(info.mask) | (Int(info.dyn) << 32)
+            ir[SSAValue(idx)][:stmt] = Expr(:call, GlobalRef(Core, :attributed_call), bits, cur.args...)
+        end
+        return nothing
+    end
+    if info.cast
+        inner isa ConstCallInfo && (inner = inner.call)
+        inner isa MethodMatchInfo || return nothing
+        length(inner.results) == 1 || return nothing
+        match = inner.results[1]::MethodMatch
+        match.fully_covers || return nothing
+        mi = specialize_method(match; preexisting=true)
+        mi === nothing && (mi = specialize_method(match))
+        code = get(code_cache(state), mi, nothing)
+        code isa CodeInstance || (code = mi)
+        ir[SSAValue(idx)][:stmt] = Expr(:invoke, code, stmt.args[3:end]...)
+        return nothing
+    end
+    if inner !== NoCallInfo()
+        n = length(todo)
+        handle_call!(todo, ir, idx, stmt, inner, flag, sig, state)
+        (length(todo) != n || !isexpr(ir[SSAValue(idx)][:stmt], :call)) && return nothing
+    end
+    # left a dynamic call: it passes its arguments' attributes on
+    cur = ir[SSAValue(idx)][:stmt]
+    if isexpr(cur, :call)
+        bits = Int(info.mask) | (Int(info.dyn) << 32)
+        ir[SSAValue(idx)][:stmt] = Expr(:call, GlobalRef(Core, :attributed_call), bits, cur.args...)
+    end
+    return nothing
+end
+
 function assemble_inline_todo!(ir::IRCode, state::InliningState)
     todo = Pair{Int, Any}[]
 
@@ -1755,6 +1800,16 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
         end
         if isa(info, DeclaredResultInfo)
             handle_declared_result!(ir, idx, stmt, info)
+            continue
+        end
+        if isa(info, KeepInfo)
+            # `Core.keep(x)` (compiler §6.9): `x`, or `Dynamic{X}(x)` in an instance compiled once for it
+            x = stmt.args[2]
+            ir[SSAValue(idx)][:stmt] = info.T === nothing ? x : Expr(:new, info.T, x)
+            continue
+        end
+        if isa(info, AttributedCallInfo)
+            handle_attributed_call!(todo, ir, idx, stmt, info, flag, sig, state)
             continue
         end
 

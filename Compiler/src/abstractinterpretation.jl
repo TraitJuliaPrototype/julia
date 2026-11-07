@@ -250,7 +250,8 @@ end
 
 function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(func),
                                   arginfo::ArgInfo, si::StmtInfo, @nospecialize(atype),
-                                  sv::AbsIntState, max_methods::Int)
+                                  sv::AbsIntState, max_methods::Int;
+                                  attr::Tuple{UInt32,UInt32} = (UInt32(0), UInt32(0)))
     𝕃ₚ, 𝕃ᵢ = ipo_lattice(interp), typeinf_lattice(interp)
     ⊑ₚ, ⊔ₚ, ⊔ᵢ  = partialorder(𝕃ₚ), join(𝕃ₚ), join(𝕃ᵢ)
     argtypes = arginfo.argtypes
@@ -271,10 +272,14 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
             CallMeta(drt, Any, Effects(), SplitCallInfo(call.info, drt))
         end
     end
-    matches = find_method_matches(interp, argtypes, atype; max_methods)
+    # each trait argument's attribute (compiler §6.3): a cast's, the one an argument of this frame
+    # carries, else the method's; each match is inferred at the instance that runs
+    amask, adyn = call_attributes(attr, arginfo.fargs, sv)
+    acast = attr[1] != 0
+    matches, adispatch = attributed_matches(find_method_matches(interp, argtypes, atype; max_methods), amask, adyn)
     if isa(matches, FailedMethodMatch)
         add_remark!(interp, sv, matches.reason)
-        return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
+        return Future(CallMeta(Any, Any, unedged_effects(interp), attributed_info(NoCallInfo(), amask, adyn, acast, false)))
     end
 
     (; valid_worlds, applicable) = matches
@@ -497,12 +502,189 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
             infercalls2(interp, sv) || push!(sv.tasks, infercalls2)
         end
 
-        gfresult[] = CallMeta(state.rettype, state.exctype, state.all_effects, retinfo, state.slotrefinements)
+        gfresult[] = CallMeta(state.rettype, state.exctype, state.all_effects,
+                              attributed_info(retinfo, amask, adyn, acast, adispatch), state.slotrefinements)
         return true
     end # function infercalls
     # start making progress on the first call
     infercalls(interp, sv) || push!(sv.tasks, infercalls)
     return gfresult
+end
+
+# ---- the attribute of a trait argument (compiler §6.3) ----
+
+is_trait_arg_type(@nospecialize(t)) = ccall(:jl_is_trait_arg_type, Cint, (Any,), t) != 0
+
+# the argument slot of the frame that `a` reads, if it is one the body never assigns, else 0
+function argument_slot(@nospecialize(a), sv::InferenceState, nargs::Int)
+    if a isa Argument
+        n = a.n
+    elseif a isa SlotNumber
+        n = slot_id(a)
+        n <= nargs || return 0
+        # an argument assigned once has this flag; one assigned more often gets a slot of its own
+        (sv.src.slotflags[n] & SLOT_ASSIGNEDONCE) == 0 || return 0
+    else
+        return 0
+    end
+    return 1 < n <= nargs ? n : 0
+end
+
+# The attributes the trait arguments of this frame's instance carry into a call that passes them on
+# (compiler §6.3, step 2): `Dynamic` from an instance compiled once for the argument, `Compiled` from
+# one compiled for its type. As (mask, dyn), bit `k - 1` for the call's argument `k`.
+function carried_attributes(fargs::Union{Nothing,Vector{Any}}, sv::AbsIntState)
+    none = (UInt32(0), UInt32(0))
+    (fargs === nothing || !(sv isa InferenceState)) && return none
+    caller = sv.linfo.def
+    caller isa Method || return none
+    ccall(:jl_has_open_set, Cint, (Any,), caller.sig) == 0 && return none
+    decl = unwrap_unionall(caller.sig)
+    spec = unwrap_unionall(sv.linfo.specTypes)
+    (decl isa DataType && spec isa DataType) || return none
+    nargs = Int(caller.nargs)
+    mask = dyn = UInt32(0)
+    for k = 2:min(length(fargs), 33)
+        n = argument_slot(fargs[k], sv, nargs)
+        (n == 0 || (caller.isva && n == nargs) || n > length(decl.parameters)) && continue
+        d = decl.parameters[n]
+        is_trait_arg_type(d) || continue
+        bit = UInt32(1) << (k - 2)
+        mask |= bit
+        n <= length(spec.parameters) && spec.parameters[n] === d && (dyn |= bit)
+    end
+    return (mask, dyn)
+end
+
+# a cast's attributes first, then those the arguments carry
+function call_attributes(attr::Tuple{UInt32,UInt32}, fargs::Union{Nothing,Vector{Any}}, sv::AbsIntState)
+    cmask, cdyn = carried_attributes(fargs, sv)
+    amask, adyn = attr
+    return (amask | cmask, (adyn & amask) | (cdyn & ~amask))
+end
+
+# A match inferred at the instance that runs (compiler §6.3): the declared type at each trait argument
+# compiled once. Also whether a trait argument is `Compiled` where the call does not know its type:
+# the call then dispatches on it when it runs.
+function attributed_match(m::MethodMatch, mask::UInt32, dyn::UInt32)
+    method = m.method
+    ccall(:jl_has_open_set, Cint, (Any,), method.sig) == 0 && return (m, false)
+    traits = ccall(:jl_trait_arg_bits, UInt32, (Any,), method)
+    traits == 0 && return (m, false)
+    spec = m.spec_types
+    dbits = ccall(:jl_attribute_dynamic_bits, UInt32, (Any, Any, UInt32, UInt32), spec, method, mask, dyn)
+    dispatch = false
+    uspec = unwrap_unionall(spec)
+    if uspec isa DataType
+        for i = 1:min(32, length(uspec.parameters) - 1)
+            bit = UInt32(1) << (i - 1)
+            (traits & bit) != 0 && (dbits & bit) == 0 || continue
+            p = uspec.parameters[i + 1]
+            (isvarargtype(p) || isconcretetype(p)) || (dispatch = true)
+        end
+    end
+    w = ccall(:jl_attribute_sig, Any, (Any, Any, UInt32, UInt32), spec, method, mask, dyn)
+    w === spec && return (m, dispatch)
+    sp = ccall(:jl_type_intersection_with_env, Any, (Any, Any), w, method.sig)::SimpleVector
+    return (MethodMatch(w, sp[2]::SimpleVector, method, m.fully_covers), dispatch)
+end
+function attributed_lookup(r::MethodLookupResult, mask::UInt32, dyn::UInt32)
+    new = nothing
+    dispatch = false
+    for i = 1:length(r.matches)
+        m = r.matches[i]::MethodMatch
+        w, d = attributed_match(m, mask, dyn)
+        dispatch |= d
+        if w !== m
+            new === nothing && (new = copy(r.matches))
+            new[i] = w
+        end
+    end
+    new === nothing && return (r, dispatch)
+    return (MethodLookupResult(new, r.valid_worlds, r.ambig), dispatch)
+end
+attributed_matches(m::FailedMethodMatch, ::UInt32, ::UInt32) = (m, false)
+function attributed_matches(m::MethodMatches, mask::UInt32, dyn::UInt32)
+    info = m.info
+    r, dispatch = attributed_lookup(info.results, mask, dyn)
+    r === info.results && return (m, dispatch)
+    newinfo = MethodMatchInfo(r, info.mt, info.atype, info.fullmatch)
+    applicable = MethodMatchTarget[MethodMatchTarget(r.matches[i]::MethodMatch, newinfo.edges, i) for i = 1:length(r.matches)]
+    return (MethodMatches(applicable, newinfo, m.valid_worlds), dispatch)
+end
+function attributed_matches(m::UnionSplitMethodMatches, mask::UInt32, dyn::UInt32)
+    changed = dispatch = false
+    infos = MethodMatchInfo[]
+    applicable = MethodMatchTarget[]
+    for info in m.info.split
+        r, d = attributed_lookup(info.results, mask, dyn)
+        dispatch |= d
+        changed |= r !== info.results
+        newinfo = r === info.results ? info : MethodMatchInfo(r, info.mt, info.atype, info.fullmatch)
+        push!(infos, newinfo)
+        for i = 1:length(r.matches)
+            push!(applicable, MethodMatchTarget(r.matches[i]::MethodMatch, newinfo.edges, i))
+        end
+    end
+    changed || return (m, dispatch)
+    return (UnionSplitMethodMatches(applicable, m.applicable_argtypes, UnionSplitInfo(infos), m.valid_worlds), dispatch)
+end
+
+attributed_info(@nospecialize(info::CallInfo), mask::UInt32, dyn::UInt32, cast::Bool, dispatch::Bool) =
+    (mask == 0 && !cast && !dispatch) ? info : AttributedCallInfo(info, mask, dyn, cast, dispatch)
+
+# `Core.attributed_call(bits, f, args...)`: the call with the attributes of its casts (compiler §6.9)
+function abstract_attributed_call(interp::AbstractInterpreter, arginfo::ArgInfo, si::StmtInfo,
+                                  sv::AbsIntState)
+    (; fargs, argtypes) = arginfo
+    length(argtypes) >= 3 || return Future(CallMeta(Bottom, ArgumentError, EFFECTS_THROWS, NoCallInfo()))
+    b = argtypes[2]
+    (b isa Const && b.val isa Int) || return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+    bits = reinterpret(UInt64, b.val::Int)
+    mask = bits % UInt32
+    dyn = (bits >> 32) % UInt32 & mask
+    newfargs = fargs === nothing ? nothing : fargs[3:end]
+    newargtypes = argtypes[3:end]
+    ft = widenconst(argtypes[3])
+    f = singleton_type(ft)
+    newarginfo = ArgInfo(newfargs, newargtypes)
+    call = if f === nothing || isa(f, Builtin)
+        abstract_call(interp, newarginfo, si, sv)::Future
+    else
+        abstract_call_known(interp, f, newarginfo, si, sv; attr = (mask, dyn))::Future
+    end
+    return Future{CallMeta}(call, interp, sv) do call, _, _
+        info = call.info
+        info isa AttributedCallInfo || (info = AttributedCallInfo(info, mask, dyn, true, false))
+        CallMeta(call.rt, call.exct, call.effects, info, call.refinements)
+    end
+end
+
+# `Core.keep(x)` resolved where the instance is compiled (compiler §6.9): `Dynamic{X}(x)` where the
+# frame's instance is compiled once for the argument `x` at the set `X`, `x` otherwise. Its result
+# depends on the instance, so it is not consistent.
+function abstract_keep(fargs::Union{Nothing,Vector{Any}}, argtypes::Vector{Any}, sv::AbsIntState)
+    effects = Effects(EFFECTS_TOTAL; consistent=ALWAYS_FALSE)
+    if fargs !== nothing && sv isa InferenceState
+        caller = sv.linfo.def
+        if caller isa Method
+            nargs = Int(caller.nargs)
+            n = argument_slot(fargs[2], sv, nargs)
+            decl = unwrap_unionall(caller.sig)
+            spec = unwrap_unionall(sv.linfo.specTypes)
+            if n != 0 && !(caller.isva && n == nargs) && decl isa DataType && spec isa DataType &&
+                    n <= length(decl.parameters) && n <= length(spec.parameters)
+                d = decl.parameters[n]
+                if is_trait_arg_type(d) && spec.parameters[n] === d
+                    # this instance at the set's type is the one compiled once, and inference's stand-in
+                    # for every instance at a member's type: either result
+                    T = Core.Dynamic{d}
+                    return CallMeta(Union{d, T}, Union{}, effects, KeepInfo(T))
+                end
+            end
+        end
+    end
+    return CallMeta(argtypes[2], Union{}, effects, KeepInfo(nothing))
 end
 
 function find_method_matches(interp::AbstractInterpreter, argtypes::Vector{Any}, @nospecialize(atype);
@@ -2868,7 +3050,8 @@ end
 # call where the function is known exactly
 function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
         arginfo::ArgInfo, si::StmtInfo, sv::AbsIntState,
-        max_methods::Int = get_max_methods(interp, f, sv))
+        max_methods::Int = get_max_methods(interp, f, sv);
+        attr::Tuple{UInt32,UInt32} = (UInt32(0), UInt32(0)))
     (; fargs, argtypes) = arginfo
     argtypes::Vector{Any} = arginfo.argtypes  # declare type because the closure below captures `argtypes`
     fargs = arginfo.fargs
@@ -2879,6 +3062,8 @@ function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
             return abstract_apply(interp, argtypes, si, sv)
         elseif f === invoke
             return abstract_invoke(interp, arginfo, si, sv)
+        elseif f === Core.attributed_call
+            return abstract_attributed_call(interp, arginfo, si, sv)
         elseif f === modifyfield! || f === Core.modifyglobal! ||
                f === Core.memoryrefmodify! || f === atomic_pointermodify
             return abstract_modifyop!(interp, f, argtypes, si, sv)
@@ -3022,9 +3207,11 @@ function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
         return Future(CallMeta(typename_static(argtypes[2]), Bottom, EFFECTS_TOTAL, MethodResultPure()))
     elseif f === Core._hasmethod
         return Future(_hasmethod_tfunc(interp, argtypes, sv))
+    elseif f === Core.keep && la == 2
+        return Future(abstract_keep(fargs, argtypes, sv))
     end
     atype = argtypes_to_type(argtypes)
-    return abstract_call_gf_by_type(interp, f, arginfo, si, atype, sv, max_methods)::Future
+    return abstract_call_gf_by_type(interp, f, arginfo, si, atype, sv, max_methods; attr)::Future
 end
 
 function abstract_call_opaque_closure(interp::AbstractInterpreter,
