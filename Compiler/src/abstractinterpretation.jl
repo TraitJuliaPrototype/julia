@@ -61,6 +61,18 @@ struct MethodMatches
     info::MethodMatchInfo
     valid_worlds::WorldRange
 end
+
+# A match through a membership entry rests on it: the entries join the frame's record
+# (compiler §3.1, §4.8), beside the dispatch edge the match gives.
+function record_match_memberships!(sv::InferenceState, applicable::Vector{MethodMatchTarget})
+    for target in applicable
+        m = target.match
+        sig = m.method.sig
+        ccall(:jl_has_open_set, Cint, (Any,), sig) == 0 && continue
+        record_memberships!(sv, m.spec_types, sig)
+    end
+    return nothing
+end
 any_ambig(result::MethodLookupResult) = result.ambig
 any_ambig(info::MethodMatchInfo) = any_ambig(info.results)
 any_ambig(m::MethodMatches) = any_ambig(m.info)
@@ -267,6 +279,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
 
     (; valid_worlds, applicable) = matches
     update_valid_age!(sv, valid_worlds) # need to record the negative world now, since even if we don't generate any useful information, inlining might want to add an invoke edge and it won't have this information anymore
+    sv isa InferenceState && record_match_memberships!(sv, applicable)
     # Concrete-only functions refuse to commit (and record no backedge) when any
     # applicable match has a non-concrete signature, regardless of scope. This is the
     # generalization of the top-level `!isdispatchtuple` bail below to a per-function opt-in.

@@ -741,6 +741,11 @@ function Base.iterate(it::ForwardToBackedgeIterator, i::Int = 1)
             continue
         elseif isa(item, Core.Binding)
             return ((nothing, item), i + 1)
+        elseif isa(item, Core.MembershipEntry)
+            # a positive membership the code folded (compiler §3.1): it never ends while the
+            # code is valid (§4.3), so it takes no backedge
+            i += 1
+            continue
         end
         if isa(item, CodeInstance)
             item = get_ci_mi(item)

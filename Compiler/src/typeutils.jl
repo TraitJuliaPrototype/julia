@@ -49,9 +49,10 @@ has_extended_info(@nospecialize x) = (!isa(x, Type) && !isvarargtype(x)) || isTy
 isnotbrokensubtype(@nospecialize(a), @nospecialize(b)) = (!iskindtype(b) || !isType(a) || hasuniquerep(a.parameters[1]) || b <: a)
 
 # membership fold gates (compiler §4.8): a negative about a pair that a future
-# declaration could join never folds; a positive answered by a membership entry
-# never folds either until the fold raises the code's min_world (W-100). Both are
-# cheap flag reads in a session without open sets.
+# declaration could join never folds. A positive answered by a membership entry folds
+# only where the fold can be recorded: the frame being inferred takes the entries into
+# its record and its worlds start no earlier than theirs (compiler §3.1); elsewhere it
+# does not fold (C-51). Both are cheap flag reads in a session without open sets.
 function negative_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
     (ccall(:jl_has_open_set, Cint, (Any,), a) != 0 || ccall(:jl_has_open_set, Cint, (Any,), b) != 0) || return false
     return ccall(:jl_could_join, Cint, (Any, Any), a, b) != 0 ||
@@ -60,6 +61,29 @@ end
 function positive_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
     (ccall(:jl_has_open_set, Cint, (Any,), a) != 0 || ccall(:jl_has_open_set, Cint, (Any,), b) != 0) || return false
     return ccall(:jl_subtype_via_membership, Cint, (Any, Any), a, b) != 0
+end
+function positive_fold_blocked(@nospecialize(a), @nospecialize(b), sv::Union{Nothing,AbsIntState})::Bool
+    positive_fold_blocked(a, b) || return false
+    sv isa InferenceState || return true
+    return !record_memberships!(sv, a, b)
+end
+
+"""
+    record_memberships!(sv::InferenceState, a, b) -> Bool
+
+Record the membership entries a positive answer `a <: b` rests on in the frame's record, and
+start the frame's worlds no earlier than theirs (compiler §3.1, §4.8). False where no entry is
+found to rest it on: the answer is then not folded.
+"""
+function record_memberships!(sv::InferenceState, @nospecialize(a), @nospecialize(b))
+    entries = ccall(:jl_membership_entries_for, Any, (Any, Any, UInt), a, b, frame_world(sv))::SimpleVector
+    isempty(entries) && return false
+    for e in entries
+        e = e::Core.MembershipEntry
+        update_valid_age!(sv, WorldRange(e.min_world, @atomic :monotonic e.max_world))
+        any(x -> x === e, sv.edges) || push!(sv.edges, e)
+    end
+    return true
 end
 
 function argtypes_to_type(argtypes::Array{Any,1})
