@@ -3648,16 +3648,15 @@ STATIC_INLINE int sig_has_open_set(jl_value_t *sig) JL_NOTSAFEPOINT
 }
 
 // Check if m2 is in m1's interferences set, which means !morespecific(m1, m2).
-// The set is recorded when a method is inserted. A pair at open sets is asked again in the
-// query's world: a later membership can order two sets (compiler §5.2), and memberships only
-// grow, so the recorded set over-states such a pair's ambiguity and never under-states it.
+// The set is recorded when a method is inserted. A pair with a method at an open set is asked
+// in the query's world instead (compiler §5.2): a later membership can make two methods meet that
+// were disjoint at insertion (a method at a set and one at a type that later joins it), or order
+// two sets, and the record knows neither.
 static int method_in_interferences(jl_method_t *m2, jl_method_t *m1)
 {
-    if (!has_key(jl_atomic_load_relaxed(&m1->interferences), (jl_value_t*)m2))
-        return 0;
-    if (sig_has_open_set((jl_value_t*)m1->sig) && sig_has_open_set((jl_value_t*)m2->sig))
+    if (sig_has_open_set((jl_value_t*)m1->sig) || sig_has_open_set((jl_value_t*)m2->sig))
         return !jl_method_morespecific(m1, m2);
-    return 1;
+    return has_key(jl_atomic_load_relaxed(&m1->interferences), (jl_value_t*)m2);
 }
 
 // Find the index of a method in the method match array
