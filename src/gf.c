@@ -2629,7 +2629,9 @@ static int shadow_at(jl_value_t *tt, jl_method_t *m0, jl_method_t *mz, size_t i)
         if (d0 != NULL && d0 != (jl_value_t*)jl_any_type && !jl_has_open_set_in(d0))
             return 0; // matched through the type's own supertypes
     }
-    for (size_t j = 1; j < np; j++) {
+    // the other arguments, the function's own type included: the methods at sets indexed under `Type`
+    // are every type's constructors, whose first argument (`Type{X}`) tells them apart
+    for (size_t j = 0; j < np; j++) {
         jl_value_t *dj = sig_arg(zsig, j, mz->isva);
         if (j == i || dj == NULL || jl_is_vararg(jl_tparam(tt, j)))
             continue;
