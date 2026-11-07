@@ -544,6 +544,16 @@ static int obviously_in_union(jl_value_t *u, jl_value_t *x)
 
 static int membership_may_reach(jl_datatype_t *x, jl_typename_t *yname);
 
+// whether `k` is a kind of type object and `c` is Callable: a type is called through its
+// constructors, so some values of the kind are Callable's members (compiler §7.4)
+static int callable_meets_kind(jl_datatype_t *k, jl_datatype_t *c) JL_NOTSAFEPOINT
+{
+    return jl_callable_type != NULL &&
+        c->name == ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type))->name &&
+        (k == jl_datatype_type || k == jl_unionall_type || k == jl_uniontype_type ||
+         (k->name == jl_type_typename && jl_has_free_typevars((jl_value_t*)k)));
+}
+
 int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
 {
     if (a == b || a == (jl_value_t*)jl_any_type || b == (jl_value_t*)jl_any_type)
@@ -576,6 +586,10 @@ int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
                     // a membership can relate a pair the chains do not (compiler §4.5): not
                     // obviously disjoint, unless one side is a concrete type no entry of whose
                     // chain can reach the other, a set (subtyping's fast path for a non-member)
+                    // A kind of type object (DataType, UnionAll, Union) meets Callable, which takes a
+                    // type by its constructors, not by entries (compiler §7.4)
+                    if (callable_meets_kind(ad, bd) || callable_meets_kind(bd, ad))
+                        return 0;
                     if (bd->name->open_set)
                         return !specificity && !ad->name->open_set && jl_is_concrete_type((jl_value_t*)ad) &&
                                !membership_may_reach(ad, bd->name);
@@ -1899,8 +1913,10 @@ JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X)
     }
     jl_datatype_t *sud = (jl_datatype_t*)su, *xud = (jl_datatype_t*)xu;
     if (xud->name->open_set && sud->name != xud->name) {
-        if (sud->name == jl_datatype_type->name || sud->name == jl_type_typename)
-            return 1; // type objects: a later entry for Type{S} answers (compiler §4.10)
+        if (sud->name == jl_datatype_type->name || sud->name == jl_type_typename ||
+            sud->name == jl_unionall_type->name || sud->name == jl_uniontype_type->name)
+            return 1; // type objects of every kind (`Dict` is a UnionAll): a later entry for Type{S}
+                      // answers, and Callable takes a type by its constructors (compiler §4.10, §7.4)
         // a differently-headed S could join the family later unless it is a Core kind
         return !sud->name->never_member;
     }
@@ -4788,6 +4804,10 @@ static jl_value_t *intersect_membership(jl_datatype_t *x, jl_value_t *y, jl_sten
 {
     size_t world = jl_membership_world();
     jl_typename_t *yname = ((jl_datatype_t*)jl_unwrap_unionall(y))->name;
+    // a kind of type object meets Callable: a type is called through its constructors, and Callable
+    // takes it by its methods, not by entries (compiler §7.4); the kind itself is the answer
+    if (jl_is_datatype(jl_unwrap_unionall(y)) && callable_meets_kind(x, (jl_datatype_t*)jl_unwrap_unionall(y)))
+        return (jl_value_t*)x;
     int ground = !jl_has_free_typevars((jl_value_t*)x);
     jl_value_t *res = jl_bottom_type;
     jl_value_t *inst = NULL;
