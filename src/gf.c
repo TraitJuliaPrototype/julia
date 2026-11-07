@@ -2688,6 +2688,11 @@ JL_DLLEXPORT jl_value_t *jl_call_shadows(jl_value_t *tt, jl_value_t *m0v)
                 cell = jl_membership_cell(s, (jl_value_t*)names.items[k]);
                 jl_array_ptr_1d_push(cells, cell);
                 r = mz->declared_result ? mz->declared_result : (jl_value_t*)jl_any_type;
+                // a declared result that names the method's static parameters (`Tuple{T, Any}` at
+                // `Iterable{T}`) is not instantiated at the call: the shadow's result is `Any`, never a
+                // type with a free variable in the caller's result
+                if (jl_has_free_typevars(r))
+                    r = (jl_value_t*)jl_any_type;
                 jl_array_ptr_1d_push(results, r);
             }
             arraylist_free(&names);
@@ -5242,11 +5247,20 @@ JL_DLLEXPORT int jl_method_is_macro(jl_method_t *m)
 
 // ---- The code slot's revalidation (compiler §3.3) ----
 
+// two result types the same type: egal, or equal as types (a `where` clause's variables may be
+// named differently in two CodeInstances)
+static int same_type(jl_value_t *a, jl_value_t *b)
+{
+    if (a == b || jl_egal(a, b))
+        return 1;
+    return jl_is_type(a) && jl_is_type(b) && jl_types_equal(a, b);
+}
+
 // whether a callee's new CodeInstance has the result its caller used: return type, exception type,
 // constant and effects
-static int ci_result_equal(jl_code_instance_t *a, jl_code_instance_t *b) JL_NOTSAFEPOINT
+static int ci_result_equal(jl_code_instance_t *a, jl_code_instance_t *b)
 {
-    if (!jl_egal(a->rettype, b->rettype) || !jl_egal(a->exctype, b->exctype))
+    if (!same_type(a->rettype, b->rettype) || !same_type(a->exctype, b->exctype))
         return 0;
     if ((a->rettype_const == NULL) != (b->rettype_const == NULL))
         return 0;
@@ -5436,7 +5450,7 @@ static jl_code_instance_t *code_slot_find(jl_method_instance_t *mi JL_PROPAGATES
     for (; ci; ci = jl_atomic_load_relaxed(&ci->next)) {
         if (ci->owner == jl_nothing && ci_policy_is(ci, facts) &&
                 jl_atomic_load_relaxed(&ci->min_world) <= world && world <= jl_atomic_load_relaxed(&ci->max_world) &&
-                jl_egal(ci->rettype, rettype) && code_slot_entry(ci, specsig))
+                same_type(ci->rettype, rettype) && code_slot_entry(ci, specsig))
             return ci;
     }
     return NULL;
