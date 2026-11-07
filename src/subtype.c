@@ -1129,9 +1129,17 @@ static int forall_exists_equal(jl_value_t *x, jl_value_t *y, jl_stenv_t *e);
 // the task's world age. With no task (0), a query sees every entry.
 
 // set the task's query world, returning the previous value for the caller to restore
+// the current task, or NULL on a thread without one; inline, since method matching and
+// subtyping ask it on every query
+STATIC_INLINE jl_task_t *query_task(void) JL_NOTSAFEPOINT
+{
+    jl_gcframe_t **pgcstack = jl_get_pgcstack();
+    return pgcstack == NULL ? NULL : container_of(pgcstack, jl_task_t, gcstack);
+}
+
 JL_DLLEXPORT size_t jl_set_membership_query_world(size_t world) JL_NOTSAFEPOINT
 {
-    jl_task_t *ct = jl_get_current_task();
+    jl_task_t *ct = query_task();
     if (ct == NULL)
         return 0;
     size_t last = ct->membership_world;
@@ -1142,13 +1150,13 @@ JL_DLLEXPORT size_t jl_set_membership_query_world(size_t world) JL_NOTSAFEPOINT
 // the task's query world (0: unset)
 JL_DLLEXPORT size_t jl_membership_query_world(void) JL_NOTSAFEPOINT
 {
-    jl_task_t *ct = jl_get_current_task();
+    jl_task_t *ct = query_task();
     return ct ? ct->membership_world : 0;
 }
 
 static size_t jl_membership_world(void) JL_NOTSAFEPOINT
 {
-    jl_task_t *ct = jl_get_current_task();
+    jl_task_t *ct = query_task();
     if (ct && ct->membership_world)
         return ct->membership_world;
     return ct ? ct->world_age : 0;
@@ -1626,7 +1634,7 @@ JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *
 // membership entry is live in world 1, since each is declared in a later one.
 JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b)
 {
-    if (!jl_has_open_set(a) && !jl_has_open_set(b))
+    if (!jl_has_open_set_in(a) && !jl_has_open_set_in(b))
         return jl_subtype(a, b);
     size_t last = jl_set_membership_query_world(1);
     int r = jl_subtype(a, b);
@@ -1753,7 +1761,7 @@ JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X)
 // orientation-free pair relevance used by codegen (item 10e)
 JL_DLLEXPORT int jl_membership_flip_possible(jl_value_t *a, jl_value_t *b)
 {
-    if (!jl_has_open_set(a) && !jl_has_open_set(b))
+    if (!jl_has_open_set_in(a) && !jl_has_open_set_in(b))
         return 0;
     return jl_could_join(a, b) || jl_could_join(b, a);
 }
@@ -2675,8 +2683,6 @@ static int obvious_subtype(jl_value_t *x, jl_value_t *y, jl_value_t *y0, int *su
         *subtype = 1;
         return 1;
     }
-    if (jl_is_all_type(jl_unwrap_unionall(x)) || jl_is_all_type(jl_unwrap_unionall(y)))
-        return 0; // intersections take the full walk (compiler §4.9)
     while (jl_is_unionall(x)) {
         if (!jl_is_unionall(y)) {
             if (obvious_subtype(jl_unwrap_unionall(x), y, y0, subtype) && !*subtype)
@@ -2729,6 +2735,9 @@ static int obvious_subtype(jl_value_t *x, jl_value_t *y, jl_value_t *y0, int *su
         *subtype = jl_egal(x, y);
         return 1;
     }
+    // x and y are unwrapped here: an intersection takes the full walk (compiler §4.9)
+    if (jl_is_all_type(x) || jl_is_all_type(y))
+        return 0;
     if (jl_is_uniontype(x)) {
         // TODO: consider handling more LHS unions, being wary of covariance
         if (obvious_subtype(((jl_uniontype_t*)x)->a, y, y0, subtype) && *subtype) {
@@ -6481,7 +6490,7 @@ JL_DLLEXPORT int jl_type_morespecific(jl_value_t *a, jl_value_t *b)
     // when either side mentions an open set (a memoized bit); with no open set
     // anywhere the two bit reads are false and behavior is unchanged. The full
     // walk still answers 0 for genuinely unordered pairs.
-    if (!(jl_has_open_set(a) || jl_has_open_set(b)) && obviously_disjoint(a, b, 1))
+    if (!(jl_has_open_set_in(a) || jl_has_open_set_in(b)) && obviously_disjoint(a, b, 1))
         return 0;
     if (jl_has_free_typevars(a) || jl_has_free_typevars(b))
         return 0;
@@ -6504,7 +6513,7 @@ JL_DLLEXPORT int jl_method_morespecific(jl_method_t *ma, jl_method_t *mb)
     jl_value_t *a = (jl_value_t*)ma->sig;
     jl_value_t *b = (jl_value_t*)mb->sig;
     // the same open-set skip as jl_type_morespecific above
-    if (!(jl_has_open_set(a) || jl_has_open_set(b)) && obviously_disjoint(a, b, 1))
+    if (!(jl_has_open_set_in(a) || jl_has_open_set_in(b)) && obviously_disjoint(a, b, 1))
         return 0;
     if (jl_has_free_typevars(a) || jl_has_free_typevars(b))
         return 0;

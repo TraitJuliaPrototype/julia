@@ -752,7 +752,7 @@ JL_DLLEXPORT jl_value_t *jl_type_all(jl_value_t **ts, size_t n)
                     c[b] = NULL;                    // the narrower absorbs the wider
                     changed = 1;
                 }
-                else if (a < b && !jl_has_open_set(x) && !jl_has_open_set(y)) {
+                else if (a < b && !jl_has_open_set_in(x) && !jl_has_open_set_in(y)) {
                     // two closed types: their intersection, where Julia computes it exactly
                     jl_value_t *r = jl_type_intersection(x, y);
                     if (r == jl_bottom_type) {
@@ -2036,7 +2036,7 @@ void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable)
         }
         if (jl_is_vararg(p))
             p = ((jl_vararg_t*)p)->T;
-        if (!dt->has_open_set && p && jl_has_open_set(p))
+        if (!dt->has_open_set && p && jl_has_open_set_in(p))
             dt->has_open_set = 1;
         if (istuple && dt->has_concrete_subtype) {
             // tuple types like Tuple{:x} and Tuple{Union{}} cannot have instances
@@ -4174,6 +4174,8 @@ static jl_value_t *core(const char *name)
 void post_boot_hooks(void)
 {
     jl_all_type = (jl_unionall_t*)core("All");
+    // an intersection carries the open-set bit, so the bit gates the test for one (julia_internal.h)
+    ((jl_datatype_t*)jl_all_type->body)->has_open_set = 1;
     jl_char_type    = (jl_datatype_t*)core("Char");
     XX(char);
     jl_int8_type    = (jl_datatype_t*)core("Int8");

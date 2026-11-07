@@ -1458,7 +1458,7 @@ static void jl_typemap_level_insert_(
     // that return early without reaching a level's linear list are the subtype=0
     // lookups, which reach only jl_method_table->defs — the builtin-only table
     // where this bit is false, so their type-equality premise keeps holding.
-    if (jl_has_open_set((jl_value_t*)newrec->sig)) {
+    if (jl_has_open_set_in((jl_value_t*)newrec->sig)) {
         jl_typemap_list_insert_(map, &cache->linear, (jl_value_t*)cache, newrec);
         return;
     }
