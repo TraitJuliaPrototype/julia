@@ -119,3 +119,36 @@ function facts_find_method_matches(interp::AbstractInterpreter, argtypes::Vector
     is_fact_sig(atype, max_union_splitting) || return FACTS_ABSTRACT_SITE
     return find_simple_method_matches(interp, atype, max_methods)
 end
+
+# The policy per method (compiler §2.3): a method compiled by facts by itself; a boundary and a
+# neutral method plain (C-44, C-45).
+method_policy_facts(m::Method) = ccall(:jl_method_is_facts, Cint, (Any,), m) != 0
+mi_policy_facts(mi::MethodInstance) = (def = mi.def; def isa Method && method_policy_facts(def))
+
+"The native interpreter of the other policy, in the same world and with the same parameters, one crossing further."
+policy_interp(interp::NativeInterpreter, facts::Bool) =
+    NativeInterpreter(get_inference_world(interp); inf_params = InferenceParams(interp),
+                      opt_params = OptimizationParams(interp), facts, crossings = interp.crossings + 1)
+
+# How many inferences of the other policy may nest: past it a call is answered as unknown, so that
+# two policies' inferences of a cycle do not recurse into each other.
+const MAX_POLICY_CROSSINGS = 4
+
+"""
+A callee whose policy differs from the caller's is inferred under its own policy, in an inference
+of its own (compiler §2.4): its cached code of that policy, or a new inference; the caller's result
+rests on the callee's CodeInstance.
+"""
+function typeinf_other_policy(interp::NativeInterpreter, method::Method, mi::MethodInstance,
+                              caller::AbsIntState, edgecycle::Bool, edgelimited::Bool)
+    other = policy_interp(interp, !interp.facts)
+    codeinst = get(code_cache(other), mi, nothing)
+    if !(codeinst isa CodeInstance)
+        interp.crossings >= MAX_POLICY_CROSSINGS &&
+            return Future(MethodCallResult(interp, caller, method, Any, Any, unedged_effects(interp), nothing, edgecycle, edgelimited))
+        codeinst = typeinf_ext(other, mi, SOURCE_MODE_NOT_REQUIRED)
+    end
+    codeinst isa CodeInstance ||
+        return Future(MethodCallResult(interp, caller, method, Any, Any, unedged_effects(interp), nothing, edgecycle, edgelimited))
+    return return_cached_result(interp, method, codeinst, caller, edgecycle, edgelimited)
+end

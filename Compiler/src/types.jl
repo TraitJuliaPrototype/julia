@@ -394,12 +394,14 @@ struct NativeInterpreter <: AbstractInterpreter
 
     # whether calls are inferred only at facts (compiler §1.1)
     facts::Bool
+    # how many inferences of the other policy this one is nested in (compiler §2.4)
+    crossings::Int
 end
 
 function NativeInterpreter(world::UInt = get_world_counter();
                            inf_params::InferenceParams = InferenceParams(),
                            opt_params::OptimizationParams = OptimizationParams(),
-                           facts::Bool = false)
+                           facts::Bool = false, crossings::Int = 0)
     curr_max_world = get_world_counter()
     # Sometimes the caller is lazy and passes typemax(UInt).
     # we cap it to the current world age for correctness
@@ -412,7 +414,7 @@ function NativeInterpreter(world::UInt = get_world_counter();
     method_table = CachedMethodTable(InternalMethodTable(world))
     inf_cache = Vector{InferenceResult}() # Initially empty cache
     codegen = IdDict{CodeInstance,CodeInfo}()
-    return NativeInterpreter(world, method_table, inf_cache, codegen, inf_params, opt_params, facts)
+    return NativeInterpreter(world, method_table, inf_cache, codegen, inf_params, opt_params, facts, crossings)
 end
 
 # Quickly and easily satisfy the AbstractInterpreter API contract
@@ -420,8 +422,8 @@ InferenceParams(interp::NativeInterpreter) = interp.inf_params
 OptimizationParams(interp::NativeInterpreter) = interp.opt_params
 get_inference_world(interp::NativeInterpreter) = interp.world
 get_inference_cache(interp::NativeInterpreter) = interp.inf_cache
-# facts code has a cache owner of its own until the policy is in a CodeInstance's flags (compiler C-42)
-cache_owner(interp::NativeInterpreter) = interp.facts ? :facts : nothing
+# code of either policy is cached under Julia's own owner, with the policy in its flags (compiler §2.3)
+cache_owner(::NativeInterpreter) = nothing
 
 engine_reserve(interp::AbstractInterpreter, mi::MethodInstance) = engine_reserve(mi, cache_owner(interp))
 engine_reserve(mi::MethodInstance, @nospecialize owner) = ccall(:jl_engine_reserve, Any, (Any, Any), mi, owner)::CodeInstance

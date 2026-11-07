@@ -1047,6 +1047,10 @@ end
 # compute (and cache) an inferred AST and return the current best estimate of the result type
 function typeinf_edge(interp::AbstractInterpreter, method::Method, @nospecialize(atype), sparams::SimpleVector, caller::AbsIntState, edgecycle::Bool, edgelimited::Bool)
     mi = specialize_method(method, atype, sparams)
+    # a callee of the other policy: an inference of its own (compiler §2.4)
+    if interp isa NativeInterpreter && method_policy_facts(method) != interp.facts
+        return typeinf_other_policy(interp, method, mi, caller, edgecycle, edgelimited)
+    end
     cache_mode = CACHE_MODE_GLOBAL # cache edge targets globally by default
     force_inline = is_stmt_inline(get_curr_ssaflag(caller))
     edge_ci = nothing
@@ -1641,7 +1645,8 @@ end
 # This is a bridge for the C code calling `jl_typeinf_func()` on a single Method match
 function typeinf_ext_toplevel(mi::MethodInstance, world::UInt, source_mode::UInt8, trim_mode::UInt8)
     inf_params = InferenceParams(; force_enable_inference = trim_mode != TRIM_NO)
-    interp = NativeInterpreter(world; inf_params)
+    # an inference of a method instance runs under its method's policy (compiler §2.3)
+    interp = NativeInterpreter(world; inf_params, facts = mi_policy_facts(mi))
     return typeinf_ext_toplevel(interp, mi, source_mode)
 end
 

@@ -398,12 +398,25 @@ static int emit_codeinst_and_edges(jl_code_instance_t *codeinst)
     return 0;
 }
 
+// The policy of a method instance's code (compiler §2.3): by facts for a method compiled by facts by
+// itself; a boundary and a neutral method plain (C-44, C-45). A CodeInstance of Julia's own owner
+// records the policy it was compiled in, and a lookup takes only one of its method instance's policy.
+static int mi_policy_facts(jl_method_instance_t *mi) JL_NOTSAFEPOINT
+{
+    return jl_is_method(mi->def.value) && jl_method_is_facts(mi->def.method);
+}
+static int ci_policy_ok(jl_code_instance_t *ci) JL_NOTSAFEPOINT
+{
+    int facts = (jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_FACTS) != 0;
+    return facts == mi_policy_facts(jl_get_ci_mi(ci));
+}
+
 // Opportunistic SOURCE_MODE_ABI cache lookup, only for bootstrapping.
 static jl_code_instance_t *jl_method_inferred_with_abi(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world)
 {
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     for (; codeinst; codeinst = jl_atomic_load_relaxed(&codeinst->next)) {
-        if (codeinst->owner != jl_nothing)
+        if (codeinst->owner != jl_nothing || !ci_policy_ok(codeinst))
             continue;
         if (jl_atomic_load_relaxed(&codeinst->min_world) <= world && world <= jl_atomic_load_relaxed(&codeinst->max_world)) {
             if (emit_codeinst_and_edges(codeinst))
@@ -597,7 +610,7 @@ JL_DLLEXPORT jl_code_instance_t *jl_get_method_inferred(
     for (; codeinst; codeinst = jl_atomic_load_relaxed(&codeinst->next)) {
         if (jl_atomic_load_relaxed(&codeinst->min_world) == min_world &&
             jl_atomic_load_relaxed(&codeinst->max_world) == max_world &&
-            jl_egal(codeinst->owner, owner) &&
+            jl_egal(codeinst->owner, owner) && ci_policy_ok(codeinst) &&
             jl_egal(codeinst->rettype, rettype)) {
             if (di == NULL)
                 return codeinst;
@@ -650,6 +663,7 @@ JL_DLLEXPORT jl_code_instance_t *jl_get_ci_equiv(jl_code_instance_t *ci JL_PROPA
             jl_atomic_load_relaxed(&codeinst->max_world) >= (target_world ? target_world : max_world) &&
             jl_egal(codeinst->def, def) &&
             jl_egal(codeinst->owner, owner) &&
+            (owner != jl_nothing || ci_policy_ok(codeinst)) &&
             jl_egal(codeinst->rettype, rettype)) {
             return codeinst;
         }
@@ -693,7 +707,8 @@ JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst(
     codeinst->time_infer_total = 0;
     codeinst->time_infer_self = 0;
     jl_atomic_store_relaxed(&codeinst->time_compile, 0);
-    jl_atomic_store_relaxed(&codeinst->flags, 0);
+    // Julia's own owner records the policy the code is compiled in: its method instance's (§2.3)
+    jl_atomic_store_relaxed(&codeinst->flags, owner == jl_nothing && mi_policy_facts(mi) ? JL_CI_FLAGS_FACTS : 0);
     jl_atomic_store_relaxed(&codeinst->precompile, 0);
     jl_atomic_store_relaxed(&codeinst->next, NULL);
     jl_atomic_store_relaxed(&codeinst->ipo_purity_bits, effects);
@@ -4186,7 +4201,8 @@ STATIC_INLINE jl_value_t *_jl_rettype_inferred(jl_value_t *owner, jl_method_inst
     while (codeinst) {
         if (jl_atomic_load_relaxed(&codeinst->min_world) <= min_world &&
             max_world <= jl_atomic_load_relaxed(&codeinst->max_world) &&
-            jl_egal(codeinst->owner, owner)) {
+            jl_egal(codeinst->owner, owner) &&
+            (owner != jl_nothing || ci_policy_ok(codeinst))) {
 
             jl_value_t *code = jl_atomic_load_relaxed(&codeinst->inferred);
             if (code)
@@ -4213,7 +4229,7 @@ STATIC_INLINE jl_callptr_t jl_method_compiled_callptr(jl_method_instance_t *mi, 
 {
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     for (; codeinst; codeinst = jl_atomic_load_relaxed(&codeinst->next)) {
-        if (codeinst->owner != jl_nothing)
+        if (codeinst->owner != jl_nothing || !ci_policy_ok(codeinst))
             continue;
         if (jl_atomic_load_relaxed(&codeinst->min_world) <= world && world <= jl_atomic_load_relaxed(&codeinst->max_world)) {
             jl_callptr_t invoke = jl_atomic_load_acquire(&codeinst->invoke);
@@ -4502,7 +4518,8 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
                     jl_atomic_store_relaxed(&codeinst->specptr.fptr, fptr);
                     jl_atomic_store_relaxed(&codeinst->invoke, invoke);
                     // unspec is probably not specsig, but might be using specptr
-                    jl_atomic_store_relaxed(&codeinst->flags, specsigflags & JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR);
+                    jl_atomic_store_relaxed(&codeinst->flags, (specsigflags & JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR) |
+                        (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FACTS)); // the policy stays
                     jl_mi_cache_insert(mi, codeinst);
                     record_precompile_statement(mi, 0, 0);
                     return codeinst;
@@ -4617,7 +4634,8 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
         // unspec is always not specsig, but might use specptr
         jl_atomic_store_relaxed(&codeinst->specptr.fptr, fptr);
         jl_atomic_store_relaxed(&codeinst->invoke, invoke);
-        jl_atomic_store_relaxed(&codeinst->flags, specsigflags & JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR);
+        jl_atomic_store_relaxed(&codeinst->flags, (specsigflags & JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR) |
+                        (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FACTS)); // the policy stays
         jl_mi_cache_insert(mi, codeinst);
     }
     jl_atomic_store_relaxed(&codeinst->precompile, 1);

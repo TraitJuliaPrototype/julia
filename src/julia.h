@@ -454,6 +454,7 @@ typedef struct _jl_opaque_closure_t {
 #define JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR   0b0010
 #define JL_CI_FLAGS_FROM_IMAGE               0b0100
 #define JL_CI_FLAGS_NATIVE_CACHE_VALID       0b1000
+#define JL_CI_FLAGS_FACTS                   0b100000  // compiled by facts (compiler §2.3)
 
 typedef struct _jl_code_instance_t {
     JL_DATA_TYPE
