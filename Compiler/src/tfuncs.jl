@@ -3199,6 +3199,10 @@ function return_type_tfunc(interp::AbstractInterpreter, argtypes::Vector{Any}, s
         if rt === Bottom || (isconcretetype(rt) && !iskindtype(rt))
             # output cannot be improved so it is known for certain
             return CallMeta(Const(rt), Union{}, RT_CALL_EFFECTS, info)
+        elseif facts_mode(interp)
+            # in code compiled by facts, any other answer may be wider than plain inference's, which
+            # `return_type` gives: the call is made at run time (compiler §1.4)
+            return CallMeta(Type, Any, Effects(EFFECTS_THROWS; nortcall=false, nortsite=false), NoCallInfo())
         elseif isa(sv, InferenceState) && !isempty(sv.pclimitations)
             # conservatively express uncertainty of this result
             # in two ways: both as being a subtype of this, and
