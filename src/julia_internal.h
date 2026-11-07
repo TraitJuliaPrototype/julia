@@ -914,7 +914,16 @@ jl_datatype_t *jl_new_abstracttype(jl_value_t *name, jl_module_t *module,
 JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *set_instance,
                                                jl_value_t *declarer, jl_value_t *by,
                                                jl_value_t *receiver);
-int jl_has_open_set_in(jl_value_t *v) JL_NOTSAFEPOINT;
+int jl_open_set_witness(jl_value_t *v) JL_NOTSAFEPOINT; // datatype.c: unions, variables, varargs
+// whether an open set occurs in v (compiler §4.8): a type's bit, read inline on the hot paths
+STATIC_INLINE int jl_has_open_set_in(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    while (jl_is_unionall(v))
+        v = ((jl_unionall_t*)v)->body;
+    if (jl_is_datatype(v))
+        return ((jl_datatype_t*)v)->has_open_set;
+    return jl_open_set_witness(v);
+}
 JL_DLLEXPORT int jl_has_open_set(jl_value_t *v);
 JL_DLLEXPORT int jl_is_open_set(jl_value_t *T);
 JL_DLLEXPORT void jl_set_open_set(jl_value_t *T);
@@ -939,6 +948,15 @@ JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b);
 // they are in `world`; returns whether t reaches any entry (*lo/*hi untouched if not)
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *lo, size_t *hi) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
+// intersections (compiler §4.9): All{X, Y} is Core.All{Tuple{X, Y}}, built in its normal form
+// an intersection All{X, Y} (compiler §4.9). Every intersection has the open-set bit, so a type
+// without it is answered by two loads and the hot paths of subtyping pay nothing more.
+STATIC_INLINE int jl_is_all_type(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    return jl_is_datatype(v) && ((jl_datatype_t*)v)->has_open_set && jl_all_type != NULL &&
+           ((jl_datatype_t*)v)->name == ((jl_datatype_t*)((jl_unionall_t*)jl_all_type)->body)->name;
+}
+JL_DLLEXPORT jl_value_t *jl_type_all(jl_value_t **ts, size_t n);
 // dispatch at a declaration (gf.c; compiler §5.4, §5.5): replay "insert m with the
 // member substituted" for every method m at the set or a set the member joins, and
 // report the ambiguities the member's set-join creates. Call under

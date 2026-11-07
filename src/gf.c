@@ -2247,7 +2247,7 @@ static void open_set_walk_names(jl_value_t *v, jl_method_t *m, int depth)
 // insert takes world_counter_lock, so the lock stays the innermost nest (W4-10).
 static void jl_index_open_set_methods(jl_method_t *m)
 {
-    if (!jl_has_open_set((jl_value_t*)m->sig)) // one bit; false for every Base method (I3)
+    if (!jl_has_open_set_in((jl_value_t*)m->sig)) // one bit; false for every Base method (I3)
         return;
     open_set_walk_names((jl_value_t*)m->sig, m, 0);
 }
@@ -3012,10 +3012,25 @@ static int has_key(jl_genericmemory_t *keys, jl_value_t *key)
     return 0;
 }
 
-// Check if m2 is in m1's interferences set, which means !morespecific(m1, m2)
+// a signature's open-set bit (its tuple type's, which covers its variables' bounds); inline
+STATIC_INLINE int sig_has_open_set(jl_value_t *sig) JL_NOTSAFEPOINT
+{
+    while (jl_is_unionall(sig))
+        sig = ((jl_unionall_t*)sig)->body;
+    return jl_is_datatype(sig) && ((jl_datatype_t*)sig)->has_open_set;
+}
+
+// Check if m2 is in m1's interferences set, which means !morespecific(m1, m2).
+// The set is recorded when a method is inserted. A pair at open sets is asked again in the
+// query's world: a later membership can order two sets (compiler §5.2), and memberships only
+// grow, so the recorded set over-states such a pair's ambiguity and never under-states it.
 static int method_in_interferences(jl_method_t *m2, jl_method_t *m1)
 {
-    return has_key(jl_atomic_load_relaxed(&m1->interferences), (jl_value_t*)m2);
+    if (!has_key(jl_atomic_load_relaxed(&m1->interferences), (jl_value_t*)m2))
+        return 0;
+    if (sig_has_open_set((jl_value_t*)m1->sig) && sig_has_open_set((jl_value_t*)m2->sig))
+        return !jl_method_morespecific(m1, m2);
+    return 1;
 }
 
 // Find the index of a method in the method match array
@@ -5256,7 +5271,7 @@ static void member_hook_at_dispatch(jl_tupletype_t *tt, size_t world)
     roots[0] = (jl_value_t*)matc;
     jl_value_t *sig = jl_unwrap_unionall((jl_value_t*)matc->method->sig);
     size_t ns = jl_nparams(sig);
-    if (jl_has_open_set(sig) && ns > 0) {
+    if (jl_has_open_set_in(sig) && ns > 0) {
         for (size_t i = 1; i < n; i++) {
             size_t j = i < ns ? i : ns - 1;
             jl_value_t *p = jl_tparam(sig, j);
@@ -5679,7 +5694,7 @@ static int ml_matches_visitor(jl_typemap_entry_t *ml, struct typemap_intersectio
     // a match that holds only through membership entries is valid only while
     // those entries live (I2: this is the dispatch-side world bound — inference
     // intersects it into sv.world.valid_worlds the way it does method worlds)
-    if (jl_has_open_set((jl_value_t*)ml->sig)) {
+    if (sig_has_open_set((jl_value_t*)ml->sig)) {
         size_t lo = 1, hi = ~(size_t)0;
         if (jl_membership_world_range(closure->match.ti, closure->world, &lo, &hi)) {
             if (closure->match.min_valid < lo)
@@ -6510,7 +6525,10 @@ JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t 
                             gc[3] = jl_type_intersection(gc[3], gc[4]);
                             if (gc[3] != jl_bottom_type &&
                                 ambiguous_at(mtX, mX, mY, gc[3], entry_min_world)) {
-                                membership_ambig_warn(mX, X, Y, member, gc[3]);
+                                // the joint method: the two signatures' intersection, where the
+                                // two sets meet as All{X, Y} (§4.9); at the member where it is empty
+                                gc[4] = jl_type_intersection((jl_value_t*)mX->sig, (jl_value_t*)mY->sig);
+                                membership_ambig_warn(mX, X, Y, member, gc[4] != jl_bottom_type ? gc[4] : gc[3]);
                                 jl_array_ptr_1d_push(warned, fX);
                             }
                         }

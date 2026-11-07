@@ -123,7 +123,7 @@ static int open_set_witness(jl_value_t *v) JL_NOTSAFEPOINT
     return 0;
 }
 
-int jl_has_open_set_in(jl_value_t *v) JL_NOTSAFEPOINT
+int jl_open_set_witness(jl_value_t *v) JL_NOTSAFEPOINT
 {
     return open_set_witness(v);
 }

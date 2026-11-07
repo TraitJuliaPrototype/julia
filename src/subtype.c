@@ -550,6 +550,8 @@ int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
         return 1;
     if (jl_is_unionall(a)) a = jl_unwrap_unionall(a);
     if (jl_is_unionall(b)) b = jl_unwrap_unionall(b);
+    if (jl_is_all_type(a) || jl_is_all_type(b))
+        return 0; // an intersection meets what each component meets (compiler §4.9)
     if (jl_is_uniontype(a))
         return obviously_disjoint(((jl_uniontype_t *)a)->a, b, specificity) &&
                obviously_disjoint(((jl_uniontype_t *)a)->b, b, specificity);
@@ -1127,9 +1129,17 @@ static int forall_exists_equal(jl_value_t *x, jl_value_t *y, jl_stenv_t *e);
 // the task's world age. With no task (0), a query sees every entry.
 
 // set the task's query world, returning the previous value for the caller to restore
+// the current task, or NULL on a thread without one; inline, since method matching and
+// subtyping ask it on every query
+STATIC_INLINE jl_task_t *query_task(void) JL_NOTSAFEPOINT
+{
+    jl_gcframe_t **pgcstack = jl_get_pgcstack();
+    return pgcstack == NULL ? NULL : container_of(pgcstack, jl_task_t, gcstack);
+}
+
 JL_DLLEXPORT size_t jl_set_membership_query_world(size_t world) JL_NOTSAFEPOINT
 {
-    jl_task_t *ct = jl_get_current_task();
+    jl_task_t *ct = query_task();
     if (ct == NULL)
         return 0;
     size_t last = ct->membership_world;
@@ -1140,13 +1150,13 @@ JL_DLLEXPORT size_t jl_set_membership_query_world(size_t world) JL_NOTSAFEPOINT
 // the task's query world (0: unset)
 JL_DLLEXPORT size_t jl_membership_query_world(void) JL_NOTSAFEPOINT
 {
-    jl_task_t *ct = jl_get_current_task();
+    jl_task_t *ct = query_task();
     return ct ? ct->membership_world : 0;
 }
 
 static size_t jl_membership_world(void) JL_NOTSAFEPOINT
 {
-    jl_task_t *ct = jl_get_current_task();
+    jl_task_t *ct = query_task();
     if (ct && ct->membership_world)
         return ct->membership_world;
     return ct ? ct->world_age : 0;
@@ -1624,7 +1634,7 @@ JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *
 // membership entry is live in world 1, since each is declared in a later one.
 JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b)
 {
-    if (!jl_has_open_set(a) && !jl_has_open_set(b))
+    if (!jl_has_open_set_in(a) && !jl_has_open_set_in(b))
         return jl_subtype(a, b);
     size_t last = jl_set_membership_query_world(1);
     int r = jl_subtype(a, b);
@@ -1641,6 +1651,28 @@ JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X)
 {
     jl_value_t *su = jl_unwrap_unionall(S);
     jl_value_t *xu = jl_unwrap_unionall(X);
+    // an intersection (compiler §4.9): S could join All{Z, W} when it is in, or could join, each
+    // component; All{X, Y} could join X' when some component could
+    if (jl_is_all_type(xu)) {
+        jl_value_t *tup = jl_tparam0(xu);
+        if (!jl_is_tuple_type(tup))
+            return 1;
+        for (size_t i = 0; i < jl_nparams(tup); i++) {
+            jl_value_t *c = jl_tparam(tup, i);
+            if (!(jl_subtype(S, c) || jl_could_join(S, c)))
+                return 0;
+        }
+        return 1;
+    }
+    if (jl_is_all_type(su)) {
+        jl_value_t *tup = jl_tparam0(su);
+        if (!jl_is_tuple_type(tup))
+            return 1;
+        for (size_t i = 0; i < jl_nparams(tup); i++)
+            if (jl_could_join(jl_tparam(tup, i), X))
+                return 1;
+        return 0;
+    }
     if (jl_is_uniontype(xu))
         return jl_could_join(S, ((jl_uniontype_t*)xu)->a) || jl_could_join(S, ((jl_uniontype_t*)xu)->b);
     if (jl_is_uniontype(su))
@@ -1692,6 +1724,8 @@ JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X)
         return 0;
     jl_value_t *su = jl_unwrap_unionall(S);
     jl_value_t *xu = jl_unwrap_unionall(X);
+    if (jl_is_all_type(su) || jl_is_all_type(xu))
+        return 1; // an intersection's answer may come through an entry (compiler §4.9)
     if (!jl_is_datatype(su) || !jl_is_datatype(xu) || jl_is_uniontype(xu))
         return 1;
     if (jl_is_type_type(su) && ((jl_datatype_t*)xu)->name->open_set)
@@ -1727,7 +1761,7 @@ JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X)
 // orientation-free pair relevance used by codegen (item 10e)
 JL_DLLEXPORT int jl_membership_flip_possible(jl_value_t *a, jl_value_t *b)
 {
-    if (!jl_has_open_set(a) && !jl_has_open_set(b))
+    if (!jl_has_open_set_in(a) && !jl_has_open_set_in(b))
         return 0;
     return jl_could_join(a, b) || jl_could_join(b, a);
 }
@@ -2050,6 +2084,32 @@ static int has_existential_typevar(jl_value_t *x, jl_stenv_t *e) JL_NOTSAFEPOINT
 // (as opposed to being outside any type constructor, or comparing variable bounds).
 // this is used to record the positions where type variables occur for the
 // diagonal rule (record_var_occurrence).
+// x <: All{Z, W}: x is a subtype of each component, in the same environment (compiler §4.9)
+static int subtype_all_right(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
+{
+    jl_value_t *tup = jl_tparam0(y);
+    if (!jl_is_datatype(tup))
+        return 0; // All{T} with T a variable: no components to ask
+    for (size_t i = 0; i < jl_nparams(tup); i++)
+        if (!subtype(x, jl_tparam(tup, i), e, param))
+            return 0;
+    return 1;
+}
+
+// All{X, Y} <: y: some component is a subtype of y (compiler §4.9). The component is chosen
+// as an element of a Union on the right is, by the walk's decisions, so that the outer loop
+// backtracks over the choice with the rest of the walk.
+static int subtype_all_left(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
+{
+    jl_value_t *tup = jl_tparam0(x);
+    if (!jl_is_tuple_type(tup))
+        return 0;
+    size_t n = jl_nparams(tup), i = 0;
+    while (i + 1 < n && pick_union_decision(e, 1))
+        i++;
+    return subtype(jl_tparam(tup, i), y, e, param);
+}
+
 static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
 {
     if (jl_is_uniontype(x)) {
@@ -2158,7 +2218,7 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
     jl_value_t *ux = jl_unwrap_unionall(x);
     jl_value_t *uy = jl_unwrap_unionall(y);
     if ((x != ux || y != uy) && y != (jl_value_t*)jl_any_type && jl_is_datatype(ux) && jl_is_datatype(uy) &&
-        !jl_is_type_type(ux)) {
+        !jl_is_type_type(ux) && !jl_is_all_type(ux) && !jl_is_all_type(uy)) {
         assert(ux);
         if (uy == (jl_value_t*)jl_any_type)
             return 1;
@@ -2181,6 +2241,14 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
     if (jl_is_datatype(x) && jl_is_datatype(y)) {
         if (x == y) return 1;
         if (y == (jl_value_t*)jl_any_type) return 1;
+        // intersections (compiler §4.9): x <: All{Z, W} when x is a subtype of each component,
+        // checked in the same environment as a tuple's parameters are; All{X, Y} <: y when some
+        // component is a subtype of y
+        // the wrapper Core.All (a variable for the components) takes the ordinary rule below
+        if (jl_is_all_type(y) && jl_is_tuple_type(jl_tparam0(y)))
+            return subtype_all_right(x, y, e, param);
+        if (jl_is_all_type(x) && !(jl_is_all_type(y) && !jl_is_tuple_type(jl_tparam0(y))))
+            return subtype_all_left(x, y, e, param);
         jl_datatype_t *xd = (jl_datatype_t*)x, *yd = (jl_datatype_t*)y;
         if (jl_is_type_type(x) && !jl_is_type_type(y)) {
             jl_value_t *tp0 = jl_tparam0(xd);
@@ -2667,6 +2735,9 @@ static int obvious_subtype(jl_value_t *x, jl_value_t *y, jl_value_t *y0, int *su
         *subtype = jl_egal(x, y);
         return 1;
     }
+    // x and y are unwrapped here: an intersection takes the full walk (compiler §4.9)
+    if (jl_is_all_type(x) || jl_is_all_type(y))
+        return 0;
     if (jl_is_uniontype(x)) {
         // TODO: consider handling more LHS unions, being wary of covariance
         if (obvious_subtype(((jl_uniontype_t*)x)->a, y, y0, subtype) && *subtype) {
@@ -3591,6 +3662,9 @@ static int var_occurs_inside(jl_value_t *v, jl_tvar_t *var, int inside, int want
     }
     else if (jl_is_datatype(v)) {
         size_t i;
+        if (jl_is_all_type(v) && jl_is_tuple_type(jl_tparam0(v)))
+            // an intersection's components are covariant positions, as a tuple's (compiler §4.9)
+            return var_occurs_inside(jl_tparam0(v), var, inside, want_inv);
         int istuple = jl_is_tuple_type(v);
         for (i=0; i < jl_nparams(v); i++) {
             int ins_i = inside || !want_inv || !istuple;
@@ -4139,6 +4213,8 @@ static int always_occurs_cov(jl_value_t *v, jl_tvar_t *var, int param) JL_NOTSAF
         return vm->T && always_occurs_cov(vm->T, var, param);
     }
     else if (jl_is_datatype(v)) {
+        if (jl_is_all_type(v) && jl_is_tuple_type(jl_tparam0(v)))
+            return always_occurs_cov(jl_tparam0(v), var, param); // covariant components (compiler §4.9)
         int nparam = jl_is_tuple_type(v) ? 1 : param;
         for (size_t i = 0; i < jl_nparams(v); i++) {
             if (always_occurs_cov(jl_tparam(v, i), var, nparam))
@@ -4742,6 +4818,63 @@ static int has_typevar_via_env(jl_value_t *x, jl_tvar_t *t, jl_stenv_t *e)
 // (as opposed to being outside any type constructor, or comparing variable bounds).
 // this is used to record the positions where type variables occur for the
 // diagonal rule (record_var_occurrence).
+// x ∩ All{Z, W}: x met with each component in the same environment, and the results'
+// intersection in its normal form (compiler §4.9). x is met with the components, never with
+// a partial result, so no intersection is built and met again.
+static jl_value_t *intersect_with_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
+{
+    int R = !jl_is_all_type(y);                 // the intersection is on the left
+    jl_value_t *all = R ? x : y;
+    jl_value_t *other = R ? y : x;
+    jl_value_t *tup = jl_tparam0(all);
+    if (!jl_is_datatype(tup))
+        return jl_bottom_type;
+    size_t i, n = jl_nparams(tup);
+    jl_value_t **rs;
+    JL_GC_PUSHARGS(rs, n + 1);
+    for (i = 0; i < n; i++) {
+        jl_value_t *c = jl_tparam(tup, i);
+        rs[i] = R ? intersect(c, other, e, param) : intersect(other, c, e, param);
+        if (rs[i] == jl_bottom_type) {
+            JL_GC_POP();
+            return jl_bottom_type;
+        }
+    }
+    jl_value_t *res = rs[0];
+    JL_TRY {
+        res = jl_type_all(rs, n);
+    }
+    JL_CATCH {
+        res = rs[0];                            // x ∩ Z covers x ∩ All{Z, W}
+    }
+    rs[n] = res;
+    JL_GC_POP();
+    return res;
+}
+
+// A closed type with subtypes that may be members of an open set: an abstract type other
+// than a tuple type or a type value's
+static int meets_open(jl_value_t *t)
+{
+    jl_datatype_t *d = (jl_datatype_t*)t;
+    return d->name->abstract && !jl_is_tuple_type(t) && !jl_is_type_type(t) && !jl_is_all_type(t);
+}
+
+// An open set meets a set or an abstract type that no entry relates to it as their
+// intersection All{X, T} (compiler §4.7, §4.9): the members of X below T, now or later.
+static jl_value_t *meet_open(jl_value_t *x, jl_value_t *y)
+{
+    jl_value_t *ts[2] = {x, y};
+    jl_value_t *r = jl_bottom_type;
+    JL_TRY {
+        r = jl_type_all(ts, 2);
+    }
+    JL_CATCH {
+        r = jl_bottom_type;
+    }
+    return r;
+}
+
 static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
 {
     if (x == y) return y;
@@ -4960,6 +5093,8 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
         return intersect_unionall(x, (jl_unionall_t*)y, e, 1, param);
     if (jl_is_datatype(x) && jl_is_datatype(y)) {
         jl_datatype_t *xd = (jl_datatype_t*)x, *yd = (jl_datatype_t*)y;
+        if (param < 2 && (jl_is_all_type(x) || jl_is_all_type(y)))
+            return intersect_with_all(x, y, e, param);
         if (param < 2) {
             // a type value meets a set by an entry for Type{S} (compiler §4.5)
             if (jl_is_type_type(x)) {
@@ -5026,11 +5161,18 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
                 yd = yd->super;
             if (yd == jl_any_type) {
                 // the chains missed: a membership is a supertype too (compiler §4.5)
-                if (((jl_datatype_t*)y)->name->open_set)
-                    return intersect_membership((jl_datatype_t*)x, y, e, 0, param);
-                if (((jl_datatype_t*)x)->name->open_set)
-                    return intersect_membership((jl_datatype_t*)y, x, e, 1, param);
-                return jl_bottom_type;
+                int xo = ((jl_datatype_t*)x)->name->open_set, yo = ((jl_datatype_t*)y)->name->open_set;
+                jl_value_t *r = jl_bottom_type;
+                if (yo)
+                    r = intersect_membership((jl_datatype_t*)x, y, e, 0, param);
+                if (r == jl_bottom_type && xo)
+                    r = intersect_membership((jl_datatype_t*)y, x, e, 1, param);
+                // a set meets a set or an abstract type that no entry relates as their
+                // intersection (compiler §4.7, §4.9); a concrete non-member does not meet it
+                if (r == jl_bottom_type && param < 2 &&
+                    ((xo && (yo || meets_open(y))) || (yo && meets_open(x))))
+                    r = meet_open(x, y);
+                return r;
             }
             return intersect_sub_datatype((jl_datatype_t*)y, xd, e, 1, param);
         }
@@ -6079,6 +6221,40 @@ int tuple_cmp_typeofbottom(jl_datatype_t *a, jl_datatype_t *b)
     newenv.val = (jl_value_t*)(intptr_t)count_occurs(ub->body, ub->var); \
     return type_morespecific_(a, ub->body, a0, b0, invariant, &newenv)
 
+// a component at least as specific as t: the same type, or more specific
+static int all_component_covers(jl_value_t *c, jl_value_t *t, jl_value_t *a0, jl_value_t *b0, jl_typeenv_t *env)
+{
+    return c == t || eq_msp(c, t, a0, b0, env) || type_morespecific_(c, t, a0, b0, 0, env);
+}
+
+// a at least as specific as b where either is an intersection (compiler §5.2): an
+// intersection is as specific as b when one of its components is; a type is as specific as
+// an intersection when it is as specific as each component. So an intersection is more
+// specific than each component, and one with a closed component ranks as closed against an
+// open set, by the rule for closed and open types at each component.
+static int all_covers(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_value_t *b0, jl_typeenv_t *env)
+{
+    if (jl_is_all_type(b)) {
+        jl_value_t *tb = jl_tparam0(b);
+        if (!jl_is_datatype(tb))
+            return 0;
+        for (size_t j = 0; j < jl_nparams(tb); j++)
+            if (!all_covers(a, jl_tparam(tb, j), a0, b0, env))
+                return 0;
+        return 1;
+    }
+    if (jl_is_all_type(a)) {
+        jl_value_t *ta = jl_tparam0(a);
+        if (!jl_is_datatype(ta))
+            return 0;
+        for (size_t i = 0; i < jl_nparams(ta); i++)
+            if (all_component_covers(jl_tparam(ta, i), b, a0, b0, env))
+                return 1;
+        return 0;
+    }
+    return all_component_covers(a, b, a0, b0, env);
+}
+
 static int type_morespecific_(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_value_t *b0, int invariant, jl_typeenv_t *env)
 {
     if (a == b)
@@ -6161,6 +6337,10 @@ static int type_morespecific_(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_v
             return !type_morespecific_(b, a, b0, a0, invariant, env);
         return 0;
     }
+
+    if (!invariant && (jl_is_all_type(a) || jl_is_all_type(b)) &&
+        (jl_is_datatype(a) || jl_is_typevar(a)) && (jl_is_datatype(b) || jl_is_typevar(b)))
+        return all_covers(a, b, a0, b0, env) && !all_covers(b, a, b0, a0, env);
 
     if (jl_is_datatype(a) && jl_is_datatype(b)) {
         jl_datatype_t *tta = (jl_datatype_t*)a, *ttb = (jl_datatype_t*)b;
@@ -6310,7 +6490,7 @@ JL_DLLEXPORT int jl_type_morespecific(jl_value_t *a, jl_value_t *b)
     // when either side mentions an open set (a memoized bit); with no open set
     // anywhere the two bit reads are false and behavior is unchanged. The full
     // walk still answers 0 for genuinely unordered pairs.
-    if (!(jl_has_open_set(a) || jl_has_open_set(b)) && obviously_disjoint(a, b, 1))
+    if (!(jl_has_open_set_in(a) || jl_has_open_set_in(b)) && obviously_disjoint(a, b, 1))
         return 0;
     if (jl_has_free_typevars(a) || jl_has_free_typevars(b))
         return 0;
@@ -6333,7 +6513,7 @@ JL_DLLEXPORT int jl_method_morespecific(jl_method_t *ma, jl_method_t *mb)
     jl_value_t *a = (jl_value_t*)ma->sig;
     jl_value_t *b = (jl_value_t*)mb->sig;
     // the same open-set skip as jl_type_morespecific above
-    if (!(jl_has_open_set(a) || jl_has_open_set(b)) && obviously_disjoint(a, b, 1))
+    if (!(jl_has_open_set_in(a) || jl_has_open_set_in(b)) && obviously_disjoint(a, b, 1))
         return 0;
     if (jl_has_free_typevars(a) || jl_has_free_typevars(b))
         return 0;

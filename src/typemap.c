@@ -434,8 +434,9 @@ static int tname_intersection(jl_value_t *a, jl_typename_t *bname, int8_t tparam
             if (!jl_is_datatype(a))
                 return tname_intersection(a, bname, 0);
         }
-        // a set's members need not have it on their supertype chains (compiler §4.4): any name may meet it
-        if (((jl_datatype_t*)a)->name->open_set)
+        // a set's members need not have it on their supertype chains (compiler §4.4), nor an
+        // intersection's (§4.9): any name may meet them
+        if (((jl_datatype_t*)a)->name->open_set || jl_is_all_type(a))
             return 1;
         return tname_intersection_dt((jl_datatype_t*)a, bname, jl_supertype_height((jl_datatype_t*)a));
     }
@@ -475,8 +476,8 @@ static int jl_typemap_intersection_memory_visitor(jl_genericmemory_t *a, jl_valu
             ttype = jl_type_extract_name(ttype, tparam & 1);
             tydt = ttype ? (jl_datatype_t*)jl_unwrap_unionall(((jl_typename_t*)ttype)->wrapper) : NULL;
         }
-        if (tydt != NULL && tydt != jl_any_type && tydt->name->open_set)
-            tydt = jl_any_type;                     // a set meets any name (compiler §4.4)
+        if (tydt != NULL && tydt != jl_any_type && (tydt->name->open_set || jl_is_all_type((jl_value_t*)tydt)))
+            tydt = jl_any_type;                     // a set or an intersection meets any name (compiler §4.4, §4.9)
         if (tydt == jl_any_type)
             ty = (jl_value_t*)jl_any_type;
         else if (tydt == NULL)
@@ -1457,7 +1458,7 @@ static void jl_typemap_level_insert_(
     // that return early without reaching a level's linear list are the subtype=0
     // lookups, which reach only jl_method_table->defs — the builtin-only table
     // where this bit is false, so their type-equality premise keeps holding.
-    if (jl_has_open_set((jl_value_t*)newrec->sig)) {
+    if (jl_has_open_set_in((jl_value_t*)newrec->sig)) {
         jl_typemap_list_insert_(map, &cache->linear, (jl_value_t*)cache, newrec);
         return;
     }
