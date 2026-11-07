@@ -527,7 +527,17 @@
   (and (length> e 1) (eq? (car e) 'meta)))
 
 (define (method-meta-sym? x)
-  (memq x '(inline noinline aggressive_constprop no_constprop propagate_inbounds)))
+  (or (memq x '(inline noinline aggressive_constprop no_constprop propagate_inbounds))
+      (policy-meta-sym? x)))
+
+;; a method's policy (compiler §2.2): lowering carries it into every method a definition makes
+(define (policy-meta-sym? x)
+  (memq x '(facts_boundary facts_always)))
+
+(define (policy-metas stmts)
+  (let ((syms (apply append (map (lambda (e) (filter policy-meta-sym? (cdr e)))
+                                 (filter meta? stmts)))))
+    (if (null? syms) '() `((meta ,@syms)))))
 
 (define (propagate-method-meta e)
   `(meta ,@(filter (lambda (x)

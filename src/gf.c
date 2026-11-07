@@ -405,7 +405,7 @@ static int mi_policy_uncached(jl_method_instance_t *mi) JL_NOTSAFEPOINT
     jl_value_t *def = mi->def.value;
     if (jl_is_method(def))
         return jl_method_policy((jl_method_t*)def);
-    if (jl_is_module(def)) {
+    if (jl_is_module(def) && jl_options.trim == JL_TRIM_NO) {
         int8_t mf = ((jl_module_t*)def)->facts;
         if (mf == 1)
             return JL_POLICY_FACTS;

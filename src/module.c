@@ -772,6 +772,8 @@ static int method_is_builtin(jl_method_t *m) JL_NOTSAFEPOINT
 // method plain, and under the test bed the policy of the code that reaches it. A builtin is plain.
 JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT
 {
+    if (jl_options.trim != JL_TRIM_NO)
+        return JL_POLICY_PLAIN; // a trimmed build has no facts policy (compiler §2.6)
     int8_t mf = m->module->facts;
     if (mf == 2)
         return JL_POLICY_PLAIN;
