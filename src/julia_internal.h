@@ -450,6 +450,9 @@ extern jl_array_t *_jl_debug_method_invalidation JL_GLOBALLY_ROOTED;
 extern jl_array_t *open_set_methods JL_GLOBALLY_ROOTED;
 // the member hook (gf.c, compiler §10.4), rooted alongside it
 extern jl_value_t *jl_member_hook JL_GLOBALLY_ROOTED;
+extern jl_value_t *jl_fully_typed_hook JL_GLOBALLY_ROOTED;
+extern jl_value_t *jl_method_deletion_hook JL_GLOBALLY_ROOTED;
+void jl_call_deletion_hook(jl_method_t *m);
 extern jl_value_t *jl_method_definition_hook JL_GLOBALLY_ROOTED; // the library's hooks (gf.c, compiler §10.1)
 extern jl_value_t *jl_image_methods_hook JL_GLOBALLY_ROOTED;
 extern jl_value_t *jl_module_end_hook JL_GLOBALLY_ROOTED;
@@ -775,6 +778,7 @@ JL_DLLEXPORT jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t
 #define JL_REACH_FACTS 1
 #define JL_REACH_RUNTIME 2
 JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_method_fully_typed(jl_method_t *m) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_compile_by_facts_all(void) JL_NOTSAFEPOINT;
 // whether the code of `mi` reached with `reach` is compiled by facts
 JL_DLLEXPORT int jl_mi_policy_at(jl_method_instance_t *mi, int reach) JL_NOTSAFEPOINT;
@@ -2130,6 +2134,8 @@ JL_DLLEXPORT int jl_isabspath(const char *in) JL_NOTSAFEPOINT;
     XX(facts_sym) \
     XX(facts_boundary_sym) \
     XX(facts_always_sym) \
+    XX(fully_typed_warn_sym) \
+    XX(fully_typed_enforce_sym) \
     XX(trait_option_sym) \
     XX(meta_sym) \
     XX(method_sym) \

@@ -2506,6 +2506,34 @@ static void jl_index_open_set_methods(jl_method_t *m)
     open_set_walk_names((jl_value_t*)m->sig, m, 0);
 }
 
+// The methods whose signatures name the set (its TypeName, or a type of it): the set-to-methods
+// index (compiler §5.1), for compiling ahead (§9; traits §16). Each method once, in index order.
+JL_DLLEXPORT jl_value_t *jl_open_set_methods_of(jl_value_t *set)
+{
+    jl_value_t *uw = jl_unwrap_unionall(set);
+    jl_typename_t *tn = jl_is_typename(uw) ? (jl_typename_t*)uw :
+                        jl_is_datatype(uw) ? ((jl_datatype_t*)uw)->name : NULL;
+    jl_array_t *out = jl_alloc_vec_any(0);
+    if (tn == NULL)
+        return (jl_value_t*)out;
+    JL_GC_PUSH1(&out);
+    JL_LOCK(&open_set_methods_lock);
+    size_t n = open_set_methods ? jl_array_nrows(open_set_methods) : 0;
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        if (jl_array_ptr_ref(open_set_methods, i) != (jl_value_t*)tn)
+            continue;
+        jl_value_t *m = jl_array_ptr_ref(open_set_methods, i + 1);
+        int dup = 0;
+        for (size_t k = 0; k < jl_array_nrows(out); k++)
+            dup |= jl_array_ptr_ref(out, k) == m;
+        if (!dup)
+            jl_array_ptr_1d_push(out, m);
+    }
+    JL_UNLOCK(&open_set_methods_lock);
+    JL_GC_POP();
+    return (jl_value_t*)out;
+}
+
 static int is_set_type(jl_value_t *t) JL_NOTSAFEPOINT
 {
     if (jl_is_typevar(t))
@@ -3550,6 +3578,7 @@ static void lower_callable_dispatch(jl_method_t *method, size_t max_world)
 
 JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
 {
+    jl_call_deletion_hook(method); // strict mode may refuse it (compiler §10.2)
     jl_methtable_t *mt = jl_method_get_table(method);
     jl_typemap_entry_t *methodentry = do_typemap_search(mt, method);
     JL_LOCK(&world_counter_lock);
@@ -6031,6 +6060,45 @@ JL_DLLEXPORT void jl_set_member_hook(jl_value_t *hook)
     jl_member_hook = hook == jl_nothing ? NULL : hook;
 }
 
+// Fully typed mode (compiler §2.7): the compiler puts a call of `jl_not_fully_typed` at the start of
+// code that fails it, with the site `svec(mi, level, warned, kind, rt)`. The library's hook (site)
+// warns or raises; under warn it runs once per site. Run in the latest world.
+jl_value_t *jl_fully_typed_hook JL_GLOBALLY_ROOTED = NULL;
+JL_DLLEXPORT void jl_set_fully_typed_hook(jl_value_t *hook)
+{
+    jl_fully_typed_hook = hook == jl_nothing ? NULL : hook;
+}
+JL_DLLEXPORT void jl_not_fully_typed(jl_value_t *site)
+{
+    if (!jl_is_svec(site) || jl_svec_len(site) < 3 || jl_svecref(site, 2) != jl_false)
+        return;
+    int enforce = jl_unbox_long(jl_svecref(site, 1)) == 2;
+    if (!enforce)
+        jl_svecset(site, 2, jl_true);
+    jl_value_t *hook = jl_fully_typed_hook;
+    if (hook == NULL) {
+        if (enforce)
+            jl_error("the code is not fully typed (fully typed mode)");
+        return;
+    }
+    jl_task_t *ct = jl_current_task;
+    size_t last_age = ct->world_age;
+    ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 2);
+    args[0] = hook;
+    args[1] = site;
+    JL_TRY {
+        jl_apply(args, 2);
+    }
+    JL_CATCH {
+        ct->world_age = last_age;
+        jl_rethrow();
+    }
+    ct->world_age = last_age;
+    JL_GC_POP();
+}
+
 // The library's definition, image and module-end hooks (compiler §10.1). Each runs in the latest
 // world, outside the world counter's lock, not for a definition a hook makes, and not while the
 // system image is built. They are rooted for the collectors.
@@ -6048,6 +6116,13 @@ JL_DLLEXPORT void jl_set_image_methods_hook(jl_value_t *hook)
 JL_DLLEXPORT void jl_set_module_end_hook(jl_value_t *hook)
 {
     jl_module_end_hook = hook == jl_nothing ? NULL : hook;
+}
+// Strict mode's deletion hook (compiler §10.2): hook(m), before a method is deleted; it may throw to
+// refuse the deletion.
+jl_value_t *jl_method_deletion_hook JL_GLOBALLY_ROOTED = NULL;
+JL_DLLEXPORT void jl_set_method_deletion_hook(jl_value_t *hook)
+{
+    jl_method_deletion_hook = hook == jl_nothing ? NULL : hook;
 }
 
 static _Thread_local int library_hook_depth = 0;
@@ -6086,6 +6161,19 @@ void jl_call_definition_hook(jl_method_t *m, int after)
     args[1] = (jl_value_t*)m;
     args[2] = after ? jl_true : jl_false;
     call_library_hook(args, 3);
+    JL_GC_POP();
+}
+
+// before a method is deleted (it may throw to refuse it)
+void jl_call_deletion_hook(jl_method_t *m)
+{
+    if (jl_method_deletion_hook == NULL)
+        return;
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 2);
+    args[0] = jl_method_deletion_hook;
+    args[1] = (jl_value_t*)m;
+    call_library_hook(args, 2);
     JL_GC_POP();
 }
 

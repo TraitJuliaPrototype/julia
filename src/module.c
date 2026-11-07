@@ -777,9 +777,10 @@ JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT
     int8_t mf = m->module->facts;
     if (mf == 2)
         return JL_POLICY_PLAIN;
-    if (m->facts == 2)
-        return JL_POLICY_FACTS;
-    if (m->facts == 1)
+    int flag = m->facts & 3;
+    if (flag == 2 || jl_method_fully_typed(m) != 0)
+        return JL_POLICY_FACTS; // fully typed mode is checked on the code compiled by facts (compiler §2.7)
+    if (flag == 1)
         return JL_POLICY_CALLER;
     if (mf == 1)
         return JL_POLICY_FACTS;
@@ -792,8 +793,18 @@ JL_DLLEXPORT int jl_method_is_facts(jl_method_t *m) JL_NOTSAFEPOINT
 {
     return jl_method_policy(m) == JL_POLICY_FACTS;
 }
+// Fully typed mode (compiler §2.7): 0 off, 1 warn, 2 enforce; the method's own, else its module's.
+JL_DLLEXPORT int jl_method_fully_typed(jl_method_t *m) JL_NOTSAFEPOINT
+{
+    if (m->facts & 8)
+        return 2;
+    if (m->facts & 4)
+        return 1;
+    uint8_t o = m->module->trait_options;
+    return (o & 32) ? 2 : (o & 16) ? 1 : 0;
+}
 // The trait language's scope options (compiler §2.1), as bits: 1 bounded, 2 no_pirates, 4 dynamic,
-// 8 first_seen.
+// 8 first_seen; fully typed mode 16 warn, 32 enforce.
 JL_DLLEXPORT void jl_set_module_trait_option(jl_module_t *self, int bit, int value)
 {
     if (value)

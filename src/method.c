@@ -958,16 +958,27 @@ JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src)
             if (nargs > 1) {
                 // a policy marker merged into another meta (`pushmeta!`, as `@inline` does): the meta stays
                 for (size_t k = 0; k < nargs; k++) {
-                    if (jl_exprarg(st, k) == (jl_value_t*)jl_facts_boundary_sym)
-                        m->facts = 1;
-                    else if (jl_exprarg(st, k) == (jl_value_t*)jl_facts_always_sym)
-                        m->facts = 2;
+                    jl_value_t *ak = jl_exprarg(st, k);
+                    if (ak == (jl_value_t*)jl_facts_boundary_sym)
+                        m->facts = (m->facts & ~3) | 1;
+                    else if (ak == (jl_value_t*)jl_facts_always_sym)
+                        m->facts = (m->facts & ~3) | 2;
+                    else if (ak == (jl_value_t*)jl_fully_typed_warn_sym)
+                        m->facts = (m->facts & 3) | 4;
+                    else if (ak == (jl_value_t*)jl_fully_typed_enforce_sym)
+                        m->facts = (m->facts & 3) | 8;
                 }
             }
             if (nargs == 1 && (jl_exprarg(st, 0) == (jl_value_t*)jl_facts_boundary_sym ||
                                jl_exprarg(st, 0) == (jl_value_t*)jl_facts_always_sym)) {
                 // the method's policy (compiler §2.2): a boundary, or always facts
-                m->facts = jl_exprarg(st, 0) == (jl_value_t*)jl_facts_always_sym ? 2 : 1;
+                m->facts = (m->facts & ~3) | (jl_exprarg(st, 0) == (jl_value_t*)jl_facts_always_sym ? 2 : 1);
+                st = jl_nothing;
+            }
+            else if (nargs == 1 && (jl_exprarg(st, 0) == (jl_value_t*)jl_fully_typed_warn_sym ||
+                                    jl_exprarg(st, 0) == (jl_value_t*)jl_fully_typed_enforce_sym)) {
+                // fully typed mode (compiler §2.7): warn, or enforce
+                m->facts = (m->facts & 3) | (jl_exprarg(st, 0) == (jl_value_t*)jl_fully_typed_enforce_sym ? 8 : 4);
                 st = jl_nothing;
             }
             else if (nargs >= 1 && jl_exprarg(st, 0) == (jl_value_t*)jl_nospecialize_sym) {

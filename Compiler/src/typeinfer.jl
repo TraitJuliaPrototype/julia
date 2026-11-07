@@ -577,6 +577,11 @@ function adjust_effects(sv::InferenceState)
         # under the facts mode, no asserted effect applies to a frame that holds a run-time site,
         # itself or in a callee (compiler §1.5)
         (facts_mode(sv.interp) && !is_nortsite(ipo_effects)) || (ipo_effects = adjust_effects(ipo_effects, def))
+        # code that fails fully typed mode starts with the library's check, which warns or raises
+        # (compiler §2.7): never folded, never removed
+        if fully_typed_fault(sv.interp, sv.linfo, ipo_effects, sv.bestguess) != 0
+            ipo_effects = Effects(ipo_effects; consistent=ALWAYS_FALSE, effect_free=ALWAYS_FALSE, nothrow=false)
+        end
     end
 
     return ipo_effects

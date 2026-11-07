@@ -390,7 +390,8 @@ typedef struct _jl_method_t {
     // whether it covers every member of the sets the method is at (a trait's method for an operation)
     jl_value_t *declared_result;
     uint8_t declared_covers;
-    // the policy flag (compiler §2.2): 0 as its module says, 1 a boundary, 2 always facts
+    // the policy flag (compiler §2.2), bits 0-1: 0 as its module says, 1 a boundary, 2 always facts;
+    // fully typed mode (compiler §2.7): 4 warn, 8 enforce
     uint8_t facts;
     // bit flags: the arguments written `@specialize`; at an argument typed by a set, the attribute
     // `Compiled` (compiler §6.3, step 3), as a `nospecialize` bit there gives `Dynamic`

@@ -163,7 +163,7 @@ macro max_methods(n::Int, fdef::Expr)
 end
 
 """
-    Experimental.@compiler_options optimize={0,1,2,3} compile={yes,no,all,min} infer={true,false} max_methods={default,1,2,3,4} facts={true,false} bounded={true,false} no_pirates={true,false} dynamic={true,false} first_seen={true,false}
+    Experimental.@compiler_options optimize={0,1,2,3} compile={yes,no,all,min} infer={true,false} max_methods={default,1,2,3,4} facts={true,false} bounded={true,false} no_pirates={true,false} dynamic={true,false} first_seen={true,false} fully_typed={off,warn,enforce}
 
 Set compiler options for code in the enclosing module. Options correspond directly to
 command-line options with the same name, where applicable. The following options
@@ -178,6 +178,9 @@ are currently supported:
     only at fact signatures; every other call is dispatched when it runs.
   * `bounded`, `no_pirates`, `dynamic`, `first_seen`: the trait language's scope options, which a
     trait library reads.
+  * `fully_typed`: fully typed mode for the module's methods: compiled by facts, and where the code
+    at a signature has a call dispatched when it runs, or a result of an abstract type, it warns at
+    its first run there (`warn`) or raises (`enforce`), through the hook a trait library sets.
 """
 macro compiler_options(args...)
     opts = Expr(:block)
@@ -214,6 +217,11 @@ macro compiler_options(args...)
                 a = a === false || a === :no  ? 0 :
                     a === true  || a === :yes ? 1 : error("invalid argument to \"$(ex.args[1])\" option")
                 push!(opts.args, Expr(:meta, :trait_option, bit << 1 | a))
+            elseif ex.args[1] === :fully_typed
+                a = ex.args[2]
+                a in (:off, :warn, :enforce) || error("invalid argument to \"fully_typed\" option")
+                push!(opts.args, Expr(:meta, :trait_option, 16 << 1 | (a === :warn)))
+                push!(opts.args, Expr(:meta, :trait_option, 32 << 1 | (a === :enforce)))
             else
                 error("unknown option \"$(ex.args[1])\"")
             end

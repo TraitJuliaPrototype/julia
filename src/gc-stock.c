@@ -2910,12 +2910,14 @@ static void gc_mark_roots(jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT
     gc_try_claim_and_push(mq, open_set_methods, NULL); // the set->methods index (gf.c)
     gc_heap_snapshot_record_gc_roots((jl_value_t*)open_set_methods, "open_set_methods");
     gc_try_claim_and_push(mq, jl_member_hook, NULL); // the member hook (gf.c)
+    gc_try_claim_and_push(mq, jl_fully_typed_hook, NULL); // fully typed mode's hook (gf.c)
     gc_heap_snapshot_record_gc_roots(jl_member_hook, "member_hook");
     gc_try_claim_and_push(mq, jl_method_definition_hook, NULL); // the library's hooks (gf.c)
     gc_heap_snapshot_record_gc_roots(jl_method_definition_hook, "method_definition_hook");
     gc_try_claim_and_push(mq, jl_image_methods_hook, NULL);
     gc_heap_snapshot_record_gc_roots(jl_image_methods_hook, "image_methods_hook");
     gc_try_claim_and_push(mq, jl_module_end_hook, NULL);
+    gc_try_claim_and_push(mq, jl_method_deletion_hook, NULL); // strict mode's deletion hook (gf.c)
     gc_heap_snapshot_record_gc_roots(jl_module_end_hook, "module_end_hook");
     gc_try_claim_and_push(mq, jl_declared_memberships, NULL); // this session's memberships (datatype.c)
     gc_try_claim_and_push(mq, jl_set_candidates, NULL); // the sets' candidates (datatype.c)

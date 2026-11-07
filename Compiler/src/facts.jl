@@ -179,3 +179,51 @@ function edges_satisfy_g2(edges::SimpleVector)
     end
     return true
 end
+
+# Fully typed mode (compiler §2.7): a method that asks for it is compiled by facts; where its code at a
+# signature holds a run-time site, itself or in a callee, or returns a value of an abstract type that
+# is not a set, the optimizer puts a call of `jl_not_fully_typed` at the code's start, which reaches
+# the library's hook: it warns at the first run there, or raises at every run. Fully typed code gets
+# no check.
+
+"The method's fully typed mode: 0 off, 1 warn, 2 enforce (its own, else its module's)."
+method_fully_typed(m::Method) = ccall(:jl_method_fully_typed, Cint, (Any,), m)
+
+"""
+Whether a result type fails fully typed mode: abstract, and neither a union of at most four concrete
+types, a type's type, nor a set or an intersection of sets (a value known by its trait is declared).
+"""
+function ft_abstract_result(@nospecialize(rt))
+    (rt === Bottom || isconcretetype(rt) || isType(rt)) && return false
+    if rt isa Union
+        ts = uniontypes(rt)
+        length(ts) <= 4 && all(t -> isconcretetype(t) || isType(t), ts) && return false
+    end
+    ccall(:jl_is_trait_arg_type, Cint, (Any,), rt) != 0 && return false
+    return true
+end
+
+"""
+The fault of `mi`'s code under fully typed mode: 0 none, 1 a run-time site (in it or a callee), 2 a
+result of an abstract type. Only for code compiled by facts of a method that asks for the mode.
+"""
+function fully_typed_fault(interp::AbstractInterpreter, mi::MethodInstance, effects::Effects, @nospecialize(rt))
+    facts_mode(interp) || return 0
+    def = mi.def
+    def isa Method || return 0
+    method_fully_typed(def) == 0 && return 0
+    is_nortsite(effects) || return 1
+    ft_abstract_result(widenconst(ignorelimited(rt))) && return 2
+    return 0
+end
+
+"The check at the start of code that fails fully typed mode: `jl_not_fully_typed(svec(mi, level, warned, kind, rt))`."
+function insert_fully_typed_check!(ir::IRCode, interp::AbstractInterpreter, mi::MethodInstance, result::InferenceResult)
+    kind = fully_typed_fault(interp, mi, result.ipo_effects, result.result)
+    kind == 0 && return ir
+    site = svec(mi, Int(method_fully_typed(mi.def::Method)), false, Int(kind), widenconst(ignorelimited(result.result)))
+    stmt = Expr(:foreigncall, Expr(:tuple, QuoteNode(:jl_not_fully_typed)), Nothing, svec(Any), 0,
+                QuoteNode(:ccall), QuoteNode(site))
+    insert_node!(ir, 1, NewInstruction(stmt, Nothing, NoCallInfo(), nothing, IR_FLAG_NULL))
+    return compact!(ir)
+end

@@ -532,7 +532,7 @@
 
 ;; a method's policy (compiler §2.2): lowering carries it into every method a definition makes
 (define (policy-meta-sym? x)
-  (memq x '(facts_boundary facts_always)))
+  (memq x '(facts_boundary facts_always fully_typed_warn fully_typed_enforce)))
 
 (define (policy-metas stmts)
   (let ((syms (apply append (map (lambda (e) (filter policy-meta-sym? (cdr e)))

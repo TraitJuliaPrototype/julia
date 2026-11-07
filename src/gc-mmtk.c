@@ -541,9 +541,11 @@ JL_DLLEXPORT void jl_gc_scan_vm_specific_roots(RootsWorkClosure* closure)
     add_node_to_roots_buffer(closure, &buf, &len, _jl_debug_method_invalidation);
     add_node_to_roots_buffer(closure, &buf, &len, open_set_methods); // the set->methods index (gf.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_member_hook); // the member hook (gf.c)
+    add_node_to_roots_buffer(closure, &buf, &len, jl_fully_typed_hook); // fully typed mode's hook (gf.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_method_definition_hook); // the library's hooks (gf.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_image_methods_hook);
     add_node_to_roots_buffer(closure, &buf, &len, jl_module_end_hook);
+    add_node_to_roots_buffer(closure, &buf, &len, jl_method_deletion_hook); // strict mode's deletion hook (gf.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_declared_memberships); // this session's memberships (datatype.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_set_candidates); // the sets' candidates (datatype.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_attributed_cache); // Core.attributed_call's cache (builtins.c)
