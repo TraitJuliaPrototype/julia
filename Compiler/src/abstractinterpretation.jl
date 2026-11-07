@@ -70,6 +70,32 @@ function record_match_memberships!(sv::InferenceState, applicable::Vector{Method
         sig = m.method.sig
         ccall(:jl_has_open_set, Cint, (Any,), sig) == 0 && continue
         record_memberships!(sv, m.spec_types, sig)
+        record_callable_dispatch!(sv, m.spec_types, sig)
+    end
+    return nothing
+end
+
+# A match through `Callable{A, S}` rests on the member's own methods (compiler §7.4): the code holds
+# an edge to the member's dispatch at `A`, and is invalidated with it.
+function record_callable_dispatch!(sv::InferenceState, @nospecialize(spec), @nospecialize(sig))
+    s = unwrap_unionall(spec)
+    d = unwrap_unionall(sig)
+    (s isa DataType && d isa DataType) || return nothing
+    cname = unwrap_unionall(Core.Callable).name
+    for i = 2:min(length(s.parameters), length(d.parameters))
+        di = d.parameters[i]
+        di isa TypeVar && (di = di.ub)
+        du = unwrap_unionall(di)
+        (du isa DataType && du.name === cname && length(du.parameters) == 2) || continue
+        F = s.parameters[i]
+        A = du.parameters[1]
+        (isa(F, DataType) && isconcretetype(F) && A isa DataType && A <: Tuple && !has_free_typevars(A)) || continue
+        atype = Tuple{F, A.parameters...}
+        matches = findall(atype, method_table(sv.interp); limit = -1)
+        matches === nothing && continue
+        info = MethodMatchInfo(matches, Core.methodtable, atype, any(m::MethodMatch -> m.fully_covers, matches))
+        add_edges!(sv.edges, info)
+        update_valid_age!(sv, matches.valid_worlds)
     end
     return nothing
 end
@@ -3330,6 +3356,10 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
             ft, ArgInfo(arginfo.fargs, newargtypes), si, sv, #=check=#true)
     end
     wft = widenconst(ft)
+    # a call of a value known as a `Callable{A, S}` (compiler §7.4): its result is `S`, asserted. A
+    # builtin is never a member, though the set meets `Builtin` as an intersection
+    S = callable_result(wft, arginfo.argtypes)
+    S === nothing || return Future(CallMeta(S, Any, Effects(), DeclaredResultInfo(S)))
     if hasintersect(wft, Builtin)
         add_remark!(interp, sv, "Could not identify method table for call")
         return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
@@ -3344,6 +3374,33 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
     atype = argtypes_to_type(arginfo.argtypes)
     atype === Bottom && return Future(CallMeta(Union{}, Union{}, EFFECTS_THROWS, NoCallInfo())) # accidentally unreachable
     return abstract_call_gf_by_type(interp, nothing, arginfo, si, atype, sv, max_methods)::Future
+end
+
+# The declared result of a call of a value known as `Callable{A, S}` (compiler §7.4), or of an
+# intersection of such, the one whose signature the arguments match: `S`, where it is a type with no
+# free variable; else `nothing`
+function callable_result(@nospecialize(ft), argtypes::Vector{Any})
+    u = unwrap_unionall(ft)
+    u isa DataType || return nothing
+    if u.name === unwrap_unionall(Core.Callable).name
+        length(u.parameters) == 2 || return nothing
+        S = u.parameters[2]
+        (S isa Type && !has_free_typevars(S)) || return nothing
+        return S
+    elseif u.name === unwrap_unionall(Core.All).name
+        tup = u.parameters[1]
+        tup isa DataType || return nothing
+        args = argtypes_to_type(Any[widenconst(a) for a in argtypes[2:end]])
+        for c in tup.parameters
+            cu = unwrap_unionall(c)
+            (cu isa DataType && cu.name === unwrap_unionall(Core.Callable).name && length(cu.parameters) == 2) || continue
+            A = cu.parameters[1]
+            (A isa Type && args <: A) || continue
+            S = cu.parameters[2]
+            (S isa Type && !has_free_typevars(S)) && return S
+        end
+    end
+    return nothing
 end
 
 # call where the function is any lattice element
