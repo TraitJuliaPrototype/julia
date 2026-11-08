@@ -549,6 +549,10 @@ end
 VecElement(arg::T) where {T} = VecElement{T}(arg)
 
 eval(Core, quote
+    # `keep(x)` in an instance compiled once (compiler §6.9): `Dynamic{X}(x)`, a `Dynamic`'s object held anew,
+    # as the constructor does; no membership check, since the argument is a member already
+    _keep_dynamic(::Type{T}, @nospecialize(x)) where {T} =
+        (y = isa(x, Dynamic) ? getfield(x, :object) : x; $(Expr(:new, :T, :y)))
     GotoNode(label::Int) = $(Expr(:new, :GotoNode, :label))
     NewvarNode(slot::SlotNumber) = $(Expr(:new, :NewvarNode, :slot))
     QuoteNode(@nospecialize value) = $(Expr(:new, :QuoteNode, :value))

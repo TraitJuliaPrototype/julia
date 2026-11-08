@@ -1834,9 +1834,10 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
             continue
         end
         if isa(info, KeepInfo)
-            # `Core.keep(x)` (compiler §6.9): `x`, or `Dynamic{X}(x)` in an instance compiled once for it
+            # `Core.keep(x)` (compiler §6.9): `x`, or `Dynamic{X}(x)` in an instance compiled once for it,
+            # a `Dynamic`'s object held anew (never a `Dynamic` of a `Dynamic`)
             x = stmt.args[2]
-            ir[SSAValue(idx)][:stmt] = info.T === nothing ? x : Expr(:new, info.T, x)
+            ir[SSAValue(idx)][:stmt] = info.T === nothing ? x : Expr(:call, GlobalRef(Core, :_keep_dynamic), info.T, x)
             continue
         end
         if isa(info, AttributedCallInfo)
