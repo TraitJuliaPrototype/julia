@@ -531,36 +531,75 @@ static jl_array_t *queue_external_cis(jl_array_t *list, jl_query_cache *query_ca
     arraylist_new(&stack, 0);
     jl_array_t *new_ext_cis = jl_alloc_vec_any(0);
     JL_GC_PUSH1(&new_ext_cis);
+    // JULIA_DEBUG_EXTERNAL_CIS=1: the count of each of the tests below, printed at the end (E-306)
+    static int debug_ext = -1;
+    if (debug_ext == -1) {
+        const char *e = getenv("JULIA_DEBUG_EXTERNAL_CIS");
+        debug_ext = e != NULL && e[0] == '1';
+    }
+    size_t n_replaced = 0, n_nohash = 0, n_noinferred = 0, n_internal = 0, n_found1 = 0, n_g2 = 0, n_dropped = 0, n_found2 = 0;
+    size_t n_dropped_facts = 0;
     for (i = n0; i-- > 0; ) {
         jl_code_instance_t *ci = (jl_code_instance_t*)jl_array_ptr_ref(list, i);
         assert(jl_is_code_instance(ci));
         jl_method_instance_t *mi = jl_get_ci_mi(ci);
         jl_method_t *m = mi->def.method;
         int dispatch_status = jl_atomic_load_relaxed(&m->dispatch_status);
-        if (!(dispatch_status & METHOD_SIG_LATEST_WHICH))
+        if (!(dispatch_status & METHOD_SIG_LATEST_WHICH)) {
+            n_replaced++;
             continue; // ignore replaced methods
+        }
         // code specialized on one runtime value whose signature type has no hash (a type value pushed into
         // a `Type[]`, `_push!(::Vector{Type}, ::Type{Union{Tuple{…},…}})`) is not kept: such instances are
         // inserted at load by a scan of the method's whole list of specializations (gf.c,
         // jl_specializations_get_linfo_), and the documentation system can make thousands of them.
         // Dropping compiled code from an image changes no result.
         jl_value_t *ut = jl_unwrap_unionall(mi->specTypes);
-        if (jl_is_datatype(ut) && ((jl_datatype_t*)ut)->hash == 0)
+        if (jl_is_datatype(ut) && ((jl_datatype_t*)ut)->hash == 0) {
+            n_nohash++;
             continue;
-        if (jl_atomic_load_relaxed(&ci->inferred) && jl_is_method(m) && jl_object_in_image((jl_value_t*)m->module)) {
+        }
+        if (!jl_atomic_load_relaxed(&ci->inferred)) {
+            n_noinferred++;
+            continue;
+        }
+        if (jl_is_method(m) && jl_object_in_image((jl_value_t*)m->module)) {
             int found = has_backedge_to_worklist(mi, &visited, &stack, query_cache);
             assert(found == 0 || found == 1 || found == 2);
             assert(stack.len == 0);
             if (found == 1) {
+                n_found1++;
                 jl_array_ptr_1d_push(new_ext_cis, (jl_value_t*)ci);
             }
             else if (found == 0 && (jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_G2)) {
                 // code the workload reached only by a dynamic call is kept where its record satisfies
                 // G2, of either policy: only a stakeholder's change or a pirate invalidates it (compiler §9)
+                n_g2++;
                 jl_array_ptr_1d_push(new_ext_cis, (jl_value_t*)ci);
             }
+            else if (found == 0) {
+                n_dropped++;
+                if (jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_FACTS)
+                    n_dropped_facts++;
+                if (debug_ext && n_dropped <= 10) {
+                    jl_printf(JL_STDERR, "external CI dropped: ");
+                    jl_static_show(JL_STDERR, (jl_value_t*)mi);
+                    jl_printf(JL_STDERR, " (flags %u)\n", (unsigned)jl_atomic_load_relaxed(&ci->flags));
+                }
+            }
+            else {
+                n_found2++;
+            }
+        }
+        else {
+            n_internal++;
         }
     }
+    if (debug_ext)
+        jl_printf(JL_STDERR, "external CIs: %zu newly inferred; kept %zu by a backedge or a tag, %zu by G2; dropped %zu "
+                  "with no backedge to the worklist (%zu of them facts), %zu replaced methods, %zu without a hash, "
+                  "%zu without inferred code, %zu internal, %zu other\n", n0, n_found1, n_g2, n_dropped,
+                  n_dropped_facts, n_replaced, n_nohash, n_noinferred, n_internal, n_found2);
     htable_free(&visited);
     arraylist_free(&stack);
     JL_GC_POP();
