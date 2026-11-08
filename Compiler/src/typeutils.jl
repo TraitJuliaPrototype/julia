@@ -80,7 +80,8 @@ function record_memberships!(sv::InferenceState, @nospecialize(a), @nospecialize
     isempty(entries) && return false
     for e in entries
         e = e::Core.MembershipEntry
-        update_valid_age!(sv, WorldRange(e.min_world, @atomic :monotonic e.max_world))
+        # the fields by the builtin, which infers their declared type (the atomic `getproperty` did not)
+        update_valid_age!(sv, WorldRange(getfield(e, :min_world), getfield(e, :max_world, :monotonic)))
         any(x -> x === e, sv.edges) || push!(sv.edges, e)
     end
     return true

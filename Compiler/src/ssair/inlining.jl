@@ -844,7 +844,8 @@ end
 
 "Whether the compileable signature `new` differs from `atype` only by a varargs tail widened to `Vararg`."
 function only_vararg_widened(@nospecialize(atype), @nospecialize(new))
-    (atype isa DataType && new isa DataType) || return false
+    atype isa DataType || return false
+    new isa DataType || return false
     np = length(new.parameters)
     (np >= 1 && isvarargtype(new.parameters[np])) || return false
     length(atype.parameters) >= np - 1 || return false

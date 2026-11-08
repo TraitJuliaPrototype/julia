@@ -80,13 +80,16 @@ end
 function record_callable_dispatch!(sv::InferenceState, @nospecialize(spec), @nospecialize(sig))
     s = unwrap_unionall(spec)
     d = unwrap_unionall(sig)
-    (s isa DataType && d isa DataType) || return nothing
+    # each narrowed on its own: inference narrows only the second of `(a isa T && b isa T) || return`
+    s isa DataType || return nothing
+    d isa DataType || return nothing
     cname = unwrap_unionall(Core.Callable).name
     for i = 2:min(length(s.parameters), length(d.parameters))
         di = d.parameters[i]
         di isa TypeVar && (di = di.ub)
         du = unwrap_unionall(di)
-        (du isa DataType && du.name === cname && length(du.parameters) == 2) || continue
+        du isa DataType || continue
+        (du.name === cname && length(du.parameters) == 2) || continue
         F = s.parameters[i]
         A = du.parameters[1]
         (isa(F, DataType) && isconcretetype(F) && A isa DataType && A <: Tuple && !has_free_typevars(A)) || continue
@@ -164,7 +167,8 @@ end
 # `nothing` where no argument is typed by a set, or no such method applies.
 function declared_operation_result(interp::AbstractInterpreter, argtypes::Vector{Any}, @nospecialize(atype))
     tt = unwrap_unionall(atype)
-    (tt isa DataType && length(tt.parameters) >= 2) || return nothing
+    tt isa DataType || return nothing
+    length(tt.parameters) >= 2 || return nothing
     # a declared field read at a value typed by its set: its declared type
     if length(argtypes) == 3 && argtypes[1] === Const(Base.getproperty)
         name = argtypes[3]
@@ -252,8 +256,9 @@ const MAX_OPERATION_SPLITS = 4
 # candidates are read without an edge: a member registered later reaches the fallback.
 function operation_split_type(@nospecialize(atype))
     tt = unwrap_unionall(atype)::DataType
-    for i = 2:length(tt.parameters)
-        p = tt.parameters[i]
+    ps = getfield(tt, :parameters)  # by the builtin: a SimpleVector in every specialization
+    for i = 2:length(ps)
+        p = ps[i]
         isvarargtype(p) && break
         (isconcretetype(p) || has_free_typevars(p)) && continue
         u = unwrap_unionall(p)
@@ -598,7 +603,8 @@ function carried_attributes(fargs::Union{Nothing,Vector{Any}}, sv::AbsIntState)
     ccall(:jl_has_open_set, Cint, (Any,), caller.sig) == 0 && return none
     decl = unwrap_unionall(caller.sig)
     spec = unwrap_unionall(sv.linfo.specTypes)
-    (decl isa DataType && spec isa DataType) || return none
+    decl isa DataType || return none
+    spec isa DataType || return none
     nargs = Int(caller.nargs)
     mask = dyn = UInt32(0)
     for k = 2:min(length(fargs), 33)
@@ -725,7 +731,8 @@ function abstract_attributed_call(interp::AbstractInterpreter, arginfo::ArgInfo,
     (; fargs, argtypes) = arginfo
     length(argtypes) >= 3 || return Future(CallMeta(Bottom, ArgumentError, EFFECTS_THROWS, NoCallInfo()))
     b = argtypes[2]
-    (b isa Const && b.val isa Int) || return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+    b isa Const || return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+    b.val isa Int || return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
     bits = reinterpret(UInt64, b.val::Int)
     mask = bits % UInt32
     dyn = (bits >> 32) % UInt32 & mask
@@ -3409,7 +3416,8 @@ function callable_result(@nospecialize(ft), argtypes::Vector{Any})
     if u.name === unwrap_unionall(Core.Callable).name
         length(u.parameters) == 2 || return nothing
         S = u.parameters[2]
-        (S isa Type && !has_free_typevars(S)) || return nothing
+        S isa Type || return nothing
+        !has_free_typevars(S) || return nothing
         return S
     elseif u.name === unwrap_unionall(Core.All).name
         tup = u.parameters[1]
@@ -3417,9 +3425,11 @@ function callable_result(@nospecialize(ft), argtypes::Vector{Any})
         args = argtypes_to_type(Any[widenconst(a) for a in argtypes[2:end]])
         for c in tup.parameters
             cu = unwrap_unionall(c)
-            (cu isa DataType && cu.name === unwrap_unionall(Core.Callable).name && length(cu.parameters) == 2) || continue
+            cu isa DataType || continue
+            (cu.name === unwrap_unionall(Core.Callable).name && length(cu.parameters) == 2) || continue
             A = cu.parameters[1]
-            (A isa Type && args <: A) || continue
+            A isa Type || continue
+            args <: A || continue
             S = cu.parameters[2]
             (S isa Type && !has_free_typevars(S)) && return S
         end

@@ -27,7 +27,8 @@ is_fact_sig(@nospecialize(T), max_union_splitting::Int = FACT_UNION_SPLITTING) =
 
 "Concrete members followed by a `Vararg{E}` tail of a concrete member `E`, every element a concrete member."
 function vararg_fact(@nospecialize(T))
-    (T isa DataType && T <: Tuple) || return false
+    T isa DataType || return false
+    T <: Tuple || return false
     isdispatchtuple(T) && return false
     ps = T.parameters
     for i in 1:length(ps)
@@ -46,7 +47,8 @@ concrete_member(@nospecialize(p)) = (isdispatchelem(p) && !iskindtype(p)) || var
 
 "Whether `T`'s tuple-typed arguments have unions of concrete element types within Julia's union-splitting cost."
 function fact_splits_ok(@nospecialize(T), max_union_splitting::Int)
-    (T isa DataType && T <: Tuple) || return false
+    T isa DataType || return false
+    T <: Tuple || return false
     ps = T.parameters
     (isempty(ps) || isvarargtype(ps[end])) && return false
     lens = Int[]
@@ -57,7 +59,8 @@ function fact_splits_ok(@nospecialize(T), max_union_splitting::Int)
     return union_split_cost(lens) <= max_union_splitting
 end
 function tuple_union_lengths!(lens::Vector{Int}, @nospecialize(P))
-    (P isa DataType && P <: Tuple) || return false
+    P isa DataType || return false
+    P <: Tuple || return false
     ps = P.parameters
     (isempty(ps) || isvarargtype(ps[end])) && return false
     for q in ps
@@ -90,14 +93,16 @@ end
 
 "A closure's type: its instance's name is generated (`#…`), unlike a named function's."
 function is_closure_type(@nospecialize(F))
-    (F isa DataType && F <: Function) || return false
+    F isa DataType || return false
+    F <: Function || return false
     s = F.name.singletonname
     p = ccall(:jl_symbol_name, Ptr{UInt8}, (Any,), s)
     return Core.Intrinsics.pointerref(p, 1, 1) === UInt8(0x23)     # '#'
 end
 function kinds_ok(ps::SimpleVector)
     for p in ps
-        (p isa Type && (isdispatchelem(p) || p === DataType || p === UnionAll || p === Union)) || return false
+        p isa Type || return false
+        ((isdispatchelem(p) || p === DataType || p === UnionAll || p === Union)) || return false
     end
     return true
 end
