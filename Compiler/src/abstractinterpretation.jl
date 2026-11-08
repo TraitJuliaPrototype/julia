@@ -581,6 +581,7 @@ is_trait_arg_type(@nospecialize(t)) = ccall(:jl_is_trait_arg_type, Cint, (Any,),
 # set, or, where `d` names the method's variables (`X{T}`), the instance with their values (`X{T₀}`);
 # `nothing` where the instance is compiled for the value's type.
 function compiled_once_type(@nospecialize(d), @nospecialize(s), @nospecialize(sig))
+    has_free_typevars(s) && return nothing      # an abstract frame (the definition-time check's) is no instance
     s === d && return s
     has_free_typevars(d) || return nothing
     (is_trait_arg_type(s) && !has_free_typevars(s)) || return nothing
@@ -3409,7 +3410,8 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
         if A !== nothing
             args = argtypes_to_type(Any[widenconst(a) for a in arginfo.argtypes[2:end]])
             if !hasintersect(args, A)
-                return Future(CallMeta(Union{}, MethodError, EFFECTS_THROWS, NoCallInfo()))
+                # proved outside `A`: the check still runs, and raises, before the call would
+                return Future(CallMeta(Union{}, MethodError, EFFECTS_THROWS, CallableCallInfo(Union{}, A)))
             elseif !(args <: A)
                 return Future(CallMeta(S, Any, Effects(), CallableCallInfo(S, A)))
             end

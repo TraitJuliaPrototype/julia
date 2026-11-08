@@ -5295,13 +5295,27 @@ JL_DLLEXPORT jl_value_t *jl_attribute_sig(jl_value_t *tt, jl_method_t *m, uint32
     uint32_t nospec = effective_nospecialize(m, (jl_tupletype_t*)tt, 1, mask, dyn) & traits;
     if (nospec == 0)
         return tt;
-    jl_svec_t *params = NULL;
-    JL_GC_PUSH2(&params, &tt);
+    jl_svec_t *params = NULL, *env = NULL;
+    jl_value_t *decl_i = NULL;
+    JL_GC_PUSH4(&params, &tt, &env, &decl_i);
     size_t np = jl_nparams(tt);
     for (size_t i = 1; i < np && i <= 32; i++) {
         if (!(nospec & (1u << (i - 1))))
             continue;
-        jl_value_t *decl_i = jl_nth_slot_type(m->sig, i);
+        decl_i = jl_nth_slot_type(m->sig, i);
+        if (jl_has_free_typevars(decl_i)) {
+            // a declared type that names the method's variables (`X{T}`, C-54): its instance with their
+            // values from the call, or the type over them where the call does not fix them
+            if (env == NULL) {
+                env = jl_emptysvec;
+                if (jl_is_unionall(m->sig) && jl_type_intersection_env(tt, m->sig, &env) == jl_bottom_type)
+                    env = jl_emptysvec;
+            }
+            jl_value_t *inst = NULL;
+            if (jl_is_unionall(m->sig) && jl_svec_len(env) > 0)
+                inst = jl_instantiate_type_in_env(decl_i, (jl_unionall_t*)m->sig, jl_svec_data(env));
+            decl_i = (inst == NULL || jl_has_free_typevars(inst)) ? jl_rewrap_unionall(decl_i, m->sig) : inst;
+        }
         if (jl_egal(jl_tparam(tt, i), decl_i))
             continue;
         if (params == NULL)
