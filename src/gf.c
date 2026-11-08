@@ -2911,6 +2911,7 @@ static struct {
     _Atomic(size_t) kept;        // marked callers made valid again
     _Atomic(size_t) final_marks; // marks that became invalidations
     _Atomic(size_t) misses;      // slot misses resolved by the runtime
+    _Atomic(size_t) fallbacks;   // misses served by the dispatching last resort
 } code_slot_stats;
 #define CODE_SLOT_COUNT(f) jl_atomic_fetch_add_relaxed(&code_slot_stats.f, 1)
 
@@ -2931,6 +2932,7 @@ JL_DLLEXPORT size_t jl_code_slot_stat(int which) JL_NOTSAFEPOINT
     case 1: return jl_atomic_load_relaxed(&code_slot_stats.kept);
     case 2: return jl_atomic_load_relaxed(&code_slot_stats.final_marks);
     case 3: return jl_atomic_load_relaxed(&code_slot_stats.misses);
+    case 4: return jl_atomic_load_relaxed(&code_slot_stats.fallbacks);
     }
     return 0;
 }
@@ -5487,6 +5489,65 @@ static void code_slot_show(jl_code_instance_t *ci) JL_NOTSAFEPOINT
     jl_printf(JL_STDERR, "\n");
 }
 
+// The slot's last resort (compiler §3.3): where no code of `mi` with the caller's result type and the
+// entry its call needs can be made in the task's world, an entry with the call's signature that
+// dispatches when the call runs, in the task's world, and asserts the caller's result type (the ABI
+// adapter's conversion from `Any`). A dynamic call at the static call's signature selects the
+// caller's method wherever the caller is valid. A boxed call runs the method's code in the
+// interpreter. It is held by a CodeInstance of its own, valid in every world, kept for the session
+// (the slot keeps a raw pointer to it).
+static jl_array_t *code_slot_fallbacks JL_GLOBALLY_ROOTED = NULL;
+static jl_mutex_t code_slot_fallback_lock;
+// for tests: every miss takes the last resort
+static int code_slot_force_fallback = 0;
+JL_DLLEXPORT int jl_code_slot_force_fallback(int on) JL_NOTSAFEPOINT
+{
+    int last = code_slot_force_fallback;
+    code_slot_force_fallback = on;
+    return last;
+}
+
+static jl_code_instance_t *code_slot_fallback(jl_method_instance_t *mi, jl_value_t *rettype, int specsig)
+{
+    jl_code_instance_t *ci = NULL;
+    JL_LOCK(&code_slot_fallback_lock);
+    if (code_slot_fallbacks != NULL) {
+        for (size_t i = 0; i < jl_array_nrows(code_slot_fallbacks); i++) {
+            jl_code_instance_t *c = (jl_code_instance_t*)jl_array_ptr_ref(code_slot_fallbacks, i);
+            if (jl_get_ci_mi(c) == mi && same_type(c->rettype, rettype)) {
+                ci = c;
+                break;
+            }
+        }
+    }
+    JL_UNLOCK(&code_slot_fallback_lock);
+    if (ci != NULL)
+        return ci;
+    void *f = NULL;
+    if (specsig) {
+        jl_abi_t abi = { mi->specTypes, rettype, jl_nparams(mi->specTypes), 1, 0 };
+        f = jl_jit_abi_converter(jl_current_task, abi, NULL);
+        if (f == NULL)
+            return NULL;
+    }
+    ci = jl_new_codeinst(mi, jl_nothing, rettype, (jl_value_t*)jl_any_type, NULL, NULL,
+                         0, 1, ~(size_t)0, 0, jl_nothing, NULL, jl_emptysvec);
+    JL_GC_PUSH1(&ci);
+    if (specsig) {
+        jl_atomic_store_relaxed(&ci->specptr.fptr, f);
+        jl_atomic_store_relaxed(&ci->flags, JL_CI_FLAGS_SPECPTR_SPECIALIZED);
+    }
+    // the generic entry runs the method's code in the interpreter (a boxed call's last resort)
+    jl_atomic_store_release(&ci->invoke, jl_fptr_interpret_call);
+    JL_LOCK(&code_slot_fallback_lock);
+    if (code_slot_fallbacks == NULL)
+        code_slot_fallbacks = jl_alloc_vec_any(0);
+    jl_array_ptr_1d_push(code_slot_fallbacks, (jl_value_t*)ci);
+    JL_UNLOCK(&code_slot_fallback_lock);
+    JL_GC_POP();
+    return ci;
+}
+
 // A slot's miss (compiler §3.3): the code of `mi` and the policy valid in `world`, revalidated or
 // compiled as needed, with the result type the caller was compiled against, put in the slot.
 // `target` is the CodeInstance the call was compiled against, where codegen knows it (the JIT).
@@ -5517,6 +5578,11 @@ JL_DLLEXPORT jl_code_instance_t *jl_code_slot_resolve(_Atomic(jl_code_instance_t
             jl_compile_codeinst(ci2);
         }
         ci = code_slot_find(mi, world, facts, rettype, specsig);
+    }
+    if (ci == NULL || code_slot_force_fallback) {
+        ci = code_slot_fallback(mi, rettype, specsig);
+        if (ci != NULL)
+            CODE_SLOT_COUNT(fallbacks);
     }
     if (ci == NULL) {
         jl_printf(JL_STDERR, "code slot: no code with the caller's result for ");
