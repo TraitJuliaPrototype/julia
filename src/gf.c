@@ -5640,7 +5640,7 @@ static void code_slot_show(jl_code_instance_t *ci) JL_NOTSAFEPOINT
 // caller's method wherever the caller is valid. A boxed call runs the method's code in the
 // interpreter. It is held by a CodeInstance of its own, valid in every world, kept for the session
 // (the slot keeps a raw pointer to it).
-static jl_array_t *code_slot_fallbacks JL_GLOBALLY_ROOTED = NULL;
+jl_array_t *jl_code_slot_fallbacks JL_GLOBALLY_ROOTED = NULL;   // a GC root (gc_mark_roots)
 static jl_mutex_t code_slot_fallback_lock;
 // for tests: every miss takes the last resort
 static int code_slot_force_fallback = 0;
@@ -5655,9 +5655,9 @@ static jl_code_instance_t *code_slot_fallback(jl_method_instance_t *mi, jl_value
 {
     jl_code_instance_t *ci = NULL;
     JL_LOCK(&code_slot_fallback_lock);
-    if (code_slot_fallbacks != NULL) {
-        for (size_t i = 0; i < jl_array_nrows(code_slot_fallbacks); i++) {
-            jl_code_instance_t *c = (jl_code_instance_t*)jl_array_ptr_ref(code_slot_fallbacks, i);
+    if (jl_code_slot_fallbacks != NULL) {
+        for (size_t i = 0; i < jl_array_nrows(jl_code_slot_fallbacks); i++) {
+            jl_code_instance_t *c = (jl_code_instance_t*)jl_array_ptr_ref(jl_code_slot_fallbacks, i);
             if (jl_get_ci_mi(c) == mi && same_type(c->rettype, rettype)) {
                 ci = c;
                 break;
@@ -5684,9 +5684,9 @@ static jl_code_instance_t *code_slot_fallback(jl_method_instance_t *mi, jl_value
     // the generic entry runs the method's code in the interpreter (a boxed call's last resort)
     jl_atomic_store_release(&ci->invoke, jl_fptr_interpret_call);
     JL_LOCK(&code_slot_fallback_lock);
-    if (code_slot_fallbacks == NULL)
-        code_slot_fallbacks = jl_alloc_vec_any(0);
-    jl_array_ptr_1d_push(code_slot_fallbacks, (jl_value_t*)ci);
+    if (jl_code_slot_fallbacks == NULL)
+        jl_code_slot_fallbacks = jl_alloc_vec_any(0);
+    jl_array_ptr_1d_push(jl_code_slot_fallbacks, (jl_value_t*)ci);
     JL_UNLOCK(&code_slot_fallback_lock);
     JL_GC_POP();
     return ci;

@@ -448,6 +448,7 @@ extern jl_array_t *_jl_debug_method_invalidation JL_GLOBALLY_ROOTED;
 // collectors mark explicitly (JL_GLOBALLY_ROOTED is an annotation for the analyzer
 // only; marked alongside _jl_debug_method_invalidation)
 extern jl_array_t *open_set_methods JL_GLOBALLY_ROOTED;
+extern jl_array_t *jl_code_slot_fallbacks JL_GLOBALLY_ROOTED;   // the code slot's last resorts (gf.c)
 // the member hook (gf.c, compiler §10.4), rooted alongside it
 extern jl_value_t *jl_member_hook JL_GLOBALLY_ROOTED;
 extern jl_value_t *jl_fully_typed_hook JL_GLOBALLY_ROOTED;
