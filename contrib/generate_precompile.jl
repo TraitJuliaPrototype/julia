@@ -51,6 +51,8 @@ precompile(Tuple{typeof(Base.Compiler.ir_to_codeinf!), Base.Compiler.Optimizatio
 precompile(Tuple{typeof(Core.kwcall), NamedTuple{(:allow_typevars, :volatile_inf_result), Tuple{Bool, Base.Compiler.VolatileInferenceResult}}, typeof(Base.Compiler.handle_match!), Array{Base.Compiler.InliningCase, 1}, Core.MethodMatch, Array{Any, 1}, Base.Compiler.CallInfo, UInt32, Base.Compiler.InliningState{Base.Compiler.NativeInterpreter}})
 precompile(Tuple{typeof(Base.getindex), Type{Pair{Base.PkgId, UInt128}}, Pair{Base.PkgId, UInt128}, Pair{Base.PkgId, UInt128}, Pair{Base.PkgId, UInt128}, Vararg{Pair{Base.PkgId, UInt128}}})
 precompile(Tuple{typeof(Base.Compiler.ir_to_codeinf!), Base.Compiler.OptimizationState{Base.Compiler.NativeInterpreter}, Core.SimpleVector})
+# `Base.infer_return_type`'s inference, compiled: the trait library's member checks call it at a session's first member (E-301)
+precompile(Tuple{typeof(Base.Compiler.typeinf_type), Base.Compiler.NativeInterpreter, Core.MethodMatch})
 
 # LazyArtifacts (but more generally helpful)
 precompile(Tuple{Type{Base.Val{x} where x}, Module})

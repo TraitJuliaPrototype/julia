@@ -1731,9 +1731,8 @@ JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *
 {
     size_t last = jl_atomic_load_acquire(&membership_last_change);
     if (world != 0 && world >= last) {
-        // an entry is reached only through a TypeName that holds one, so `t` reaches none without them
-        if (!jl_type_has_memberships(t))
-            return 0;
+        // whether `t` reaches an entry at all is not asked: the callers ask only for a match at a
+        // signature that names an open set, and starting its range here is sound either way
         if (*lo < last)
             *lo = last;
         return 1;
