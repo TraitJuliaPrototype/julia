@@ -458,6 +458,10 @@ _cast_compiled(@nospecialize(x)) = isa(x, Dynamic) ? getfield(x, :object) : x
 # `keep(x)` (compiler §6.9) for an argument at a set: `Dynamic{X}(x)` where the code is compiled once
 # for it, `x` otherwise; inference resolves it, and where the code is not compiled it is `x`
 keep(@nospecialize(x)) = x
+# a call of a value known as `Callable{A, S}` (compiler §7.4): its arguments are of `A`, or the call
+# raises `MethodError`; the compiler inserts the check where it cannot prove them
+_callable_argcheck(@nospecialize(f), @nospecialize(A), @nospecialize(args...)) =
+    (isa(args, A) || throw_methoderror(f, args...); nothing)
 struct UndefKeywordError <: Exception
     var::Symbol
 end

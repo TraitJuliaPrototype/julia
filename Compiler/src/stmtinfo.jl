@@ -36,6 +36,19 @@ end
 add_edges_impl(::Vector{Any}, ::DeclaredResultInfo) = nothing
 
 """
+    info::CallableCallInfo <: CallInfo
+
+A call of a value known as `Callable{A, S}` (compiler §7.4) whose arguments inference cannot prove to
+be of `A`: the dynamic call, its arguments checked against `A` (`MethodError`) and its result asserted
+to `rt`.
+"""
+struct CallableCallInfo <: CallInfo
+    rt::Any
+    A::Any
+end
+add_edges_impl(::Vector{Any}, ::CallableCallInfo) = nothing
+
+"""
     info::AttributedCallInfo <: CallInfo
 
 A call with attributes for its trait arguments (compiler §6.3): from casts written at the call (`cast`,

@@ -328,7 +328,7 @@ function finish!(interp::AbstractInterpreter, caller::InferenceState, validation
             ci, inferred_result, const_flag, min_world, max_world, ipo_effects,
             result.analysis_results, time_total, caller.time_caches, time_self_ns * 1e-9, debuginfo, edges)
         # G2 as a predicate, for code of either policy (compiler §3.2)
-        edges_satisfy_g2(edges) && ccall(:jl_ci_set_g2, Cvoid, (Any,), ci)
+        edges_satisfy_g2(edges, inlined_defs!(IdSet{Any}(), debuginfo.edges)) && ccall(:jl_ci_set_g2, Cvoid, (Any,), ci)
         if is_cached(caller) # CACHE_MODE_GLOBAL
             cache_result!(interp, result, ci)
         end

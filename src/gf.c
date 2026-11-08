@@ -1287,7 +1287,8 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
 // ---- the attribute of a trait argument (compiler §6.3) ----
 // Which of a method's arguments are compiled once at their declared type (`Dynamic`) rather than for
 // the value's type (`Compiled`). A trait argument is one typed by a set or an intersection of sets,
-// not by a `where` variable (whose binding is the value's type) and with no free variable in its type.
+// its type naming the method's variables or not (`X{T}` is compiled once at `X{T₀}`), not by a `where`
+// variable (whose binding is the value's type).
 
 // the package a module belongs to: its root module; a module under `Main`, as a script makes one,
 // is its own
@@ -1301,7 +1302,10 @@ static jl_module_t *module_package(jl_module_t *m) JL_NOTSAFEPOINT
 
 static int is_trait_arg_type(jl_value_t *decl_i) JL_NOTSAFEPOINT
 {
-    if (jl_is_typevar(decl_i) || jl_has_free_typevars(decl_i))
+    // a set or an intersection, also where its type names the method's variables (`X{T}`): compiled
+    // once at its instance with those variables' values (compiler §6.2; C-54). A `where` variable
+    // bounded by a set is the value's own type.
+    if (jl_is_typevar(decl_i))
         return 0;
     jl_value_t *u = jl_unwrap_unionall(decl_i);
     return jl_is_datatype(u) && (((jl_datatype_t*)u)->name->open_set || jl_is_all_type(u));
@@ -1526,6 +1530,19 @@ static void jl_compilation_sig(
                 }
                 continue;
             }
+            // a trait argument whose type names the method's variables (`X{T}`): compiled once at that
+            // instance with the variables' values from the match, the erased key (compiler §6.2; C-54)
+            if (is_trait_arg_type(decl_i) && sparams != NULL && jl_svec_len(sparams) > 0 && jl_is_unionall(decl)) {
+                type_i = jl_instantiate_type_in_env(decl_i, (jl_unionall_t*)decl, jl_svec_data(sparams));
+                if (!jl_has_free_typevars(type_i)) {
+                    if (type_i != elt) {
+                        if (!*newparams) *newparams = jl_svec_copy(tt->parameters);
+                        jl_svecset(*newparams, i, type_i);
+                    }
+                    continue;
+                }
+                type_i = jl_rewrap_unionall(decl_i, decl);
+            }
         }
 
         if (jl_types_equal(elt, (jl_value_t*)jl_type_type)) { // elt == Type{T} where T
@@ -1745,6 +1762,12 @@ JL_DLLEXPORT int jl_isa_compileable_sig(
         }
         // a trait argument compiled once has its declared type, whichever attribute decided it
         if (i_arg > 0 && i_arg <= 32 && (trait_bits & (1u << (i_arg - 1))) && jl_egal(elt, decl_i))
+            continue;
+        // or, where that type names the method's variables, its instance with their values (C-54)
+        if (i_arg > 0 && i_arg <= 32 && (trait_bits & (1u << (i_arg - 1))) && jl_has_free_typevars(decl_i) &&
+                is_trait_arg_type(elt) && !jl_has_free_typevars(elt) &&
+                ((jl_datatype_t*)jl_unwrap_unionall(elt))->name == ((jl_datatype_t*)jl_unwrap_unionall(decl_i))->name &&
+                jl_subtype(elt, type_i))
             continue;
 
         if (jl_is_kind(elt)) {

@@ -167,11 +167,21 @@ function typeinf_other_policy(interp::NativeInterpreter, method::Method, mi::Met
 end
 
 """
-Whether a record satisfies G2 (compiler §3.2): every dispatch edge is at a fact signature. An invoke
-at a declared signature is not gated; a binding edge is not a dispatch. (Whether an inlined callee's
-own record satisfies it: C-46.)
+Whether a record satisfies G2 (compiler §3.2): every dispatch edge is at a fact signature, and every
+inlined callee's own record satisfies G2, since its code is part of the caller's (C-46). `inlined` holds
+the inlined callees' MethodInstances and Methods, from the code's debug information. An invoke at a
+declared signature is not gated; a binding edge is not a dispatch.
 """
-function edges_satisfy_g2(edges::SimpleVector)
+function edges_satisfy_g2(edges::SimpleVector, inlined::IdSet{Any})
+    if !isempty(inlined)
+        for e in edges
+            e isa CodeInstance || continue
+            mi = get_ci_mi(e)
+            (mi in inlined || mi.def in inlined) || continue
+            # its G2 bit (`JL_CI_FLAGS_G2`); one not yet set, as in a cycle, is not G2
+            (getfield(e, :flags, :monotonic)::UInt8 & 0x10) == 0x00 && return false
+        end
+    end
     for (invokesig, item) in ForwardToBackedgeIterator(edges)
         if item isa Core.Binding
             continue

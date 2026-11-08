@@ -1829,6 +1829,10 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
             handle_declared_result!(ir, idx, stmt, info)
             continue
         end
+        if isa(info, CallableCallInfo)
+            handle_callable_call!(ir, idx, stmt, info)
+            continue
+        end
         if isa(info, KeepInfo)
             # `Core.keep(x)` (compiler §6.9): `x`, or `Dynamic{X}(x)` in an instance compiled once for it
             x = stmt.args[2]
@@ -1867,6 +1871,15 @@ function handle_declared_result!(ir::IRCode, idx::Int, stmt::Expr, info::Declare
     inst[:info] = NoCallInfo()
     inst[:flag] = IR_FLAG_NULL
     return nothing
+end
+
+# A call of a value known as `Callable{A, S}` (compiler §7.4): its arguments checked against `A`
+# (`MethodError`), then the dynamic call, its result asserted to `S`.
+function handle_callable_call!(ir::IRCode, idx::Int, stmt::Expr, info::CallableCallInfo)
+    inst = ir[SSAValue(idx)]
+    check = Expr(:call, GlobalRef(Core, :_callable_argcheck), stmt.args[1], info.A, stmt.args[2:end]...)
+    insert_node!(ir, SSAValue(idx), NewInstruction(check, Nothing, NoCallInfo(), inst[:line], nothing))
+    return handle_declared_result!(ir, idx, stmt, DeclaredResultInfo(info.rt))
 end
 
 function linear_inline_eligible(ir::IRCode)

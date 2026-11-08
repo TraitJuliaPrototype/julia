@@ -577,6 +577,16 @@ end
 # ---- the attribute of a trait argument (compiler §6.3) ----
 
 is_trait_arg_type(@nospecialize(t)) = ccall(:jl_is_trait_arg_type, Cint, (Any,), t) != 0
+# The type an argument of this frame is compiled once at (compiler §6.2): its declared type `d` at the
+# set, or, where `d` names the method's variables (`X{T}`), the instance with their values (`X{T₀}`);
+# `nothing` where the instance is compiled for the value's type.
+function compiled_once_type(@nospecialize(d), @nospecialize(s), @nospecialize(sig))
+    s === d && return s
+    has_free_typevars(d) || return nothing
+    (is_trait_arg_type(s) && !has_free_typevars(s)) || return nothing
+    s <: rewrap_unionall(d, sig) || return nothing
+    return s
+end
 
 # the argument slot of the frame that `a` reads, if it is one the body never assigns, else 0
 function argument_slot(@nospecialize(a), sv::InferenceState, nargs::Int)
@@ -615,7 +625,7 @@ function carried_attributes(fargs::Union{Nothing,Vector{Any}}, sv::AbsIntState)
         is_trait_arg_type(d) || continue
         bit = UInt32(1) << (k - 2)
         mask |= bit
-        n <= length(spec.parameters) && spec.parameters[n] === d && (dyn |= bit)
+        n <= length(spec.parameters) && compiled_once_type(d, spec.parameters[n], caller.sig) !== nothing && (dyn |= bit)
     end
     return (mask, dyn)
 end
@@ -769,11 +779,12 @@ function abstract_keep(fargs::Union{Nothing,Vector{Any}}, argtypes::Vector{Any},
             if n != 0 && !(caller.isva && n == nargs) && decl isa DataType && spec isa DataType &&
                     n <= length(decl.parameters) && n <= length(spec.parameters)
                 d = decl.parameters[n]
-                if is_trait_arg_type(d) && spec.parameters[n] === d
+                s = is_trait_arg_type(d) ? compiled_once_type(d, spec.parameters[n], caller.sig) : nothing
+                if s !== nothing
                     # this instance at the set's type is the one compiled once, and inference's stand-in
                     # for every instance at a member's type: either result
-                    T = Core.Dynamic{d}
-                    return CallMeta(Union{d, T}, Union{}, effects, KeepInfo(T))
+                    T = Core.Dynamic{s}
+                    return CallMeta(Union{s, T}, Union{}, effects, KeepInfo(T))
                 end
             end
         end
@@ -3391,7 +3402,20 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
     # a call of a value known as a `Callable{A, S}` (compiler §7.4): its result is `S`, asserted. A
     # builtin is never a member, though the set meets `Builtin` as an intersection
     S = callable_result(wft, arginfo.argtypes)
-    S === nothing || return Future(CallMeta(S, Any, Effects(), DeclaredResultInfo(S)))
+    if S !== nothing
+        # its arguments must be of `A`, or the call raises `MethodError` (C-60): checked when it runs
+        # where inference cannot prove them; an intersection's component is chosen by the arguments
+        A = callable_args(wft)
+        if A !== nothing
+            args = argtypes_to_type(Any[widenconst(a) for a in arginfo.argtypes[2:end]])
+            if !hasintersect(args, A)
+                return Future(CallMeta(Union{}, MethodError, EFFECTS_THROWS, NoCallInfo()))
+            elseif !(args <: A)
+                return Future(CallMeta(S, Any, Effects(), CallableCallInfo(S, A)))
+            end
+        end
+        return Future(CallMeta(S, Any, Effects(), DeclaredResultInfo(S)))
+    end
     if hasintersect(wft, Builtin)
         add_remark!(interp, sv, "Could not identify method table for call")
         return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
@@ -3406,6 +3430,18 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
     atype = argtypes_to_type(arginfo.argtypes)
     atype === Bottom && return Future(CallMeta(Union{}, Union{}, EFFECTS_THROWS, NoCallInfo())) # accidentally unreachable
     return abstract_call_gf_by_type(interp, nothing, arginfo, si, atype, sv, max_methods)::Future
+end
+
+# The argument types `A` of a value known as `Callable{A, S}`, where `A` is a type with no free variable
+function callable_args(@nospecialize(ft))
+    u = unwrap_unionall(ft)
+    u isa DataType || return nothing
+    u.name === unwrap_unionall(Core.Callable).name || return nothing
+    length(u.parameters) == 2 || return nothing
+    A = u.parameters[1]
+    A isa Type || return nothing
+    has_free_typevars(A) && return nothing
+    return A
 end
 
 # The declared result of a call of a value known as `Callable{A, S}` (compiler §7.4), or of an
