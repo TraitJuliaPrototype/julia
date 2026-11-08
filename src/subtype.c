@@ -1727,10 +1727,18 @@ void jl_membership_changed(size_t world) JL_NOTSAFEPOINT
         ;
 }
 
+// whether a range asked at `world` is taken without a walk (and without asking anything of the type)
+int jl_membership_range_is_fast(size_t world) JL_NOTSAFEPOINT
+{
+    return world != 0 && world >= jl_atomic_load_acquire(&membership_last_change);
+}
+
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *lo, size_t *hi) JL_NOTSAFEPOINT
 {
+    if (world == 0)     // no range asked: whether `t` reaches an entry
+        return jl_type_has_memberships(t);
     size_t last = jl_atomic_load_acquire(&membership_last_change);
-    if (world != 0 && world >= last) {
+    if (world >= last) {
         // whether `t` reaches an entry at all is not asked: the callers ask only for a match at a
         // signature that names an open set, and starting its range here is sound either way
         if (*lo < last)

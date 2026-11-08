@@ -2370,6 +2370,9 @@ static jl_value_t *get_intersect_matches(jl_typemap_t *defs, jl_typemap_entry_t 
             /* .min_valid = */ world, /* .max_valid = */ world,
             /* .ti = */ NULL, /* .env = */ jl_emptysvec, /* .issubty = */ 0},
         /* .newentry = */ newentry, /* .shadowed */ NULL, /* .replaced */ NULL, /* .replay */ replay};
+    // the shadowed and replaced methods are the answer, not the matches' worlds: no membership range is
+    // taken (at the world before a membership the walk asks at, it would walk every entry, E-303)
+    env.match.skip_ranges = 1;
     JL_GC_PUSH3(&env.match.env, &env.match.ti, &env.shadowed);
     jl_typemap_intersection_visitor(defs, 0, &env.match);
     env.match.env = NULL;

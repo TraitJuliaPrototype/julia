@@ -1009,6 +1009,7 @@ JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b);
 // the world range over which the memberships a question about t can read are what
 // they are in `world`; returns whether t reaches any entry (*lo/*hi untouched if not)
 void jl_membership_changed(size_t world) JL_NOTSAFEPOINT;
+int jl_membership_range_is_fast(size_t world) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *lo, size_t *hi) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
 // intersections (compiler §4.9): All{X, Y} is Core.All{Tuple{X, Y}}, built in its normal form
@@ -2034,6 +2035,7 @@ struct typemap_intersection_env {
     jl_value_t *ti; // intersection type
     jl_svec_t *env; // intersection env (initialize to null to perform intersection without an environment)
     int issubty;    // if `a <: b` is true in `intersect(a,b)`
+    int skip_ranges; // the caller reads no match's worlds: the membership range is not taken (zero by default)
 };
 int jl_typemap_intersection_visitor(jl_typemap_t *a, int offs, struct typemap_intersection_env *closure);
 void typemap_slurp_search(jl_typemap_entry_t *ml, struct typemap_intersection_env *closure);
