@@ -2627,11 +2627,18 @@ static void set_names_in(jl_value_t *t, arraylist_t *out, int depth) JL_NOTSAFEP
 // but could by a later membership; `m0` takes the argument as `Any` or at a type naming a set (a
 // method matched through the type's own supertypes is more specific than one at a set); `mz`'s other
 // arguments could meet the call's.
+// A method that can only raise at the members of the sets it is at (compiler §5.6, §6.8): its declared
+// result is `Union{}`, or it serves no member (`declared_covers` bit 1, a body's `serves_no_member` meta)
+static int method_raises_only(jl_method_t *m) JL_NOTSAFEPOINT
+{
+    return m->declared_result == (jl_value_t*)jl_bottom_type || (m->declared_covers & 2);
+}
+
 static int shadow_at(jl_value_t *tt, jl_method_t *m0, jl_method_t *mz, size_t i)
 {
-    // open issue 158 (a): a method that can only raise at a member (declared result `Union{}`) is no
-    // shadow: dispatched, it throws as the pruned arm would
-    if (mz->declared_result == (jl_value_t*)jl_bottom_type)
+    // open issue 158 (a): a method that can only raise at a member is no shadow: dispatched, it
+    // throws as the pruned arm would
+    if (method_raises_only(mz))
         return 0;
     jl_value_t *zsig = jl_unwrap_unionall(mz->sig);
     if (!jl_is_datatype(zsig) || !jl_is_datatype(tt))
@@ -2835,7 +2842,7 @@ JL_DLLEXPORT void jl_method_set_declared_result(jl_method_t *m, jl_value_t *rt, 
         jl_type_error("declared result", (jl_value_t*)jl_type_type, rt);
     m->declared_result = rt;
     jl_gc_wb(m, rt);
-    m->declared_covers = covers != 0;
+    m->declared_covers = (m->declared_covers & ~1) | (covers != 0);
 }
 
 // The methods at open sets of the function type `ft` that carry a declared result covering
@@ -2850,7 +2857,7 @@ JL_DLLEXPORT jl_value_t *jl_declared_methods_of(jl_value_t *ft)
         size_t i, l = jl_array_nrows(open_set_methods);
         for (i = 0; i + 1 < l; i += 2) {
             jl_method_t *m = (jl_method_t*)jl_array_ptr_ref(open_set_methods, i + 1);
-            if (!m->declared_covers || m->declared_result == NULL)
+            if (!(m->declared_covers & 1) || m->declared_result == NULL)
                 continue;
             jl_value_t *sig = jl_unwrap_unionall(m->sig);
             if (!jl_is_tuple_type(sig) || jl_nparams(sig) == 0 || !jl_egal(jl_tparam0(sig), ft))
@@ -4301,10 +4308,10 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
 
     jl_methcache_t *mc = jl_method_table->cache;
     JL_LOCK(&mc->writelock);
-    // C-73: a method at an open set reaches the missing edges of arms its set could later shadow; a method
-    // that can only raise (its declared result `Union{}`) is no shadow
+    // compiler §5.6: a method at an open set reaches the missing edges of arms its set could later
+    // shadow; a method that can only raise at a member is no shadow
     jl_method_t *setmethod = (jl_has_open_set_in((jl_value_t*)method->sig) &&
-                              method->declared_result != (jl_value_t*)jl_bottom_type) ? method : NULL;
+                              !method_raises_only(method)) ? method : NULL;
     struct _typename_invalidate_backedge typename_env = {type, type, &isect, &isect2, d, n, max_world, invalidated, setmethod};
     invalidate_missing_backedges(&typename_env);
     invalidated |= typename_env.invalidated;

@@ -241,9 +241,10 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
                         edge = sig
                     elseif edge isa Core.MembershipCell
                         # a guard's cell (compiler §5.6, §9): registered at load, it invalidates nothing
+                        # (and bounds no world, so the log does not name it as a cause)
                         j += 1
-                        min_valid2 = minworld
-                        max_valid2 = maxworld
+                        min_valid2 = UInt(1)
+                        max_valid2 = typemax(UInt)
                     elseif edge isa Core.MembershipEntry
                         # a positive membership the code folded (compiler §3.1, §9): valid from
                         # the entry's world in this session, if it is in force here

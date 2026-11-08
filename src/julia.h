@@ -387,7 +387,8 @@ typedef struct _jl_method_t {
     // forcing the conclusion to always true.
     _jl_purity_overrides_t purity;
     // a declared result (compiler §6.8): an upper bound of what the method returns, or NULL; and
-    // whether it covers every member of the sets the method is at (a trait's method for an operation)
+    // bit 0: whether it covers every member of the sets the method is at (a trait's method for an
+    // operation); bit 1: the method serves no member, so it can only raise there (compiler §5.6)
     jl_value_t *declared_result;
     uint8_t declared_covers;
     // the policy flag (compiler §2.2), bits 0-1: 0 as its module says, 1 a boundary, 2 always facts;
