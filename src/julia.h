@@ -578,6 +578,9 @@ typedef struct {
     uint8_t max_methods; // override for inference's max_methods setting (0 = no additional limit or relaxation)
     uint8_t constprop_heustic; // override for inference's constprop heuristic
     uint8_t concrete_only; // Bool: inference refuses to commit (records no backedge) at non-concrete call sites
+    // a set's inputs (compiler §4.6): bit i set when parameter i (of the first eight) is an input; a member
+    // has one instance per value of the inputs. Written once by the library at the declaration.
+    uint8_t input_params;
     // list of MembershipEntry objects (SimpleVector, replaced copy-on-write),
     // membership of this type in open sets; jl_emptysvec when none was declared.
     // An entry for the type value (member pattern Type{S}) is kept on S's TypeName.

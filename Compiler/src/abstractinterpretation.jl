@@ -206,22 +206,40 @@ function declared_field_type(@nospecialize(X), name::Symbol)
     u isa DataType || return nothing
     comps = u.name === (unwrap_unionall(Core.All)::DataType).name ? (u.parameters[1]::DataType).parameters : Any[u]
     for c in comps
-        c = unwrap_unionall(c)
-        while c isa DataType && c !== Any
-            tn = c.name
-            if isdefined(tn, :declared_fields)
-                df = tn.declared_fields::SimpleVector
-                names = df[1]::SimpleVector
-                for k in 1:length(names)
-                    names[k] === name || continue
-                    T = df[2][k]
-                    has_free_typevars(T) || return T
-                    T = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), T, tn.wrapper, c.parameters)
-                    return has_free_typevars(T) ? rewrap_unionall(T, X) : T
+        T = declared_field_in(unwrap_unionall(c), name, 0)
+        T === nothing && continue
+        return has_free_typevars(T) ? rewrap_unionall(T, X) : T
+    end
+    return nothing
+end
+
+# The declared type of the field `name` at the set instance `c`: on its TypeName, its declared
+# supertypes' or its supertraits' (their instances at `c`'s parameters). A field named by an input
+# parameter (`HasProperty{N, R}`'s `N`) is named by that parameter's value at `c`.
+function declared_field_in(@nospecialize(c), name::Symbol, depth::Int)
+    while c isa DataType && c !== Any
+        tn = c.name
+        if isdefined(tn, :declared_fields)
+            df = tn.declared_fields::SimpleVector
+            names = df[1]::SimpleVector
+            for k in 1:length(names)
+                nk = names[k]
+                if nk isa TypeVar
+                    nk = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), nk, tn.wrapper, c.parameters)
                 end
+                nk === name || continue
+                T = df[2][k]
+                has_free_typevars(T) || return T
+                return ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), T, tn.wrapper, c.parameters)
             end
-            c = c.super
         end
+        if depth < 8 && ccall(:jl_is_open_set, Cint, (Any,), c) != 0
+            for s in ccall(:jl_supertrait_instances, Any, (Any,), c)::Vector{Any}
+                T = declared_field_in(unwrap_unionall(s), name, depth + 1)
+                T === nothing || return T
+            end
+        end
+        c = c.super
     end
     return nothing
 end

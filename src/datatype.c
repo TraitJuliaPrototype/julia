@@ -97,6 +97,7 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     jl_atomic_store_relaxed(&tn->cache_entry_count, 0);
     tn->constprop_heustic = 0;
     tn->concrete_only = 0;
+    tn->input_params = 0;
     jl_atomic_store_relaxed(&tn->memberships, jl_emptysvec);
     jl_atomic_store_relaxed(&tn->contract, NULL);
     jl_atomic_store_relaxed(&tn->declared_fields, NULL);
@@ -434,6 +435,50 @@ void jl_memberships_activated(jl_array_t *list, size_t world)
     jl_set_membership_query_world(mq);
 }
 
+// The set at the inputs of its instance `inst`, its other parameters free (compiler §4.6):
+// for `HasProperty{N, R}` with input `N`, `HasProperty{:ps, R} where R`. The set's wrapper if it
+// has no inputs.
+static jl_value_t *set_at_inputs(jl_typename_t *tn, jl_datatype_t *inst)
+{
+    if (tn->input_params == 0)
+        return tn->wrapper;
+    size_t n = jl_nparams(inst);
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, n + 1);
+    jl_value_t *body = tn->wrapper;
+    for (size_t i = 0; i < n; i++) {
+        if (!jl_is_unionall(body)) {
+            JL_GC_POP();
+            return tn->wrapper;
+        }
+        jl_tvar_t *v = ((jl_unionall_t*)body)->var;
+        args[i] = (i < 8 && (tn->input_params >> i) & 1) ? jl_tparam(inst, i) : (jl_value_t*)v;
+        body = ((jl_unionall_t*)body)->body;
+    }
+    jl_value_t *t = args[n] = jl_apply_type(tn->wrapper, args, n);
+    for (size_t i = n; i-- > 0; ) {
+        if (i < 8 && (tn->input_params >> i) & 1)
+            continue;
+        t = args[n] = jl_type_unionall((jl_tvar_t*)args[i], t);
+    }
+    JL_GC_POP();
+    return t;
+}
+
+// Whether two instances of the set `tn` agree in every input (compiler §4.6).
+static int same_inputs(jl_typename_t *tn, jl_value_t *a, jl_value_t *b)
+{
+    if (tn->input_params == 0)
+        return 1;
+    jl_value_t *ua = jl_unwrap_unionall(a), *ub = jl_unwrap_unionall(b);
+    if (!jl_is_datatype(ua) || !jl_is_datatype(ub) || jl_nparams(ua) != jl_nparams(ub))
+        return 0;
+    for (size_t i = 0; i < jl_nparams(ua) && i < 8; i++)
+        if (((tn->input_params >> i) & 1) && !jl_types_equal(jl_tparam(ua, i), jl_tparam(ub, i)))
+            return 0;
+    return 1;
+}
+
 // Declare `member` a member of the set `set_instance` names (compiler §4.2-§4.6).
 // The library checks ownership and the contract first; the runtime checks what
 // keeps subtyping sound: an open set, no cycle among sets, one instance per member.
@@ -482,32 +527,38 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         jl_errorf("the membership %s <: %s would close a cycle among sets",
                   jl_symbol_name(home->name), jl_symbol_name(setname->name));
     }
-    // one instance per member (compiler §4.6), exactly for a concrete member: a member
-    // of the set already must be a member of this instance, and then this is a
-    // redeclaration. A pattern is not checked yet (compiler C-27).
+    // one instance per member and value of the set's inputs (compiler §4.6), exactly for a
+    // concrete member: a member of the set at these inputs already must be a member of this
+    // instance, and then this is a redeclaration. A pattern is not checked yet (compiler C-27).
     int redeclare = 0;
+    jl_value_t *entry = NULL;
+    JL_GC_PUSH1(&entry);
     if (jl_is_concrete_type(member)) {
         size_t mq = jl_set_membership_query_world(world);
-        int in_set = jl_subtype(member, setname->wrapper);
+        entry = set_at_inputs(setname, (jl_datatype_t*)setuw);
+        int in_set = jl_subtype(member, entry);
         int in_instance = in_set && jl_subtype(member, set_instance);
         jl_set_membership_query_world(mq);
+        entry = NULL;
         if (in_set && !in_instance) {
             JL_UNLOCK(&world_counter_lock);
+            JL_GC_POP();
+            if (setname->input_params != 0)
+                jl_errorf("%s is a member of %s at these inputs already, at another instance",
+                          jl_symbol_name(home->name), jl_symbol_name(setname->name));
             jl_errorf("%s is a member of %s at another instance already",
                       jl_symbol_name(home->name), jl_symbol_name(setname->name));
         }
         redeclare = in_instance;
     }
     size_t min_world = world + 1;
-    jl_value_t *entry = NULL;
-    JL_GC_PUSH1(&entry);
     if (redeclare) {
-        // the old entry of the same pattern ends where the new one begins (§4.3)
+        // the old entry of the same pattern and inputs ends where the new one begins (§4.3)
         jl_svec_t *list = jl_typename_memberships(home);
         for (size_t i = 0; i < jl_svec_len(list); i++) {
             jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
             if (en->set == setname && jl_atomic_load_relaxed(&en->max_world) == ~(uint64_t)0 &&
-                jl_types_equal(en->member, member))
+                jl_types_equal(en->member, member) && same_inputs(setname, en->instance, set_instance))
                 jl_atomic_store_release(&en->max_world, world);
         }
     }
@@ -561,6 +612,23 @@ JL_DLLEXPORT void jl_set_open_set(jl_value_t *T)
         if (jl_is_datatype(t))
             ((jl_datatype_t*)t)->has_open_set = 1;
     }
+}
+
+// Write a set's inputs (compiler §4.6), the library's @trait, before the set has a member: bit i
+// set when parameter i is an input. Only the first eight parameters can be inputs.
+JL_DLLEXPORT void jl_set_input_params(jl_value_t *T, uint8_t mask)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->open_set)
+        jl_error("only a set has inputs");
+    jl_typename_t *tn = ((jl_datatype_t*)uw)->name;
+    if (jl_nparams(uw) < 8 && (mask >> jl_nparams(uw)) != 0)
+        jl_errorf("%s has %d parameters: an input beyond them", jl_symbol_name(tn->name), (int)jl_nparams(uw));
+    if (tn->input_params == mask)
+        return;
+    if (tn->input_params != 0)
+        jl_errorf("the inputs of %s are written once", jl_symbol_name(tn->name));
+    tn->input_params = mask;
 }
 
 // Write a set's declared fields (compiler §7.1), once: their names and types, the types in the
