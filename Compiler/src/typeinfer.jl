@@ -1554,12 +1554,6 @@ end
 
 # compute (and cache) an inferred AST and return type
 function typeinf_ext(interp::AbstractInterpreter, mi::MethodInstance, source_mode::UInt8)
-    # a method of the other policy than the interpreter's is inferred under its own (compiler §2.3,
-    # §2.4), whoever asks: the image's native compile, the JIT's queue
-    if interp isa NativeInterpreter && !interp.plainrt && mi.def isa Method
-        facts = mi_policy_facts_at(mi, interp.facts)
-        facts === interp.facts || return typeinf_ext(interp_for_policy(interp, facts), mi, source_mode)
-    end
     start_time = ccall(:jl_typeinf_timing_begin, UInt64, ())
     let code = get(code_cache(interp), mi, nothing)
         if code isa CodeInstance
@@ -1865,7 +1859,9 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             # and this is either the primary world, or not applicable in the primary world
             # then we want to compile and emit this
             if item.def.primary_world <= world
-                ci = typeinf_ext(interp, item, SOURCE_MODE_GET_SOURCE)
+                # under the policy of the method as the queue reaches it (compiler §2.3)
+                ci = typeinf_ext(item.def isa Method ? interp_for_policy(interp, mi_policy_facts_at(item, code_policy(interp) == 1)) : interp,
+                                 item, SOURCE_MODE_GET_SOURCE)
                 ci isa CodeInstance && push!(workqueue, ci)
             end
             markinspected!(workqueue, item)
