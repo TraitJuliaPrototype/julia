@@ -1337,14 +1337,40 @@ static int set_default_attribute(jl_value_t *decl_i, jl_module_t **setmod) JL_NO
     return d < 0 ? 0 : d;
 }
 
-// whether a value's type is Julia's own or the set's package's: the set's default does not apply to it
+// whether a type is Julia's own or the set's package's, with every type among its parameters,
+// recursively (a value parameter, a number or a symbol, is the type's own): the set's default does
+// not apply to a value of such a type, since such types are few and fixed. A parametric type that
+// carries another package's type (`FunctionDynamics{typeof(f)}`, `Base.Fix1{typeof(f)}`) is not.
+static int type_is_own_(jl_value_t *t, jl_module_t *setpkg, int depth) JL_NOTSAFEPOINT
+{
+    if (depth > 8)
+        return 0;
+    if (jl_is_typevar(t))
+        return type_is_own_(((jl_tvar_t*)t)->ub, setpkg, depth + 1);
+    if (jl_is_unionall(t))
+        return type_is_own_(jl_unwrap_unionall(t), setpkg, depth);
+    if (jl_is_uniontype(t))
+        return type_is_own_(((jl_uniontype_t*)t)->a, setpkg, depth + 1) &&
+               type_is_own_(((jl_uniontype_t*)t)->b, setpkg, depth + 1);
+    if (jl_is_vararg(t)) {
+        jl_value_t *vt = jl_unwrap_vararg(t);
+        return vt == NULL || type_is_own_(vt, setpkg, depth + 1);
+    }
+    if (!jl_is_datatype(t))
+        return 1; // a value parameter
+    jl_datatype_t *dt = (jl_datatype_t*)t;
+    jl_module_t *p = module_package(dt->name->module);
+    if (!(p == jl_core_module || p == jl_base_module || (setpkg != NULL && p == setpkg)))
+        return 0;
+    for (size_t k = 0; k < jl_nparams(dt); k++) {
+        if (!type_is_own_(jl_tparam(dt, k), setpkg, depth + 1))
+            return 0;
+    }
+    return 1;
+}
 static int type_is_own(jl_value_t *elt, jl_module_t *setmod) JL_NOTSAFEPOINT
 {
-    jl_value_t *u = jl_unwrap_unionall(elt);
-    if (!jl_is_datatype(u))
-        return 0;
-    jl_module_t *p = module_package(((jl_datatype_t*)u)->name->module);
-    return p == jl_core_module || p == jl_base_module || (setmod != NULL && p == module_package(setmod));
+    return type_is_own_(elt, setmod != NULL ? module_package(setmod) : NULL, 0);
 }
 
 // The arguments of `m` that a call with argument types `tt` compiles once (compiler §6.3, steps 3 to
