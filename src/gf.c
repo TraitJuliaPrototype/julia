@@ -2606,6 +2606,10 @@ static void set_names_in(jl_value_t *t, arraylist_t *out, int depth) JL_NOTSAFEP
 // arguments could meet the call's.
 static int shadow_at(jl_value_t *tt, jl_method_t *m0, jl_method_t *mz, size_t i)
 {
+    // open issue 158 (a): a method that can only raise at a member (declared result `Union{}`) is no
+    // shadow: dispatched, it throws as the pruned arm would
+    if (mz->declared_result == (jl_value_t*)jl_bottom_type)
+        return 0;
     jl_value_t *zsig = jl_unwrap_unionall(mz->sig);
     if (!jl_is_datatype(zsig) || !jl_is_datatype(tt))
         return 0;
@@ -3351,7 +3355,10 @@ struct _typename_invalidate_backedge {
     size_t n;
     size_t max_world;
     int invalidated;
+    jl_method_t *setmethod; // C-73: a method at an open set being inserted (not a replay), else NULL
 };
+
+static int shadow_at(jl_value_t *tt, jl_method_t *m0, jl_method_t *mz, size_t i);
 
 static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *env0)
 {
@@ -3395,6 +3402,13 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
                     }
                 }
             }
+        }
+        else if (env->setmethod != NULL && jl_is_datatype(backedgetyp)) {
+            // C-73 (compiler §5.6): the edge's concrete argument is not a member of the new method's set,
+            // so the exact intersection is empty; but it could join later, and the caller that pruned this
+            // arm (no method there) holds no guard for it. Invalidated, it compiles again with the guard.
+            for (size_t k = 1; k < jl_nparams(backedgetyp) && !missing; k++)
+                missing = shadow_at(backedgetyp, NULL, env->setmethod, k);
         }
         *env->isect = *env->isect2 = NULL;
         if (missing) {
@@ -3575,7 +3589,7 @@ static void jl_method_invalidate_core(jl_method_t *replaced, size_t max_world, i
         JL_GC_PUSH2(&isect, &isect2);
         jl_methcache_t *mc = jl_method_table->cache;
         JL_LOCK(&mc->writelock);
-        struct _typename_invalidate_backedge typename_env = {(jl_value_t*)replaced->sig, (jl_value_t*)replaced->sig, &isect, &isect2, NULL, 0, max_world, 0};
+        struct _typename_invalidate_backedge typename_env = {(jl_value_t*)replaced->sig, (jl_value_t*)replaced->sig, &isect, &isect2, NULL, 0, max_world, 0, NULL};
         invalidate_missing_backedges(&typename_env);
         JL_UNLOCK(&mc->writelock);
         JL_GC_POP();
@@ -4264,7 +4278,11 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
 
     jl_methcache_t *mc = jl_method_table->cache;
     JL_LOCK(&mc->writelock);
-    struct _typename_invalidate_backedge typename_env = {type, type, &isect, &isect2, d, n, max_world, invalidated};
+    // C-73: a method at an open set reaches the missing edges of arms its set could later shadow; a method
+    // that can only raise (its declared result `Union{}`) is no shadow
+    jl_method_t *setmethod = (jl_has_open_set_in((jl_value_t*)method->sig) &&
+                              method->declared_result != (jl_value_t*)jl_bottom_type) ? method : NULL;
+    struct _typename_invalidate_backedge typename_env = {type, type, &isect, &isect2, d, n, max_world, invalidated, setmethod};
     invalidate_missing_backedges(&typename_env);
     invalidated |= typename_env.invalidated;
     if (jl_has_open_set_in((jl_value_t*)method->sig))
@@ -4810,7 +4828,7 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
         // fix 4: intersections walk under the substituted sig, but the missing-edge
         // winner question answers with m's original sig (identical on the
         // conservative path, where type == m->sig already).
-        struct _typename_invalidate_backedge typename_env = {type, (jl_value_t*)m->sig, &gc[8], &gc[9], d, n, max_world, invalidated};
+        struct _typename_invalidate_backedge typename_env = {type, (jl_value_t*)m->sig, &gc[8], &gc[9], d, n, max_world, invalidated, NULL};
         if (membership_walk_invalidates) {
             invalidate_missing_backedges(&typename_env);
             invalidated |= typename_env.invalidated;
@@ -6826,6 +6844,49 @@ static void member_hook_uncache(jl_tupletype_t *tt)
     JL_UNLOCK(&mc->writelock);
 }
 
+// C-71 (compiler §10.4): after a failed check, also the cache entries the check itself made for other
+// calls at the member (its method matching for the set's other operations): every live entry whose
+// signature names the member at an argument, and the leaf cache, dropped whole as an insertion does.
+// A failed check is an error path, so the walk's cost does not matter.
+struct uncache_member_env {
+    jl_value_t *member;
+    size_t max_world;
+};
+static int uncache_member_visitor(jl_typemap_entry_t *e, void *closure0)
+{
+    struct uncache_member_env *env = (struct uncache_member_env*)closure0;
+    if (jl_atomic_load_relaxed(&e->max_world) != ~(size_t)0)
+        return 1;
+    jl_value_t *sig = jl_unwrap_unionall((jl_value_t*)e->sig);
+    if (jl_is_datatype(sig)) {
+        for (size_t i = 1; i < jl_nparams(sig); i++) {
+            if (jl_tparam(sig, i) == env->member) {
+                jl_atomic_store_relaxed(&e->max_world, env->max_world);
+                break;
+            }
+        }
+    }
+    return 1;
+}
+static void member_hook_uncache_member(jl_value_t *member)
+{
+    jl_methcache_t *mc = jl_method_table->cache;
+    size_t world = jl_atomic_load_acquire(&jl_world_counter);
+    struct uncache_member_env env = {member, world - 1};
+    JL_LOCK(&mc->writelock);
+    jl_typemap_visitor(jl_atomic_load_relaxed(&mc->cache), uncache_member_visitor, (void*)&env);
+    jl_genericmemory_t *leafcache = jl_atomic_load_relaxed(&mc->leafcache);
+    for (size_t li = 1; li < leafcache->length; li += 2) {
+        jl_value_t *entry = jl_genericmemory_ptr_ref(leafcache, li);
+        while (entry != NULL && entry != jl_nothing) {
+            jl_atomic_store_relaxed(&((jl_typemap_entry_t*)entry)->max_world, world - 1);
+            entry = (jl_value_t*)jl_atomic_load_relaxed(&((jl_typemap_entry_t*)entry)->next);
+        }
+    }
+    jl_atomic_store_relaxed(&mc->leafcache, (jl_genericmemory_t*)jl_an_empty_memory_any);
+    JL_UNLOCK(&mc->writelock);
+}
+
 // At dispatch, before the instance lookup of a call that a method at a set serves: for each
 // argument at a position the method types by a set, and a member through a membership, the
 // library checks the member at its first use. The hook runs in the latest world with no lock
@@ -6877,6 +6938,7 @@ static void member_hook_at_dispatch(jl_tupletype_t *tt, size_t world)
             }
             JL_CATCH {
                 member_hook_uncache(tt);
+                member_hook_uncache_member(roots[2]);
                 jl_rethrow();
             }
             ct->world_age = last_age;

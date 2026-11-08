@@ -256,7 +256,8 @@ const MAX_OPERATION_SPLITS = 4
 # candidates are read without an edge: a member registered later reaches the fallback.
 function operation_split_type(@nospecialize(atype))
     tt = unwrap_unionall(atype)::DataType
-    ps = getfield(tt, :parameters)  # by the builtin: a SimpleVector in every specialization
+    # asserted: at an argument typed `Type{Tuple{…}}` (a specialization of the image) the field infers `Any`
+    ps = getfield(tt, :parameters)::SimpleVector
     for i = 2:length(ps)
         p = ps[i]
         isvarargtype(p) && break

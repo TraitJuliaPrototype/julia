@@ -385,6 +385,28 @@ jl_array_t *jl_declared_memberships JL_GLOBALLY_ROOTED = NULL;
 // Activate an image's memberships, [home TypeName, entry, ...] (compiler §9), under the world
 // counter's lock and before the image's code is validated: each entry the image wrote live is in
 // force from `world`, and one on another module's TypeName joins that TypeName's list.
+static jl_value_t *set_at_inputs(jl_typename_t *tn, jl_datatype_t *inst);
+
+// C-35 (compiler §4.6, §9): would this image's entry give its concrete member a second instance of
+// its set, against the entries in force at `world`?
+static int activation_conflicts(jl_membership_t *en, size_t world)
+{
+    if (!jl_is_concrete_type(en->member))
+        return 0; // a pattern's second instance is compiler C-27
+    jl_value_t *setuw = jl_unwrap_unionall(en->instance);
+    if (!jl_is_datatype(setuw))
+        return 0;
+    jl_value_t *at = NULL;
+    JL_GC_PUSH1(&at);
+    size_t mq = jl_set_membership_query_world(world);
+    at = set_at_inputs(((jl_datatype_t*)setuw)->name, (jl_datatype_t*)setuw);
+    int in_set = jl_subtype(en->member, at);
+    int in_instance = in_set && jl_subtype(en->member, en->instance);
+    jl_set_membership_query_world(mq);
+    JL_GC_POP();
+    return in_set && !in_instance;
+}
+
 void jl_activate_memberships(jl_array_t *list, size_t world)
 {
     size_t n = jl_array_nrows(list);
@@ -396,6 +418,16 @@ void jl_activate_memberships(jl_array_t *list, size_t world)
         if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
             continue;   // superseded while the image was built: never in force
         en->min_world = world;
+        if (activation_conflicts(en, world)) {
+            // refused as at a declaration: never in force, and said (C-35)
+            jl_atomic_store_release(&en->max_world, world - 1);
+            jl_printf(JL_STDERR, "WARNING: a package image's membership of ");
+            jl_static_show(JL_STDERR, en->member);
+            jl_printf(JL_STDERR, " in ");
+            jl_static_show(JL_STDERR, en->instance);
+            jl_printf(JL_STDERR, " is refused: the member is in the set at another instance already\n");
+            continue;
+        }
         jl_svec_t *old = jl_typename_memberships(home);
         int present = 0;
         for (size_t k = 0; k < jl_svec_len(old) && !present; k++)
