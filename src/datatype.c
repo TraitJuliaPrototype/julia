@@ -186,6 +186,7 @@ static jl_value_t *publish_entry(jl_typename_t *tn, jl_typename_t *setname, jl_v
     entry->receiver = receiver;
     entry->min_world = world;
     jl_atomic_store_relaxed(&entry->max_world, ~(uint64_t)0);
+    jl_membership_changed(world);   // a redeclaration's old entry ends at world - 1 too
     entry->declarer = declarer;
     entry->by = by;
     jl_svec_t *old = jl_typename_memberships(tn);
@@ -410,6 +411,8 @@ static int activation_conflicts(jl_membership_t *en, size_t world)
 void jl_activate_memberships(jl_array_t *list, size_t world)
 {
     size_t n = jl_array_nrows(list);
+    if (n > 0)
+        jl_membership_changed(world);   // the entries begin, or are refused, at `world`
     jl_value_t *nd = NULL;
     JL_GC_PUSH1(&nd);
     for (size_t i = 0; i + 1 < n; i += 2) {

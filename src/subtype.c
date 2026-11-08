@@ -1714,8 +1714,30 @@ JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT
     return 0;
 }
 
+// The latest world in which an entry's visibility changed (compiler §5.3): a declaration, an image's
+// activation, a redeclaration's end of the old entry and a refusal raise it, before their world is
+// published. At a query in this world or later every entry is either in force from a world no later than
+// it, with no end, or retired before it: the exact range is [w, ∞) with w no later than this world, so
+// starting the range here is exact at its end and narrower at its start, and needs no walk.
+static _Atomic(size_t) membership_last_change = 1;
+void jl_membership_changed(size_t world) JL_NOTSAFEPOINT
+{
+    size_t old = jl_atomic_load_relaxed(&membership_last_change);
+    while (old < world && !jl_atomic_cmpswap(&membership_last_change, &old, world))
+        ;
+}
+
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *lo, size_t *hi) JL_NOTSAFEPOINT
 {
+    size_t last = jl_atomic_load_acquire(&membership_last_change);
+    if (world != 0 && world >= last) {
+        // an entry is reached only through a TypeName that holds one, so `t` reaches none without them
+        if (!jl_type_has_memberships(t))
+            return 0;
+        if (*lo < last)
+            *lo = last;
+        return 1;
+    }
     arraylist_t seen;
     arraylist_new(&seen, 0);
     int found = membership_range_visit(t, world, lo, hi, &seen);

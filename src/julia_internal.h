@@ -1008,6 +1008,7 @@ JL_DLLEXPORT size_t jl_membership_query_world(void) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b);
 // the world range over which the memberships a question about t can read are what
 // they are in `world`; returns whether t reaches any entry (*lo/*hi untouched if not)
+void jl_membership_changed(size_t world) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *lo, size_t *hi) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
 // intersections (compiler §4.9): All{X, Y} is Core.All{Tuple{X, Y}}, built in its normal form
