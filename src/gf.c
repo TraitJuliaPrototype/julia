@@ -4398,6 +4398,22 @@ static int set_name_nested(jl_value_t *v, jl_typename_t *tn, int depth)
 // set to 0 when the shape resists substitution (a parametric or free-var
 // position of the set's family that the walked set is not a subtype of, or a
 // nested/Vararg occurrence); the caller then takes the conservative path.
+// can m's parameter `uw` (its free variables m's) be met by a member of the set instance `Y`?
+// Exact where both are closed; where either keeps a variable it cannot close, yes (C-72):
+// the substituted walk then over-approximates, which lowers more and never misses.
+static int membership_param_meets(jl_value_t *Y, jl_value_t *uw, jl_value_t *msig)
+{
+    if (jl_has_free_typevars(Y))
+        return 1; // a pattern's instance
+    if (!jl_has_free_typevars(uw))
+        return jl_egal(Y, uw) || jl_subtype(Y, uw);
+    jl_value_t *w = jl_rewrap_unionall(uw, msig);
+    JL_GC_PUSH1(&w);
+    int meets = jl_has_free_typevars(w) || !jl_has_empty_intersection(Y, w);
+    JL_GC_POP();
+    return meets;
+}
+
 static jl_value_t *membership_subst_sig(jl_method_t *m, jl_array_t *sets,
                                         jl_value_t *member, int *clean)
 {
@@ -4434,38 +4450,44 @@ static jl_value_t *membership_subst_sig(jl_method_t *m, jl_array_t *sets,
     jl_datatype_t *tuple = NULL;
     jl_value_t *res = NULL;
     JL_GC_PUSH3(&newparams, &tuple, &res);
+    size_t nreplaced = 0;
     for (size_t i = 0; i < n; i++) {
         jl_value_t *p = jl_tparam(mbd, i);
         jl_value_t *uw = jl_is_vararg(p) ? jl_unwrap_vararg(p) : jl_unwrap_unionall(p);
+        if (uw && jl_is_typevar(uw)) // f(c::C) where C <: X{T}: the variable's bound names the set
+            uw = jl_unwrap_unionall(((jl_tvar_t*)uw)->ub);
         int replaced = 0;
-        if (jl_is_datatype(uw)) {
+        int named = 0;
+        if (uw && jl_is_datatype(uw)) {
             jl_datatype_t *pd = (jl_datatype_t*)uw;
-            int named = 0;
             for (size_t s = 0; s < jl_array_nrows(sets); s++) {
-                jl_value_t *Yuw = jl_unwrap_unionall(jl_array_ptr_ref(sets, s));
+                jl_value_t *Y = jl_array_ptr_ref(sets, s);
+                jl_value_t *Yuw = jl_unwrap_unionall(Y);
                 if (((jl_datatype_t*)Yuw)->name != pd->name)
                     continue;
                 named = 1;
-                if (!jl_has_free_typevars(uw) &&
-                    (jl_egal(jl_array_ptr_ref(sets, s), uw) || jl_subtype(jl_array_ptr_ref(sets, s), uw))) {
-                    if (jl_is_vararg(p)) {
-                        // review W2-5c: substituting at a vararg position here would
-                        // write the BARE member and strip the Vararg — a malformed
-                        // dummy sig. Route to the conservative path instead (making
-                        // the driver's "set under Vararg is conservative" claim true).
-                        *clean = 0;
-                        JL_GC_POP();
-                        return NULL;
-                    }
-                    jl_svecset(newparams, i, memb);
-                    replaced = 1;
-                    break;
+                if (!membership_param_meets(Y, uw, msig))
+                    continue; // another instance of the set: the membership does not reach m here
+                if (jl_is_vararg(p)) {
+                    // review W2-5c: substituting at a vararg position here would
+                    // write the BARE member and strip the Vararg — a malformed
+                    // dummy sig. Route to the conservative path instead (making
+                    // the driver's "set under Vararg is conservative" claim true).
+                    *clean = 0;
+                    JL_GC_POP();
+                    return NULL;
                 }
+                // C-72: also where m's parameter has its own variables (X{T}, C <: X{T}): the
+                // member in its place, the variables left free elsewhere, which the walk's
+                // intersections over-approximate, never miss
+                jl_svecset(newparams, i, memb);
+                replaced = 1;
+                nreplaced++;
+                break;
             }
-            if (named && !replaced) { // a different instance of the family: conservative
-                *clean = 0;
-                JL_GC_POP();
-                return NULL;
+            if (named && !replaced) { // only other instances of the set at this position
+                jl_svecset(newparams, i, p);
+                continue;
             }
         }
         if (!replaced) {
@@ -4479,6 +4501,13 @@ static jl_value_t *membership_subst_sig(jl_method_t *m, jl_array_t *sets,
             }
             jl_svecset(newparams, i, p);
         }
+    }
+    if (nreplaced == 0) {
+        // m names the set at top level only at instances the member is not of (else the
+        // nested check above went conservative): its dispatch at the member is unchanged
+        *clean = 2;
+        JL_GC_POP();
+        return NULL;
     }
     // build: tuple, wrapped over m's vars, then the member's vars not already bound there
     tuple = (jl_datatype_t*)jl_apply_tuple_type(newparams, 0);
@@ -4609,6 +4638,53 @@ static int membership_shadow_visitor(jl_typemap_entry_t *def, void *closure0)
     return 1;
 }
 
+// A method decides only the calls of its own function (compiler C-72): the walk's visits of
+// the method table's definitions and of the method cache are by intersection with
+// `Tuple{F, Vararg{Any}}`, F the method's first parameter, not over every function's entries
+// (Julia's method table is one table for all functions). Exact: an entry another method's
+// call reaches has a first parameter disjoint from F.
+static jl_value_t *method_function_search_type(jl_method_t *m)
+{
+    jl_value_t *sig = (jl_value_t*)m->sig;
+    jl_value_t *body = jl_unwrap_unionall(sig);
+    if (!jl_is_tuple_type(body) || jl_nparams(body) == 0 || jl_is_vararg(jl_tparam0(body)))
+        return (jl_value_t*)jl_anytuple_type;
+    jl_value_t *params[2] = {jl_tparam0(body), jl_tparam0(jl_anytuple_type)}; // F, Vararg{Any}
+    jl_value_t *t = (jl_value_t*)jl_apply_tuple_type_v(params, 2);
+    JL_GC_PUSH1(&t);
+    t = jl_rewrap_unionall(t, sig); // the method's variables that F names
+    JL_GC_POP();
+    return t;
+}
+
+struct membership_function_visit {
+    struct typemap_intersection_env match;
+    jl_typemap_visitor_fptr fptr;
+    void *closure;
+};
+static int membership_function_visitor(jl_typemap_entry_t *e, struct typemap_intersection_env *closure0)
+{
+    struct membership_function_visit *env = container_of(closure0, struct membership_function_visit, match);
+    return env->fptr(e, env->closure);
+}
+// calls fptr(entry, closure) on each entry of `map` whose signature meets `search`, live or not
+// (the callbacks check the worlds themselves, as under jl_typemap_visitor)
+static void membership_visit_function(jl_typemap_t *map, jl_value_t *search, size_t world,
+                                      jl_typemap_visitor_fptr fptr, void *closure)
+{
+    jl_value_t *va = jl_unwrap_unionall(search);
+    va = jl_tparam(va, jl_nparams(va) - 1);
+    va = jl_is_vararg(va) ? jl_unwrap_vararg(va) : NULL;
+    struct membership_function_visit env = {{membership_function_visitor, search, va,
+            /* .search_slurp = */ 0, /* .world = */ world,
+            /* .min_valid = */ 0, /* .max_valid = */ ~(size_t)0,
+            /* .ti = */ NULL, /* .env = */ NULL, /* .issubty = */ 0},
+        fptr, closure};
+    JL_GC_PUSH1(&env.match.ti);
+    jl_typemap_intersection_visitor(map, 0, &env.match);
+    JL_GC_POP();
+}
+
 JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *set_instance,
                                               size_t entry_min_world)
 {
@@ -4645,13 +4721,16 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
         jl_methtable_t *mt = jl_method_get_table(m);
         if (!jl_is_mtable(mt))
             continue;
+        int clean = 1;
+        jl_value_t *substsing = membership_subst_sig(m, sets, member, &clean);
+        if (clean == 2)
+            continue; // m names the set only at other instances: the membership does not reach it
         membership_stats.replays++;
         int invalidated = 0;
         jl_value_t *type = NULL;
         jl_method_t *const *d = NULL;
         size_t j, n = 0;
-        int clean = 1;
-        jl_value_t *substsing = membership_subst_sig(m, sets, member, &clean);
+        jl_value_t *search = gc[2] = method_function_search_type(m); // C-72: m's function only
         jl_value_t *dummy_sig = NULL;
         jl_typemap_entry_t *dummy = NULL;
         jl_array_t *oldmi = NULL;
@@ -4670,8 +4749,8 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
             membership_all_specializations(m, oldmi);
             struct membership_shadow_env shadow_env = {m, entry_min_world, max_world, oldmi,
                                                        &membership_stats, 0};
-            jl_typemap_visitor(jl_atomic_load_relaxed(&mt->defs), membership_shadow_visitor,
-                               (void*)&shadow_env);
+            membership_visit_function(jl_atomic_load_relaxed(&mt->defs), search, entry_min_world,
+                                      membership_shadow_visitor, (void*)&shadow_env);
             invalidated |= shadow_env.invalidated;
             // a member's own methods now meet m's signature, so m is no longer the only method there;
             // `which(m.sig)` is still m (a membership adds no method): LATEST_WHICH stays, or validation
@@ -4749,10 +4828,9 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
             mt_cache_env.shadowed = oldmi;
             mt_cache_env.newentry = dummy;
             mt_cache_env.stats = &membership_stats;
-            if (dummy)
-                jl_typemap_visitor(jl_atomic_load_relaxed(&mc->cache), invalidate_mt_cache, (void*)&mt_cache_env);
-            else
-                jl_typemap_visitor(jl_atomic_load_relaxed(&mc->cache), invalidate_all_mt_cache, (void*)&mt_cache_env);
+            // C-72: the cache entries of m's function only; the leaf cache below is dropped whole, as at an insertion
+            membership_visit_function(jl_atomic_load_relaxed(&mc->cache), search, entry_min_world,
+                                      dummy ? invalidate_mt_cache : invalidate_all_mt_cache, (void*)&mt_cache_env);
             jl_genericmemory_t *leafcache = jl_atomic_load_relaxed(&mc->leafcache);
             size_t li, ll = leafcache->length;
             for (li = 1; li < ll; li += 2) {
@@ -4772,6 +4850,7 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
             gc[7] = (jl_value_t*)jl_cstr_to_string("jl_membership_dispatch_walk");
             jl_array_ptr_1d_push(_jl_debug_method_invalidation, gc[7]);
         }
+        gc[2] = NULL;
         gc[3] = NULL;
         gc[4] = NULL;
         gc[5] = NULL;
