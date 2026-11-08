@@ -3139,6 +3139,9 @@ function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
     argtypes::Vector{Any} = arginfo.argtypes  # declare type because the closure below captures `argtypes`
     fargs = arginfo.fargs
     la = length(argtypes)
+    # the definition-time check (compiler §6.7): the library's hook records the call; no other
+    # interpreter reaches this, and the test folds for each of them
+    isa(interp, DefinitionCheckInterpreter) && Core.invokelatest(interp.hook, interp, f, argtypes, sv)
     𝕃ᵢ = typeinf_lattice(interp)
     if isa(f, Builtin)
         if f === _apply_iterate

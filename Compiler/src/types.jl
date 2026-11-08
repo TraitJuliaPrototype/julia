@@ -526,6 +526,41 @@ function code_cache(interp::AbstractInterpreter)
   return WorldView(cache, worlds)
 end
 
+"""
+    DefinitionCheckInterpreter(world, hook, state)
+
+The definition-time check (compiler §6.7): Julia's inference of a method at its own signature, with an
+ephemeral cache, so that every function the method reaches is inferred again, and at each known call
+`hook(interp, f, argtypes, sv)`, the library's, which records a use outside a set's contract in `state`.
+The interpreter is the compiler's own: a library that runs the check defines no method of the
+compiler's functions, so loading it invalidates none of the compiler's code (compiler C-40).
+"""
+struct DefinitionCheckCache
+    dict::IdDict{MethodInstance,CodeInstance}
+end
+struct DefinitionCheckInterpreter <: AbstractInterpreter
+    world::UInt
+    inf_params::InferenceParams
+    opt_params::OptimizationParams
+    inf_cache::Vector{InferenceResult}
+    code_cache::DefinitionCheckCache
+    hook::Any       # hook(interp, f, argtypes::Vector{Any}, sv) -> nothing, called in the latest world
+    state::Any      # the library's record of this check
+end
+DefinitionCheckInterpreter(world::UInt, @nospecialize(hook), @nospecialize(state)) =
+    DefinitionCheckInterpreter(world, InferenceParams(), OptimizationParams(), InferenceResult[],
+                               DefinitionCheckCache(IdDict{MethodInstance,CodeInstance}()), hook, state)
+InferenceParams(interp::DefinitionCheckInterpreter) = interp.inf_params
+OptimizationParams(interp::DefinitionCheckInterpreter) = interp.opt_params
+get_inference_world(interp::DefinitionCheckInterpreter) = interp.world
+get_inference_cache(interp::DefinitionCheckInterpreter) = interp.inf_cache
+cache_owner(::DefinitionCheckInterpreter) = :DefinitionCheck
+code_cache(interp::DefinitionCheckInterpreter) = WorldView(interp.code_cache, WorldRange(interp.world))
+get(wvc::WorldView{DefinitionCheckCache}, mi::MethodInstance, default) = get(wvc.cache.dict, mi, default)
+getindex(wvc::WorldView{DefinitionCheckCache}, mi::MethodInstance) = getindex(wvc.cache.dict, mi)
+haskey(wvc::WorldView{DefinitionCheckCache}, mi::MethodInstance) = haskey(wvc.cache.dict, mi)
+setindex!(wvc::WorldView{DefinitionCheckCache}, ci::CodeInstance, mi::MethodInstance) = (setindex!(wvc.cache.dict, ci, mi); wvc)
+
 get_escape_cache(interp::AbstractInterpreter) = GetNativeEscapeCache(interp)
 
 abstract type CallInfo end
