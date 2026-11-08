@@ -308,7 +308,10 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     if drt !== nothing
         split = operation_split_type(atype)
         split === nothing && return Future(CallMeta(drt, Any, Effects(), DeclaredResultInfo(drt)))
-        i, U = split
+        # asserted, as the compiler's own results are: inferred while the compiler bootstraps itself,
+        # an untyped index made `newargs[i]` a dynamic call whose edges any new integer constructor
+        # invalidated, and the compiler with it
+        i, U = split::Tuple{Int,Type}
         newargs = copy(argtypes)
         newargs[i] = U
         call = abstract_call(interp, ArgInfo(nothing, newargs), si, sv)::Future
