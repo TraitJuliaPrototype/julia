@@ -130,6 +130,8 @@ end
 const POLICY_PLAIN = Cint(0)
 const POLICY_FACTS = Cint(1)
 const POLICY_CALLER = Cint(2)
+const REACH_PLAIN = Cint(0)
+const REACH_FACTS = Cint(1)
 const REACH_RUNTIME = Cint(2)
 method_policy(m::Method) = ccall(:jl_method_policy, Cint, (Any,), m)
 method_policy_facts(m::Method) = method_policy(m) === POLICY_FACTS
@@ -138,10 +140,32 @@ mi_policy_facts(mi::MethodInstance) = ccall(:jl_mi_policy_at, Cint, (Any, Cint),
 "Whether a callee of policy `p` is inferred under the other policy than the caller's `facts`."
 other_policy(p::Cint, facts::Bool) = p !== POLICY_CALLER && (p === POLICY_FACTS) !== facts
 
-"The native interpreter of the other policy, in the same world and with the same parameters, one crossing further."
-policy_interp(interp::NativeInterpreter, facts::Bool) =
-    NativeInterpreter(get_inference_world(interp); inf_params = InferenceParams(interp),
-                      opt_params = OptimizationParams(interp), facts, crossings = interp.crossings + 1)
+"Whether `mi`'s code is compiled by facts where code of policy `facts` reaches it."
+mi_policy_facts_at(mi::MethodInstance, facts::Bool) =
+    ccall(:jl_mi_policy_at, Cint, (Any, Cint), mi, facts ? REACH_FACTS : REACH_PLAIN) != 0
+"The policy a CodeInstance of Julia's own owner was compiled in (`JL_CI_FLAGS_FACTS`)."
+ci_policy_facts(ci::CodeInstance) = (getfield(ci, :flags, :monotonic)::UInt8 & 0x20) !== 0x00
+
+"""
+The native interpreter of the other policy, in the same world and with the same parameters; one
+crossing further where it is nested in an inference (`nested`). It shares the codegen cache, so a
+queue that compiles what it infers finds the source of code of either policy.
+"""
+function policy_interp(interp::NativeInterpreter, facts::Bool; nested::Bool = true)
+    world = get_inference_world(interp)
+    return NativeInterpreter(world, CachedMethodTable(InternalMethodTable(world)), InferenceResult[],
+                             interp.codegen, InferenceParams(interp), OptimizationParams(interp),
+                             facts, interp.crossings + Int(nested), false)
+end
+
+"""
+The interpreter that infers code of policy `facts` at the top level (compiler §2.3): `interp` where
+it has that policy, else the other policy's, sharing its codegen cache. `return_type`'s run-time
+interpreter infers every method plainly, under an owner of its own.
+"""
+interp_for_policy(interp::AbstractInterpreter, ::Bool) = interp
+interp_for_policy(interp::NativeInterpreter, facts::Bool) =
+    interp.plainrt || interp.facts === facts ? interp : policy_interp(interp, facts; nested = false)
 
 # How many inferences of the other policy may nest: past it a call is answered as unknown, so that
 # two policies' inferences of a cycle do not recurse into each other.

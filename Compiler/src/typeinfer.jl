@@ -1554,6 +1554,12 @@ end
 
 # compute (and cache) an inferred AST and return type
 function typeinf_ext(interp::AbstractInterpreter, mi::MethodInstance, source_mode::UInt8)
+    # a method of the other policy than the interpreter's is inferred under its own (compiler §2.3,
+    # §2.4), whoever asks: the image's native compile, the JIT's queue
+    if interp isa NativeInterpreter && !interp.plainrt && mi.def isa Method
+        facts = mi_policy_facts_at(mi, interp.facts)
+        facts === interp.facts || return typeinf_ext(interp_for_policy(interp, facts), mi, source_mode)
+    end
     start_time = ccall(:jl_typeinf_timing_begin, UInt64, ())
     let code = get(code_cache(interp), mi, nothing)
         if code isa CodeInstance
@@ -1792,7 +1798,9 @@ function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UIn
                 src = _uncompressed_ir(callee, src)
             end
             if !isa(src, CodeInfo)
-                newcallee = typeinf_ext(workqueue.interp, callee.def, source_mode) # always SOURCE_MODE_ABI
+                # inferred again under the policy it was compiled in (compiler §2.3)
+                newcallee = typeinf_ext(callee.owner === nothing ? interp_for_policy(workqueue.interp, ci_policy_facts(callee)) : workqueue.interp,
+                                        callee.def, source_mode) # always SOURCE_MODE_ABI
                 if newcallee isa CodeInstance
                     callee === ci && (ci = newcallee) # ci stopped meeting the requirements after typeinf_ext last checked, try again with newcallee
                     push!(workqueue, newcallee)
@@ -1886,7 +1894,9 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             else
                 src = get(interp.codegen, callee, nothing)
                 if src === nothing
-                    newcallee = typeinf_ext(interp, mi, SOURCE_MODE_GET_SOURCE)
+                    # inferred again under the policy it was compiled in (compiler §2.3)
+                    newcallee = typeinf_ext(callee.owner === nothing ? interp_for_policy(interp, ci_policy_facts(callee)) : interp,
+                                            mi, SOURCE_MODE_GET_SOURCE)
                     if newcallee isa CodeInstance
                         @assert use_const_api(newcallee) || haskey(interp.codegen, newcallee)
                         push!(workqueue, newcallee)
