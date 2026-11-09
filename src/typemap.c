@@ -1450,19 +1450,22 @@ static void jl_typemap_level_insert_(
     }
     if (t1 == (jl_value_t*)jl_typeofbottom_type)
         t1 = (jl_value_t*)jl_assume(jl_typeofbottom_type)->super;
-    // a method at an open set (compiler §5.1): its entry stays in the linear list,
-    // which every walk visits — name1 probes key on the query's supertype chain,
-    // and a membership is not in any chain. One memoized bit read; false for every
-    // method when no set is open. This also holds when a list overflows
-    // MAX_METHLIST_COUNT and jl_method_convert_list_to_cache re-inserts every
-    // entry: open-set sigs are routed back to linear at the level they are reached,
-    // where every lookup that intersects the earlier positions arrives (assoc_exact
-    // and assoc_by_type walk linear after the name probes, before the any bucket;
-    // the intersection visitor and the any bucket always visit it). The only walks
-    // that return early without reaching a level's linear list are the subtype=0
-    // lookups, which reach only jl_method_table->defs — the builtin-only table
-    // where this bit is false, so their type-equality premise keeps holding.
-    if (jl_has_open_set_in((jl_value_t*)newrec->sig)) {
+    // a method whose type at this position mentions an open set (compiler §5.1): its entry
+    // stays in this level's linear list, which every walk reaching the level visits —
+    // name1 probes key on the query's supertype chain, and a membership is not in any
+    // chain. At the other positions the entry is indexed as any other, so a set at the
+    // second argument does not put the method in the list of the function's level
+    // (`show(io::IO, x)` is filed under `typeof(show)` and listed one level down). One
+    // memoized bit read; false when no set occurs at the position. This also holds when a
+    // list overflows MAX_METHLIST_COUNT and jl_method_convert_list_to_cache re-inserts
+    // every entry: the entry is routed back to the linear list of the level of its set's
+    // position, where every lookup that intersects the earlier positions arrives
+    // (assoc_exact and assoc_by_type walk linear after the name probes, before the any
+    // bucket; the intersection visitor and the any bucket always visit it). The only walks
+    // that return early without reaching a level's linear list are the subtype=0 lookups,
+    // which reach only jl_method_table->defs — the builtin-only table where this bit is
+    // false, so their type-equality premise keeps holding.
+    if (t1 && jl_has_open_set_in(t1)) {
         jl_typemap_list_insert_(map, &cache->linear, (jl_value_t*)cache, newrec);
         return;
     }
