@@ -448,6 +448,15 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
                     else
                         add_remark!(interp, sv, "[constprop] Discarded exception type because result was wider than inference")
                     end
+                    # The const result's code runs at this call where it was taken for its effects or its
+                    # exception type, so its type joins the call's: a declared result makes inference at
+                    # a wider argument (an operation's result through the set) and at a narrower one (the
+                    # member's own method, known by constant propagation) non-monotone, and code must
+                    # never return a type its call's type excludes (open issue 171)
+                    if const_result !== volatile_inf_result && !(this_const_rt ⊑ₚ this_rt)
+                        this_rt = this_rt ⊔ₚ this_const_rt
+                        this_conditional = this_rt
+                    end
                     if const_edge !== nothing
                         edge = const_edge
                         update_valid_age!(sv, world_range(const_edge))
@@ -3465,7 +3474,7 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
                 return Future(CallMeta(S, Any, Effects(), CallableCallInfo(S, A)))
             end
         end
-        return Future(CallMeta(S, Any, Effects(), DeclaredResultInfo(S, false)))
+        return Future(CallMeta(S, Any, Effects(), DeclaredResultInfo(S)))
     end
     if hasintersect(wft, Builtin)
         add_remark!(interp, sv, "Could not identify method table for call")

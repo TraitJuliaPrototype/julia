@@ -32,10 +32,7 @@ operation's declared result `rt`. The call stays a dynamic call and its result i
 """
 struct DeclaredResultInfo <: CallInfo
     rt::Any
-    # an operation's result converts to `rt` (traits §7.9); a `Callable`'s is asserted (§7.4)
-    convert::Bool
 end
-DeclaredResultInfo(@nospecialize(rt)) = DeclaredResultInfo(rt, true)
 add_edges_impl(::Vector{Any}, ::DeclaredResultInfo) = nothing
 
 """

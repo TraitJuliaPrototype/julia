@@ -5,7 +5,7 @@
 # called through a `:caller_world` pointer to the call's target compiled for its type, made here the
 # first time the type is met at the call's signature.
 
-# `_SplitTarget` and `_to_declared` are defined first in Base (base/splittarget.jl), before any stream:
+# `_SplitTarget` is defined first in Base (base/splittarget.jl), before any stream:
 # a pointer dispatches to the target in its caller's world, which may be any world of Base's build.
 
 # the compiler reads the target here, not by a binding of Base it would look up in its own world

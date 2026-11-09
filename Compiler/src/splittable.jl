@@ -13,7 +13,7 @@ const MAX_SPLIT_TABLE_ARGS = 6
 
 """
 Base's target type for a split's pointers, `Base._SplitTarget`, set by base/splittable.jl once it has
-defined the target and the declared result's conversion (`Base._to_declared`); `nothing` before. The
+defined the target; `nothing` before. The
 inliner reads it here: it runs in the compiler's world, which precedes Base's definitions.
 """
 const SPLIT_TARGET = RefValue{Any}(nothing)

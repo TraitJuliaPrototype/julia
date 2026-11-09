@@ -736,11 +736,7 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
             ssa = insert_node_here!(compact, NewInstruction(stmt, fallback_rt === nothing ? typ : Any, line))
         end
         if fallback_rt !== nothing
-            # the split's last branch: the dynamic call, its result converted to the declared result
-            if declared_converts(fallback_rt)
-                ssa = insert_node_here!(compact, NewInstruction(
-                    Expr(:call, GlobalRef(Base, :_to_declared), fallback_rt, ssa), Any, line))
-            end
+            # the split's last branch: the dynamic call, its result asserted to the declared result
             ssa = insert_node_here!(compact, NewInstruction(
                 Expr(:call, GlobalRef(Core, :typeassert), ssa, fallback_rt), fallback_rt, line))
         end
@@ -1984,26 +1980,18 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
     return todo
 end
 
-# An operation's call at a receiver typed by its set (compiler §7.1): the dynamic call, its result
-# converted to the declared result (traits §7.9), which inference took as the call's type. A call of
-# a `Callable` (`convert = false`): asserted.
-function handle_declared_result!(ir::IRCode, idx::Int, stmt::Expr, info::DeclaredResultInfo; convert::Bool = true)
+# An operation's call at a receiver typed by its set (compiler §7.1), or a `Callable`'s (§7.4): the
+# dynamic call, its result asserted to the declared result (traits §7.9), which inference took as the
+# call's type.
+function handle_declared_result!(ir::IRCode, idx::Int, stmt::Expr, info::DeclaredResultInfo)
     inst = ir[SSAValue(idx)]
     call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], nothing))
-    val = call
-    if convert && info.convert && declared_converts(info.rt)
-        val = insert_node!(ir, SSAValue(idx), NewInstruction(
-            Expr(:call, GlobalRef(Base, :_to_declared), info.rt, call), Any, NoCallInfo(), inst[:line], nothing))
-    end
-    inst[:stmt] = Expr(:call, GlobalRef(Core, :typeassert), val, info.rt)
+    inst[:stmt] = Expr(:call, GlobalRef(Core, :typeassert), call, info.rt)
     inst[:info] = NoCallInfo()
     inst[:flag] = IR_FLAG_NULL
     return nothing
 end
 
-# A declared result other than `Any` converts once Base defines the conversion (base/splittable.jl
-# sets `SPLIT_TARGET` after it).
-declared_converts(@nospecialize(R)) = R !== Any && SPLIT_TARGET[] !== nothing
 
 # A call of a value known as `Callable{A, S}` (compiler §7.4): its arguments checked against `A`
 # (`MethodError`), then the dynamic call, its result asserted to `S`.
@@ -2011,7 +1999,7 @@ function handle_callable_call!(ir::IRCode, idx::Int, stmt::Expr, info::CallableC
     inst = ir[SSAValue(idx)]
     check = Expr(:call, GlobalRef(Core, :_callable_argcheck), stmt.args[1], info.A, stmt.args[2:end]...)
     insert_node!(ir, SSAValue(idx), NewInstruction(check, Nothing, NoCallInfo(), inst[:line], nothing))
-    return handle_declared_result!(ir, idx, stmt, DeclaredResultInfo(info.rt); convert = false)
+    return handle_declared_result!(ir, idx, stmt, DeclaredResultInfo(info.rt))
 end
 
 function linear_inline_eligible(ir::IRCode)

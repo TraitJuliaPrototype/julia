@@ -1,27 +1,26 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
 # `IO`'s contract (traits §9b; compiler §7.1, §7.5). `IO` is Julia's closed abstract type, and a
-# method typed `io::IO` is compiled per stream type. The contract's operations carry their declared
-# results. So at a value typed `IO` (a field, an element, an argument declared `@nospecialize`), an
-# operation's call has its declared result and branches over the candidates.
+# method typed `io::IO` is compiled per stream type. At a value typed `IO` (a field, an element, an
+# argument declared `@nospecialize`), an operation's call branches over the candidates.
 
-# The operations, each Base's method at `::IO` with its declared result. A write's count is an
-# `Int`, as `IOBuffer` and `IOStream` return it. A call through `IO` converts another stream's count
-# (Core's streams and `Filesystem.File` return a `UInt`), as `f(…)::Int` would (traits §7.9).
+# The operations, each Base's method at `::IO`. A closed type's members are Julia's streams, which no
+# check reaches, so no result can be promised for them: each operation's result is `Any`, Julia's own
+# answer at such a receiver, and the split neither converts nor asserts (open issue 171).
 let ops = Any[]
-    for (f, sig, rt) in Any[
-            (write,        Tuple{IO, UInt8},              Int),
-            (unsafe_write, Tuple{IO, Ptr{UInt8}, UInt},   Int),
-            (read,         Tuple{IO, Type{UInt8}},        UInt8),
-            (unsafe_read,  Tuple{IO, Ptr{UInt8}, UInt},   Any),
-            (flush,        Tuple{IO},                     Any),
-            (lock,         Tuple{IO},                     Any),
-            (unlock,       Tuple{IO},                     Any),
-            (get,          Tuple{IO, Any, Any},           Any),
-            (haskey,       Tuple{IO, Any},                Bool)]
+    for (f, sig) in Any[
+            (write,        Tuple{IO, UInt8}),
+            (unsafe_write, Tuple{IO, Ptr{UInt8}, UInt}),
+            (read,         Tuple{IO, Type{UInt8}}),
+            (unsafe_read,  Tuple{IO, Ptr{UInt8}, UInt}),
+            (flush,        Tuple{IO}),
+            (lock,         Tuple{IO}),
+            (unlock,       Tuple{IO}),
+            (get,          Tuple{IO, Any, Any}),
+            (haskey,       Tuple{IO, Any})]
         m = which(f, sig)
         m.sig === Tuple{typeof(f), sig.parameters...} || error("IO's operation $f: Base's method at ::IO is $m")
-        ccall(:jl_method_set_declared_result, Cvoid, (Any, Any, Cint), m, rt, 1)
+        ccall(:jl_method_set_declared_result, Cvoid, (Any, Any, Cint), m, Any, 1)
         push!(ops, m)
     end
     ccall(:jl_declare_contract, Cvoid, (Any, Any), IO, Core.svec(ops...))
