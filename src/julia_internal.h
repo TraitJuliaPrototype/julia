@@ -1015,10 +1015,9 @@ JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b);
 // they are in `world`; returns whether t reaches any entry (*lo/*hi untouched if not)
 void jl_membership_changed(size_t world) JL_NOTSAFEPOINT;
 int jl_membership_range_is_fast(size_t world) JL_NOTSAFEPOINT;
+// `sig`, where given, is the signature of the method matched: a match at one that names Callable is
+// narrowed by the call methods of the query's types at those positions (compiler §7.4)
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_t world, size_t *lo, size_t *hi);
-// whether the type names Callable (a parameter, a union's member, a variable's bound): a match at a
-// method whose signature names it rests on the member's call methods too (compiler §7.4)
-int jl_names_callable(jl_value_t *t) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
 // intersections (compiler §4.9): All{X, Y} is Core.All{Tuple{X, Y}}, built in its normal form
 // an intersection All{X, Y} (compiler §4.9). Every intersection has the open-set bit, so a type

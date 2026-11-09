@@ -1744,10 +1744,6 @@ static int names_callable(jl_value_t *t, int depth) JL_NOTSAFEPOINT
             return 1;
     return 0;
 }
-int jl_names_callable(jl_value_t *t) JL_NOTSAFEPOINT
-{
-    return names_callable(t, 0);
-}
 
 // Narrows [*lo, *hi] by the call methods of each concrete callable type in `t`, its parameters
 // included: the worlds in which its memberships of Callable are as in `world` (compiler §7.4).
