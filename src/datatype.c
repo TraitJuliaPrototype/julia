@@ -250,9 +250,9 @@ static void index_entry(jl_membership_t *en)
     JL_GC_POP();
 }
 
-// A closed abstract type with a contract (compiler §7.1): its declaring module writes the
-// contract's operations, a SimpleVector of its methods with their declared results, once on the
-// type's contract slot, which images keep with the TypeName. A set's contract slot is the library's.
+// A closed abstract type with a contract (compiler §7.1, §7.2): its declaring module writes the
+// contract once on the type's contract slot, which images keep with the TypeName: `svec(ops, cands)`,
+// the operations' methods and the split's candidates in order. A set's contract slot is the library's.
 static int has_contract(jl_value_t *T) JL_NOTSAFEPOINT
 {
     jl_value_t *uw = jl_unwrap_unionall(T);
@@ -262,17 +262,34 @@ static int has_contract(jl_value_t *T) JL_NOTSAFEPOINT
     return tn->abstract && !tn->open_set && jl_atomic_load_relaxed(&tn->contract) != NULL;
 }
 
-JL_DLLEXPORT void jl_declare_contract(jl_value_t *T, jl_value_t *ops)
+JL_DLLEXPORT void jl_declare_contract(jl_value_t *T, jl_value_t *ops, jl_value_t *cands)
 {
     jl_value_t *uw = jl_unwrap_unionall(T);
     if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->abstract || ((jl_datatype_t*)uw)->name->open_set)
         jl_error("only a closed abstract type declares a contract by its operations");
     JL_TYPECHK(jl_declare_contract, simplevector, ops);
+    JL_TYPECHK(jl_declare_contract, simplevector, cands);
     jl_typename_t *tn = ((jl_datatype_t*)uw)->name;
+    // declared where the type is defined: a contract written on a type another image holds would not be
+    // kept by the writer's image (Base's build declares Core's `IO`'s)
+    if (jl_object_in_image((jl_value_t*)tn) && !(jl_generating_output() && !jl_options.incremental))
+        jl_errorf("the contract of %s is declared in the image that defines it", jl_symbol_name(tn->name));
+    size_t n = jl_svec_len(cands);
+    for (size_t i = 0; i < n; i++) {
+        jl_value_t *C = jl_svecref(cands, i);
+        if (!jl_is_concrete_type(C) || !jl_subtype(C, T))
+            jl_errorf("a candidate of %s is a concrete subtype of it", jl_symbol_name(tn->name));
+        for (size_t j = 0; j < i; j++)
+            if (jl_svecref(cands, j) == C)
+                jl_errorf("a candidate of %s is named once", jl_symbol_name(tn->name));
+    }
+    jl_value_t *c = (jl_value_t*)jl_svec2(ops, cands);
+    JL_GC_PUSH1(&c);
     jl_value_t *expected = NULL;
-    if (!jl_atomic_cmpswap(&tn->contract, &expected, ops))
+    if (!jl_atomic_cmpswap(&tn->contract, &expected, c))
         jl_errorf("the contract of %s is written once", jl_symbol_name(tn->name));
-    jl_gc_wb(tn, ops);
+    jl_gc_wb(tn, c);
+    JL_GC_POP();
 }
 
 JL_DLLEXPORT int jl_has_contract(jl_value_t *T) JL_NOTSAFEPOINT
@@ -285,15 +302,17 @@ JL_DLLEXPORT jl_value_t *jl_contract_operations(jl_value_t *T)
 {
     if (!has_contract(T))
         return jl_nothing;
-    return jl_atomic_load_relaxed(&((jl_datatype_t*)jl_unwrap_unionall(T))->name->contract);
+    return jl_svecref(jl_atomic_load_relaxed(&((jl_datatype_t*)jl_unwrap_unionall(T))->name->contract), 0);
 }
 
 // a member of a pattern joins its set's candidates at its first use (the library, compiler §10.4);
-// a closed type's declaring module registers its candidates (§7.2)
+// a closed type's candidates are its contract's, named once with it (§7.2)
 JL_DLLEXPORT void jl_register_candidate(jl_value_t *set, jl_value_t *T)
 {
     jl_value_t *uw = jl_unwrap_unionall(set);
-    if (jl_is_datatype(uw) && (((jl_datatype_t*)uw)->name->open_set || has_contract(set)) && jl_is_concrete_type(T))
+    if (has_contract(set))
+        jl_errorf("the candidates of %s are its contract's", jl_symbol_name(((jl_datatype_t*)uw)->name->name));
+    if (jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->open_set && jl_is_concrete_type(T))
         register_candidate(((jl_datatype_t*)uw)->name, T);
 }
 
@@ -302,7 +321,18 @@ JL_DLLEXPORT jl_value_t *jl_candidates_of(jl_value_t *set)
 {
     jl_value_t *uw = jl_unwrap_unionall(set);
     jl_value_t *r = NULL;
-    if (jl_is_datatype(uw) && (((jl_datatype_t*)uw)->name->open_set || has_contract(set))) {
+    if (has_contract(set)) {
+        // a closed type's: its contract's, as a fresh list
+        jl_svec_t *cands = (jl_svec_t*)jl_svecref(jl_atomic_load_relaxed(&((jl_datatype_t*)uw)->name->contract), 1);
+        JL_GC_PUSH1(&cands);
+        size_t n = jl_svec_len(cands);
+        jl_array_t *a = jl_alloc_vec_any(n);
+        for (size_t i = 0; i < n; i++)
+            jl_array_ptr_set(a, i, jl_svecref(cands, i));
+        JL_GC_POP();
+        return (jl_value_t*)a;
+    }
+    if (jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->open_set) {
         JL_LOCK(&candidates_lock);
         if (jl_set_candidates != NULL)
             r = jl_eqtable_get(jl_set_candidates, (jl_value_t*)((jl_datatype_t*)uw)->name, NULL);

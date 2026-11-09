@@ -135,7 +135,8 @@ static void get_tags(jl_value_t **tags[NUM_TAGS])
     INSERT_TAG(jl_compile_and_emit_func);
     INSERT_TAG(jl_libdl_dlopen_func);
     // the indices of sets and memberships (compiler §5.1, §5.6, §7.2), as the image's method tables
-    // are kept: its methods at sets, each function's, the sets' candidates, entries and cells
+    // are kept: its methods at sets, each function's, the sets' candidates (a closed type's are on its
+    // TypeName, with its contract), entries and cells
     INSERT_TAG(open_set_methods);
     INSERT_TAG(jl_func_set_methods);
     INSERT_TAG(jl_set_candidates);

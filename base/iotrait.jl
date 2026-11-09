@@ -23,11 +23,8 @@ let ops = Any[]
         ccall(:jl_method_set_declared_result, Cvoid, (Any, Any, Cint), m, Any, 1)
         push!(ops, m)
     end
-    ccall(:jl_declare_contract, Cvoid, (Any, Any), IO, Core.svec(ops...))
-end
-
-# The candidates of the split (compiler §7.2), in this order: at a value typed `IO`, an operation
-# branches over these with direct calls, and goes through the table past them (§7.3).
-for T in (IOBuffer, IOStream, TTY, PipeEndpoint)
-    ccall(:jl_register_candidate, Cvoid, (Any, Any), IO, T)
+    # the split's candidates (compiler §7.2), in this order: at a value typed `IO`, an operation
+    # branches over these with direct calls, and goes through the table past them (§7.3)
+    ccall(:jl_declare_contract, Cvoid, (Any, Any, Any), IO, Core.svec(ops...),
+          Core.svec(IOBuffer, IOStream, TTY, PipeEndpoint))
 end
