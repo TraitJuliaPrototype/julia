@@ -1038,6 +1038,54 @@ JL_CALLABLE(jl_f_with_dynamic)
 jl_genericmemory_t *jl_attributed_cache JL_GLOBALLY_ROOTED = NULL; // rooted by the collectors (gc-stock.c)
 static jl_mutex_t attributed_cache_lock;
 
+// The latest answers by the call's types and bits, read without the lock, so that a call through
+// `Core.attributed_call` costs a dynamic call's lookup and no tuple type is made for it: a table of
+// ATTRIBUTED_FAST_N slots, each `svec(bits, world, mi, tt)`, at a hash of the bits and of the
+// function's and arguments' types. An entry answers a call in its world whose function and arguments
+// have exactly the types of `tt`, none of them a type (a type's tuple type is `Type{T}`).
+#define ATTRIBUTED_FAST_N 1024
+_Atomic(jl_genericmemory_t*) jl_attributed_fast JL_GLOBALLY_ROOTED = NULL; // rooted by the collectors (gc-stock.c)
+
+static size_t attributed_fast_slot(jl_value_t **cargs, uint32_t cnargs, uint64_t bits) JL_NOTSAFEPOINT
+{
+    uint64_t h = int64hash(bits);
+    for (uint32_t i = 0; i < cnargs; i++)
+        h = bitmix(h, (uint64_t)(uintptr_t)jl_typeof(cargs[i]));
+    return (size_t)(h & (ATTRIBUTED_FAST_N - 1));
+}
+
+static int attributed_fast_match(jl_value_t *tt, jl_value_t **cargs, uint32_t cnargs) JL_NOTSAFEPOINT
+{
+    if (jl_nparams(tt) != cnargs)
+        return 0;
+    for (uint32_t i = 0; i < cnargs; i++) {
+        jl_value_t *a = cargs[i];
+        if (jl_is_type(a) || jl_tparam(tt, i) != jl_typeof(a))
+            return 0;
+    }
+    return 1;
+}
+
+static void attributed_fast_put(size_t slot, jl_value_t *bits, size_t world, jl_method_instance_t *mi, jl_value_t *tt)
+{
+    jl_genericmemory_t *fast = jl_atomic_load_acquire(&jl_attributed_fast);
+    if (fast == NULL) {
+        JL_LOCK(&attributed_cache_lock);
+        fast = jl_atomic_load_relaxed(&jl_attributed_fast);
+        if (fast == NULL) {
+            fast = jl_alloc_memory_any(ATTRIBUTED_FAST_N);
+            jl_atomic_store_release(&jl_attributed_fast, fast);
+        }
+        JL_UNLOCK(&attributed_cache_lock);
+    }
+    jl_value_t *w = NULL, *e = NULL;
+    JL_GC_PUSH3(&fast, &w, &e);
+    w = jl_box_ulong(world);
+    e = (jl_value_t*)jl_svec(4, bits, w, (jl_value_t*)mi, tt);
+    jl_genericmemory_ptr_set(fast, slot, e);
+    JL_GC_POP();
+}
+
 static jl_value_t *attributed_call_reach(jl_value_t **args, uint32_t nargs, int reach)
 {
     JL_NARGSV(attributed_call, 2);
@@ -1049,6 +1097,18 @@ static jl_value_t *attributed_call_reach(jl_value_t **args, uint32_t nargs, int 
     if (mask == 0 || jl_isa(cargs[0], (jl_value_t*)jl_builtin_type))
         return jl_apply_reach(cargs, cnargs, reach);
     size_t world = jl_current_task->world_age;
+    size_t slot = attributed_fast_slot(cargs, cnargs, bits);
+    jl_genericmemory_t *fast = jl_atomic_load_acquire(&jl_attributed_fast);
+    if (fast != NULL) {
+        jl_value_t *e = jl_genericmemory_ptr_ref(fast, slot);
+        if (e != NULL && (uint64_t)jl_unbox_long(jl_svecref(e, 0)) == bits &&
+                jl_unbox_ulong(jl_svecref(e, 1)) == world &&
+                attributed_fast_match(jl_svecref(e, 3), cargs, cnargs)) {
+            jl_method_instance_t *fmi = (jl_method_instance_t*)jl_svecref(e, 2);
+            JL_GC_PROMISE_ROOTED(fmi); // its method's specializations hold it
+            return jl_invoke_reach(cargs[0], &cargs[1], cnargs - 1, fmi, reach);
+        }
+    }
     jl_value_t *tt = NULL, *list = NULL, *nl = NULL;
     jl_method_instance_t *mi = NULL;
     JL_GC_PUSH4(&tt, &list, &nl, &mi);
@@ -1089,6 +1149,7 @@ static jl_value_t *attributed_call_reach(jl_value_t **args, uint32_t nargs, int 
         jl_attributed_cache = jl_eqtable_put(jl_attributed_cache, tt, nl, NULL);
         JL_UNLOCK(&attributed_cache_lock);
     }
+    attributed_fast_put(slot, args[0], world, mi, tt);
     jl_value_t *r = jl_invoke_reach(cargs[0], &cargs[1], cnargs - 1, mi, reach);
     JL_GC_POP();
     return r;
