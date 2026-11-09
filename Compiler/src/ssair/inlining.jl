@@ -514,6 +514,31 @@ function split_table_ptr!(compact::IncrementalCompact, argexprs::Vector{Any}, ta
     return insert_node_here!(compact, NewInstruction(Expr(:foreigncall, Expr(:tuple, QuoteNode(:jl_split_table_ptr)), Ptr{Cvoid},
         svec(Any, Any), 0, QuoteNode(:ccall), table, T), Ptr{Cvoid}, line))
 end
+"""
+The `:caller_world` pointer of a split's branch not inlined (compiler §7.2, open issue 167): the
+target for the candidate at the split's value, `Base._SplitTarget{F, T, R, A}`, as the table's miss
+makes it for a type past the candidates. A call through it dispatches in the caller's world, so the
+caller holds no edge to the candidate's instance, and an invalidation below the candidate stops
+there. `nothing`, and the branch is a direct call, where the split has no table, where the case does
+not narrow the value (the call's second argument, as the table takes it) to a concrete type, and
+before Base defines the target (`SPLIT_TARGET`).
+"""
+function split_branch_pointer(@nospecialize(table), atype::DataType, mtype::DataType)
+    table isa SplitTable || return nothing
+    S = SPLIT_TARGET[]
+    S === nothing && return nothing
+    (fieldcount(atype) >= 2 && fieldcount(mtype) >= 2) || return nothing
+    T = fieldtype(mtype, 2)
+    (isconcretetype(T) && !(fieldtype(atype, 2) <: T)) || return nothing
+    A = table.args::DataType
+    D = Core.apply_type(S, table.f, T, table.rt, A)
+    (D isa DataType && isdefined(D, :instance)) || return nothing
+    target = D.instance
+    cats = Any[split_ccall_type(a) for a in A.parameters]
+    return Expr(:cfunction, Ptr{Cvoid}, QuoteNode(target), split_ccall_rt(table.rt),
+                svec(Any, Any, cats...), QuoteNode(:caller_world))
+end
+
 function split_table_call!(compact::IncrementalCompact, argexprs::Vector{Any}, table::SplitTable, fp, line)
     ats = Any[Any, Any]
     for A in (table.args::DataType).parameters
@@ -652,6 +677,10 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
         end
         if isa(case, InliningTodo)
             val = ir_inline_item!(compact, idx, argexprs′, case, boundscheck, todo_bbs)
+        elseif isa(case, InvokeCase) && (bfp = split_branch_pointer(table, atype, mtype)) !== nothing
+            # a split's branch not inlined: through the candidate's `:caller_world` pointer, with no edge
+            p = insert_node_here!(compact, NewInstruction(bfp, Ptr{Cvoid}, line))
+            val = split_table_call!(compact, argexprs′, table::SplitTable, p, line)
         elseif isa(case, InvokeCase)
             invoke_stmt = Expr(:invoke, case.invoke, argexprs′...)
             flag = flags_for_effects(case.effects)
@@ -707,7 +736,11 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
             ssa = insert_node_here!(compact, NewInstruction(stmt, fallback_rt === nothing ? typ : Any, line))
         end
         if fallback_rt !== nothing
-            # the split's last branch: the dynamic call, its result asserted to the declared result
+            # the split's last branch: the dynamic call, its result converted to the declared result
+            if declared_converts(fallback_rt)
+                ssa = insert_node_here!(compact, NewInstruction(
+                    Expr(:call, GlobalRef(Base, :_to_declared), fallback_rt, ssa), Any, line))
+            end
             ssa = insert_node_here!(compact, NewInstruction(
                 Expr(:call, GlobalRef(Core, :typeassert), ssa, fallback_rt), fallback_rt, line))
         end
@@ -1559,10 +1592,14 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
         guard = info.cells
         info = info.info
     end
-    cases = compute_inlining_cases(info, flag, sig, state)
+    # an operation's split (compiler §7.2, open issue 167): its cases' edges are collected apart, and a
+    # branch keeps its edge only where it is inlined or stays a direct call
+    split = info isa SplitCallInfo
+    estate = split ? InliningState(Any[], state.world, state.interp, state.opt_cache, state.cycle_results) : state
+    cases = compute_inlining_cases(info, flag, sig, estate)
     if cases === nothing
         # an operation's call that is not split: the dynamic call, asserted
-        info isa SplitCallInfo && handle_declared_result!(ir, idx, stmt, DeclaredResultInfo(info.rt))
+        split && handle_declared_result!(ir, idx, stmt, DeclaredResultInfo(info.rt))
         return nothing
     end
     cases, handled_all_cases, fully_covered, joint_effects = cases
@@ -1570,19 +1607,41 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
     atype === Union{} && return nothing # accidentally actually unreachable
     if guard !== nothing
         # a guarded call (compiler §5.6): its cases behind the guard, the dynamic call past it
+        split && append!(state.edges, estate.edges)
         (isa(atype, DataType) && !isempty(cases) && all(c -> isa(c.sig, DataType), cases)) || return nothing
         push!(todo, idx=>UnionSplit(false, fully_covered, atype, cases, nothing, nothing, guard))
         return nothing
     end
     # an operation's split (compiler §7.2): never fully covered, its branches asserted
-    fallback_rt = info isa SplitCallInfo ? info.rt : nothing
+    fallback_rt = split ? info.rt : nothing
     if fallback_rt !== nothing && isempty(cases)
         handle_declared_result!(ir, idx, stmt, DeclaredResultInfo(fallback_rt))
         return nothing
     end
     table = fallback_rt === nothing ? nothing : split_fallback_table(sig, fallback_rt)
+    if split
+        for c in cases
+            item = c.item
+            # a branch called through a `:caller_world` pointer dispatches in the caller's world: no edge
+            item isa InvokeCase && isa(atype, DataType) && isa(c.sig, DataType) &&
+                split_branch_pointer(table, atype, c.sig) !== nothing && continue
+            split_case_edge!(state.edges, item)
+        end
+    end
     handle_cases!(todo, ir, idx, stmt, atype, cases, fallback_rt === nothing ? handled_all_cases : false,
                   fallback_rt === nothing ? fully_covered : false, joint_effects, fallback_rt, table)
+end
+
+# the edge of a split's branch that is inlined or stays a direct call (compiler §7.2)
+function split_case_edge!(edges::Vector{Any}, @nospecialize(item))
+    if item isa InliningTodo
+        add_inlining_edge!(edges, item.mi)
+    elseif item isa InvokeCase
+        add_inlining_edge!(edges, item.invoke)
+    elseif item isa ConstantCase
+        add_inlining_edge!(edges, item.edge)
+    end
+    return nothing
 end
 
 function handle_match!(cases::Vector{InliningCase},
@@ -1898,15 +1957,25 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
 end
 
 # An operation's call at a receiver typed by its set (compiler §7.1): the dynamic call, its result
-# asserted to the declared result, which inference took as the call's type.
-function handle_declared_result!(ir::IRCode, idx::Int, stmt::Expr, info::DeclaredResultInfo)
+# converted to the declared result (traits §7.9), which inference took as the call's type. A call of
+# a `Callable` (`convert = false`): asserted.
+function handle_declared_result!(ir::IRCode, idx::Int, stmt::Expr, info::DeclaredResultInfo; convert::Bool = true)
     inst = ir[SSAValue(idx)]
     call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], nothing))
-    inst[:stmt] = Expr(:call, GlobalRef(Core, :typeassert), call, info.rt)
+    val = call
+    if convert && declared_converts(info.rt)
+        val = insert_node!(ir, SSAValue(idx), NewInstruction(
+            Expr(:call, GlobalRef(Base, :_to_declared), info.rt, call), Any, NoCallInfo(), inst[:line], nothing))
+    end
+    inst[:stmt] = Expr(:call, GlobalRef(Core, :typeassert), val, info.rt)
     inst[:info] = NoCallInfo()
     inst[:flag] = IR_FLAG_NULL
     return nothing
 end
+
+# A declared result other than `Any` converts once Base defines the conversion (base/splittable.jl
+# sets `SPLIT_TARGET` after it).
+declared_converts(@nospecialize(R)) = R !== Any && SPLIT_TARGET[] !== nothing
 
 # A call of a value known as `Callable{A, S}` (compiler §7.4): its arguments checked against `A`
 # (`MethodError`), then the dynamic call, its result asserted to `S`.
@@ -1914,7 +1983,7 @@ function handle_callable_call!(ir::IRCode, idx::Int, stmt::Expr, info::CallableC
     inst = ir[SSAValue(idx)]
     check = Expr(:call, GlobalRef(Core, :_callable_argcheck), stmt.args[1], info.A, stmt.args[2:end]...)
     insert_node!(ir, SSAValue(idx), NewInstruction(check, Nothing, NoCallInfo(), inst[:line], nothing))
-    return handle_declared_result!(ir, idx, stmt, DeclaredResultInfo(info.rt))
+    return handle_declared_result!(ir, idx, stmt, DeclaredResultInfo(info.rt); convert = false)
 end
 
 function linear_inline_eligible(ir::IRCode)

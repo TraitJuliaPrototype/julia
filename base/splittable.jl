@@ -5,17 +5,11 @@
 # called through a `:caller_world` pointer to the call's target compiled for its type, made here the
 # first time the type is met at the call's signature.
 
-"""
-The target of a split table's pointer: `f(x::T, args...)::R`, with `f` and `x` passed boxed and the
-other arguments as `Compiler.split_ccall_type` says; asserted to their types at the site (`A`), so
-the call inside is static.
-"""
-struct _SplitTarget{F,T,R,A} end
-for n in 0:Compiler.MAX_SPLIT_TABLE_ARGS
-    local as = Any[Symbol(:a, k) for k in 1:n]
-    local typed = Any[:($(as[k])::fieldtype(A, $k)) for k in 1:n]
-    @eval (::_SplitTarget{F,T,R,A})(@nospecialize(f), @nospecialize(x), $(as...)) where {F,T,R,A} = (f::F)(x::T, $(typed...))::R
-end
+# `_SplitTarget` and `_to_declared` are defined first in Base (base/splittarget.jl), before any stream:
+# a pointer dispatches to the target in its caller's world, which may be any world of Base's build.
+
+# the compiler reads the target here, not by a binding of Base it would look up in its own world
+Compiler.SPLIT_TARGET[] = _SplitTarget
 
 "The `:caller_world` pointer to the target for type `T` of a split table's call (`f` of type `F`, arguments `A` at the site, result `R`)."
 @generated function _split_pointer(::Type{F}, ::Type{T}, ::Type{R}, ::Type{A}) where {F,T,R,A}

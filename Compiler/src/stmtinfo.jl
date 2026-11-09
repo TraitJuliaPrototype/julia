@@ -111,12 +111,18 @@ A call of an operation of a set at a receiver typed by the set, split over the s
 candidates (compiler §7.2): `info` is the call at the receiver narrowed to their union. The
 inliner branches over them; the last branch is the dynamic call. Each branch's result not known to
 be a `rt`, the declared result, is asserted to it.
+
+The split records no edges of its own: its result is the declared result, as an operation's call
+that is not split (`DeclaredResultInfo`) records none. The inliner records the edge of each branch it
+makes a static call or inlines; a branch called through a `:caller_world` pointer, and the table,
+dispatch in the caller's world and record none, so an invalidation below a candidate stops there
+(open issue 167).
 """
 struct SplitCallInfo <: CallInfo
     info::CallInfo
     rt::Any
 end
-add_edges_impl(edges::Vector{Any}, info::SplitCallInfo) = add_edges!(edges, info.info)
+add_edges_impl(::Vector{Any}, ::SplitCallInfo) = nothing
 nsplit_impl(info::SplitCallInfo) = nsplit(info.info)
 getsplit_impl(info::SplitCallInfo, idx::Int) = getsplit(info.info, idx)
 getresult_impl(info::SplitCallInfo, idx::Int) = getresult(info.info, idx)

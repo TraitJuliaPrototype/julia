@@ -2849,8 +2849,9 @@ JL_DLLEXPORT void jl_set_split_table_miss(jl_value_t *f)
     jl_split_table_miss_func = f;
 }
 
-// The pointer for the type `T` in split table `tbl`: one probe, else made by the miss function, in
-// the caller's world.
+// The pointer for the type `T` in split table `tbl`: one probe, else made by the miss function. The
+// pointer dispatches in its caller's world at each call, so it is made in the latest world, where
+// Base's miss function and the target are defined whatever the caller's world.
 JL_DLLEXPORT void *jl_split_table_ptr(jl_value_t *tbl, jl_value_t *T)
 {
     jl_split_state_t *st = jl_atomic_load_acquire(&((jl_split_table_t*)tbl)->state);
@@ -2872,7 +2873,11 @@ JL_DLLEXPORT void *jl_split_table_ptr(jl_value_t *tbl, jl_value_t *T)
     if (jl_split_table_miss_func == NULL)
         jl_error("a split's table was reached before Base was initialized");
     jl_value_t *args[2] = {tbl, T};
+    jl_task_t *ct = jl_current_task;
+    size_t last_age = ct->world_age;
+    ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
     jl_value_t *fp = jl_apply_generic(jl_split_table_miss_func, args, 2);
+    ct->world_age = last_age;
     return jl_unbox_voidpointer(fp);
 }
 

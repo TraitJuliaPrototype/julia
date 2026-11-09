@@ -2,6 +2,8 @@
 
 const start_base_include = time_ns()
 
+include("splittarget.jl")
+
 include("reflection.jl")
 include("refpointer.jl")
 

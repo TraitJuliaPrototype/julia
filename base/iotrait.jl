@@ -22,9 +22,12 @@ end
 
 # The operations (traits §9b), each Base's method at `::IO` with its declared result: inference
 # reads it at a receiver typed `IO`, and the split asserts it on its branches and its fallback.
+# A write's count is an `Int`, as Base's streams return it; a call through `IO` converts another
+# stream's count, as `f(…)::Int` would (traits §7.9). With an abstract `Integer`, the branches join
+# to it and Base's `Int(…)` of the count dispatches when it runs (E-331).
 for (f, sig, rt) in Any[
-        (write,        Tuple{IO, UInt8},              Integer),
-        (unsafe_write, Tuple{IO, Ptr{UInt8}, UInt},   Integer),
+        (write,        Tuple{IO, UInt8},              Int),
+        (unsafe_write, Tuple{IO, Ptr{UInt8}, UInt},   Int),
         (read,         Tuple{IO, Type{UInt8}},        UInt8),
         (unsafe_read,  Tuple{IO, Ptr{UInt8}, UInt},   Any),
         (eof,          Tuple{IO},                     Bool),
