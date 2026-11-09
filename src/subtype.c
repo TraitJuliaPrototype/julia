@@ -1656,8 +1656,53 @@ int jl_membership_holds_at(jl_value_t *x, jl_value_t *y, size_t world)
 // parameters, supertypes and entries' instances, narrows [*lo, *hi] to the worlds
 // in which its visibility equals its visibility in `world`. Dispatch bounds the
 // validity of a match by it (compiler §5.3). Returns whether t reaches any entry.
+// The worlds in which the call methods of the callable type `f` are those visible in `world`: its
+// memberships of Callable (compiler §7.4) narrow [*lo, *hi] as entries do. Returns whether f has one.
+struct callable_range_env {
+    struct typemap_intersection_env match;
+    size_t qworld;
+    size_t *lo, *hi;
+    int found;
+};
+static int callable_range_visitor(jl_typemap_entry_t *ml, struct typemap_intersection_env *closure0)
+{
+    struct callable_range_env *c = container_of(closure0, struct callable_range_env, match);
+    if (closure0->ti == (jl_value_t*)jl_bottom_type || !jl_is_method(ml->func.value))
+        return 1;
+    c->found = 1;
+    size_t mn = jl_atomic_load_relaxed(&ml->min_world), mx = jl_atomic_load_relaxed(&ml->max_world);
+    if (mn > c->qworld) {
+        if (*c->hi >= mn)
+            *c->hi = mn - 1;
+    }
+    else if (mx < c->qworld) {
+        if (*c->lo <= mx)
+            *c->lo = mx + 1;
+    }
+    else {
+        if (*c->lo < mn)
+            *c->lo = mn;
+        if (*c->hi > mx)
+            *c->hi = mx;
+    }
+    return 1;
+}
+static int narrow_by_callable_methods(jl_value_t *f, size_t world, size_t *lo, size_t *hi)
+{
+    jl_value_t *tt = NULL;
+    JL_GC_PUSH1(&tt);
+    tt = (jl_value_t*)jl_svec2(f, jl_wrap_vararg((jl_value_t*)jl_any_type, NULL, 1, 0));
+    tt = (jl_value_t*)jl_apply_tuple_type((jl_svec_t*)tt, 1);
+    // every world's methods, with no membership range of their own taken (skip_ranges)
+    struct callable_range_env env = {{callable_range_visitor, tt, (jl_value_t*)jl_any_type, 0, world,
+                                      1, ~(size_t)0, NULL, NULL, 0, 1}, world, lo, hi, 0};
+    jl_typemap_intersection_visitor(jl_atomic_load_relaxed(&jl_method_table->defs), 0, &env.match);
+    JL_GC_POP();
+    return env.found;
+}
+
 static int membership_range_visit(jl_value_t *t, size_t world, size_t *lo, size_t *hi,
-                                  arraylist_t *seen) JL_NOTSAFEPOINT
+                                  arraylist_t *seen)
 {
     if (t == NULL)
         return 0;
@@ -1681,6 +1726,10 @@ static int membership_range_visit(jl_value_t *t, size_t world, size_t *lo, size_
     int found = 0;
     for (size_t i = 0; i < jl_nparams(dt); i++)
         found |= membership_range_visit(jl_tparam(dt, i), world, lo, hi, seen);
+    // a concrete callable type is a member of Callable by its methods (compiler §7.4)
+    if (jl_callable_type != NULL && world != 0 && !dt->name->never_member && !jl_has_free_typevars(t) &&
+            (jl_is_concrete_type(t) || jl_is_type_type(t)))
+        found |= narrow_by_callable_methods(t, world, lo, hi);
     for (jl_datatype_t *d = dt; d != NULL && d != jl_any_type; d = d->super) {
         size_t i;
         for (i = 0; i < seen->len; i++)
@@ -1742,9 +1791,9 @@ JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT
     return 0;
 }
 
-// The latest world in which an entry's visibility changed (compiler §5.3): a declaration, an image's
-// activation, a redeclaration's end of the old entry and a refusal raise it, before their world is
-// published. At a query in this world or later every entry is either in force from a world no later than
+// The latest world in which a membership's visibility changed (compiler §5.3): a declaration, an image's
+// activation, a redeclaration's end of the old entry and a refusal raise it, and a method's definition
+// or deletion, which begins or ends a membership of Callable (§7.4), before their world is published. At a query in this world or later every entry is either in force from a world no later than
 // it, with no end, or retired before it: the exact range is [w, ∞) with w no later than this world, so
 // starting the range here is exact at its end and narrower at its start, and needs no walk.
 static _Atomic(size_t) membership_last_change = 1;
@@ -1761,7 +1810,7 @@ int jl_membership_range_is_fast(size_t world) JL_NOTSAFEPOINT
     return world != 0 && world >= jl_atomic_load_acquire(&membership_last_change);
 }
 
-JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *lo, size_t *hi) JL_NOTSAFEPOINT
+JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *lo, size_t *hi)
 {
     if (world == 0)     // no range asked: whether `t` reaches an entry
         return jl_type_has_memberships(t);

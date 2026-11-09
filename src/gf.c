@@ -3799,6 +3799,7 @@ JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
         jl_atomic_store_relaxed(&methodentry->max_world, world);
         jl_method_table_invalidate(method, world, 1);
         lower_callable_dispatch(method, world);
+        jl_membership_changed(world + 1);   // its membership of Callable ends (compiler §7.4, §5.3)
         jl_atomic_store_release(&jl_world_counter, world + 1);
     }
     JL_UNLOCK(&world_counter_lock);
@@ -4346,11 +4347,13 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     invalidated |= typename_env.invalidated;
     if (jl_has_open_set_in((jl_value_t*)method->sig))
         invalidate_unguarded_callers(method, world, max_world);
-    // a method of a callable type can begin its membership in Callable (compiler §7.4)
+    // a method of a callable type can begin its membership in Callable (compiler §7.4): a membership
+    // whose visibility changes at `world`, for the worlds of a match at a set (§5.3)
     {
         jl_value_t *msig = jl_unwrap_unionall((jl_value_t*)method->sig);
         if (jl_is_datatype(msig) && jl_nparams(msig) > 0)
             jl_membership_update_callable_cells(jl_tparam0(msig), world);
+        jl_membership_changed(world);
     }
     if (oldmi && jl_array_nrows(oldmi)) {
         // drop leafcache and search mc->cache and drop anything that might overlap with the new method
