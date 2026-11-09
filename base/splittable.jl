@@ -30,6 +30,8 @@ A split table's miss (`jl_split_table_ptr`): the pointer for type `T`, made and 
 The pointer is made outside the update; the table's state is replaced, never mutated.
 """
 function _split_table_miss!(tbl::Compiler.SplitTable, @nospecialize(T))
+    # a session without the compiler makes no pointer: the call dispatches when it runs (compiler §7.3)
+    ccall(:jl_get_LLVM_VERSION, UInt32, ()) == 0 && return C_NULL
     fp = _split_pointer(tbl.f, T, tbl.rt, tbl.args)::Ptr{Cvoid}
     s = ccall(:jl_split_session, UInt64, ())
     while true

@@ -250,7 +250,20 @@ function cfg_inline_unionsplit!(ir::IRCode, idx::Int, union_split::UnionSplit,
     # NOTE This edge is only required for `!handled_all_cases` and not `!fully_covered`,
     #      since in the latter case we inline `Core.throw_methoderror` into the fallback
     #      block, which is must-throw, making the subsequent code path unreachable.
-    !handled_all_cases && push!(from_bbs, length(state.new_cfg_blocks))
+    if !handled_all_cases && union_split.table !== nothing
+        # a split's last branch through its table (compiler §7.3): the fallback block takes the
+        # pointer, then the call through it, or the dynamic call where none was made
+        fb = length(state.new_cfg_blocks)
+        for _ in 1:2
+            push!(state.new_cfg_blocks, BasicBlock(StmtRange(idx, idx)))
+            push!(state.new_cfg_blocks[end].preds, fb)
+            push!(state.new_cfg_blocks[fb].succs, length(state.new_cfg_blocks))
+            push!(from_bbs, length(state.new_cfg_blocks))
+        end
+        push!(bbs, length(state.new_cfg_blocks))
+    elseif !handled_all_cases
+        push!(from_bbs, length(state.new_cfg_blocks))
+    end
     # This block will be the block everyone returns to
     push!(state.new_cfg_blocks, BasicBlock(StmtRange(idx, idx), from_bbs, orig_succs))
     join_bb = length(state.new_cfg_blocks)
@@ -491,14 +504,17 @@ function split_fallback_table(sig::Signature, @nospecialize(rt))
 end
 
 """
-The last branch of a split through its table (`SplitTable`): `typeof(x)`, the pointer for it
-(`jl_split_table_ptr`: one probe, or the pointer made at the first miss), and the call through it,
-typed as `split_ccall_type` says. `argexprs` are the call's: `f`, `x`, the other arguments.
+The last branch of a split through its table (`SplitTable`): `typeof(x)` and the pointer for it
+(`jl_split_table_ptr`: one probe, or the pointer made at the first miss; `C_NULL` where none can be
+made), then the call through it, typed as `split_ccall_type` says. `argexprs` are the call's: `f`,
+`x`, the other arguments.
 """
-function split_table_call!(compact::IncrementalCompact, argexprs::Vector{Any}, table::SplitTable, line)
+function split_table_ptr!(compact::IncrementalCompact, argexprs::Vector{Any}, table::SplitTable, line)
     T = insert_node_here!(compact, NewInstruction(Expr(:call, GlobalRef(Core, :typeof), argexprs[2]), DataType, line))
-    fp = insert_node_here!(compact, NewInstruction(Expr(:foreigncall, Expr(:tuple, QuoteNode(:jl_split_table_ptr)), Ptr{Cvoid},
+    return insert_node_here!(compact, NewInstruction(Expr(:foreigncall, Expr(:tuple, QuoteNode(:jl_split_table_ptr)), Ptr{Cvoid},
         svec(Any, Any), 0, QuoteNode(:ccall), table, T), Ptr{Cvoid}, line))
+end
+function split_table_call!(compact::IncrementalCompact, argexprs::Vector{Any}, table::SplitTable, fp, line)
     ats = Any[Any, Any]
     for A in (table.args::DataType).parameters
         push!(ats, split_ccall_type(A))
@@ -667,8 +683,26 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
     # We're now in the fall through block, decide what to do
     if !handled_all_cases
         if table !== nothing
-            # the split's last branch: the pointer for the value's type from the table of the call's signature
-            ssa = split_table_call!(compact, argexprs, table::SplitTable, line)
+            # the split's last branch: the pointer for the value's type from the table of the call's
+            # signature, and the call through it; where no pointer was made (a session without the
+            # compiler), the dynamic call
+            dyn_bb = bbs[end-1]
+            fp = split_table_ptr!(compact, argexprs, table::SplitTable, line)
+            isnull = insert_node_here!(compact, NewInstruction(Expr(:call, GlobalRef(Core, :(===)), fp, C_NULL), Bool, line))
+            made = insert_node_here!(compact, NewInstruction(Expr(:call, not_int, isnull), Bool, line))
+            insert_node_here!(compact, NewInstruction(GotoIfNot(made, dyn_bb), Any, line))
+            finish_current_bb!(compact, 0)
+            ssa = split_table_call!(compact, argexprs, table::SplitTable, fp, line)
+            if fallback_rt !== nothing
+                ssa = insert_node_here!(compact, NewInstruction(
+                    Expr(:call, GlobalRef(Core, :typeassert), ssa, fallback_rt), fallback_rt, line))
+            end
+            push!(pn.edges, dyn_bb - 1)
+            push!(pn.values, ssa)
+            insert_node_here!(compact, NewInstruction(GotoNode(join_bb), Any, line))
+            finish_current_bb!(compact, 0)
+            bb = dyn_bb
+            ssa = insert_node_here!(compact, NewInstruction(stmt, Any, line))
         else
             ssa = insert_node_here!(compact, NewInstruction(stmt, fallback_rt === nothing ? typ : Any, line))
         end
