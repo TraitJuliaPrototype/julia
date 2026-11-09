@@ -923,7 +923,7 @@ jl_method_instance_t *jl_get_specialized(jl_method_t *m, jl_value_t *types, jl_s
 // The value of `f(…)::RT`'s `RT` at the method's definition (compiler §6.8). Lowering computes it in
 // straight-line statements before its `declared_result` meta; `copy` holds them resolved. NULL where one
 // of them is not a constant type expression: a global not constant, an argument, a call of a function
-// other than `Core.apply_type`, `TypeVar` or `UnionAll`.
+// other than `Core.apply_type`, `TypeVar`, `UnionAll` or `getproperty` at a module (`M.T`).
 static jl_value_t *declared_result_of(jl_array_t *copy, size_t upto, jl_value_t *r, jl_svec_t *sparam_vars, size_t nslots)
 {
     if (!jl_is_ssavalue(r))
@@ -1000,6 +1000,12 @@ static jl_value_t *declared_result_of(jl_array_t *copy, size_t upto, jl_value_t 
                     else if (f == (jl_value_t*)jl_unionall_type && na == 3 && jl_is_typevar(argv[1]) &&
                              (jl_is_type(argv[2]) || jl_is_typevar(argv[2]))) {
                         v = jl_type_unionall((jl_tvar_t*)argv[1], argv[2]);
+                    }
+                    else if (na == 3 && jl_is_module(argv[1]) && jl_is_symbol(argv[2]) && jl_base_module != NULL &&
+                             f == jl_get_global(jl_base_module, jl_symbol("getproperty"))) {
+                        // `M.T`: a constant binding of a module
+                        jl_binding_t *b = jl_get_binding((jl_module_t*)argv[1], (jl_sym_t*)argv[2]);
+                        v = jl_get_latest_binding_value_if_const(b);
                     }
                 }
                 JL_GC_POP();
