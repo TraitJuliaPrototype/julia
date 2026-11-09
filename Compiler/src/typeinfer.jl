@@ -139,6 +139,22 @@ end
 
 edge_mi(@nospecialize e) = e isa CodeInstance ? get_ci_mi(e) : e isa MethodInstance ? e : nothing
 
+"The MethodInstances and Methods that a result's code inlined, from its debug information; `nothing` where its code is gone."
+function inlined_of_result(@nospecialize src)
+    defs = IdSet{Any}()
+    if src isa OptimizationState
+        opt = src.optresult
+        inlined_defs!(defs, opt === nothing ? src.src.debuginfo.edges : opt.ir.debuginfo.edges)
+    elseif src isa IRCode
+        inlined_defs!(defs, src.debuginfo.edges)
+    elseif src isa CodeInfo
+        inlined_defs!(defs, src.debuginfo.edges)
+    else
+        return nothing
+    end
+    return defs
+end
+
 """
     slot_result_edges(caller, src, edges) -> Union{Nothing, SimpleVector}
 
@@ -1214,6 +1230,10 @@ function codeinst_as_edge(interp::AbstractInterpreter, sv::InferenceState, @nosp
     ci = CodeInstance(mi, cache_owner(interp), Any, Any, nothing, nothing, zero(Int32),
         min_world, max_world, zero(UInt32), nothing, nothing, edges)
     set_code_policy!(ci, interp)
+    # G2 as a predicate (compiler §3.2), as for a cached result: a caller that inlines this result
+    # reads the bit on this edge
+    inlined = inlined_of_result(sv.result.src)
+    inlined === nothing || (edges_satisfy_g2(edges, inlined) && ccall(:jl_ci_set_g2, Cvoid, (Any,), ci))
     if max_world == typemax(UInt)
         # if we can record all of the backedges in the global reverse-cache,
         # we can now widen our applicability in the global cache too
