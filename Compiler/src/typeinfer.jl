@@ -1619,6 +1619,13 @@ end
 typeinf_type(interp::AbstractInterpreter, match::MethodMatch) =
     typeinf_type(interp, specialize_method(match))
 function typeinf_type(interp::AbstractInterpreter, mi::MethodInstance)
+    if infers_other_policy(interp, mi)
+        # reflection's top frame of a method of the other policy (facts F-24) is inferred but never
+        # cached as the method's code, which is of the method's policy only (compiler §2.3)
+        frame = typeinf_frame(interp, mi, false)
+        frame === nothing && return nothing
+        return widenconst(ignorelimited(frame.result.result))
+    end
     ci = typeinf_ext(interp, mi, SOURCE_MODE_NOT_REQUIRED)
     ci isa CodeInstance || return nothing
     return ci.rettype

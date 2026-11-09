@@ -158,6 +158,11 @@ function policy_interp(interp::NativeInterpreter, facts::Bool; nested::Bool = tr
                              facts, interp.crossings + Int(nested), false)
 end
 
+"Whether `interp` infers `mi`'s top frame under the other policy than its method's (facts F-24)."
+infers_other_policy(::AbstractInterpreter, ::MethodInstance) = false
+infers_other_policy(interp::NativeInterpreter, mi::MethodInstance) =
+    !interp.plainrt && mi.def isa Method && mi_policy_facts_at(mi, interp.facts) !== interp.facts
+
 """
 The interpreter that infers code of policy `facts` at the top level (compiler §2.3): `interp` where
 it has that policy, else the other policy's, sharing its codegen cache. `return_type`'s run-time
