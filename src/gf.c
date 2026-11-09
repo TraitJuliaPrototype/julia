@@ -2712,9 +2712,11 @@ static int shadow_at(jl_value_t *tt, jl_method_t *m0, jl_method_t *mz, size_t i)
 // A shadow is an argument whose concrete type could later join a set at which another method of the
 // function could then be selected, where `m0` takes that argument as `Any` or at a set (a method
 // matched through the type's own supertypes is more specific than any method at a set). Returned
-// as svec(cells, results): the cell of each (argument type, set), which the call's guard reads, and
-// each shadowing method's declared result, `Any` where it declares none. Empty where there is none.
-JL_DLLEXPORT jl_value_t *jl_call_shadows(jl_value_t *tt, jl_value_t *m0v)
+// as svec(cells, results, finals): the cell of each (argument type, set), which the call's guard reads,
+// and each shadowing method's declared result, `Any` where it declares none; and, where `allow_final`,
+// the final cell of each pair whose negative is final (compiler §4.8), which needs no guard and which
+// the caller records as an edge. Empty where there is none.
+JL_DLLEXPORT jl_value_t *jl_call_shadows(jl_value_t *tt, jl_value_t *m0v, int allow_final)
 {
     if (!jl_is_datatype(tt) || !jl_is_tuple_type(tt) || jl_nparams(tt) < 2 || jl_func_set_methods == NULL)
         return (jl_value_t*)jl_emptysvec;
@@ -2729,9 +2731,9 @@ JL_DLLEXPORT jl_value_t *jl_call_shadows(jl_value_t *tt, jl_value_t *m0v)
         return (jl_value_t*)jl_emptysvec;
     jl_method_t *m0 = jl_is_method(m0v) ? (jl_method_t*)m0v : NULL;
     size_t np = jl_nparams(tt);
-    jl_array_t *cells = NULL, *results = NULL;
+    jl_array_t *cells = NULL, *results = NULL, *finals = NULL;
     jl_value_t *cell = NULL, *r = NULL;
-    JL_GC_PUSH5(&ms, &cells, &results, &cell, &r);
+    JL_GC_PUSH6(&ms, &cells, &results, &cell, &r, &finals);
     for (size_t k = 0; k < jl_svec_len(ms); k++) {
         jl_method_t *mz = (jl_method_t*)jl_svecref(ms, k);
         if (mz == m0)
@@ -2746,13 +2748,21 @@ JL_DLLEXPORT jl_value_t *jl_call_shadows(jl_value_t *tt, jl_value_t *m0v)
             if (cells == NULL) {
                 cells = jl_alloc_vec_any(0);
                 results = jl_alloc_vec_any(0);
+                finals = jl_alloc_vec_any(0);
             }
             // a cell for each set the declared type names: a membership in any of them opens the guard
             arraylist_t names;
             arraylist_new(&names, 0);
             set_names_in(sig_arg(zsig, i, mz->isva), &names, 0);
             for (size_t k = 0; k < names.len; k++) {
-                cell = jl_membership_cell(s, (jl_value_t*)names.items[k]);
+                jl_typename_t *zn = (jl_typename_t*)names.items[k];
+                if (allow_final && jl_membership_final(s, zn->wrapper)) {
+                    // a final non-member (compiler §4.8): no guard, the final cell an edge
+                    cell = jl_membership_final_cell(s, (jl_value_t*)zn);
+                    jl_array_ptr_1d_push(finals, cell);
+                    continue;
+                }
+                cell = jl_membership_cell(s, (jl_value_t*)zn);
                 jl_array_ptr_1d_push(cells, cell);
                 r = mz->declared_result ? mz->declared_result : (jl_value_t*)jl_any_type;
                 // a declared result that names the method's static parameters (`Tuple{T, Any}` at
@@ -2766,16 +2776,19 @@ JL_DLLEXPORT jl_value_t *jl_call_shadows(jl_value_t *tt, jl_value_t *m0v)
         }
     }
     jl_value_t *out = (jl_value_t*)jl_emptysvec;
-    if (cells != NULL) {
-        size_t n = jl_array_nrows(cells);
-        jl_svec_t *cs = jl_alloc_svec(n), *rs = NULL;
-        JL_GC_PUSH2(&cs, &rs);
+    if (cells != NULL && (jl_array_nrows(cells) > 0 || jl_array_nrows(finals) > 0)) {
+        size_t n = jl_array_nrows(cells), nf = jl_array_nrows(finals);
+        jl_svec_t *cs = jl_alloc_svec(n), *rs = NULL, *fs = NULL;
+        JL_GC_PUSH3(&cs, &rs, &fs);
         rs = jl_alloc_svec(n);
+        fs = jl_alloc_svec(nf);
         for (size_t i = 0; i < n; i++) {
             jl_svecset(cs, i, jl_array_ptr_ref(cells, i));
             jl_svecset(rs, i, jl_array_ptr_ref(results, i));
         }
-        out = (jl_value_t*)jl_svec2(cs, rs);
+        for (size_t i = 0; i < nf; i++)
+            jl_svecset(fs, i, jl_array_ptr_ref(finals, i));
+        out = (jl_value_t*)jl_svec(3, cs, rs, fs);
         JL_GC_POP();
     }
     JL_GC_POP();

@@ -58,6 +58,19 @@ function negative_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
     return ccall(:jl_could_join, Cint, (Any, Any), a, b) != 0 ||
            ccall(:jl_could_join, Cint, (Any, Any), b, a) != 0
 end
+# A final negative folds (compiler §4.8): the pair is a concrete type and a set closed after load whose
+# declarers have finished loading. The frame records the pair's final cell, whose opening invalidates
+# the code. Without a frame to record it in, the negative stays blocked.
+function negative_fold_blocked(@nospecialize(a), @nospecialize(b), sv::Union{Nothing,AbsIntState})::Bool
+    negative_fold_blocked(a, b) || return false
+    sv isa InferenceState || return true
+    cells = ccall(:jl_membership_final_cells, Any, (Any, Any), a, b)
+    cells isa SimpleVector || return true
+    for c in cells
+        any(x -> x === c, sv.edges) || push!(sv.edges, c)
+    end
+    return false
+end
 function positive_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
     (ccall(:jl_has_open_set, Cint, (Any,), a) != 0 || ccall(:jl_has_open_set, Cint, (Any,), b) != 0) || return false
     return ccall(:jl_subtype_via_membership, Cint, (Any, Any), a, b) != 0

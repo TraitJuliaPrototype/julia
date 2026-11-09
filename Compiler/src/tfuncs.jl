@@ -895,19 +895,19 @@ end
             if isa(v, Const) || isa(v, Conditional)
                 # this and the `isdispatchelem` below test for knowledge of a
                 # leaftype appearing on the LHS (ensuring the isa is precise)
-                negative_fold_blocked(widenconst(v), t) && return Bool
+                negative_fold_blocked(widenconst(v), t, sv) && return Bool
                 return Const(false)
             end
             v = widenconst(v)
             if isdispatchelem(v)
-                negative_fold_blocked(v, t) && return Bool
+                negative_fold_blocked(v, t, sv) && return Bool
                 return Const(false)
             end
             if !hasintersect(v, t)
                 # similar to `isnotbrokensubtype` check above, `typeintersect(v, t)`
                 # can't be trusted for kind types so we do an extra check here
                 if !iskindtype(v)
-                    negative_fold_blocked(v, t) && return Bool
+                    negative_fold_blocked(v, t, sv) && return Bool
                     return Const(false)
                 end
             end
@@ -935,7 +935,7 @@ end
             end
         else
             if isexact_a || (b !== Bottom && !hasintersect(a, b))
-                negative_fold_blocked(a, b) && return Bool
+                negative_fold_blocked(a, b, sv) && return Bool
                 return Const(false)
             end
         end

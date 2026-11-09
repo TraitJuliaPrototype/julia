@@ -4098,8 +4098,8 @@ void jl_init_types(void) JL_GC_DISABLED
     }
     // the membership cell (compiler §5.6): its world is the one atomic field
     jl_membership_cell_type = jl_new_datatype(jl_symbol("MembershipCell"), jl_core_module, jl_any_type, jl_emptysvec,
-        jl_perm_symsvec(3, "member", "set", "min_world"),
-        jl_svec(3, jl_any_type, jl_any_type, jl_uint64_type),
+        jl_perm_symsvec(5, "member", "set", "min_world", "backedges", "isfinal"),
+        jl_svec(5, jl_any_type, jl_any_type, jl_uint64_type, jl_any_type, jl_uint8_type),
         jl_emptysvec, 0, 1, 2);
     {
         const static uint32_t cell_atomicfields[1] = { 1u << 2 };

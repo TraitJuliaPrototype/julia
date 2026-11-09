@@ -574,7 +574,7 @@ typedef struct {
     uint8_t open_set:1;       // this type is a set that may gain members after its definition
     uint8_t never_member:1;   // Core's kinds: can never receive a membership
     uint8_t default_attribute:2; // a set's default attribute (compiler §6.3, step 4): 0 none, 1 Compiled, 2 Dynamic
-    uint8_t _unused:1;
+    uint8_t closed_after_load:1; // a set closed after load (compiler §4.8): a negative is final once its declarers have loaded
     _Atomic(uint8_t) cache_entry_count; // (approximate counter of TypeMapEntry for heuristics)
     uint8_t max_methods; // override for inference's max_methods setting (0 = no additional limit or relaxation)
     uint8_t constprop_heustic; // override for inference's constprop heuristic
@@ -617,6 +617,12 @@ typedef struct {
     jl_value_t *JL_NONNULL member;   // the member type: a concrete type
     jl_value_t *JL_NONNULL set;      // the set's TypeName
     _Atomic(uint64_t) min_world;
+    // a final cell's dependents (compiler §4.8): the CodeInstances that relied on the pair's final
+    // negative; NULL for a guard's cell, and dropped from a package image (re-added at its validation)
+    jl_array_t *backedges;
+    // a final cell (compiler §4.8): its opening invalidates its backedges; a guard's cell (0), which a
+    // guard reads, invalidates nothing
+    uint8_t isfinal;
 } jl_membership_cell_t;
 
 typedef struct {
@@ -919,6 +925,9 @@ typedef struct _jl_module_t {
     int8_t facts;
     // the trait language's scope options (compiler §2.1): JL_TRAIT_OPTION_* bits
     uint8_t trait_options;
+    // set once the module's package has finished loading, after its `__init__` (compiler §4.8); a
+    // module is loaded when it or a module it is nested in carries the bit. Main never does.
+    uint8_t loaded;
     // If cleared no binding partition in this module has PARTITION_FLAG_EXPORTED and min_world > jl_require_world.
     _Atomic(int8_t) export_set_changed_since_require_world;
     jl_mutex_t lock;

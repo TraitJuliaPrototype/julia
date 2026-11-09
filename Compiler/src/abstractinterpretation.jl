@@ -338,7 +338,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     (; valid_worlds, applicable) = matches
     update_valid_age!(sv, valid_worlds) # need to record the negative world now, since even if we don't generate any useful information, inlining might want to add an invoke edge and it won't have this information anymore
     # the guard of a call a later membership could change (compiler §5.6)
-    gcells, grt = call_shadows(matches)
+    gcells, grt = call_shadows(matches, sv)
     sv isa InferenceState && record_match_memberships!(sv, applicable)
     # Concrete-only functions refuse to commit (and record no backedge) when any
     # applicable match has a non-concrete signature, regardless of scope. This is the
@@ -707,9 +707,11 @@ end
 
 # The shadows of a call (compiler §5.6): for each signature the call is inferred at, the membership
 # cells of the arguments whose type could join a set at which another method would then be selected,
-# and those methods' declared results.
-function call_shadows(matches::Union{MethodMatches,UnionSplitMethodMatches})
+# and those methods' declared results. A pair whose negative is final (compiler §4.8) needs no guard:
+# the frame records its final cell instead, where there is a frame to record it in.
+function call_shadows(matches::Union{MethodMatches,UnionSplitMethodMatches}, sv::AbsIntState)
     infos = matches isa MethodMatches ? MethodMatchInfo[matches.info] : matches.info.split
+    allow_final = sv isa InferenceState
     cells = Any[]
     rt = Bottom
     for info in infos
@@ -720,10 +722,14 @@ function call_shadows(matches::Union{MethodMatches,UnionSplitMethodMatches})
                 break
             end
         end
-        sh = ccall(:jl_call_shadows, Any, (Any, Any), info.atype, m0)::SimpleVector
+        sh = ccall(:jl_call_shadows, Any, (Any, Any, Cint), info.atype, m0, allow_final)::SimpleVector
         isempty(sh) && continue
         cs = sh[1]::SimpleVector
         rs = sh[2]::SimpleVector
+        for c in sh[3]::SimpleVector
+            fedges = (sv::InferenceState).edges
+            any(x -> x === c, fedges) || push!(fedges, c)
+        end
         for i = 1:length(cs)
             c = cs[i]
             any(x -> x === c, cells) || push!(cells, c)

@@ -716,6 +716,19 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
             }
         }
     }
+    if (jl_typetagis(v, jl_membership_cell_type)) {
+        // a final cell's dependents (compiler §4.8): a package image drops them, and its validation adds
+        // back those of its code that hold; the system image keeps those it keeps, pruned below
+        jl_membership_cell_t *c = (jl_membership_cell_t*)v;
+        if (s->incremental || jl_options.trim || jl_options.strip_ir) {
+            record_field_change((jl_value_t**)&c->backedges, NULL);
+        }
+        else {
+            jl_value_t *backedges = get_replaceable_field((jl_value_t**)&c->backedges, 1);
+            if (backedges)
+                jl_queue_for_serialization_(s, (jl_value_t*)((jl_array_t*)backedges)->ref.mem, 0, 1);
+        }
+    }
     if (s->incremental && jl_is_globalref(v)) {
         jl_globalref_t *gr = (jl_globalref_t*)v;
         if (jl_object_in_image((jl_value_t*)gr->mod)) {
@@ -3182,6 +3195,11 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
             else if (jl_is_binding(v)) {
                 jl_binding_t *b = (jl_binding_t*)v;
                 jl_value_t *backedges = get_replaceable_field((jl_value_t**)&b->backedges, 1);
+                jl_prune_binding_backedges((jl_array_t*)backedges);
+            }
+            else if (jl_typetagis(v, jl_membership_cell_type)) {
+                jl_membership_cell_t *c = (jl_membership_cell_t*)v;
+                jl_value_t *backedges = get_replaceable_field((jl_value_t**)&c->backedges, 1);
                 jl_prune_binding_backedges((jl_array_t*)backedges);
             }
             else if (jl_is_mtable(v)) {

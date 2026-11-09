@@ -1484,6 +1484,10 @@ function run_module_init(mod::Module, i::Int=1)
 end
 
 function run_package_callbacks(modkey::PkgId)
+    # the package has finished loading, its `__init__` included (compiler §4.8): a negative at a set
+    # closed after load that it may declare becomes final; its extensions that load later declare late
+    m = maybe_root_module(modkey)
+    m isa Module && ccall(:jl_module_set_loaded, Cvoid, (Any,), m)
     run_extension_callbacks(modkey)
     assert_havelock(require_lock)
     unlock(require_lock)

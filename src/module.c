@@ -524,6 +524,7 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
     // a submodule takes its parent's policy and options (compiler §2.1)
     m->facts = parent != NULL && parent != m ? parent->facts : 0;
     m->trait_options = parent != NULL && parent != m ? parent->trait_options : 0;
+    m->loaded = 0;
     m->file = jl_empty_sym;
     m->line = 0;
     m->hash = parent == NULL ? bitmix(name->hash, jl_module_type->hash) :

@@ -467,7 +467,7 @@ extern jl_genericmemory_t *jl_attributed_cache JL_GLOBALLY_ROOTED; // Core.attri
 extern _Atomic(jl_genericmemory_t*) jl_attributed_fast JL_GLOBALLY_ROOTED; // its table of the latest answers (builtins.c)
 extern jl_genericmemory_t *jl_set_cells JL_GLOBALLY_ROOTED; // each set's membership cells (datatype.c)
 extern jl_genericmemory_t *jl_func_set_methods JL_GLOBALLY_ROOTED; // each function's methods at sets (gf.c)
-JL_DLLEXPORT jl_value_t *jl_call_shadows(jl_value_t *tt, jl_value_t *m0);
+JL_DLLEXPORT jl_value_t *jl_call_shadows(jl_value_t *tt, jl_value_t *m0, int allow_final);
 // membership cells (compiler §5.6, datatype.c)
 JL_DLLEXPORT jl_value_t *jl_membership_cell(jl_value_t *member, jl_value_t *set);
 void jl_membership_cell_register(jl_membership_cell_t *cell);
@@ -994,6 +994,10 @@ JL_DLLEXPORT int jl_is_open_set(jl_value_t *T);
 JL_DLLEXPORT void jl_set_open_set(jl_value_t *T);
 JL_DLLEXPORT void jl_set_contract(jl_value_t *T, jl_value_t *contract);
 JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X);
+// sets closed after load (compiler §4.8): final negatives and their cells
+JL_DLLEXPORT int jl_membership_final(jl_value_t *S, jl_value_t *X);
+JL_DLLEXPORT jl_value_t *jl_membership_final_cell(jl_value_t *member, jl_value_t *set);
+JL_DLLEXPORT void jl_invalidate_code_instance(jl_code_instance_t *replaced, size_t max_world);
 JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X);
 // x <: y at an explicit world
 int jl_membership_holds_at(jl_value_t *x, jl_value_t *y, size_t world);

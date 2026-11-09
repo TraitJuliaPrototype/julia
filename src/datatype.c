@@ -82,7 +82,7 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     jl_atomic_store_relaxed(&tn->linearcache, jl_emptysvec);
     tn->names = NULL;
     tn->hash = bitmix(bitmix(module ? module->build_id.lo : 0, name->hash), 0xa1ada1da);
-    tn->_unused = 0;
+    tn->closed_after_load = 0;
     tn->open_set = 0;
     tn->default_attribute = 0;
     tn->never_member = 0;
@@ -304,8 +304,9 @@ static void cells_list_add(jl_typename_t *setname, jl_value_t *cell)
 }
 
 // The cell of the member type `member` and the set `set` (a set, or its TypeName): one per pair in a
-// session, made on demand. Its world is the membership's where `member` is a member already.
-JL_DLLEXPORT jl_value_t *jl_membership_cell(jl_value_t *member, jl_value_t *set)
+// session, made on demand, a guard's (isfinal 0) or a final negative's (1, compiler §4.8). Its world is
+// the membership's where `member` is a member already.
+static jl_value_t *membership_cell(jl_value_t *member, jl_value_t *set, int isfinal)
 {
     jl_typename_t *setname;
     if (jl_is_typename(set))
@@ -322,7 +323,7 @@ JL_DLLEXPORT jl_value_t *jl_membership_cell(jl_value_t *member, jl_value_t *set)
     jl_svec_t *list = jl_set_cells ? (jl_svec_t*)jl_eqtable_get(jl_set_cells, (jl_value_t*)setname, NULL) : NULL;
     for (size_t i = 0; list != NULL && i < jl_svec_len(list); i++) {
         jl_membership_cell_t *c = (jl_membership_cell_t*)jl_svecref(list, i);
-        if (c->member == member || jl_types_equal(c->member, member)) {
+        if (c->isfinal == isfinal && (c->member == member || jl_types_equal(c->member, member))) {
             cell = (jl_value_t*)c;
             break;
         }
@@ -332,6 +333,8 @@ JL_DLLEXPORT jl_value_t *jl_membership_cell(jl_value_t *member, jl_value_t *set)
         jl_membership_cell_t *c = (jl_membership_cell_t*)cell;
         c->member = member;
         c->set = (jl_value_t*)setname;
+        c->backedges = NULL;
+        c->isfinal = isfinal;
         size_t world = jl_atomic_load_acquire(&jl_world_counter);
         jl_atomic_store_relaxed(&c->min_world, cell_holds(member, setname, world) ? (uint64_t)world : ~(uint64_t)0);
         cells_list_add(setname, cell);
@@ -339,6 +342,144 @@ JL_DLLEXPORT jl_value_t *jl_membership_cell(jl_value_t *member, jl_value_t *set)
     JL_UNLOCK(&cells_lock);
     JL_GC_POP();
     return cell;
+}
+JL_DLLEXPORT jl_value_t *jl_membership_cell(jl_value_t *member, jl_value_t *set)
+{
+    return membership_cell(member, set, 0);
+}
+JL_DLLEXPORT jl_value_t *jl_membership_final_cell(jl_value_t *member, jl_value_t *set)
+{
+    return membership_cell(member, set, 1);
+}
+
+// A CodeInstance relied on the final negative of a final cell's pair (compiler §4.8): the cell's opening
+// invalidates it. Where the cell is open already, the code is invalid from the cell's world.
+JL_DLLEXPORT void jl_membership_final_cell_add_backedge(jl_value_t *cellv, jl_code_instance_t *caller)
+{
+    jl_membership_cell_t *c = (jl_membership_cell_t*)cellv;
+    if (!c->isfinal)
+        return;
+    JL_LOCK(&cells_lock);
+    uint64_t opened = jl_atomic_load_relaxed(&c->min_world);
+    if (opened == ~(uint64_t)0) {
+        if (c->backedges == NULL) {
+            c->backedges = jl_alloc_vec_any(0);
+            jl_gc_wb(c, c->backedges);
+        }
+        size_t n = jl_array_nrows(c->backedges), i;
+        for (i = 0; i < n; i++)
+            if (jl_array_ptr_ref(c->backedges, i) == (jl_value_t*)caller)
+                break;
+        if (i == n)
+            jl_array_ptr_1d_push(c->backedges, (jl_value_t*)caller);
+    }
+    JL_UNLOCK(&cells_lock);
+    if (opened != ~(uint64_t)0 && jl_atomic_load_relaxed(&caller->max_world) >= opened)
+        jl_invalidate_code_instance(caller, (size_t)opened - 1);
+}
+
+// A module is loaded once its package has finished loading (compiler §4.8): it, or a module it is
+// nested in, carries the bit Base's loader sets after the package's `__init__`. Main never does.
+static int module_loaded(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    while (m != NULL) {
+        if (m->loaded)
+            return 1;
+        if (m->parent == m)
+            return 0;
+        m = m->parent;
+    }
+    return 0;
+}
+JL_DLLEXPORT void jl_module_set_loaded(jl_module_t *m)
+{
+    m->loaded = 1;
+}
+JL_DLLEXPORT int jl_module_is_loaded(jl_module_t *m)
+{
+    return module_loaded(m);
+}
+
+// whether every TypeName in `t` belongs to a loaded module: the type's declarers (compiler §4.8)
+static int type_declarers_loaded(jl_value_t *t, int depth)
+{
+    if (depth > 8)
+        return 0;
+    if (jl_is_datatype(t)) {
+        jl_datatype_t *dt = (jl_datatype_t*)t;
+        if (!module_loaded(dt->name->module))
+            return 0;
+        for (size_t i = 0; i < jl_nparams(dt); i++) {
+            jl_value_t *p = jl_tparam(dt, i);
+            if ((jl_is_datatype(p) || jl_is_uniontype(p) || jl_is_unionall(p)) && !type_declarers_loaded(p, depth + 1))
+                return 0;
+        }
+        return 1;
+    }
+    if (jl_is_uniontype(t))
+        return type_declarers_loaded(((jl_uniontype_t*)t)->a, depth + 1) &&
+               type_declarers_loaded(((jl_uniontype_t*)t)->b, depth + 1);
+    if (jl_is_unionall(t))
+        return type_declarers_loaded(((jl_unionall_t*)t)->body, depth + 1);
+    return 1; // a value parameter
+}
+
+// Is "S is not a member of X" final (compiler §4.8)? X is a set closed after load, S a concrete type
+// that is not a member of X in the query world, and the declarers have finished loading: X's module and
+// the module of every TypeName in S. Code that relies on it records the pair's final cell.
+JL_DLLEXPORT int jl_membership_final(jl_value_t *S, jl_value_t *X)
+{
+    jl_value_t *xu = jl_unwrap_unionall(X);
+    if (!jl_is_datatype(xu) || jl_is_all_type(xu))
+        return 0;
+    jl_typename_t *xn = ((jl_datatype_t*)xu)->name;
+    if (!xn->open_set || !xn->closed_after_load)
+        return 0;
+    if (!jl_is_concrete_type(S) || jl_is_type_type(S) || ((jl_datatype_t*)S)->name->never_member)
+        return 0;
+    if (!module_loaded(xn->module) || !type_declarers_loaded(S, 0))
+        return 0;
+    return !jl_subtype(S, xn->wrapper);
+}
+
+// The final cells of a negative `a` vs `b` that the compiler would fold (compiler §4.8): `nothing`
+// unless each direction in which one could join the other is a final pair of a concrete type and a set
+// closed after load.
+JL_DLLEXPORT jl_value_t *jl_membership_final_cells(jl_value_t *a, jl_value_t *b)
+{
+    int join_ab = jl_could_join(a, b), join_ba = jl_could_join(b, a);
+    if (!join_ab && !join_ba)
+        return jl_nothing;
+    if ((join_ab && !jl_membership_final(a, b)) || (join_ba && !jl_membership_final(b, a)))
+        return jl_nothing;
+    jl_value_t *c1 = NULL, *c2 = NULL;
+    JL_GC_PUSH2(&c1, &c2);
+    if (join_ab)
+        c1 = jl_membership_final_cell(a, b);
+    if (join_ba)
+        c2 = jl_membership_final_cell(b, a);
+    jl_value_t *out = (c1 && c2) ? (jl_value_t*)jl_svec2(c1, c2) : (jl_value_t*)jl_svec1(c1 ? c1 : c2);
+    JL_GC_POP();
+    return out;
+}
+
+// The final cells a membership just opened (under cells_lock): their dependents are invalidated once
+// the lock is released, from the opening world on (compiler §4.8).
+static void final_cells_invalidate(arraylist_t *opened, size_t world)
+{
+    for (size_t i = 0; i < opened->len; i++) {
+        jl_membership_cell_t *c = (jl_membership_cell_t*)opened->items[i];
+        JL_LOCK(&cells_lock);
+        jl_array_t *be = c->backedges;
+        c->backedges = NULL;
+        JL_UNLOCK(&cells_lock);
+        if (be == NULL)
+            continue;
+        JL_GC_PUSH1(&be);
+        for (size_t j = 0; j < jl_array_nrows(be); j++)
+            jl_invalidate_code_instance((jl_code_instance_t*)jl_array_ptr_ref(be, j), world - 1);
+        JL_GC_POP();
+    }
 }
 
 // After a method of the callable type `f` is activated in `world`: Callable's cells of `f` whose
@@ -382,6 +523,8 @@ void jl_membership_update_cells(jl_value_t *set_instance, size_t world)
     if (!jl_is_datatype(u) || jl_set_cells == NULL)
         return;
     jl_typename_t *from = ((jl_datatype_t*)u)->name;
+    arraylist_t opened;
+    arraylist_new(&opened, 0);
     JL_LOCK(&cells_lock);
     jl_genericmemory_t *table = jl_set_cells;
     for (size_t k = 0; k + 1 < table->length; k += 2) {
@@ -397,11 +540,16 @@ void jl_membership_update_cells(jl_value_t *set_instance, size_t world)
             jl_membership_cell_t *c = (jl_membership_cell_t*)jl_svecref(list, i);
             if (jl_atomic_load_relaxed(&c->min_world) != ~(uint64_t)0)
                 continue;
-            if (cell_holds(c->member, setname, world))
+            if (cell_holds(c->member, setname, world)) {
                 jl_atomic_store_release(&c->min_world, (uint64_t)world);
+                if (c->isfinal)
+                    arraylist_push(&opened, c);
+            }
         }
     }
     JL_UNLOCK(&cells_lock);
+    final_cells_invalidate(&opened, world);
+    arraylist_free(&opened);
 }
 
 // The memberships declared in this session, as [home TypeName, entry, ...]. A package image
@@ -889,6 +1037,20 @@ JL_DLLEXPORT int jl_get_default_attribute(jl_value_t *T)
 {
     jl_value_t *uw = jl_unwrap_unionall(T);
     return jl_is_datatype(uw) ? ((jl_datatype_t*)uw)->name->default_attribute : 0;
+}
+
+// A set closed after load (compiler §4.8; traits §3.4), written by the library at the declaration.
+JL_DLLEXPORT void jl_set_closed_after_load(jl_value_t *T)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->open_set)
+        jl_error("only a set is closed after load");
+    ((jl_datatype_t*)uw)->name->closed_after_load = 1;
+}
+JL_DLLEXPORT int jl_is_closed_after_load(jl_value_t *T)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    return jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->open_set && ((jl_datatype_t*)uw)->name->closed_after_load;
 }
 
 JL_DLLEXPORT int jl_is_open_set(jl_value_t *T)

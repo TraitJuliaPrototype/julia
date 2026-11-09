@@ -384,6 +384,13 @@ function __init__()
     for mod in loaded_modules_order
         push!(get!(Vector{Module}, loaded_precompiles, PkgId(mod)), mod)
     end
+    # the system image's modules have finished loading (compiler §4.8): Core, Base and the standard
+    # libraries in it; Main never has
+    ccall(:jl_module_set_loaded, Cvoid, (Any,), Core)
+    ccall(:jl_module_set_loaded, Cvoid, (Any,), Base)
+    for mod in values(loaded_modules)
+        mod === Main || ccall(:jl_module_set_loaded, Cvoid, (Any,), mod)
+    end
     if haskey(ENV, "JULIA_MAX_NUM_PRECOMPILE_FILES")
         MAX_NUM_PRECOMPILE_FILES[] = parse(Int, ENV["JULIA_MAX_NUM_PRECOMPILE_FILES"])
     end

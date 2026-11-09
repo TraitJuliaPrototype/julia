@@ -930,7 +930,8 @@ function Base.iterate(it::ForwardToBackedgeIterator, i::Int = 1)
         elseif isa(item, Core.MembershipEntry) || isa(item, Core.MembershipCell)
             # a positive membership the code folded (compiler §3.1): it never ends while the
             # code is valid (§4.3), so it takes no backedge; a membership cell (§5.6) is read by the
-            # code's guard, which a membership never invalidates
+            # code's guard, which a membership never invalidates; a final cell (§4.8) keeps its
+            # dependents itself (`store_backedges`)
             i += 1
             continue
         end
@@ -966,6 +967,13 @@ end
 
 function store_backedges(caller::CodeInstance, edges::SimpleVector)
     isa(get_ci_mi(caller).def, Method) || return # don't add backedges to toplevel method instance
+
+    # a final negative the code relied on (compiler §4.8): the final cell's opening invalidates it
+    for item in edges
+        if item isa Core.MembershipCell && getfield(item, :isfinal) != 0x00
+            ccall(:jl_membership_final_cell_add_backedge, Cvoid, (Any, Any), item, caller)
+        end
+    end
 
     backedges = ForwardToBackedgeIterator(edges)
     for (i, (invokesig, item)) in enumerate(backedges)
