@@ -1620,16 +1620,44 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
     end
     table = fallback_rt === nothing ? nothing : split_fallback_table(sig, fallback_rt)
     if split
-        for c in cases
+        for i in 1:length(cases)
+            c = cases[i]
             item = c.item
+            pointer = isa(atype, DataType) && isa(c.sig, DataType) && split_branch_pointer(table, atype, c.sig) !== nothing
+            # an inlined branch brings its body's edges: only a leaf is inlined, any other branch calls
+            # its candidate's target through the pointer
+            if pointer && item isa InliningTodo && !split_inline_leaf(item)
+                item = InvokeCase(item.mi, item.effects, NoCallInfo())
+                cases[i] = InliningCase(c.sig, item)
+            end
             # a branch called through a `:caller_world` pointer dispatches in the caller's world: no edge
-            item isa InvokeCase && isa(atype, DataType) && isa(c.sig, DataType) &&
-                split_branch_pointer(table, atype, c.sig) !== nothing && continue
+            pointer && item isa InvokeCase && continue
             split_case_edge!(state.edges, item)
         end
     end
     handle_cases!(todo, ir, idx, stmt, atype, cases, fallback_rt === nothing ? handled_all_cases : false,
                   fallback_rt === nothing ? fully_covered : false, joint_effects, fallback_rt, table)
+end
+
+"""
+Whether a split's branch may be inlined (compiler §7.2): its body, with what it inlined itself, is a
+leaf, calling only builtins and intrinsics. Inlined into an instance compiled once, which every caller
+of the operation shares, a body that calls further would carry those callees' invalidation to all of
+them.
+"""
+function split_inline_leaf(item::InliningTodo)
+    ir = item.ir
+    for i in 1:length(ir.stmts)
+        st = ir.stmts[i][:stmt]
+        st isa Expr || continue
+        if st.head === :invoke || st.head === :invoke_modify
+            return false
+        elseif st.head === :call
+            f = singleton_type(argextype(st.args[1], ir))
+            f isa Builtin || return false
+        end
+    end
+    return true
 end
 
 # the edge of a split's branch that is inlined or stays a direct call (compiler §7.2)
