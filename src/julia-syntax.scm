@@ -5215,7 +5215,9 @@ f(x) = yt(x)
                      ((and (eq? (car e) 'meta) (length> e 2) (eq? (cadr e) 'ret-type))
                       (assert (or (not value) tail))
                       (assert (not rett))
-                      (set! rett (caddr e)))
+                      (set! rett (caddr e))
+                      ;; the method's declared result (compiler §6.8): the definition evaluates it
+                      (emit `(meta declared_result ,(caddr e))))
                      (else
                       (emit e)))
                (if (and tail (not have-ret?))
@@ -5471,6 +5473,9 @@ f(x) = yt(x)
             ((nospecialize-meta? e)
              ;; convert nospecialize vars to slot numbers
              `(meta ,(cadr e) ,@(map renumber-stuff (cddr e))))
+            ((and (pair? e) (eq? (car e) 'meta) (length= e 3) (eq? (cadr e) 'declared_result))
+             ;; the method's declared result (compiler §6.8): its SSA value renumbered as any use
+             `(meta declared_result ,(renumber-stuff (caddr e))))
             ((or (atom? e) (quoted? e) (memq (car e) '(export public global toplevel)))
              e)
             ((ssavalue? e)

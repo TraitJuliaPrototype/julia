@@ -920,6 +920,108 @@ jl_method_instance_t *jl_get_specialized(jl_method_t *m, jl_value_t *types, jl_s
     return new_linfo;
 }
 
+// The value of `f(…)::RT`'s `RT` at the method's definition (compiler §6.8). Lowering computes it in
+// straight-line statements before its `declared_result` meta; `copy` holds them resolved. NULL where one
+// of them is not a constant type expression: a global not constant, an argument, a call of a function
+// other than `Core.apply_type`, `TypeVar` or `UnionAll`.
+static jl_value_t *declared_result_of(jl_array_t *copy, size_t upto, jl_value_t *r, jl_svec_t *sparam_vars, size_t nslots)
+{
+    if (!jl_is_ssavalue(r))
+        return NULL;
+    size_t target = ((jl_ssavalue_t*)r)->id - 1;
+    if (((jl_ssavalue_t*)r)->id < 1 || target >= upto)
+        return NULL;
+    size_t nv = target + 1 + nslots;
+    jl_value_t **vals;
+    JL_GC_PUSHARGS(vals, nv);
+    jl_value_t *result = NULL;
+#define DR_ARG(x, out) do {                                                                 \
+        jl_value_t *x_ = (x);                                                               \
+        if (jl_is_ssavalue(x_)) {                                                           \
+            size_t id_ = ((jl_ssavalue_t*)x_)->id;                                          \
+            out = (id_ >= 1 && id_ - 1 < k) ? vals[id_ - 1] : NULL;                         \
+        }                                                                                   \
+        else if (jl_is_slotnumber(x_)) {                                                    \
+            size_t s_ = jl_slot_number(x_);                                                 \
+            out = (s_ >= 1 && s_ <= nslots) ? vals[target + s_] : NULL;                    \
+        }                                                                                   \
+        else if (jl_is_globalref(x_)) {                                                     \
+            jl_binding_t *b_ = jl_get_binding(jl_globalref_mod(x_), jl_globalref_name(x_)); \
+            out = jl_get_latest_binding_value_if_const(b_);                                 \
+        }                                                                                   \
+        else if (jl_is_quotenode(x_)) {                                                     \
+            out = jl_quotenode_value(x_);                                                   \
+        }                                                                                   \
+        else if (jl_is_expr(x_) && ((jl_expr_t*)x_)->head == jl_static_parameter_sym) {     \
+            size_t i_ = jl_unbox_long(jl_exprarg(x_, 0));                                   \
+            out = (i_ >= 1 && i_ <= jl_svec_len(sparam_vars)) ? jl_svecref(sparam_vars, i_ - 1) : NULL; \
+        }                                                                                   \
+        else if (jl_is_expr(x_) || jl_is_symbol(x_) || jl_is_argument(x_)) {                \
+            out = NULL;                                                                     \
+        }                                                                                   \
+        else {                                                                              \
+            out = x_;                                                                       \
+        }                                                                                   \
+    } while (0)
+    JL_TRY {
+        size_t k;
+        for (k = 0; k <= target; k++) {
+            jl_value_t *st = jl_array_ptr_ref(copy, k);
+            jl_value_t *v = NULL;
+            if (jl_is_gotonode(st) || jl_is_gotoifnot(st) || jl_is_returnnode(st) || jl_is_enternode(st))
+                break; // not straight-line: no value
+            if (jl_is_expr(st) && ((jl_expr_t*)st)->head == jl_assign_sym) {
+                jl_value_t *lhs = jl_exprarg(st, 0);
+                jl_value_t *x = NULL;
+                DR_ARG(jl_exprarg(st, 1), x);
+                if (jl_is_slotnumber(lhs) && jl_slot_number(lhs) >= 1 && jl_slot_number(lhs) <= nslots)
+                    vals[target + jl_slot_number(lhs)] = x;
+            }
+            else if (jl_is_expr(st) && ((jl_expr_t*)st)->head == jl_call_sym && jl_expr_nargs(st) >= 1) {
+                size_t na = jl_expr_nargs(st), j;
+                jl_value_t **argv;
+                JL_GC_PUSHARGS(argv, na);
+                for (j = 0; j < na; j++) {
+                    DR_ARG(jl_exprarg(st, j), argv[j]);
+                    if (argv[j] == NULL)
+                        break;
+                }
+                if (j == na) {
+                    jl_value_t *f = argv[0];
+                    if (f == BUILTIN(apply_type)) {
+                        v = jl_apply(argv, na);
+                    }
+                    else if (f == (jl_value_t*)jl_tvar_type && na >= 2 && na <= 4 && jl_is_symbol(argv[1])) {
+                        jl_value_t *lb = na == 4 ? argv[2] : (jl_value_t*)jl_bottom_type;
+                        jl_value_t *ub = na >= 3 ? argv[na - 1] : (jl_value_t*)jl_any_type;
+                        if ((jl_is_type(lb) || jl_is_typevar(lb)) && (jl_is_type(ub) || jl_is_typevar(ub)))
+                            v = (jl_value_t*)jl_new_typevar((jl_sym_t*)argv[1], lb, ub);
+                    }
+                    else if (f == (jl_value_t*)jl_unionall_type && na == 3 && jl_is_typevar(argv[1]) &&
+                             (jl_is_type(argv[2]) || jl_is_typevar(argv[2]))) {
+                        v = jl_type_unionall((jl_tvar_t*)argv[1], argv[2]);
+                    }
+                }
+                JL_GC_POP();
+            }
+            else if (!(jl_is_expr(st) && ((jl_expr_t*)st)->head == jl_meta_sym)) {
+                DR_ARG(st, v);
+            }
+            vals[k] = v;
+        }
+        if (k > target)
+            result = vals[target];
+    }
+    JL_CATCH {
+        result = NULL;
+    }
+#undef DR_ARG
+    JL_GC_POP();
+    if (result != NULL && !jl_is_type(result) && !jl_is_typevar(result))
+        result = NULL;
+    return result;
+}
+
 JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src)
 {
     uint8_t j;
@@ -1048,6 +1150,19 @@ JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src)
             }
             else if (nargs == 1 && jl_exprarg(st, 0) == (jl_value_t*)jl_generated_only_sym) {
                 gen_only = 1;
+                st = jl_nothing;
+            }
+            else if (nargs == 2 && jl_exprarg(st, 0) == (jl_value_t*)jl_symbol("declared_result")) {
+                // the method's declared result (compiler §6.8): `f(…)::RT`, recorded where `RT` is a
+                // constant type expression; the library's for a trait's operation is set after
+                if (m->declared_result == NULL) {
+                    jl_value_t *rt = declared_result_of(copy, i, jl_exprarg(st, 1), sparam_vars,
+                                                        jl_array_nrows(src->slotnames));
+                    if (rt != NULL) {
+                        m->declared_result = rt;
+                        jl_gc_wb(m, rt);
+                    }
+                }
                 st = jl_nothing;
             }
             else if (nargs == 2 && jl_exprarg(st, 0) == (jl_value_t*)jl_symbol("nkw")) {
