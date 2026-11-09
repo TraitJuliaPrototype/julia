@@ -339,6 +339,16 @@ convert(::Type{IOContext{IO_t}}, io::IO) where {IO_t} = IOContext{IO_t}(io, iopr
 
 IOContext(io::IO) = convert(IOContext, io)
 IOContext{IO_t}(io::IO) where {IO_t} = convert(IOContext{IO_t}, io)
+# `IOContext{IO}(io, key => value, …)`, the erased stream (traits §9b): one type whatever the stream,
+# with the stream's properties and the pairs; its operations on the stream it holds branch over
+# `IO`'s candidates (compiler §7.5). An `IOContext` given is unwrapped, its properties kept.
+function IOContext{IO_t}(io::IO, KV::Pair, KVs::Pair...) where {IO_t}
+    d = ImmutableDict{Symbol,Any}(ioproperties(io), KV[1], KV[2])
+    for kv in KVs
+        d = ImmutableDict{Symbol,Any}(d, kv[1], kv[2])
+    end
+    return IOContext{IO_t}(io, d)
+end
 
 function IOContext(io::IO, KV::Pair)
     d = ioproperties(io)

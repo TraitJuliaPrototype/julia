@@ -886,8 +886,7 @@ function write(s::IO, A::StridedArray)
     end
 end
 
-# a byte per call: compiled per stream (compiler §7.5; E-332, `write(::IOBuffer, ::Char)` 4.4x vanilla's)
-function write(@specialize(io::IO), c::Char)
+function write(io::IO, c::Char)
     u = bswap(reinterpret(UInt32, c))
     n = 0
     while true

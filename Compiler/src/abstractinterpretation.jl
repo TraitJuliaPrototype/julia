@@ -164,7 +164,8 @@ end
 # below it, and not a concrete member (compiler §7.1): its result is the operation's declared
 # result, which the trait's method carries with the flag that it covers every member (§6.8). Each
 # such method the call's types fall under bounds the result, so the result is their intersection.
-# `nothing` where no argument is typed by a set, or no such method applies.
+# The same at a closed abstract type with a contract, whose operations carry their declared results.
+# `nothing` where no argument is typed by a set or such a type, or no such method applies.
 function declared_operation_result(interp::AbstractInterpreter, argtypes::Vector{Any}, @nospecialize(atype))
     tt = unwrap_unionall(atype)
     tt isa DataType || return nothing
@@ -177,18 +178,27 @@ function declared_operation_result(interp::AbstractInterpreter, argtypes::Vector
             dft === nothing || return dft
         end
     end
-    atset = false
+    # the methods with a declared result: at a set, the function's at sets; at a closed abstract type
+    # with a contract, its contract's operations of the function
+    ms = nothing
     for i = 2:length(tt.parameters)
         p = tt.parameters[i]
         isvarargtype(p) && break
-        if !isconcretetype(p) && ccall(:jl_has_open_set, Cint, (Any,), p) != 0
-            atset = true
+        isconcretetype(p) && continue
+        if ccall(:jl_has_open_set, Cint, (Any,), p) != 0
+            ms = ccall(:jl_declared_methods_of, Any, (Any,), tt.parameters[1])::Vector{Any}
+            break
+        end
+        ops = ccall(:jl_contract_operations, Any, (Any,), p)
+        if ops isa SimpleVector
+            ms = Any[]
+            for m in ops
+                (unwrap_unionall((m::Method).sig)::DataType).parameters[1] === tt.parameters[1] && push!(ms, m)
+            end
             break
         end
     end
-    atset || return nothing
-    ms = ccall(:jl_declared_methods_of, Any, (Any,), tt.parameters[1])::Vector{Any}
-    isempty(ms) && return nothing
+    (ms === nothing || isempty(ms)) && return nothing
     world = get_inference_world(interp)
     rt = nothing
     for m in ms
@@ -250,10 +260,11 @@ end
 
 const MAX_OPERATION_SPLITS = 4
 
-# The split of an operation's call (compiler §7.2): the first argument typed by a set instance or an
-# intersection, and the union of the first `MAX_OPERATION_SPLITS` candidates of its set that are of
-# that type (at an intersection, the first component's candidates that are members of all). The
-# candidates are read without an edge: a member registered later reaches the fallback.
+# The split of an operation's call (compiler §7.2): the first argument typed by a set instance, an
+# intersection or a closed abstract type with a contract, and the union of the first
+# `MAX_OPERATION_SPLITS` candidates of its set or type that are of that type (at an intersection, the
+# first component's candidates that are members of all). The candidates are read without an edge: a
+# member registered later reaches the fallback.
 function operation_split_type(@nospecialize(atype))
     tt = unwrap_unionall(atype)::DataType
     # asserted: at an argument typed `Type{Tuple{…}}` (a specialization of the image) the field infers `Any`
@@ -268,7 +279,7 @@ function operation_split_type(@nospecialize(atype))
         if u.name === (unwrap_unionall(Core.All)::DataType).name
             X = (u.parameters[1]::DataType).parameters[1]
         end
-        ccall(:jl_is_open_set, Cint, (Any,), X) != 0 || continue
+        (ccall(:jl_is_open_set, Cint, (Any,), X) != 0 || ccall(:jl_has_contract, Cint, (Any,), X) != 0) || continue
         cands = ccall(:jl_candidates_of, Any, (Any,), X)::Vector{Any}
         U = Union{}
         n = 0

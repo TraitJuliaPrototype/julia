@@ -1,65 +1,34 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
-# `IO`, Base's trait of streams (traits §9b; compiler §7.5). `Core.IO` is a set from Core's build
-# (boot.jl): a method typed `io::IO` is compiled once, whatever the stream, Julia's own included;
-# `IO` is closed after load.
+# `IO`'s contract (traits §9b; compiler §7.1, §7.5). `IO` is Julia's closed abstract type, and a
+# method typed `io::IO` is compiled per stream type. The contract's operations carry their declared
+# results. So at a value typed `IO` (a field, an element, an argument declared `@nospecialize`), an
+# operation's call has its declared result and branches over the candidates.
 
-# a method that can only raise at a type that joins `IO` later is no shadow (compiler §5.6)
-macro _serves_no_member()
-    return Expr(:meta, :serves_no_member)
+# The operations, each Base's method at `::IO` with its declared result. A write's count is an
+# `Int`, as `IOBuffer` and `IOStream` return it. A call through `IO` converts another stream's count
+# (Core's streams and `Filesystem.File` return a `UInt`), as `f(…)::Int` would (traits §7.9).
+let ops = Any[]
+    for (f, sig, rt) in Any[
+            (write,        Tuple{IO, UInt8},              Int),
+            (unsafe_write, Tuple{IO, Ptr{UInt8}, UInt},   Int),
+            (read,         Tuple{IO, Type{UInt8}},        UInt8),
+            (unsafe_read,  Tuple{IO, Ptr{UInt8}, UInt},   Any),
+            (flush,        Tuple{IO},                     Any),
+            (lock,         Tuple{IO},                     Any),
+            (unlock,       Tuple{IO},                     Any),
+            (get,          Tuple{IO, Any, Any},           Any),
+            (haskey,       Tuple{IO, Any},                Bool)]
+        m = which(f, sig)
+        m.sig === Tuple{typeof(f), sig.parameters...} || error("IO's operation $f: Base's method at ::IO is $m")
+        ccall(:jl_method_set_declared_result, Cvoid, (Any, Any, Cint), m, rt, 1)
+        push!(ops, m)
+    end
+    ccall(:jl_declare_contract, Cvoid, (Any, Any), IO, Core.svec(ops...))
 end
 
-# The operations' defaults where Base has none: each raises the `MethodError` the call would.
-eof(io::IO) = (@_serves_no_member; throw(MethodError(eof, (io,))))
-isopen(io::IO) = (@_serves_no_member; throw(MethodError(isopen, (io,))))
-close(io::IO) = (@_serves_no_member; throw(MethodError(close, (io,))))
-
-# The candidates of the split (compiler §7.2, §7.5), registered before any other member: in code
-# compiled once, an operation on the stream branches over these with direct calls.
+# The candidates of the split (compiler §7.2), in this order: at a value typed `IO`, an operation
+# branches over these with direct calls, and goes through the table past them (§7.3).
 for T in (IOBuffer, IOStream, TTY, PipeEndpoint)
     ccall(:jl_register_candidate, Cvoid, (Any, Any), IO, T)
 end
-
-# The operations (traits §9b), each Base's method at `::IO` with its declared result: inference
-# reads it at a receiver typed `IO`, and the split asserts it on its branches and its fallback.
-# A write's count is an `Int`, as Base's streams return it; a call through `IO` converts another
-# stream's count, as `f(…)::Int` would (traits §7.9). With an abstract `Integer`, the branches join
-# to it and Base's `Int(…)` of the count dispatches when it runs (E-331).
-for (f, sig, rt) in Any[
-        (write,        Tuple{IO, UInt8},              Int),
-        (unsafe_write, Tuple{IO, Ptr{UInt8}, UInt},   Int),
-        (read,         Tuple{IO, Type{UInt8}},        UInt8),
-        (unsafe_read,  Tuple{IO, Ptr{UInt8}, UInt},   Any),
-        (eof,          Tuple{IO},                     Bool),
-        (isopen,       Tuple{IO},                     Bool),
-        (close,        Tuple{IO},                     Any),
-        (flush,        Tuple{IO},                     Any),
-        (lock,         Tuple{IO},                     Any),
-        (unlock,       Tuple{IO},                     Any),
-        (get,          Tuple{IO, Any, Any},           Any),
-        (haskey,       Tuple{IO, Any},                Bool)]
-    m = which(f, sig)
-    m.sig === Tuple{typeof(f), sig.parameters...} || error("IO's operation $f: Base's method at ::IO is $m")
-    ccall(:jl_method_set_declared_result, Cvoid, (Any, Any, Cint), m, rt, 1)
-end
-
-# `Dynamic{IO}(io)` is an `IO` (traits §9b): a member by Base's entry, forwarding by its object, so
-# plain code typed `io::IO` takes it and an `IOContext`'s properties reach `show` through it.
-let Z = TypeVar(:Z, IO)
-    ccall(:jl_declare_membership, Any, (Any, Any, Any, Any, Any),
-          UnionAll(Z, Core.Dynamic{Z}), IO, Base, :object, :field)
-end
-@Core.latestworld
-_dynamic_io(d::Core.Dynamic) = getfield(d, :object)::IO
-write(d::Core.Dynamic{<:IO}, x::UInt8) = write(_dynamic_io(d), x)
-unsafe_write(d::Core.Dynamic{<:IO}, p::Ptr{UInt8}, n::UInt) = unsafe_write(_dynamic_io(d), p, n)
-read(d::Core.Dynamic{<:IO}, ::Type{UInt8}) = read(_dynamic_io(d), UInt8)
-unsafe_read(d::Core.Dynamic{<:IO}, p::Ptr{UInt8}, n::UInt) = unsafe_read(_dynamic_io(d), p, n)
-eof(d::Core.Dynamic{<:IO}) = eof(_dynamic_io(d))
-isopen(d::Core.Dynamic{<:IO}) = isopen(_dynamic_io(d))
-close(d::Core.Dynamic{<:IO}) = close(_dynamic_io(d))
-flush(d::Core.Dynamic{<:IO}) = flush(_dynamic_io(d))
-lock(d::Core.Dynamic{<:IO}) = lock(_dynamic_io(d))
-unlock(d::Core.Dynamic{<:IO}) = unlock(_dynamic_io(d))
-get(d::Core.Dynamic{<:IO}, key, default) = get(_dynamic_io(d), key, default)
-haskey(d::Core.Dynamic{<:IO}, key) = haskey(_dynamic_io(d), key)

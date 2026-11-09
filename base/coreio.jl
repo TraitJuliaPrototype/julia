@@ -23,8 +23,7 @@ bytesavailable(io::DevNull) = 0
 
 let CoreIO = Union{Core.CoreSTDOUT, Core.CoreSTDERR}
     global write(io::CoreIO, x::UInt8) = Core.write(io, x)
-    # the count as an `Int`, the declared result of `IO`'s `unsafe_write` (base/iotrait.jl)
-    global unsafe_write(io::CoreIO, x::Ptr{UInt8}, nb::UInt) = (Core.unsafe_write(io, x, nb); Int(nb))
+    global unsafe_write(io::CoreIO, x::Ptr{UInt8}, nb::UInt) = Core.unsafe_write(io, x, nb)
 
     CoreIO = Union{CoreIO, DevNull}
     global read(::CoreIO, ::Type{UInt8}) = throw(EOFError())

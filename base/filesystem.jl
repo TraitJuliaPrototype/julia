@@ -235,7 +235,7 @@ function unsafe_write(f::File, buf::Ptr{UInt8}, len::UInt, offset::Int64=Int64(-
     err = ccall(:jl_fs_write, Int32, (OS_HANDLE, Ptr{UInt8}, Csize_t, Int64),
                 f.handle, buf, len, offset)
     uv_error("write", err)
-    return Int(len)
+    return len
 end
 
 write(f::File, c::UInt8) = write(f, Ref{UInt8}(c))

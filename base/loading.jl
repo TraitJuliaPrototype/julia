@@ -1816,7 +1816,7 @@ struct ImageTarget
     features_dis::Vector{UInt8}
 end
 
-function parse_image_target(@specialize(io::IO))
+function parse_image_target(io::IO)
     flags = read(io, Int32)
     nfeature = read(io, Int32)
     feature_en = read(io, 4*nfeature)
@@ -3598,9 +3598,7 @@ function resolve_depot(inc::AbstractString)
     return :no_depot_found
 end
 
-# The cache file's readers parse a binary format from the file's stream: compiled for it (compiler §7.5),
-# so the values they read keep their types
-function read_module_list(@specialize(f::IO), has_buildid_hi::Bool)
+function read_module_list(f::IO, has_buildid_hi::Bool)
     modules = Vector{Pair{PkgId, UInt128}}()
     while true
         n = read(f, Int32)
@@ -3614,7 +3612,7 @@ function read_module_list(@specialize(f::IO), has_buildid_hi::Bool)
     return modules
 end
 
-function _parse_cache_header(@specialize(f::IO), cachefile::AbstractString)
+function _parse_cache_header(f::IO, cachefile::AbstractString)
     flags = read(f, UInt8)
     modules = read_module_list(f, false)
     totbytes = Int64(read(f, UInt64)) # total bytes for file dependencies + preferences
@@ -3676,7 +3674,7 @@ function _parse_cache_header(@specialize(f::IO), cachefile::AbstractString)
     return modules, (includes, srcfiles, requires), required_modules, srctextpos, prefs_blob, clone_targets, flags
 end
 
-function parse_cache_header(@specialize(f::IO), cachefile::AbstractString)
+function parse_cache_header(f::IO, cachefile::AbstractString)
     modules, (includes, srcfiles, requires), required_modules,
         srctextpos, prefs_blob, clone_targets, flags = _parse_cache_header(f, cachefile)
 
@@ -3766,7 +3764,7 @@ function parse_cache_header(cachefile::String)
     end
 end
 
-preferences_blob(@specialize(f::IO), cachefile::AbstractString) = parse_cache_header(f, cachefile)[5]
+preferences_blob(f::IO, cachefile::AbstractString) = parse_cache_header(f, cachefile)[5]
 function preferences_blob(cachefile::String)
     io = open(cachefile, "r")
     try
@@ -3779,7 +3777,7 @@ function preferences_blob(cachefile::String)
     end
 end
 
-function cache_dependencies(@specialize(f::IO), cachefile::AbstractString)
+function cache_dependencies(f::IO, cachefile::AbstractString)
     _, (includes, _, _), modules, _... = parse_cache_header(f, cachefile)
     return modules, map(chi -> chi.filename, includes)  # return just filename
 end
@@ -3794,14 +3792,14 @@ function cache_dependencies(cachefile::String)
     end
 end
 
-function read_dependency_src(@specialize(io::IO), cachefile::AbstractString, filename::AbstractString)
+function read_dependency_src(io::IO, cachefile::AbstractString, filename::AbstractString)
     _, (includes, _, _), _, srctextpos, _, _, _ = parse_cache_header(io, cachefile)
     srctextpos == 0 && error("no source-text stored in cache file")
     seek(io, srctextpos)
     return _read_dependency_src(io, filename, includes)
 end
 
-function _read_dependency_src(@specialize(io::IO), filename::AbstractString, includes::Vector{CacheHeaderIncludes}=CacheHeaderIncludes[])
+function _read_dependency_src(io::IO, filename::AbstractString, includes::Vector{CacheHeaderIncludes}=CacheHeaderIncludes[])
     while !eof(io)
         filenamelen = read(io, Int32)
         filenamelen == 0 && break
@@ -3834,7 +3832,7 @@ function read_dependency_src(cachefile::String, filename::AbstractString)
     end
 end
 
-function srctext_files(@specialize(f::IO), srctextpos::Int64, includes::Vector{CacheHeaderIncludes})
+function srctext_files(f::IO, srctextpos::Int64, includes::Vector{CacheHeaderIncludes})
     files = Set{String}()
     srctextpos == 0 && return files
     seek(f, srctextpos)
