@@ -544,14 +544,42 @@ static int obviously_in_union(jl_value_t *u, jl_value_t *x)
 
 static int membership_may_reach(jl_datatype_t *x, jl_typename_t *yname);
 
-// whether `k` is a kind of type object and `c` is Callable: a type is called through its
-// constructors, so some values of the kind are Callable's members (compiler §7.4)
-static int callable_meets_kind(jl_datatype_t *k, jl_datatype_t *c) JL_NOTSAFEPOINT
+static int entry_live(jl_membership_t *en, size_t world) JL_NOTSAFEPOINT;
+static int entry_for_value(jl_membership_t *en) JL_NOTSAFEPOINT;
+static size_t jl_membership_world(void) JL_NOTSAFEPOINT;
+
+// whether the set `yname`, or a set that joins it, has an entry for a type value live in `world`
+// (the entries at each set, datatype.c). Sets have no cycles (compiler §4.4).
+static int set_takes_type_values(jl_typename_t *yname, size_t world) JL_NOTSAFEPOINT
 {
-    return jl_callable_type != NULL &&
-        c->name == ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type))->name &&
-        (k == jl_datatype_type || k == jl_unionall_type || k == jl_uniontype_type ||
-         (k->name == jl_type_typename && jl_has_free_typevars((jl_value_t*)k)));
+    jl_genericmemory_t *index = jl_set_entries;
+    jl_array_t *list = index == NULL ? NULL : (jl_array_t*)jl_eqtable_get(index, (jl_value_t*)yname, NULL);
+    for (size_t i = 0; list != NULL && i < jl_array_nrows(list); i++) {
+        jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i);
+        if (en == NULL || !entry_live(en, world))
+            continue;
+        if (entry_for_value(en))
+            return 1;
+        jl_value_t *mu = jl_unwrap_unionall(en->member);
+        if (jl_is_datatype(mu) && ((jl_datatype_t*)mu)->name->open_set &&
+            set_takes_type_values(((jl_datatype_t*)mu)->name, world))
+            return 1;
+    }
+    return 0;
+}
+
+// whether `k` is a kind of type object and the open set `c` takes some of its values: Callable,
+// which takes a type by its constructors (compiler §7.4), or a set with an entry for a type value,
+// its own or that of a set that joins it (§4.10)
+static int kind_meets_set(jl_datatype_t *k, jl_datatype_t *c) JL_NOTSAFEPOINT
+{
+    if (!(k == jl_datatype_type || k == jl_unionall_type || k == jl_uniontype_type ||
+          (k->name == jl_type_typename && jl_has_free_typevars((jl_value_t*)k))))
+        return 0;
+    if (jl_callable_type != NULL &&
+        c->name == ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type))->name)
+        return 1;
+    return c->name->open_set && set_takes_type_values(c->name, jl_membership_world());
 }
 
 int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
@@ -587,8 +615,8 @@ int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
                     // obviously disjoint, unless one side is a concrete type no entry of whose
                     // chain can reach the other, a set (subtyping's fast path for a non-member)
                     // A kind of type object (DataType, UnionAll, Union) meets Callable, which takes a
-                    // type by its constructors, not by entries (compiler §7.4)
-                    if (callable_meets_kind(ad, bd) || callable_meets_kind(bd, ad))
+                    // type by its constructors (compiler §7.4), and a set that takes a type value (§4.10)
+                    if (kind_meets_set(ad, bd) || kind_meets_set(bd, ad))
                         return 0;
                     if (bd->name->open_set)
                         return !specificity && !ad->name->open_set && jl_is_concrete_type((jl_value_t*)ad) &&
@@ -4864,9 +4892,9 @@ static jl_value_t *intersect_membership(jl_datatype_t *x, jl_value_t *y, jl_sten
 {
     size_t world = jl_membership_world();
     jl_typename_t *yname = ((jl_datatype_t*)jl_unwrap_unionall(y))->name;
-    // a kind of type object meets Callable: a type is called through its constructors, and Callable
-    // takes it by its methods, not by entries (compiler §7.4); the kind itself is the answer
-    if (jl_is_datatype(jl_unwrap_unionall(y)) && callable_meets_kind(x, (jl_datatype_t*)jl_unwrap_unionall(y)))
+    // a kind of type object meets Callable, which takes a type by its methods (compiler §7.4), and a
+    // set that takes a type value by an entry (§4.10); the kind itself is the answer
+    if (jl_is_datatype(jl_unwrap_unionall(y)) && kind_meets_set(x, (jl_datatype_t*)jl_unwrap_unionall(y)))
         return (jl_value_t*)x;
     int ground = !jl_has_free_typevars((jl_value_t*)x);
     jl_value_t *res = jl_bottom_type;
