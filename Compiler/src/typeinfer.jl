@@ -1934,6 +1934,16 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             if src isa CodeInfo
                 sptypes = sptypes_from_meth_instance(mi)
                 collectinvokes!(workqueue, src, sptypes; invokelatest_queue, external_linkage)
+                # an image holds the code a facts run-time site reaches whatever the values (compiler §9)
+                if invokelatest_queue !== nothing && callee.owner === nothing && ci_policy_facts(callee)
+                    for target in rtsite_targets(interp, src, sptypes)
+                        isinspected(workqueue, target) && continue
+                        markinspected!(workqueue, target)
+                        target.def.primary_world <= world || continue
+                        tci = typeinf_ext(interp_for_policy(interp, mi_policy_facts(target)), target, SOURCE_MODE_GET_SOURCE)
+                        tci isa CodeInstance && push!(workqueue, tci)
+                    end
+                end
                 # try to reuse an existing CodeInstance from before to avoid making duplicates in the cache
                 if iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), mi, callee))
                     cached = ccall(:jl_get_ci_equiv, Any, (Any, UInt), callee, world)::CodeInstance
