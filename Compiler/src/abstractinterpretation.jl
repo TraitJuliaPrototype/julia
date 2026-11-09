@@ -701,14 +701,14 @@ function attributed_lookup(r::MethodLookupResult, mask::UInt32, dyn::UInt32)
         end
     end
     new === nothing && return (r, dispatch)
-    return (MethodLookupResult(new, r.valid_worlds, r.ambig), dispatch)
+    return (MethodLookupResult(new, r.valid_worlds, r.ambig, r.cells), dispatch)
 end
 attributed_matches(m::FailedMethodMatch, ::UInt32, ::UInt32) = (m, false)
 function attributed_matches(m::MethodMatches, mask::UInt32, dyn::UInt32)
     info = m.info
     r, dispatch = attributed_lookup(info.results, mask, dyn)
     r === info.results && return (m, dispatch)
-    newinfo = MethodMatchInfo(r, info.mt, info.atype, info.fullmatch, info.cells)
+    newinfo = MethodMatchInfo(r, info.mt, info.atype, info.fullmatch)
     applicable = MethodMatchTarget[MethodMatchTarget(r.matches[i]::MethodMatch, newinfo.edges, i) for i = 1:length(r.matches)]
     return (MethodMatches(applicable, newinfo, m.valid_worlds), dispatch)
 end
@@ -720,7 +720,7 @@ function attributed_matches(m::UnionSplitMethodMatches, mask::UInt32, dyn::UInt3
         r, d = attributed_lookup(info.results, mask, dyn)
         dispatch |= d
         changed |= r !== info.results
-        newinfo = r === info.results ? info : MethodMatchInfo(r, info.mt, info.atype, info.fullmatch, info.cells)
+        newinfo = r === info.results ? info : MethodMatchInfo(r, info.mt, info.atype, info.fullmatch)
         push!(infos, newinfo)
         for i = 1:length(r.matches)
             push!(applicable, MethodMatchTarget(r.matches[i]::MethodMatch, newinfo.edges, i))
@@ -855,11 +855,9 @@ function find_union_split_method_matches(interp::AbstractInterpreter, argtypes::
             return FailedMethodMatch("For one of the union split cases, too many methods matched")
         end
         valid_worlds = intersect(valid_worlds, thismatches.valid_worlds)
-        thiscells = Any[]
-        thismatches = drop_unmet_final_matches(thismatches, thiscells)
         thisfullmatch = any(match::MethodMatch->match.fully_covers, thismatches)
         mt = Core.methodtable
-        thisinfo = MethodMatchInfo(thismatches, mt, sig_n, thisfullmatch, thiscells)
+        thisinfo = MethodMatchInfo(thismatches, mt, sig_n, thisfullmatch)
         push!(infos, thisinfo)
         for idx = 1:length(thismatches)
             push!(applicable, MethodMatchTarget(thismatches[idx], thisinfo.edges, idx))
@@ -871,29 +869,6 @@ function find_union_split_method_matches(interp::AbstractInterpreter, argtypes::
         applicable, applicable_argtypes, info, valid_worlds)
 end
 
-"""
-A match whose argument is an intersection no type of the world is in, at a set closed after load, is
-unreachable: a final negative (compiler §4.8, open issue 169). It is dropped, even where it would win
-were the intersection met, and its final cells are recorded with the call, so a membership that meets
-the intersection invalidates the caller. No instance is compiled at it.
-"""
-function drop_unmet_final_matches(matches::MethodLookupResult, cells::Vector{Any})
-    keep = nothing
-    for i in 1:length(matches)
-        m = matches[i]::MethodMatch
-        c = ccall(:jl_unmet_final_cells, Any, (Any,), m.spec_types)
-        c isa SimpleVector || continue
-        keep === nothing && (keep = fill(true, length(matches)))
-        keep[i] = false
-        for x in c
-            any(y -> y === x, cells) || push!(cells, x)
-        end
-    end
-    keep === nothing && return matches
-    kept = Any[matches[i] for i in 1:length(matches) if keep[i]]
-    return MethodLookupResult(kept, matches.valid_worlds, matches.ambig)
-end
-
 function find_simple_method_matches(interp::AbstractInterpreter, @nospecialize(atype), max_methods::Int)
     matches = findall(atype, method_table(interp); limit = max_methods)
     if matches === nothing
@@ -901,11 +876,9 @@ function find_simple_method_matches(interp::AbstractInterpreter, @nospecialize(a
         # (assume this will always be true, so we don't compute / update valid age in this case)
         return FailedMethodMatch("Too many methods matched")
     end
-    cells = Any[]
-    matches = drop_unmet_final_matches(matches, cells)
     fullmatch = any(match::MethodMatch->match.fully_covers, matches)
     mt = Core.methodtable
-    info = MethodMatchInfo(matches, mt, atype, fullmatch, cells)
+    info = MethodMatchInfo(matches, mt, atype, fullmatch)
     applicable = MethodMatchTarget[MethodMatchTarget(matches[idx], info.edges, idx) for idx = 1:length(matches)]
     return MethodMatches(applicable, info, matches.valid_worlds)
 end

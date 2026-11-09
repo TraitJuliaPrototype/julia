@@ -203,6 +203,14 @@ static jl_value_t *publish_entry(jl_typename_t *tn, jl_typename_t *setname, jl_v
 
 // The candidates of each set (compiler §7.2): its concrete members in declaration order, a set's
 // TypeName to a Vector{Any} of types. A list is replaced, never mutated, on each registration.
+// Whether any set is closed after load: until one is, no negative is final, and Base's build skips its
+// walk for code that relied on one (base/sysimg.jl)
+static _Atomic(int) any_closed_after_load = 0;
+JL_DLLEXPORT int jl_any_closed_after_load(void) JL_NOTSAFEPOINT
+{
+    return jl_atomic_load_relaxed(&any_closed_after_load);
+}
+
 jl_genericmemory_t *jl_set_candidates JL_GLOBALLY_ROOTED = NULL;
 static jl_mutex_t candidates_lock;
 
@@ -818,6 +826,10 @@ static int member_meets_others(jl_value_t *m, jl_value_t *comps, size_t skip)
 // cycles, compiler §4.4), has a member that could be in the other components.
 static int set_entries_meet(jl_typename_t *sname, jl_value_t *comps, size_t skip, size_t world)
 {
+    // `Callable`'s members are the types whose methods match it (compiler §7.4), not entries: any later
+    // method can make one, so an intersection with it, or with a set it joins, is met
+    if (jl_callable_type != NULL && sname == ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type))->name)
+        return 1;
     jl_array_t *list = jl_set_entries == NULL ? NULL : (jl_array_t*)jl_eqtable_get(jl_set_entries, (jl_value_t*)sname, NULL);
     if (list == NULL)
         return 0;
@@ -855,10 +867,14 @@ static int all_type_met(jl_value_t *a, size_t world)
     return 0;
 }
 
-// an argument met only as an intersection that no type of `world` is in (compiler §4.9, §5.4)
+// an argument met only as an intersection that no type of `world` is in (compiler §4.9, §5.4); a
+// `Vararg` whose length is not a positive constant is met by its empty tail
 static int unmet_argument(jl_value_t *p, size_t world)
 {
     if (jl_is_vararg(p)) {
+        jl_value_t *n = jl_unwrap_vararg_num(p);
+        if (n == NULL || !jl_is_long(n) || jl_unbox_long(n) <= 0)
+            return 0;
         p = jl_unwrap_vararg(p);
         if (p == NULL)
             return 0;
@@ -1317,6 +1333,8 @@ JL_DLLEXPORT void jl_set_core_set(jl_value_t *T, intptr_t attr, intptr_t closed)
     dt->has_open_set = 1;
     dt->name->default_attribute = attr;
     dt->name->closed_after_load = closed != 0;
+    if (closed)
+        jl_atomic_store_relaxed(&any_closed_after_load, 1);
 }
 
 // A set closed after load (compiler §4.8; traits §3.4), written by the library at the declaration.
@@ -1326,6 +1344,7 @@ JL_DLLEXPORT void jl_set_closed_after_load(jl_value_t *T)
     if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->open_set)
         jl_error("only a set is closed after load");
     ((jl_datatype_t*)uw)->name->closed_after_load = 1;
+    jl_atomic_store_relaxed(&any_closed_after_load, 1);
 }
 JL_DLLEXPORT int jl_is_closed_after_load(jl_value_t *T)
 {

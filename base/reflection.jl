@@ -1193,7 +1193,7 @@ false
 # An argument of a signature met only as an intersection `All{…}` that no type of the world is in
 # (the runtime's `jl_has_unmet_argument`, compiler §4.9, §5.4): no value has those types there. Two
 # methods are ambiguous only over values that exist; a membership that makes them meet is reported at
-# its declaration (§5.4). Dispatch's lookup asks the same question.
+# its declaration (§5.4). Dispatch's lookup drops such a match only at a final pair (§4.8).
 has_unmet_intersection(@nospecialize(sig), world::UInt = get_world_counter()) =
     ccall(:jl_has_unmet_argument, Cint, (Any, UInt), sig, world) != 0
 

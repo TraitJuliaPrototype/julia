@@ -7,11 +7,11 @@ Base.include("Base.jl") # finish populating Base (currently just has the Compile
 ccall(:jl_module_set_loaded, Cvoid, (Any,), Core)
 ccall(:jl_module_set_loaded, Cvoid, (Any,), Base)
 
-# Code compiled during Base's build kept a match at an intersection no type is in, whose negative was
-# not final yet (`write(::All{AbstractString, IO}, …)` in `show(::IO, ::Char)`). Final now: those
-# instances are invalidated, with their callers, and what the image compiles from here drops the match
-# (compiler §4.8, open issue 169)
-let cis = Any[]
+# Code compiled during Base's build kept a match at an intersection no type is in, whose negative was not
+# final yet: once a set of Base's build is closed after load, those instances are invalidated, with
+# their callers, and what the image compiles from here drops the match (compiler §4.8, open issue 169).
+# Base declares no such set, so the walk runs only where one is.
+ccall(:jl_any_closed_after_load, Cint, ()) != 0 && let cis = Any[]
     Base.visit(Core.methodtable) do m
         m isa Method || return
         for mi in Base.specializations(m)

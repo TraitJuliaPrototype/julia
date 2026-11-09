@@ -6,6 +6,16 @@ struct MethodLookupResult
     matches::Vector{Any}
     valid_worlds::WorldRange
     ambig::Bool
+    # the final cells of the matches the lookup dropped as unreachable at a final pair (compiler §4.8,
+    # §5.4), `nothing` where it dropped none: a caller that relies on the lookup records them
+    cells::Any
+end
+MethodLookupResult(matches, valid_worlds::WorldRange, ambig::Bool) =
+    MethodLookupResult(matches, valid_worlds, ambig, nothing)
+function merge_cells(@nospecialize(a), @nospecialize(b))
+    a === nothing && return b
+    b === nothing && return a
+    return Core.svec(a..., (c for c in b if !any(x -> x === c, a))...)
 end
 length(result::MethodLookupResult) = length(result.matches)
 function iterate(result::MethodLookupResult, args...)
@@ -95,16 +105,23 @@ function findall(@nospecialize(sig::Type), table::OverlayMethodTable; limit::Int
         WorldRange(
             max(result.valid_worlds.min_world, fallback_result.valid_worlds.min_world),
             min(result.valid_worlds.max_world, fallback_result.valid_worlds.max_world)),
-        result.ambig | fallback_result.ambig)
+        result.ambig | fallback_result.ambig, merge_cells(result.cells, fallback_result.cells))
 end
 
 function _findall(@nospecialize(sig::Type), mt::Union{Nothing,MethodTable}, world::UInt, limit::Int)
     _min_val = RefValue{UInt}(typemin(UInt))
     _max_val = RefValue{UInt}(typemax(UInt))
     _ambig = RefValue{Int32}(0)
-    ms = _methods_by_ftype(sig, mt, limit, world, false, _min_val, _max_val, _ambig)
-    isa(ms, Vector) || return nothing
-    return MethodLookupResult(ms, WorldRange(_min_val[], _max_val[]), _ambig[] != 0)
+    # the lookup with the final cells of what it dropped (compiler §4.8, §5.4)
+    r = ccall(:jl_matching_methods_cells, Any, (Any, Any, Cint, Cint, UInt, Ptr{UInt}, Ptr{UInt}, Ptr{Int32}),
+              sig, mt === nothing ? nothing : mt, limit, false, world, _min_val, _max_val, _ambig)
+    cells = nothing
+    if r isa SimpleVector
+        cells = r[2]
+        r = r[1]
+    end
+    isa(r, Vector) || return nothing
+    return MethodLookupResult(r, WorldRange(_min_val[], _max_val[]), _ambig[] != 0, cells)
 end
 
 function findall(@nospecialize(sig::Type), table::CachedMethodTable; limit::Int=-1)

@@ -141,19 +141,20 @@ struct MethodMatchInfo <: CallInfo
     atype
     fullmatch::Bool
     edges::Vector{Union{Nothing,CodeInstance}}
-    # the final cells of the matches dropped as unreachable (compiler §4.8, open issue 169)
-    cells::Vector{Any}
     function MethodMatchInfo(
-        results::MethodLookupResult, mt::MethodTable, @nospecialize(atype), fullmatch::Bool,
-        cells::Vector{Any} = Any[])
+        results::MethodLookupResult, mt::MethodTable, @nospecialize(atype), fullmatch::Bool)
         edges = fill!(Vector{Union{Nothing,CodeInstance}}(undef, length(results)), nothing)
-        return new(results, mt, atype, fullmatch, edges, cells)
+        return new(results, mt, atype, fullmatch, edges)
     end
 end
 add_edges_impl(edges::Vector{Any}, info::MethodMatchInfo) = _add_edges_impl(edges, info)
 function _add_edges_impl(edges::Vector{Any}, info::MethodMatchInfo, mi_edge::Bool=false)
-    for c in info.cells
-        any(x -> x === c, edges) || push!(edges, c)
+    # the final cells the lookup relied on (compiler §4.8, §5.4)
+    cells = info.results.cells
+    if cells !== nothing
+        for c in cells::SimpleVector
+            any(x -> x === c, edges) || push!(edges, c)
+        end
     end
     if !fully_covering(info)
         exists = false
