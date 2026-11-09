@@ -8189,9 +8189,9 @@ JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t 
         return;
     jl_typename_t *mtn = ((jl_datatype_t*)member_core)->name;
     // gc slots: 0 sets, 1 listX, 2 listY, 3 and 4 the query's parts, 5 the functions warned
-    // for the current pair of sets (values held directly)
+    // for the current pair of sets, 6 a pattern's query (values held directly)
     jl_value_t **gc;
-    JL_GC_PUSHARGS(gc, 6);
+    JL_GC_PUSHARGS(gc, 7);
     // sets = every set the member joins (§1's lists on the member's TypeName):
     // an entry (M, X) with member ⊆ M witnesses member ⊆ M ⊆ X. The svec stays
     // rooted through mtn across the allocations below (review sweep 7).
@@ -8280,16 +8280,30 @@ JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t 
                         gc[3] = gc[4] = NULL;
                     }
                     else {
-                        // abstract/parametric member: no instance to ask. Suppress
-                        // when some indexed method is more specific than both sides.
+                        // abstract/parametric member: the call types at which both methods apply to its
+                        // members, as for a concrete member (compiler §5.4, C-29). Empty: no call reaches
+                        // both, as for `f(::Type{A}, ::X)` and `f(::Type{B}, ::Y)`. Else Base.isambiguous's
+                        // rule at those types, where a method more specific than both that covers them,
+                        // closed or at a set, dominates.
+                        gc[3] = sig_at_member((jl_value_t*)mX->sig, tnX, member);
+                        gc[4] = sig_at_member((jl_value_t*)mY->sig, tnY, member);
+                        if (gc[3] == NULL || gc[4] == NULL) {
+                            gc[3] = gc[4] = NULL;
+                            continue;
+                        }
+                        gc[6] = jl_type_intersection(gc[3], gc[4]);
+                        gc[3] = gc[4] = NULL;
+                        if (gc[6] == jl_bottom_type || !ambiguous_at(mtX, mX, mY, gc[6], entry_min_world)) {
+                            gc[6] = NULL;
+                            continue;
+                        }
+                        // Suppress also when some indexed method is more specific than both sides.
                         // The candidates are the two sets' own lists AND the methods
                         // indexed under any open set Q that itself joins X or Y by
                         // the entry chain (M2a fix round 2, gate m2_ambiguity_report:
                         // the set-in-set method g(::ZB), ZB ∈ XB ∧ ZB ∈ YB, resolves
                         // the pair for every member of ZB — it is indexed under ZB,
                         // so the exact-name lists alone missed it and over-warned).
-                        // A closed method on both sides not among these is missed —
-                        // over-warn (deviations.md).
                         int suppressed = 0;
                         for (int l = 0; l < 2 && !suppressed; l++) {
                             jl_array_t *l3 = l == 0 ? listX : listY;
@@ -8324,9 +8338,13 @@ JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t 
                             JL_UNLOCK(&open_set_methods_lock);
                         }
                         if (!suppressed) {
-                            membership_ambig_warn(mX, X, Y, member, NULL);
+                            // the joint method, as for a concrete member
+                            gc[4] = jl_type_intersection((jl_value_t*)mX->sig, (jl_value_t*)mY->sig);
+                            membership_ambig_warn(mX, X, Y, member, gc[4] != jl_bottom_type ? gc[4] : gc[6]);
                             jl_array_ptr_1d_push(warned, fX);
+                            gc[4] = NULL;
                         }
+                        gc[6] = NULL;
                     }
                 }
             }
