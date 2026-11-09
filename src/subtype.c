@@ -568,18 +568,30 @@ static int set_takes_type_values(jl_typename_t *yname, size_t world) JL_NOTSAFEP
     return 0;
 }
 
-// whether `k` is a kind of type object and the open set `c` takes some of its values: Callable,
-// which takes a type by its constructors (compiler §7.4), or a set with an entry for a type value,
-// its own or that of a set that joins it (§4.10)
+// whether the open set `cname` takes some values of a kind of type object in `world`: Callable, which
+// takes a type by its constructors (compiler §7.4), or a set with an entry for a type value, its own
+// or that of a set that joins it (§4.10)
+static int set_meets_kinds(jl_typename_t *cname, size_t world) JL_NOTSAFEPOINT
+{
+    if (jl_callable_type != NULL &&
+        cname == ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type))->name)
+        return 1;
+    return cname->open_set && set_takes_type_values(cname, world);
+}
+
+// whether `k` is a kind of type object and the open set `c` takes some of its values
 static int kind_meets_set(jl_datatype_t *k, jl_datatype_t *c) JL_NOTSAFEPOINT
 {
     if (!(k == jl_datatype_type || k == jl_unionall_type || k == jl_uniontype_type ||
           (k->name == jl_type_typename && jl_has_free_typevars((jl_value_t*)k))))
         return 0;
-    if (jl_callable_type != NULL &&
-        c->name == ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type))->name)
-        return 1;
-    return c->name->open_set && set_takes_type_values(c->name, jl_membership_world());
+    return set_meets_kinds(c->name, jl_membership_world());
+}
+
+// the same at an explicit world, for the cell of a kind (datatype.c, compiler §5.6)
+int jl_set_meets_kinds(jl_typename_t *cname, size_t world) JL_NOTSAFEPOINT
+{
+    return set_meets_kinds(cname, world);
 }
 
 int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)

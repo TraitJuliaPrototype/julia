@@ -278,9 +278,13 @@ JL_DLLEXPORT jl_value_t *jl_candidates_of(jl_value_t *set)
 jl_genericmemory_t *jl_set_cells JL_GLOBALLY_ROOTED = NULL;
 static jl_mutex_t cells_lock;
 
-// whether `member` is a member of the set `setname` in `world`, at any instance of it
+// whether `member` is a member of the set `setname` in `world`, at any instance of it; for a kind of
+// type object, which is never a member, whether the set takes some of its values (compiler §4.10)
 static int cell_holds(jl_value_t *member, jl_typename_t *setname, size_t world)
 {
+    if (member == (jl_value_t*)jl_datatype_type || member == (jl_value_t*)jl_unionall_type ||
+        member == (jl_value_t*)jl_uniontype_type)
+        return jl_set_meets_kinds(setname, world);
     return jl_membership_holds_at(member, setname->wrapper, world);
 }
 

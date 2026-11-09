@@ -2679,10 +2679,14 @@ static int shadow_at(jl_value_t *tt, jl_method_t *m0, jl_method_t *mz, size_t i)
     if (d == NULL || !jl_has_open_set_in(d))
         return 0;
     jl_value_t *s = jl_tparam(tt, i);
-    if (jl_is_vararg(s) || !jl_is_concrete_type(s) || ((jl_datatype_t*)s)->name->never_member)
+    // a kind of type object is never a member, but its values can be (compiler §4.10)
+    int kind = s == (jl_value_t*)jl_datatype_type || s == (jl_value_t*)jl_unionall_type ||
+               s == (jl_value_t*)jl_uniontype_type;
+    if (jl_is_vararg(s) || !jl_is_concrete_type(s) || (((jl_datatype_t*)s)->name->never_member && !kind))
         return 0;
     jl_value_t *db = jl_is_typevar(d) ? ((jl_tvar_t*)d)->ub : d;
-    if (jl_subtype(s, db) || !jl_could_join(s, db))
+    // a kind meets the set now where the set takes a type value already: the method is a match
+    if ((kind ? !jl_has_empty_intersection(s, db) : jl_subtype(s, db)) || !jl_could_join(s, db))
         return 0;
     jl_value_t *m0sig = m0 ? jl_unwrap_unionall(m0->sig) : NULL;
     if (m0sig != NULL && jl_is_datatype(m0sig)) {

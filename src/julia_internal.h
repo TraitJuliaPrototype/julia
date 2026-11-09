@@ -1001,6 +1001,7 @@ int jl_membership_holds_at(jl_value_t *x, jl_value_t *y, size_t world);
 // live in `world` (0: every entry)
 int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world);
 jl_value_t *jl_membership_instance(jl_value_t *x, jl_membership_t *en);
+int jl_set_meets_kinds(jl_typename_t *cname, size_t world) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_membership_flip_possible(jl_value_t *a, jl_value_t *b);
 // the query-world override for C-driven subtyping contexts (inference, the
 // declaration-time walks), whose task world is frozen below the runtime entries.
