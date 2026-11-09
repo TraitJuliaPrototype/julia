@@ -1024,6 +1024,8 @@ int jl_membership_range_is_fast(size_t world) JL_NOTSAFEPOINT;
 // narrowed by the call methods of the query's types at those positions (compiler §7.4)
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_t world, size_t *lo, size_t *hi);
 JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
+// whether call types hold an argument met only as an intersection no type of the world is in (datatype.c)
+JL_DLLEXPORT int jl_has_unmet_argument(jl_value_t *ti, size_t world);
 // intersections (compiler §4.9): All{X, Y} is Core.All{Tuple{X, Y}}, built in its normal form
 // an intersection All{X, Y} (compiler §4.9). Every intersection has the open-set bit, so a type
 // without it is answered by two loads and the hot paths of subtyping pay nothing more.

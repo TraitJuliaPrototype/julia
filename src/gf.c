@@ -7540,6 +7540,40 @@ typedef struct {
 //  * -1: too many matches for lim, other outputs are undefined
 //  *  0: the child(ren) have been added to the output
 //  * 1+: the children are part of this SCC (up to this depth)
+// A match met only as an intersection that no type of the query's world is in (compiler §4.9, §5.4)
+// leaves the matches where a covering match exists that it is not more specific than: no value
+// reaches it, and a membership that later makes one is the ambiguity report's case (§5.4). So it
+// neither selects nor makes the lookup ambiguous. Where it is more specific than every covering
+// match, or none covers, it stays: a later member would select it (a pruned arm, §5.6).
+static size_t drop_unmet_matches(jl_array_t *t, size_t len, size_t world)
+{
+    size_t i, j, k = 0;
+    int any = 0;
+    for (i = 0; i < len; i++) {
+        jl_method_match_t *matc = (jl_method_match_t*)jl_array_ptr_ref(t, i);
+        if (matc->fully_covers != FULLY_COVERS && jl_has_unmet_argument((jl_value_t*)matc->spec_types, world)) {
+            for (j = 0; j < len; j++) {
+                jl_method_match_t *c = (jl_method_match_t*)jl_array_ptr_ref(t, j);
+                if (c != NULL && c->fully_covers == FULLY_COVERS &&
+                    !jl_type_morespecific((jl_value_t*)matc->method->sig, (jl_value_t*)c->method->sig)) {
+                    jl_array_ptr_set(t, i, NULL); // a covering match is never dropped, so the scan still sees each
+                    any = 1;
+                    break;
+                }
+            }
+        }
+    }
+    if (!any)
+        return len;
+    for (i = 0; i < len; i++) {
+        jl_value_t *matc = jl_array_ptr_ref(t, i);
+        if (matc != NULL)
+            jl_array_ptr_set(t, k++, matc);
+    }
+    jl_array_del_end(t, len - k);
+    return k;
+}
+
 static int sort_mlmatches(jl_array_t *t, size_t idx, arraylist_t *visited, arraylist_t *stack, arraylist_t *result, arraylist_t *recursion_stack, int lim, int include_ambiguous, int *has_ambiguity, int *found_minmax)
 {
     // Use arraylist_t for explicit stack of processing frames
@@ -7916,6 +7950,8 @@ static jl_value_t *ml_matches_i(jl_methtable_t *mt, jl_methcache_t *mc,
     // all intersecting methods have been collected now. the remaining work is to sort
     // these and apply specificity to determine a list of dispatch-possible call targets
     size_t i, j, len = jl_array_nrows(env.t);
+    if (len > 1)
+        len = drop_unmet_matches((jl_array_t*)env.t, len, world);
 
     // the 'minmax' method is a method that (1) fully-covers the queried type, and (2) is
     // more-specific than any other fully-covering method (but if !all_subtypes, there are

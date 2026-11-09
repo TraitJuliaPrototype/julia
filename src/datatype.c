@@ -685,6 +685,96 @@ static int entry_live_at(jl_membership_t *en, size_t world)
     return en->min_world <= world && world <= jl_atomic_load_relaxed(&en->max_world);
 }
 
+// Whether the member pattern `m`, found at the component `skip` of an intersection's components
+// `comps`, could be in each other component: a concrete type by subtyping, a pattern by intersection
+// (which can answer yes where no type is: the answer errs toward "met").
+static int member_meets_others(jl_value_t *m, jl_value_t *comps, size_t skip)
+{
+    size_t n = jl_nparams(comps);
+    for (size_t k = 0; k < n; k++) {
+        if (k == skip)
+            continue;
+        jl_value_t *c = jl_tparam(comps, k);
+        if (jl_is_concrete_type(m) ? !jl_subtype(m, c) : jl_has_empty_intersection(m, c))
+            return 0;
+    }
+    return 1;
+}
+
+// Whether an entry at the set `sname` live in `world`, or at a set that joins it (sets have no
+// cycles, compiler §4.4), has a member that could be in the other components.
+static int set_entries_meet(jl_typename_t *sname, jl_value_t *comps, size_t skip, size_t world)
+{
+    jl_array_t *list = jl_set_entries == NULL ? NULL : (jl_array_t*)jl_eqtable_get(jl_set_entries, (jl_value_t*)sname, NULL);
+    if (list == NULL)
+        return 0;
+    int met = 0;
+    JL_GC_PUSH1(&list);
+    for (size_t e = 0; e < jl_array_nrows(list) && !met; e++) {
+        jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, e);
+        if (en == NULL || !entry_live_at(en, world))
+            continue;
+        jl_value_t *mu = jl_unwrap_unionall(en->member);
+        if (jl_is_datatype(mu) && ((jl_datatype_t*)mu)->name->open_set &&
+            set_entries_meet(((jl_datatype_t*)mu)->name, comps, skip, world))
+            met = 1;
+        else
+            met = member_meets_others(en->member, comps, skip);
+    }
+    JL_GC_POP();
+    return met;
+}
+
+// Whether the intersection `a` (`All{X, Y, …}`, compiler §4.9) has a value in `world`: a type in each
+// component. Nominal supertypes form a tree, so such a type is in some set component by an entry;
+// the entries at each set component are read.
+static int all_type_met(jl_value_t *a, size_t world)
+{
+    jl_value_t *comps = jl_tparam0(a);
+    if (!jl_is_tuple_type(comps))
+        return 1;
+    for (size_t i = 0; i < jl_nparams(comps); i++) {
+        jl_value_t *c = jl_unwrap_unionall(jl_tparam(comps, i));
+        if (jl_is_datatype(c) && ((jl_datatype_t*)c)->name->open_set &&
+            set_entries_meet(((jl_datatype_t*)c)->name, comps, i, world))
+            return 1;
+    }
+    return 0;
+}
+
+// an argument met only as an intersection that no type of `world` is in (compiler §4.9, §5.4)
+static int unmet_argument(jl_value_t *p, size_t world)
+{
+    if (jl_is_vararg(p)) {
+        p = jl_unwrap_vararg(p);
+        if (p == NULL)
+            return 0;
+    }
+    if (jl_is_typevar(p))
+        return unmet_argument(((jl_tvar_t*)p)->ub, world);
+    if (jl_is_uniontype(p))
+        return unmet_argument(((jl_uniontype_t*)p)->a, world) &&
+               unmet_argument(((jl_uniontype_t*)p)->b, world);
+    p = jl_unwrap_unionall(p);
+    return jl_is_all_type(p) && !all_type_met(p, world);
+}
+
+// Whether the call types `ti` (a tuple type, or a union of them, each) hold an argument met only as an
+// intersection that no type of `world` is in: no value has those types there (compiler §4.9, §5.4).
+JL_DLLEXPORT int jl_has_unmet_argument(jl_value_t *ti, size_t world)
+{
+    ti = jl_unwrap_unionall(ti);
+    if (jl_is_uniontype(ti))
+        return jl_has_unmet_argument(((jl_uniontype_t*)ti)->a, world) &&
+               jl_has_unmet_argument(((jl_uniontype_t*)ti)->b, world);
+    if (!jl_is_tuple_type(ti) || !((jl_datatype_t*)ti)->has_open_set)
+        return 0;
+    for (size_t i = 0; i < jl_nparams(ti); i++)
+        if (unmet_argument(jl_tparam(ti, i), world))
+            return 1;
+    return 0;
+}
+
 // An entry's instance with its pattern's variables free: an instance may be wrapped in them.
 static jl_value_t *instance_body(jl_value_t *inst, jl_value_t *pattern)
 {
