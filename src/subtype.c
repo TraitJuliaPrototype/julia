@@ -1402,8 +1402,9 @@ static void callable_methods(jl_value_t *f, size_t world, arraylist_t *out)
     JL_GC_PUSH1(&tt);
     tt = (jl_value_t*)jl_svec2(f, jl_wrap_vararg((jl_value_t*)jl_any_type, NULL, 1, 0));
     tt = (jl_value_t*)jl_apply_tuple_type((jl_svec_t*)tt, 1);
+    // the methods visible in `world`; no match's worlds are read (skip_ranges)
     struct callable_methods_env env = {{callable_method_visitor, tt, (jl_value_t*)jl_any_type, 0, world,
-                                        world, world, NULL, NULL, 0}, out};
+                                        world, world, NULL, NULL, 0, 1}, out};
     jl_typemap_intersection_visitor(jl_atomic_load_relaxed(&jl_method_table->defs), 0, &env.match);
     JL_GC_POP();
 }
@@ -1713,8 +1714,88 @@ static int narrow_by_callable_methods(jl_value_t *f, size_t world, size_t *lo, s
     return env.found;
 }
 
+// Whether the type `t` names Callable: in a parameter, a union's member or a variable's bound. A match
+// at a method whose signature names it can rest on a member's call methods (compiler §7.4); subtyping
+// reaches Callable only where the set asked is Callable itself. Callable is an open set, so a type
+// without the open-set bit does not name it.
+static int names_callable(jl_value_t *t, int depth) JL_NOTSAFEPOINT
+{
+    if (t == NULL || jl_callable_type == NULL)
+        return 0;
+    if (depth > 16)
+        return 1;
+    if (jl_is_unionall(t))
+        return names_callable(((jl_unionall_t*)t)->var->ub, depth + 1) ||
+               names_callable(((jl_unionall_t*)t)->body, depth + 1);
+    if (jl_is_uniontype(t))
+        return names_callable(((jl_uniontype_t*)t)->a, depth + 1) ||
+               names_callable(((jl_uniontype_t*)t)->b, depth + 1);
+    if (jl_is_typevar(t))
+        return names_callable(((jl_tvar_t*)t)->ub, depth + 1);
+    if (jl_is_vararg(t))
+        return names_callable(jl_unwrap_vararg(t), depth + 1);
+    if (!jl_is_datatype(t) || !((jl_datatype_t*)t)->has_open_set)
+        return 0;
+    jl_datatype_t *dt = (jl_datatype_t*)t;
+    if (dt->name == ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type))->name)
+        return 1;
+    for (size_t i = 0; i < jl_nparams(dt); i++)
+        if (names_callable(jl_tparam(dt, i), depth + 1))
+            return 1;
+    return 0;
+}
+int jl_names_callable(jl_value_t *t) JL_NOTSAFEPOINT
+{
+    return names_callable(t, 0);
+}
+
+// Narrows [*lo, *hi] by the call methods of each concrete callable type in `t`, its parameters
+// included: the worlds in which its memberships of Callable are as in `world` (compiler §7.4).
+static int callable_range_visit(jl_value_t *t, size_t world, size_t *lo, size_t *hi, int depth)
+{
+    if (t == NULL || depth > 4)
+        return 0;
+    if (jl_is_unionall(t))
+        return callable_range_visit(((jl_unionall_t*)t)->body, world, lo, hi, depth + 1);
+    if (jl_is_uniontype(t)) {
+        int a = callable_range_visit(((jl_uniontype_t*)t)->a, world, lo, hi, depth + 1);
+        int b = callable_range_visit(((jl_uniontype_t*)t)->b, world, lo, hi, depth + 1);
+        return a || b;
+    }
+    if (jl_is_vararg(t))
+        return callable_range_visit(jl_unwrap_vararg(t), world, lo, hi, depth + 1);
+    if (!jl_is_datatype(t))
+        return 0;
+    jl_datatype_t *dt = (jl_datatype_t*)t;
+    int found = 0;
+    if (!dt->name->never_member && !jl_has_free_typevars(t) && (jl_is_concrete_type(t) || jl_is_type_type(t)))
+        found |= narrow_by_callable_methods(t, world, lo, hi);
+    for (size_t i = 0; i < jl_nparams(dt); i++)
+        found |= callable_range_visit(jl_tparam(dt, i), world, lo, hi, depth + 1);
+    return found;
+}
+
+// A match of the query `t` at a method whose signature `sig` names Callable: the types at the
+// argument positions where `sig` names it narrow the range by their call methods (compiler §7.4).
+static int callable_positions_range(jl_value_t *t, jl_value_t *sig, size_t world, size_t *lo, size_t *hi)
+{
+    jl_value_t *tt = jl_unwrap_unionall(t), *st = jl_unwrap_unionall(sig);
+    if (!jl_is_tuple_type(tt) || !jl_is_tuple_type(st))
+        return callable_range_visit(t, world, lo, hi, 0);
+    size_t ns = jl_nparams(st);
+    int found = 0;
+    for (size_t i = 0; i < jl_nparams(tt); i++) {
+        jl_value_t *si = i < ns ? jl_tparam(st, i) : NULL;
+        if (si == NULL && ns > 0 && jl_is_vararg(jl_tparam(st, ns - 1)))
+            si = jl_tparam(st, ns - 1);
+        if (si != NULL && names_callable(si, 0))
+            found |= callable_range_visit(jl_tparam(tt, i), world, lo, hi, 0);
+    }
+    return found;
+}
+
 static int membership_range_visit(jl_value_t *t, size_t world, size_t *lo, size_t *hi,
-                                  arraylist_t *seen)
+                                  arraylist_t *seen) JL_NOTSAFEPOINT
 {
     if (t == NULL)
         return 0;
@@ -1738,10 +1819,6 @@ static int membership_range_visit(jl_value_t *t, size_t world, size_t *lo, size_
     int found = 0;
     for (size_t i = 0; i < jl_nparams(dt); i++)
         found |= membership_range_visit(jl_tparam(dt, i), world, lo, hi, seen);
-    // a concrete callable type is a member of Callable by its methods (compiler §7.4)
-    if (jl_callable_type != NULL && world != 0 && !dt->name->never_member && !jl_has_free_typevars(t) &&
-            (jl_is_concrete_type(t) || jl_is_type_type(t)))
-        found |= narrow_by_callable_methods(t, world, lo, hi);
     for (jl_datatype_t *d = dt; d != NULL && d != jl_any_type; d = d->super) {
         size_t i;
         for (i = 0; i < seen->len; i++)
@@ -1803,9 +1880,10 @@ JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT
     return 0;
 }
 
-// The latest world in which a membership's visibility changed (compiler §5.3): a declaration, an image's
-// activation, a redeclaration's end of the old entry and a refusal raise it, and a method's definition
-// or deletion, which begins or ends a membership of Callable (§7.4), before their world is published. At a query in this world or later every entry is either in force from a world no later than
+// The latest world in which an entry's visibility changed (compiler §5.3): a declaration, an image's
+// activation, a redeclaration's end of the old entry and a refusal raise it, before their world is
+// published. A membership of Callable, by a method, is read from the methods' worlds instead (§7.4).
+// At a query in this world or later every entry is either in force from a world no later than
 // it, with no end, or retired before it: the exact range is [w, ∞) with w no later than this world, so
 // starting the range here is exact at its end and narrower at its start, and needs no walk.
 static _Atomic(size_t) membership_last_change = 1;
@@ -1822,22 +1900,28 @@ int jl_membership_range_is_fast(size_t world) JL_NOTSAFEPOINT
     return world != 0 && world >= jl_atomic_load_acquire(&membership_last_change);
 }
 
-JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, size_t world, size_t *lo, size_t *hi)
+JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_t world, size_t *lo, size_t *hi)
 {
     if (world == 0)     // no range asked: whether `t` reaches an entry
         return jl_type_has_memberships(t);
+    int found;
     size_t last = jl_atomic_load_acquire(&membership_last_change);
     if (world >= last) {
         // whether `t` reaches an entry at all is not asked: the callers ask only for a match at a
         // signature that names an open set, and starting its range here is sound either way
         if (*lo < last)
             *lo = last;
-        return 1;
+        found = 1;
     }
-    arraylist_t seen;
-    arraylist_new(&seen, 0);
-    int found = membership_range_visit(t, world, lo, hi, &seen);
-    arraylist_free(&seen);
+    else {
+        arraylist_t seen;
+        arraylist_new(&seen, 0);
+        found = membership_range_visit(t, world, lo, hi, &seen);
+        arraylist_free(&seen);
+    }
+    // a member of Callable is one by its methods, whose worlds are not entries' (compiler §7.4)
+    if (sig != NULL && names_callable(sig, 0))
+        found |= callable_positions_range(t, sig, world, lo, hi);
     return found;
 }
 
