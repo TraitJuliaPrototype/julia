@@ -229,6 +229,27 @@ static void register_candidate(jl_typename_t *set, jl_value_t *T)
     JL_GC_POP();
 }
 
+// The entries at each set (compiler §4.6): a set's TypeName to a Vector{Any} of the entries whose
+// set it is, declared in this session or activated from an image, in force or ended. The check of a
+// member pattern reads it. Written under the world counter's lock; a list is replaced, never mutated.
+jl_genericmemory_t *jl_set_entries JL_GLOBALLY_ROOTED = NULL;
+
+static void index_entry(jl_membership_t *en)
+{
+    jl_array_t *nw = NULL;
+    JL_GC_PUSH1(&nw);
+    if (jl_set_entries == NULL)
+        jl_set_entries = jl_alloc_memory_any(16);
+    jl_array_t *old = (jl_array_t*)jl_eqtable_get(jl_set_entries, (jl_value_t*)en->set, NULL);
+    size_t n = old ? jl_array_nrows(old) : 0;
+    nw = jl_alloc_vec_any(n + 1);
+    for (size_t i = 0; i < n; i++)
+        jl_array_ptr_set(nw, i, jl_array_ptr_ref(old, i));
+    jl_array_ptr_set(nw, n, (jl_value_t*)en);
+    jl_set_entries = jl_eqtable_put(jl_set_entries, (jl_value_t*)en->set, (jl_value_t*)nw, NULL);
+    JL_GC_POP();
+}
+
 // a member of a pattern joins its set's candidates at its first use (the library, compiler §10.4)
 JL_DLLEXPORT void jl_register_candidate(jl_value_t *set, jl_value_t *T)
 {
@@ -388,12 +409,18 @@ jl_array_t *jl_declared_memberships JL_GLOBALLY_ROOTED = NULL;
 // force from `world`, and one on another module's TypeName joins that TypeName's list.
 static jl_value_t *set_at_inputs(jl_typename_t *tn, jl_datatype_t *inst);
 
-// C-35 (compiler §4.6, §9): would this image's entry give its concrete member a second instance of
-// its set, against the entries in force at `world`?
+// Compiler §4.6, §9: would this image's entry give a member a second instance of its set, against
+// the entries in force at `world`?
+static int pattern_second_instance(jl_value_t *pattern, jl_value_t *set_instance, jl_typename_t *setname,
+                                   size_t world);
 static int activation_conflicts(jl_membership_t *en, size_t world)
 {
-    if (!jl_is_concrete_type(en->member))
-        return 0; // a pattern's second instance is compiler C-27
+    if (!jl_is_concrete_type(en->member)) {
+        size_t mq = jl_set_membership_query_world(world);
+        int c = pattern_second_instance(en->member, en->instance, en->set, world);
+        jl_set_membership_query_world(mq);
+        return c;
+    }
     jl_value_t *setuw = jl_unwrap_unionall(en->instance);
     if (!jl_is_datatype(setuw))
         return 0;
@@ -443,6 +470,7 @@ void jl_activate_memberships(jl_array_t *list, size_t world)
         jl_svecset(nd, jl_svec_len(old), (jl_value_t*)en);
         jl_atomic_store_release(&home->memberships, (jl_svec_t*)nd);
         jl_gc_wb(home, nd);
+        index_entry(en);
     }
     nd = NULL;
     for (size_t i = 0; i + 1 < n; i += 2) {
@@ -498,6 +526,131 @@ static jl_value_t *set_at_inputs(jl_typename_t *tn, jl_datatype_t *inst)
     }
     JL_GC_POP();
     return t;
+}
+
+static int entry_live_at(jl_membership_t *en, size_t world)
+{
+    return en->min_world <= world && world <= jl_atomic_load_relaxed(&en->max_world);
+}
+
+// An entry's instance with its pattern's variables free: an instance may be wrapped in them.
+static jl_value_t *instance_body(jl_value_t *inst, jl_value_t *pattern)
+{
+    for (jl_value_t *p = pattern; jl_is_unionall(p); p = ((jl_unionall_t*)p)->body)
+        if (jl_is_unionall(inst) && ((jl_unionall_t*)inst)->var == ((jl_unionall_t*)p)->var)
+            inst = ((jl_unionall_t*)inst)->body;
+    return inst;
+}
+
+// The instances of the set `xname` that the set instance `inst` gives its members, through the
+// entries live in `world` on its TypeName chain (the sets it joins, compiler §4.9), its variables
+// black boxes; `inst` itself where it is an instance of `xname`. Sets have no cycles (§4.4).
+static void instances_at_set(jl_value_t *inst, jl_typename_t *xname, size_t world, jl_array_t *out)
+{
+    jl_value_t *uw = jl_unwrap_unionall(inst);
+    if (!jl_is_datatype(uw))
+        return;
+    if (((jl_datatype_t*)uw)->name == xname) {
+        jl_array_ptr_1d_push(out, inst);
+        return;
+    }
+    jl_value_t *j = NULL;
+    JL_GC_PUSH1(&j);
+    for (jl_datatype_t *d = (jl_datatype_t*)uw; d != NULL && d != jl_any_type; d = d->super) {
+        jl_svec_t *list = jl_typename_memberships(d->name);
+        for (size_t i = 0; i < jl_svec_len(list); i++) {
+            jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
+            JL_GC_PROMISE_ROOTED(en); // entries are never removed from a TypeName's list
+            if (!entry_live_at(en, world) || (en->set != xname && !jl_typename_reaches(en->set, xname, world)))
+                continue;
+            j = jl_membership_instance((jl_value_t*)d, en);
+            if (j == NULL)
+                continue;
+            j = jl_rewrap_unionall(j, inst);
+            instances_at_set(j, xname, world, out);
+        }
+    }
+    JL_GC_POP();
+}
+
+// Whether the TypeNames of two member patterns can share a member: one is on the other's
+// supertype chain. A type value's pattern (Type{S}) is asked by intersection.
+static int patterns_may_meet(jl_value_t *p, jl_value_t *q)
+{
+    jl_datatype_t *pd = (jl_datatype_t*)jl_unwrap_unionall(p), *qd = (jl_datatype_t*)jl_unwrap_unionall(q);
+    if (!jl_is_datatype(pd) || !jl_is_datatype(qd) || pd->name == jl_type_typename || qd->name == jl_type_typename)
+        return 1;
+    for (jl_datatype_t *d = pd; d != NULL; d = d == jl_any_type ? NULL : d->super)
+        if (d->name == qd->name)
+            return 1;
+    for (jl_datatype_t *d = qd; d != NULL; d = d == jl_any_type ? NULL : d->super)
+        if (d->name == pd->name)
+            return 1;
+    return 0;
+}
+
+// One instance per member, for a member pattern (compiler §4.6): whether an entry live in `world`
+// puts a member of `pattern` in the set at the inputs of `set_instance` (its variables the
+// pattern's) and not in `set_instance`. The candidates are the entries at the set and at each set
+// that joins it (the index); each one's instance is followed to the set's. Where the entry's
+// pattern Q meets this one P, every member at which its instance I meets the set at S's inputs
+// must be in S: as types over each pattern's variables,
+//     Tuple{P, X at S's inputs} ∩ Tuple{Q, I} <: Tuple{P, S}.
+// For a concrete member it asks what the concrete check asks.
+static int pattern_second_instance(jl_value_t *pattern, jl_value_t *set_instance, jl_typename_t *setname,
+                                   size_t world)
+{
+    jl_value_t *pb = jl_unwrap_unionall(pattern);
+    jl_value_t *sb = instance_body(set_instance, pattern);
+    jl_value_t *setuw = jl_unwrap_unionall(sb);
+    if (!jl_is_datatype(setuw))
+        return 0;
+    jl_array_t *sets = NULL, *insts = NULL;
+    jl_value_t *at = NULL, *a = NULL, *b = NULL, *t = NULL, *d = NULL;
+    JL_GC_PUSH7(&sets, &insts, &at, &a, &b, &t, &d);
+    at = set_at_inputs(setname, (jl_datatype_t*)setuw);
+    jl_value_t *pair[2] = {pb, at};
+    t = jl_apply_tuple_type_v(pair, 2);
+    a = jl_rewrap_unionall(t, pattern);
+    pair[1] = sb;
+    t = jl_apply_tuple_type_v(pair, 2);
+    b = jl_rewrap_unionall(t, pattern);
+    sets = jl_alloc_vec_any(0);
+    jl_array_ptr_1d_push(sets, (jl_value_t*)setname);
+    insts = jl_alloc_vec_any(0);
+    int conflict = 0;
+    for (size_t k = 0; k < jl_array_nrows(sets) && !conflict; k++) {
+        jl_value_t *z = jl_array_ptr_ref(sets, k);
+        jl_array_t *list = jl_set_entries == NULL ? NULL : (jl_array_t*)jl_eqtable_get(jl_set_entries, z, NULL);
+        for (size_t i = 0; list != NULL && i < jl_array_nrows(list) && !conflict; i++) {
+            jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i);
+            if (!entry_live_at(en, world))
+                continue;
+            // a set's own membership: the entries at that set reach this one too
+            jl_value_t *mu = jl_unwrap_unionall(en->member);
+            if (jl_is_datatype(mu) && ((jl_datatype_t*)mu)->name->open_set) {
+                size_t s = 0;
+                while (s < jl_array_nrows(sets) && jl_array_ptr_ref(sets, s) != (jl_value_t*)((jl_datatype_t*)mu)->name)
+                    s++;
+                if (s == jl_array_nrows(sets))
+                    jl_array_ptr_1d_push(sets, (jl_value_t*)((jl_datatype_t*)mu)->name);
+            }
+            if (!patterns_may_meet(pattern, en->member))
+                continue;
+            jl_array_del_end(insts, jl_array_nrows(insts));
+            instances_at_set(instance_body(en->instance, en->member), setname, world, insts);
+            for (size_t j = 0; j < jl_array_nrows(insts) && !conflict; j++) {
+                pair[0] = mu;
+                pair[1] = jl_array_ptr_ref(insts, j);
+                t = jl_apply_tuple_type_v(pair, 2);
+                t = jl_rewrap_unionall(t, en->member);
+                d = jl_type_intersection(a, t);
+                conflict = d != jl_bottom_type && !jl_subtype(d, b);
+            }
+        }
+    }
+    JL_GC_POP();
+    return conflict;
 }
 
 // Whether two instances of the set `tn` agree in every input (compiler §4.6).
@@ -562,9 +715,10 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         jl_errorf("the membership %s <: %s would close a cycle among sets",
                   jl_symbol_name(home->name), jl_symbol_name(setname->name));
     }
-    // one instance per member and value of the set's inputs (compiler §4.6), exactly for a
-    // concrete member: a member of the set at these inputs already must be a member of this
-    // instance, and then this is a redeclaration. A pattern is not checked yet (compiler C-27).
+    // one instance per member and value of the set's inputs (compiler §4.6): a member of the set at
+    // these inputs already must be a member of this instance. For a concrete member this is a
+    // redeclaration; a pattern is checked against the patterns at the set, and ends an entry of
+    // the same pattern at the same inputs.
     int redeclare = 0;
     jl_value_t *entry = NULL;
     JL_GC_PUSH1(&entry);
@@ -586,6 +740,21 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         }
         redeclare = in_instance;
     }
+    else {
+        size_t mq = jl_set_membership_query_world(world);
+        int conflict = pattern_second_instance(member, set_instance, setname, world);
+        jl_set_membership_query_world(mq);
+        if (conflict) {
+            JL_UNLOCK(&world_counter_lock);
+            JL_GC_POP();
+            if (setname->input_params != 0)
+                jl_errorf("a member of %s is a member of %s at these inputs already, at another instance",
+                          jl_symbol_name(home->name), jl_symbol_name(setname->name));
+            jl_errorf("a member of %s is a member of %s at another instance already",
+                      jl_symbol_name(home->name), jl_symbol_name(setname->name));
+        }
+        redeclare = 1;
+    }
     size_t min_world = world + 1;
     if (redeclare) {
         // the old entry of the same pattern and inputs ends where the new one begins (§4.3)
@@ -598,6 +767,7 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         }
     }
     entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world);
+    index_entry((jl_membership_t*)entry);
     if (jl_is_concrete_type(member))
         register_candidate(setname, member);
     if (jl_declared_memberships == NULL)

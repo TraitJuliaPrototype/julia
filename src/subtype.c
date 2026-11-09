@@ -4824,6 +4824,12 @@ static jl_value_t *membership_instance(jl_value_t *x, jl_membership_t *en)
     return inst;
 }
 
+// the same, for the one-instance check of a member pattern (datatype.c, compiler §4.6)
+jl_value_t *jl_membership_instance(jl_value_t *x, jl_membership_t *en)
+{
+    return membership_instance(x, en);
+}
+
 // The instances of the sets that the set instance `x` joins by the entries on its own TypeName, live
 // in the query world: its supertraits' instances at x's parameters (compiler §7.1). Inference reads
 // them without an edge, as it reads the declared fields. Empty where x has free variables.

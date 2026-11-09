@@ -462,6 +462,7 @@ jl_array_t *jl_call_image_methods_hook(jl_array_t *ms, const char *pkgname);
 void jl_call_module_end_hook(jl_module_t *m);
 extern jl_array_t *jl_declared_memberships JL_GLOBALLY_ROOTED; // this session's, for images (datatype.c)
 extern jl_genericmemory_t *jl_set_candidates JL_GLOBALLY_ROOTED; // the sets' candidates (datatype.c)
+extern jl_genericmemory_t *jl_set_entries JL_GLOBALLY_ROOTED; // the entries at each set (datatype.c)
 extern jl_genericmemory_t *jl_attributed_cache JL_GLOBALLY_ROOTED; // Core.attributed_call's cache (builtins.c)
 extern _Atomic(jl_genericmemory_t*) jl_attributed_fast JL_GLOBALLY_ROOTED; // its table of the latest answers (builtins.c)
 extern jl_genericmemory_t *jl_set_cells JL_GLOBALLY_ROOTED; // each set's membership cells (datatype.c)
@@ -999,6 +1000,7 @@ int jl_membership_holds_at(jl_value_t *x, jl_value_t *y, size_t world);
 // whether the TypeName `from` reaches `to` along declared supertypes and the entries
 // live in `world` (0: every entry)
 int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world);
+jl_value_t *jl_membership_instance(jl_value_t *x, jl_membership_t *en);
 JL_DLLEXPORT int jl_membership_flip_possible(jl_value_t *a, jl_value_t *b);
 // the query-world override for C-driven subtyping contexts (inference, the
 // declaration-time walks), whose task world is frozen below the runtime entries.
