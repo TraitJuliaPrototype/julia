@@ -913,12 +913,31 @@ struct ForwardToBackedgeIterator
     forward_edges::SimpleVector
 end
 
+# a backedge by the call's own signature (compiler §3.1): the runtime stores it as `svec(sig)`
+struct CallSigBackedge
+    sig::Any
+end
+
 function Base.iterate(it::ForwardToBackedgeIterator, i::Int = 1)
     edges = it.forward_edges
     i > length(edges) && return nothing
     while i ≤ length(edges)
         item = edges[i]
         if item isa Int
+            # a call with one match, fully covering, that reached an instance wider than its own
+            # signature (a method compiled once at a set, or `@nospecialize`): the backedge keeps
+            # the call's signature, so a method defined later invalidates the caller only where it
+            # meets that signature (compiler §3.1)
+            if item == 1 && i + 2 <= length(edges)
+                callee = edges[i+2]
+                if callee isa CodeInstance || callee isa MethodInstance
+                    mi = callee isa CodeInstance ? get_ci_mi(callee) : callee
+                    sig = edges[i+1]
+                    if sig isa Type && mi.specTypes !== sig
+                        return ((CallSigBackedge(sig), mi), i + 3)
+                    end
+                end
+            end
             i += 2
             continue # ignore the query information if present but process the contents
         elseif isa(item, Method)
@@ -975,13 +994,18 @@ function store_backedges(caller::CodeInstance, edges::SimpleVector)
         end
     end
 
-    backedges = ForwardToBackedgeIterator(edges)
-    for (i, (invokesig, item)) in enumerate(backedges)
+    # the backedges, collected once: the duplicate check compares the pairs, not the iterator's steps
+    backedges = Any[]
+    for be in ForwardToBackedgeIterator(edges)
+        push!(backedges, be)
+    end
+    for i in 1:length(backedges)
+        invokesig, item = backedges[i]::Tuple{Any,Any}
         # check for any duplicate edges we've already registered
         duplicate_found = false
-        for (i′, (invokesig′, item′)) in enumerate(backedges)
-            i == i′ && break
-            if item′ === item && invokesig′ == invokesig
+        for i′ in 1:(i - 1)
+            invokesig′, item′ = backedges[i′]::Tuple{Any,Any}
+            if item′ === item && invokesig′ === invokesig
                 duplicate_found = true
                 break
             end
@@ -994,7 +1018,8 @@ function store_backedges(caller::CodeInstance, edges::SimpleVector)
                 ccall(:jl_method_table_add_backedge, Cvoid, (Any, Any), invokesig, caller)
             else
                 item::MethodInstance
-                ccall(:jl_method_instance_add_backedge, Cvoid, (Any, Any, Any), item, invokesig, caller)
+                sig = invokesig isa CallSigBackedge ? Core.svec(invokesig.sig) : invokesig
+                ccall(:jl_method_instance_add_backedge, Cvoid, (Any, Any, Any), item, sig, caller)
             end
         end
     end

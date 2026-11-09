@@ -217,7 +217,8 @@ function edges_satisfy_g2(edges::SimpleVector, inlined::IdSet{Any})
         elseif item isa MethodTable
             is_fact_sig(invokesig) || return false
         elseif item isa MethodInstance
-            invokesig === nothing || continue
+            # an `invoke` edge is skipped; an ordinary call, by its own signature or not, is checked
+            (invokesig === nothing || invokesig isa CallSigBackedge) || continue
             is_fact_sig(item.specTypes) || return false
         end
     end

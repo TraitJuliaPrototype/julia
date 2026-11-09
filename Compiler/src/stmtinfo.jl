@@ -184,7 +184,10 @@ function _add_edges_impl(edges::Vector{Any}, info::MethodMatchInfo, mi_edge::Boo
         else
             mi = edge.def::MethodInstance
         end
-        if mi.specTypes === m.spec_types
+        # the one-edge form only where the instance is no wider than the call: a match the
+        # attribute widened to the instance compiled once at a set (compiler §6.3) keeps the call's
+        # signature, so its backedge does (§3.1)
+        if mi.specTypes === m.spec_types && (m.spec_types === info.atype || m.spec_types <: info.atype)
             add_one_edge!(edges, edge)
             return nothing
         end
