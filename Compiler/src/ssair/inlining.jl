@@ -1991,7 +1991,7 @@ function handle_declared_result!(ir::IRCode, idx::Int, stmt::Expr, info::Declare
     inst = ir[SSAValue(idx)]
     call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], nothing))
     val = call
-    if convert && declared_converts(info.rt)
+    if convert && info.convert && declared_converts(info.rt)
         val = insert_node!(ir, SSAValue(idx), NewInstruction(
             Expr(:call, GlobalRef(Base, :_to_declared), info.rt, call), Any, NoCallInfo(), inst[:line], nothing))
     end

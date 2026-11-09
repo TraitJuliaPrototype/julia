@@ -3142,6 +3142,27 @@ JL_DLLEXPORT void jl_invalidate_code_instance(jl_code_instance_t *replaced, size
     invalidate_code_instance(replaced, max_world, 1);
 }
 
+// Invalidates the given CodeInstances, with their callers, in the latest world, and opens a new
+// world, as a method's deletion does: code of the latest world stays valid there, and what is
+// compiled from the new world on sees the change. Used once Base counts as loaded, for code
+// compiled at an intersection whose negative has become final (compiler §4.8, open issue 169).
+JL_DLLEXPORT void jl_invalidate_code_instances_new_world(jl_svec_t *cis)
+{
+    JL_LOCK(&world_counter_lock);
+    if (!jl_atomic_load_relaxed(&allow_new_worlds)) {
+        JL_UNLOCK(&world_counter_lock);
+        jl_error("Method changes have been disabled via a call to disable_new_worlds.");
+    }
+    size_t world = jl_atomic_load_relaxed(&jl_world_counter);
+    for (size_t i = 0; i < jl_svec_len(cis); i++) {
+        jl_value_t *ci = jl_svecref(cis, i);
+        if (jl_is_code_instance(ci))
+            invalidate_code_instance((jl_code_instance_t*)ci, world, 1);
+    }
+    jl_atomic_store_release(&jl_world_counter, world + 1);
+    JL_UNLOCK(&world_counter_lock);
+}
+
 JL_DLLEXPORT void jl_maybe_log_binding_invalidation(jl_value_t *replaced)
 {
     if (_jl_debug_method_invalidation) {

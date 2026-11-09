@@ -999,6 +999,7 @@ JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X);
 JL_DLLEXPORT int jl_membership_final(jl_value_t *S, jl_value_t *X);
 JL_DLLEXPORT jl_value_t *jl_membership_final_cell(jl_value_t *member, jl_value_t *set);
 JL_DLLEXPORT void jl_invalidate_code_instance(jl_code_instance_t *replaced, size_t max_world);
+JL_DLLEXPORT void jl_invalidate_code_instances_new_world(jl_svec_t *cis);
 JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X);
 // x <: y at an explicit world
 int jl_membership_holds_at(jl_value_t *x, jl_value_t *y, size_t world);
@@ -1026,6 +1027,7 @@ JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_
 JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
 // whether call types hold an argument met only as an intersection no type of the world is in (datatype.c)
 JL_DLLEXPORT int jl_has_unmet_argument(jl_value_t *ti, size_t world);
+JL_DLLEXPORT jl_value_t *jl_unmet_final_cells(jl_value_t *spec);
 // intersections (compiler §4.9): All{X, Y} is Core.All{Tuple{X, Y}}, built in its normal form
 // an intersection All{X, Y} (compiler §4.9). Every intersection has the open-set bit, so a type
 // without it is answered by two loads and the hot paths of subtyping pay nothing more.

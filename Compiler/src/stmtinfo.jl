@@ -32,7 +32,10 @@ operation's declared result `rt`. The call stays a dynamic call and its result i
 """
 struct DeclaredResultInfo <: CallInfo
     rt::Any
+    # an operation's result converts to `rt` (traits §7.9); a `Callable`'s is asserted (§7.4)
+    convert::Bool
 end
+DeclaredResultInfo(@nospecialize(rt)) = DeclaredResultInfo(rt, true)
 add_edges_impl(::Vector{Any}, ::DeclaredResultInfo) = nothing
 
 """
@@ -141,14 +144,20 @@ struct MethodMatchInfo <: CallInfo
     atype
     fullmatch::Bool
     edges::Vector{Union{Nothing,CodeInstance}}
+    # the final cells of the matches dropped as unreachable (compiler §4.8, open issue 169)
+    cells::Vector{Any}
     function MethodMatchInfo(
-        results::MethodLookupResult, mt::MethodTable, @nospecialize(atype), fullmatch::Bool)
+        results::MethodLookupResult, mt::MethodTable, @nospecialize(atype), fullmatch::Bool,
+        cells::Vector{Any} = Any[])
         edges = fill!(Vector{Union{Nothing,CodeInstance}}(undef, length(results)), nothing)
-        return new(results, mt, atype, fullmatch, edges)
+        return new(results, mt, atype, fullmatch, edges, cells)
     end
 end
 add_edges_impl(edges::Vector{Any}, info::MethodMatchInfo) = _add_edges_impl(edges, info)
 function _add_edges_impl(edges::Vector{Any}, info::MethodMatchInfo, mi_edge::Bool=false)
+    for c in info.cells
+        any(x -> x === c, edges) || push!(edges, c)
+    end
     if !fully_covering(info)
         exists = false
         for i in 2:length(edges)

@@ -7,6 +7,26 @@ Base.include("Base.jl") # finish populating Base (currently just has the Compile
 ccall(:jl_module_set_loaded, Cvoid, (Any,), Core)
 ccall(:jl_module_set_loaded, Cvoid, (Any,), Base)
 
+# Code compiled during Base's build kept a match at an intersection no type is in, whose negative was
+# not final yet (`write(::All{AbstractString, IO}, …)` in `show(::IO, ::Char)`). Final now: those
+# instances are invalidated, with their callers, and what the image compiles from here drops the match
+# (compiler §4.8, open issue 169)
+let cis = Any[]
+    Base.visit(Core.methodtable) do m
+        m isa Method || return
+        for mi in Base.specializations(m)
+            mi isa Core.MethodInstance || continue
+            ccall(:jl_unmet_final_cells, Any, (Any,), mi.specTypes) isa Core.SimpleVector || continue
+            ci = isdefined(mi, :cache) ? mi.cache : nothing
+            while ci isa Core.CodeInstance
+                push!(cis, ci)
+                ci = isdefined(ci, :next) ? ci.next : nothing
+            end
+        end
+    end
+    ccall(:jl_invalidate_code_instances_new_world, Cvoid, (Any,), Core.svec(cis...))
+end
+
 # Set up Main module by importing from Base
 using .Base
 using .Base.MainInclude # ans, err, and sometimes Out

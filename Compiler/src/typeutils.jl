@@ -48,6 +48,12 @@ has_extended_info(@nospecialize x) = (!isa(x, Type) && !isvarargtype(x)) || isTy
 # certain combinations of `a` and `b` where one/both isa/are `Union`/`UnionAll` type(s)s.
 isnotbrokensubtype(@nospecialize(a), @nospecialize(b)) = (!iskindtype(b) || !isType(a) || hasuniquerep(a.parameters[1]) || b <: a)
 
+# an intersection type `All{X, Y, …}` (compiler §4.9), under its variables
+function is_all_type(@nospecialize(t))
+    u = unwrap_unionall(t)
+    return u isa DataType && u.name === (unwrap_unionall(Core.All)::DataType).name
+end
+
 # membership fold gates (compiler §4.8): a negative about a pair that a future
 # declaration could join never folds. A positive answered by a membership entry folds
 # only where the fold can be recorded: the frame being inferred takes the entries into

@@ -280,6 +280,40 @@ static jl_mutex_t cells_lock;
 
 // whether `member` is a member of the set `setname` in `world`, at any instance of it; for a kind of
 // type object, which is never a member, whether the set takes some of its values (compiler §4.10)
+static int all_type_met(jl_value_t *a, size_t world);
+
+// An abstract type, not a set: its final cell (compiler §4.8, open issue 169) holds where its
+// intersection with the set has a type, not where the type itself is a member.
+static int abstract_member(jl_value_t *member)
+{
+    jl_value_t *u = jl_unwrap_unionall(member);
+    return jl_is_datatype(u) && jl_is_abstracttype(u) && !((jl_datatype_t*)u)->name->open_set &&
+           !jl_is_all_type(u) && !jl_is_type_type(u) && u != (jl_value_t*)jl_any_type;
+}
+
+// whether the intersection of `member` and the set has a type in `world` (compiler §4.9)
+static int intersection_met(jl_value_t *member, jl_typename_t *setname, size_t world)
+{
+    jl_value_t *ti = jl_type_intersection(member, setname->wrapper);
+    if (ti == jl_bottom_type)
+        return 0;
+    JL_GC_PUSH1(&ti);
+    jl_value_t *tu = jl_unwrap_unionall(ti);
+    int met = jl_is_all_type(tu) ? all_type_met(tu, world) : 1;
+    JL_GC_POP();
+    return met;
+}
+
+static int cell_holds(jl_value_t *member, jl_typename_t *setname, size_t world);
+
+// a cell's state: a final cell of an abstract type holds where its intersection with the set is met
+static int cell_holds_as(jl_value_t *member, jl_typename_t *setname, int isfinal, size_t world)
+{
+    if (isfinal && abstract_member(member))
+        return intersection_met(member, setname, world);
+    return cell_holds(member, setname, world);
+}
+
 static int cell_holds(jl_value_t *member, jl_typename_t *setname, size_t world)
 {
     if (member == (jl_value_t*)jl_datatype_type || member == (jl_value_t*)jl_unionall_type ||
@@ -336,7 +370,7 @@ static jl_value_t *membership_cell(jl_value_t *member, jl_value_t *set, int isfi
         c->backedges = NULL;
         c->isfinal = isfinal;
         size_t world = jl_atomic_load_acquire(&jl_world_counter);
-        jl_atomic_store_relaxed(&c->min_world, cell_holds(member, setname, world) ? (uint64_t)world : ~(uint64_t)0);
+        jl_atomic_store_relaxed(&c->min_world, cell_holds_as(member, setname, isfinal, world) ? (uint64_t)world : ~(uint64_t)0);
         cells_list_add(setname, cell);
     }
     JL_UNLOCK(&cells_lock);
@@ -435,6 +469,16 @@ JL_DLLEXPORT int jl_membership_final(jl_value_t *S, jl_value_t *X)
     jl_typename_t *xn = ((jl_datatype_t*)xu)->name;
     if (!xn->open_set || !xn->closed_after_load)
         return 0;
+    if (abstract_member(S)) {
+        // an abstract type (open issue 169): no subtype of it is in X while their intersection has no
+        // type in the world; its final cell opens when one joins
+        if (!module_loaded(xn->module) || !type_declarers_loaded(S, 0))
+            return 0;
+        size_t world = jl_membership_query_world();
+        if (world == 0)
+            world = jl_atomic_load_acquire(&jl_world_counter);
+        return !intersection_met(S, xn, world);
+    }
     if (!jl_is_concrete_type(S) || jl_is_type_type(S) || ((jl_datatype_t*)S)->name->never_member)
         return 0;
     if (!module_loaded(xn->module) || !type_declarers_loaded(S, 0))
@@ -510,7 +554,7 @@ void jl_membership_cell_register(jl_membership_cell_t *cell)
     jl_typename_t *setname = (jl_typename_t*)cell->set;
     size_t world = jl_atomic_load_acquire(&jl_world_counter);
     jl_atomic_store_release(&cell->min_world,
-        cell_holds(cell->member, setname, world) ? (uint64_t)world : ~(uint64_t)0);
+        cell_holds_as(cell->member, setname, cell->isfinal, world) ? (uint64_t)world : ~(uint64_t)0);
     cells_list_add(setname, (jl_value_t*)cell);
     JL_UNLOCK(&cells_lock);
 }
@@ -540,7 +584,7 @@ void jl_membership_update_cells(jl_value_t *set_instance, size_t world)
             jl_membership_cell_t *c = (jl_membership_cell_t*)jl_svecref(list, i);
             if (jl_atomic_load_relaxed(&c->min_world) != ~(uint64_t)0)
                 continue;
-            if (cell_holds(c->member, setname, world)) {
+            if (cell_holds_as(c->member, setname, c->isfinal, world)) {
                 jl_atomic_store_release(&c->min_world, (uint64_t)world);
                 if (c->isfinal)
                     arraylist_push(&opened, c);
@@ -773,6 +817,65 @@ JL_DLLEXPORT int jl_has_unmet_argument(jl_value_t *ti, size_t world)
         if (unmet_argument(jl_tparam(ti, i), world))
             return 1;
     return 0;
+}
+
+// A component of an unmet intersection as its final pair names it: an abstract type with free variables
+// (`AbstractDict{K, V}` under `where {K, V}`) by its type name, whose pair is final where no type under
+// any of its instances meets the set; NULL for another component with free variables.
+static jl_value_t *final_pair_component(jl_value_t *c)
+{
+    if (!jl_has_free_typevars(c))
+        return c;
+    jl_value_t *u = jl_unwrap_unionall(c);
+    if (jl_is_datatype(u) && abstract_member(u))
+        return ((jl_datatype_t*)u)->name->wrapper;
+    return NULL;
+}
+
+// The final cells on which a method match's signature `spec` is unreachable (compiler §4.8; open issue
+// 169): `nothing` unless it has an argument no type of the world is in and each such argument is an
+// intersection of two components whose negative is final, `All{S, X}` with X a set closed after load.
+JL_DLLEXPORT jl_value_t *jl_unmet_final_cells(jl_value_t *spec)
+{
+    jl_value_t *ti = jl_unwrap_unionall(spec);
+    if (!jl_is_tuple_type(ti) || !((jl_datatype_t*)ti)->has_open_set)
+        return jl_nothing;
+    size_t world = jl_membership_query_world();
+    if (world == 0)
+        world = jl_atomic_load_acquire(&jl_world_counter);
+    jl_value_t *out = jl_nothing, *cells = NULL;
+    JL_GC_PUSH2(&out, &cells);
+    for (size_t i = 0; i < jl_nparams(ti); i++) {
+        jl_value_t *p = jl_tparam(ti, i);
+        if (!unmet_argument(p, world))
+            continue;
+        jl_value_t *pu = jl_unwrap_unionall(p);
+        jl_value_t *comps = jl_is_all_type(pu) ? jl_tparam0(pu) : NULL;
+        jl_value_t *c0 = comps && jl_is_tuple_type(comps) && jl_nparams(comps) == 2 ? final_pair_component(jl_tparam(comps, 0)) : NULL;
+        jl_value_t *c1 = c0 ? final_pair_component(jl_tparam(comps, 1)) : NULL;
+        if (c1 == NULL) {
+            out = jl_nothing;
+            break;
+        }
+        cells = jl_membership_final_cells(c0, c1);
+        if (!jl_is_svec(cells)) {
+            out = jl_nothing;
+            break;
+        }
+        if (out == jl_nothing)
+            out = cells;
+        else {
+            size_t n = jl_svec_len(out), m = jl_svec_len(cells);
+            jl_svec_t *both = jl_alloc_svec(n + m);
+            for (size_t k = 0; k < n; k++)
+                jl_svecset(both, k, jl_svecref(out, k));
+            for (size_t k = 0; k < m; k++)
+                jl_svecset(both, n + k, jl_svecref(cells, k));
+            out = (jl_value_t*)both;
+        }
+    }
+    JL_GC_POP();
+    return out;
 }
 
 // An entry's instance with its pattern's variables free: an instance may be wrapped in them.
