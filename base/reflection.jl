@@ -1190,12 +1190,33 @@ julia> Base.isambiguous(m1, m2, ambiguous_bottom=false)
 false
 ```
 """
+# An argument of a signature met only as an intersection `All{…}`: no value is of it in this world, since
+# the intersection of two sets, or of a set and a type, keeps their common members beside it (compiler
+# §4.9). Two methods are ambiguous only over values that exist; a membership that makes them meet is
+# reported at its declaration (§5.4).
+function has_unmet_intersection(@nospecialize(sig))
+    u = unwrap_unionall(sig)
+    u isa Union && return has_unmet_intersection(u.a) & has_unmet_intersection(u.b)
+    u isa DataType && u.name === Tuple.name || return false
+    for p in u.parameters
+        _is_unmet_argument(isvarargtype(p) ? unwrapva(p) : p) && return true
+    end
+    return false
+end
+function _is_unmet_argument(@nospecialize(p))
+    p isa TypeVar && return _is_unmet_argument(p.ub)
+    p isa Union && return _is_unmet_argument(p.a) & _is_unmet_argument(p.b)
+    u = unwrap_unionall(p)
+    return u isa DataType && u.name === (unwrap_unionall(Core.All)::DataType).name
+end
+
 function isambiguous(m1::Method, m2::Method; ambiguous_bottom::Bool=false)
     m1 === m2 && return false
     ti = typeintersect(m1.sig, m2.sig)
     ti === Bottom && return false
     function inner(ti)
         ti === Bottom && return false
+        has_unmet_intersection(ti) && return false
         if !ambiguous_bottom
             has_bottom_parameter(ti) && return false
         end
@@ -1206,6 +1227,7 @@ function isambiguous(m1::Method, m2::Method; ambiguous_bottom::Bool=false)
         has_ambig = Ref{Int32}(0)
         ms = collect(Core.MethodMatch, _methods_by_ftype(ti, nothing, -1, world, true, min, max, has_ambig)::Vector)
         has_ambig[] == 0 && return false
+        filter!(m::Core.MethodMatch -> !has_unmet_intersection(m.spec_types), ms)
         if !ambiguous_bottom
             filter!(ms) do m::Core.MethodMatch
                 return !has_bottom_parameter(m.spec_types)

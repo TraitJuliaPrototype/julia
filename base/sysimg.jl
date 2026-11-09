@@ -2,6 +2,11 @@
 
 Base.include("Base.jl") # finish populating Base (currently just has the Compiler)
 
+# Core and Base have finished loading (compiler §4.8): the code the image compiles from here relies
+# on the final negatives at their sets closed after load (`IO`: "a `String` is not an `IO`")
+ccall(:jl_module_set_loaded, Cvoid, (Any,), Core)
+ccall(:jl_module_set_loaded, Cvoid, (Any,), Base)
+
 # Set up Main module by importing from Base
 using .Base
 using .Base.MainInclude # ans, err, and sometimes Out

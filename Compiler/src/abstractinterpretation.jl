@@ -320,7 +320,12 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         i, U = split::Tuple{Int,Type}
         newargs = copy(argtypes)
         newargs[i] = U
-        call = abstract_call(interp, ArgInfo(nothing, newargs), si, sv)::Future
+        # each branch knows the value's type, a candidate: the argument is `Compiled` there, so a branch
+        # served by a method at the set runs that method's instance for the candidate, and the branch's
+        # case is the candidate, never the set (which would cover the values past the candidates)
+        sbit = i - 2 < 32 ? UInt32(1) << (i - 2) : UInt32(0)
+        call = abstract_call_gf_by_type(interp, func, ArgInfo(nothing, newargs), si,
+                                        argtypes_to_type(newargs), sv, max_methods; attr = (sbit, UInt32(0)))::Future
         return Future{CallMeta}(call, interp, sv) do call, _, _
             CallMeta(drt, Any, Effects(), SplitCallInfo(call.info, drt))
         end

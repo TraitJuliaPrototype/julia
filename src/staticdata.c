@@ -121,7 +121,7 @@ extern "C" {
 // TODO: put WeakRefs on the weak_refs list during deserialization
 // TODO: handle finalizers
 
-#define NUM_TAGS    6
+#define NUM_TAGS    12
 
 // An array of special references that need to be restored from the sysimg
 static void get_tags(jl_value_t **tags[NUM_TAGS])
@@ -134,6 +134,16 @@ static void get_tags(jl_value_t **tags[NUM_TAGS])
     INSERT_TAG(jl_typeinf_func);
     INSERT_TAG(jl_compile_and_emit_func);
     INSERT_TAG(jl_libdl_dlopen_func);
+    // the indices of sets and memberships (compiler §5.1, §5.6, §7.2), as the image's method tables
+    // are kept: its methods at sets, each function's, the sets' candidates, entries and cells
+    INSERT_TAG(open_set_methods);
+    INSERT_TAG(jl_func_set_methods);
+    INSERT_TAG(jl_set_candidates);
+    INSERT_TAG(jl_set_entries);
+    INSERT_TAG(jl_set_cells);
+    // the split tables' miss: code compiled once reaches it before Base's __init__ runs, and while
+    // an image is generated, when no __init__ runs (compiler §7.3)
+    INSERT_TAG(jl_split_table_miss_func);
     // n.b. must update NUM_TAGS when you add something here
 #undef INSERT_TAG
     assert(i == NUM_TAGS - 1);

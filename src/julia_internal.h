@@ -467,6 +467,7 @@ extern jl_genericmemory_t *jl_attributed_cache JL_GLOBALLY_ROOTED; // Core.attri
 extern _Atomic(jl_genericmemory_t*) jl_attributed_fast JL_GLOBALLY_ROOTED; // its table of the latest answers (builtins.c)
 extern jl_genericmemory_t *jl_set_cells JL_GLOBALLY_ROOTED; // each set's membership cells (datatype.c)
 extern jl_genericmemory_t *jl_func_set_methods JL_GLOBALLY_ROOTED; // each function's methods at sets (gf.c)
+extern jl_value_t *jl_split_table_miss_func JL_GLOBALLY_ROOTED; // the split tables' miss (gf.c, compiler §7.3)
 JL_DLLEXPORT jl_value_t *jl_call_shadows(jl_value_t *tt, jl_value_t *m0, int allow_final);
 // membership cells (compiler §5.6, datatype.c)
 JL_DLLEXPORT jl_value_t *jl_membership_cell(jl_value_t *member, jl_value_t *set);

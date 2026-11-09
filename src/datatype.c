@@ -1039,6 +1039,24 @@ JL_DLLEXPORT int jl_get_default_attribute(jl_value_t *T)
     return jl_is_datatype(uw) ? ((jl_datatype_t*)uw)->name->default_attribute : 0;
 }
 
+// A set from Core's build (compiler §7.5: `IO`), opened right after its declaration, before any type
+// names it: open, with its default attribute (3: `Dynamic`, for Julia's own types too) and closed
+// after load. Only while Core is built.
+JL_DLLEXPORT void jl_set_core_set(jl_value_t *T, intptr_t attr, intptr_t closed)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    if (jl_base_module != NULL || !jl_is_datatype(uw) || ((jl_datatype_t*)uw)->name->module != jl_core_module ||
+        !((jl_datatype_t*)uw)->name->abstract)
+        jl_error("only an abstract type of Core, while Core is built, is a set from Core's build");
+    if (attr < 0 || attr > 3)
+        jl_error("a default attribute is 0 (none), 1 (Compiled), 2 (Dynamic) or 3 (Dynamic, Julia's own types too)");
+    jl_datatype_t *dt = (jl_datatype_t*)uw;
+    dt->name->open_set = 1;
+    dt->has_open_set = 1;
+    dt->name->default_attribute = attr;
+    dt->name->closed_after_load = closed != 0;
+}
+
 // A set closed after load (compiler §4.8; traits §3.4), written by the library at the declaration.
 JL_DLLEXPORT void jl_set_closed_after_load(jl_value_t *T)
 {

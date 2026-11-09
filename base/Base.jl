@@ -175,6 +175,7 @@ include("libuv.jl")
 include("asyncevent.jl")
 include("iostream.jl")
 include("stream.jl")
+include("iotrait.jl")
 include("filesystem.jl")
 using .Filesystem
 include("cmd.jl")
@@ -250,6 +251,8 @@ using .MathConstants: ℯ, π, pi
 # experimental API's
 include("experimental.jl")
 include("splittable.jl")
+# the miss of the split tables while Base is built too: code compiled once at `IO` runs here (compiler §7.3)
+ccall(:jl_set_split_table_miss, Cvoid, (Any,), _split_table_miss!)
 
 # utilities
 include("deepcopy.jl")
@@ -370,6 +373,9 @@ function start_profile_listener()
 end
 
 function __init__()
+    # the miss of the compiler's split tables (splittable.jl), first: code compiled once at `IO`
+    # reaches it from the first write to a stream past `IO`'s candidates (compiler §7.3, §7.5)
+    ccall(:jl_set_split_table_miss, Cvoid, (Any,), _split_table_miss!)
     # Base library init
     global _atexit_hooks_finished = false
     Filesystem.__postinit__()
@@ -400,8 +406,6 @@ function __init__()
         start_profile_listener()
     end
     _require_world_age[] = get_world_counter()
-    # the miss of the compiler's split tables (splittable.jl)
-    ccall(:jl_set_split_table_miss, Cvoid, (Any,), _split_table_miss!)
     # Prevent spawned Julia process from getting stuck waiting on Tracy to connect.
     delete!(ENV, "JULIA_WAIT_FOR_TRACY")
     if get_bool_env("JULIA_USE_FLISP_PARSER", false) === false

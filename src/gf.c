@@ -1312,7 +1312,8 @@ static int is_trait_arg_type(jl_value_t *decl_i) JL_NOTSAFEPOINT
 }
 
 // the default attribute of the sets that type a trait argument (step 4): 0 none, 1 `Compiled`,
-// 2 `Dynamic`; for an intersection, the components' where they agree, else none
+// 2 `Dynamic`, 3 `Dynamic` with Julia's own types included; for an intersection, the components'
+// where they agree, else none
 static int set_default_attribute(jl_value_t *decl_i, jl_module_t **setmod) JL_NOTSAFEPOINT
 {
     jl_datatype_t *u = (jl_datatype_t*)jl_unwrap_unionall(decl_i);
@@ -1409,8 +1410,9 @@ static uint32_t effective_nospecialize(jl_method_t *m, jl_tupletype_t *tt, int s
             jl_module_t *setmod = NULL;
             int d = set_default_attribute(decl_i, &setmod);
             jl_value_t *elt = jl_tparam(tt, i);
-            if (d != 0 && !jl_is_vararg(elt) && !type_is_own(elt, setmod))
-                dyn = d == 2;                                     // 4: the set's default
+            // 4: the set's default; 3 is `Dynamic` for Julia's own types too (`IO`, §7.5)
+            if (d != 0 && !jl_is_vararg(elt) && (d == 3 || !type_is_own(elt, setmod)))
+                dyn = d >= 2;
             else // 5: `first_seen`: `Compiled` where the caller knows the value's type; else `Compiled`
                 dyn = (opts & 8) && !(static_call && !jl_is_vararg(elt) && jl_is_concrete_type(elt));
         }
@@ -2827,7 +2829,7 @@ typedef struct {
 } jl_split_table_t;
 
 static _Atomic(uint64_t) jl_split_session_id = 0;
-static jl_value_t *jl_split_table_miss_func JL_GLOBALLY_ROOTED = NULL;
+jl_value_t *jl_split_table_miss_func JL_GLOBALLY_ROOTED = NULL; // kept by the system image (staticdata.c)
 
 // This session's stamp for split tables: made at its first use, never 0.
 JL_DLLEXPORT uint64_t jl_split_session(void)
@@ -2892,26 +2894,29 @@ JL_DLLEXPORT void jl_method_set_declared_result(jl_method_t *m, jl_value_t *rt, 
 }
 
 // The methods at open sets of the function type `ft` that carry a declared result covering
-// every member: what inference reads at a receiver typed by a set (compiler §7.1). A method
-// appears once per set its signature names.
+// every member: what inference reads at a receiver typed by a set (compiler §7.1). Read from the
+// function's list of methods at sets (the shadow query's), so the cost is the function's own methods.
 JL_DLLEXPORT jl_value_t *jl_declared_methods_of(jl_value_t *ft)
 {
     jl_array_t *out = jl_alloc_vec_any(0);
-    JL_GC_PUSH1(&out);
-    JL_LOCK(&open_set_methods_lock);
-    if (open_set_methods) {
-        size_t i, l = jl_array_nrows(open_set_methods);
-        for (i = 0; i + 1 < l; i += 2) {
-            jl_method_t *m = (jl_method_t*)jl_array_ptr_ref(open_set_methods, i + 1);
-            if (!(m->declared_covers & 1) || m->declared_result == NULL)
-                continue;
-            jl_value_t *sig = jl_unwrap_unionall(m->sig);
-            if (!jl_is_tuple_type(sig) || jl_nparams(sig) == 0 || !jl_egal(jl_tparam0(sig), ft))
-                continue;
-            jl_array_ptr_1d_push(out, (jl_value_t*)m);
-        }
+    jl_svec_t *ms = NULL;
+    JL_GC_PUSH2(&out, &ms);
+    jl_value_t *fu = jl_unwrap_unionall(ft);
+    if (jl_is_datatype(fu)) {
+        JL_LOCK(&open_set_methods_lock);
+        if (jl_func_set_methods != NULL)
+            ms = (jl_svec_t*)jl_eqtable_get(jl_func_set_methods, (jl_value_t*)((jl_datatype_t*)fu)->name, NULL);
+        JL_UNLOCK(&open_set_methods_lock);
     }
-    JL_UNLOCK(&open_set_methods_lock);
+    for (size_t i = 0; ms != NULL && i < jl_svec_len(ms); i++) {
+        jl_method_t *m = (jl_method_t*)jl_svecref(ms, i);
+        if (!(m->declared_covers & 1) || m->declared_result == NULL)
+            continue;
+        jl_value_t *sig = jl_unwrap_unionall(m->sig);
+        if (!jl_is_tuple_type(sig) || jl_nparams(sig) == 0 || !jl_egal(jl_tparam0(sig), ft))
+            continue;
+        jl_array_ptr_1d_push(out, (jl_value_t*)m);
+    }
     JL_GC_POP();
     return (jl_value_t*)out;
 }

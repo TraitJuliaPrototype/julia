@@ -832,6 +832,9 @@ macro cmd end
 
 # simple stand-alone print definitions for debugging
 abstract type IO end
+# `IO`, the trait of streams (compiler §7.5): a set from Core's build, opened before any type names
+# it; compiled once by default, Julia's own streams included (3); closed after load
+ccall(:jl_set_core_set, Cvoid, (Any, Int, Int), IO, 3, 1)
 struct CoreSTDOUT <: IO end
 struct CoreSTDERR <: IO end
 const stdout = CoreSTDOUT()

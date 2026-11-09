@@ -573,7 +573,7 @@ typedef struct {
     uint8_t mayinlinealloc:1;
     uint8_t open_set:1;       // this type is a set that may gain members after its definition
     uint8_t never_member:1;   // Core's kinds: can never receive a membership
-    uint8_t default_attribute:2; // a set's default attribute (compiler §6.3, step 4): 0 none, 1 Compiled, 2 Dynamic
+    uint8_t default_attribute:2; // a set's default attribute (compiler §6.3, step 4): 0 none, 1 Compiled, 2 Dynamic, 3 Dynamic for Julia's own types too
     uint8_t closed_after_load:1; // a set closed after load (compiler §4.8): a negative is final once its declarers have loaded
     _Atomic(uint8_t) cache_entry_count; // (approximate counter of TypeMapEntry for heuristics)
     uint8_t max_methods; // override for inference's max_methods setting (0 = no additional limit or relaxation)
