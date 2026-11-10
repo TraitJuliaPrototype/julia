@@ -1097,6 +1097,44 @@ static int same_inputs(jl_typename_t *tn, jl_value_t *a, jl_value_t *b)
     return 1;
 }
 
+// Strict mode's check at a membership (traits §12.3, compiler §4.3): the library's strict mode sets it.
+static _Atomic(int) strict_memberships = 0;
+JL_DLLEXPORT int jl_set_strict_memberships(int on)
+{
+    return jl_atomic_exchange_relaxed(&strict_memberships, on != 0);
+}
+
+// the error of a membership strict mode refuses: each ambiguity as the report's warning names it
+static jl_value_t *strict_ambiguity_message(jl_value_t *member, jl_value_t *set_instance, jl_array_t *found)
+{
+    ios_t str_;
+    ios_mem(&str_, 0);
+    JL_STREAM *s = (JL_STREAM*)&str_;
+    jl_printf(s, "strict mode refuses the membership of ");
+    jl_static_show(s, member);
+    jl_printf(s, " in ");
+    jl_static_show(s, set_instance);
+    jl_printf(s, ": it makes methods ambiguous for ");
+    jl_static_show(s, member);
+    for (size_t i = 0; i < jl_array_nrows(found); i++) {
+        jl_svec_t *f = (jl_svec_t*)jl_array_ptr_ref(found, i);
+        jl_method_t *m = (jl_method_t*)jl_svecref(f, 0);
+        jl_printf(s, "\n  method %s at ", jl_symbol_name(m->name));
+        jl_static_show(s, jl_svecref(f, 1));
+        jl_printf(s, " and ");
+        jl_static_show(s, jl_svecref(f, 2));
+        jl_value_t *joint = jl_svecref(f, 4);
+        if (joint != jl_nothing) {
+            jl_printf(s, ": a method at ");
+            jl_static_show(s, joint);
+            jl_printf(s, " would resolve it");
+        }
+    }
+    jl_value_t *msg = jl_pchar_to_string(str_.buf, str_.size);
+    ios_close(&str_);
+    return msg;
+}
+
 // Declare `member` a member of the set `set_instance` names (compiler §4.2-§4.6).
 // The library checks ownership and the contract first; the runtime checks what
 // keeps subtyping sound: an open set, no cycle among sets, one instance per member.
@@ -1150,8 +1188,11 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     // redeclaration; a pattern is checked against the patterns at the set, and ends an entry of
     // the same pattern at the same inputs.
     int redeclare = 0;
+    int strict = jl_atomic_load_relaxed(&strict_memberships);
     jl_value_t *entry = NULL;
-    JL_GC_PUSH1(&entry);
+    jl_array_t *ended = NULL, *found = NULL;
+    jl_value_t *msg = NULL;
+    JL_GC_PUSH4(&entry, &ended, &found, &msg);
     if (jl_is_concrete_type(member)) {
         size_t mq = jl_set_membership_query_world(world);
         entry = set_at_inputs(setname, (jl_datatype_t*)setuw);
@@ -1187,17 +1228,44 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     }
     size_t min_world = world + 1;
     if (redeclare) {
-        // the old entry of the same pattern and inputs ends where the new one begins (§4.3)
+        // the old entries of the same pattern and inputs end where the new one begins (§4.3)
         jl_svec_t *list = jl_typename_memberships(home);
         for (size_t i = 0; i < jl_svec_len(list); i++) {
             jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
             if (en->set == setname && jl_atomic_load_relaxed(&en->max_world) == ~(uint64_t)0 &&
-                jl_types_equal(en->member, member) && same_inputs(setname, en->instance, set_instance))
+                jl_types_equal(en->member, member) && same_inputs(setname, en->instance, set_instance)) {
                 jl_atomic_store_release(&en->max_world, world);
+                if (strict) {
+                    if (ended == NULL)
+                        ended = jl_alloc_vec_any(0);
+                    jl_array_ptr_1d_push(ended, (jl_value_t*)en);
+                }
+            }
         }
     }
+    // what the ambiguity search reads: the member's list and the set's entries. The entry begins at
+    // min_world, past every task's world until the counter advances (§4.3)
     entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world);
     index_entry((jl_membership_t*)entry);
+    if (strict) {
+        // strict mode (traits §12.3): the ambiguities the entry makes, asked in its world before the
+        // counter advances to it; under the lock nothing else can enter that world. A hit retires the
+        // entry before it begins: live in no world, never removed from its lists, the counter unchanged
+        found = jl_alloc_vec_any(0);
+        size_t mq = jl_set_membership_query_world(min_world);
+        jl_membership_ambiguities(member, set_instance, min_world, found);
+        jl_set_membership_query_world(mq);
+        if (jl_array_nrows(found) > 0) {
+            jl_atomic_store_release(&((jl_membership_t*)entry)->max_world, world);
+            for (size_t i = 0; ended && i < jl_array_nrows(ended); i++)
+                jl_atomic_store_release(&((jl_membership_t*)jl_array_ptr_ref(ended, i))->max_world, ~(uint64_t)0);
+            msg = strict_ambiguity_message(member, set_instance, found);
+            JL_UNLOCK(&world_counter_lock);
+            msg = jl_new_struct(jl_errorexception_type, msg);
+            JL_GC_POP();
+            jl_throw(msg);
+        }
+    }
     if (jl_is_concrete_type(member))
         register_candidate(setname, member);
     if (jl_declared_memberships == NULL)

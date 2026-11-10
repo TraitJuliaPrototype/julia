@@ -1276,6 +1276,8 @@ static jl_value_t *ml_matches_c(jl_methtable_t *mt, jl_methcache_t *mc,
                               int intersections, size_t world, int cache_result,
                               size_t *min_valid, size_t *max_valid, int *ambig, jl_value_t **cells_out)
 {
+    if (world > jl_atomic_load_acquire(&jl_world_counter))
+        return jl_nothing; // the future is not enumerable
     size_t last_mq = jl_set_membership_query_world(world);
     jl_value_t *r = ml_matches_i(mt, mc, type, lim, include_ambiguous, intersections,
                                  world, cache_result, min_valid, max_valid, ambig, cells_out);
@@ -1287,6 +1289,8 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
                               int intersections, size_t world, int cache_result,
                               size_t *min_valid, size_t *max_valid, int *ambig)
 {
+    if (world > jl_atomic_load_acquire(&jl_world_counter))
+        return jl_nothing; // the future is not enumerable
     size_t last_mq = jl_set_membership_query_world(world);
     jl_value_t *r = ml_matches_i(mt, mc, type, lim, include_ambiguous, intersections,
                                  world, cache_result, min_valid, max_valid, ambig, NULL);
@@ -3281,12 +3285,16 @@ static int jl_type_intersection2(jl_value_t *t1, jl_value_t *t2, jl_value_t **is
 }
 
 
-// check if `type` is replacing `m` with an ambiguity here, given other methods in `d` that already match it
-static int is_replacing(char ambig, jl_value_t *type, jl_method_t *m, jl_method_t *const *d, size_t n, jl_value_t *isect, jl_value_t *isect2, char *morespec)
+// check if `type` is replacing `m` with an ambiguity here, given other methods in `d` that already match it.
+// `skip` is a membership replay's own method, which is live in `d` unlike a method being inserted: it is
+// the method that now applies, not one that matched before (compiler §5.5)
+static int is_replacing(char ambig, jl_value_t *type, jl_method_t *m, jl_method_t *const *d, size_t n, jl_value_t *isect, jl_value_t *isect2, char *morespec, jl_method_t *skip)
 {
     size_t k;
     for (k = 0; k < n; k++) {
         jl_method_t *m2 = d[k];
+        if (m2 == skip)
+            continue;
         // see if m2 also fully covered this intersection
         if (m == m2 || !(jl_subtype(isect, m2->sig) || (isect2 && jl_subtype(isect2, m2->sig))))
             continue;
@@ -3308,7 +3316,7 @@ static int is_replacing(char ambig, jl_value_t *type, jl_method_t *m, jl_method_
 
 static int _invalidate_dispatch_backedges(jl_method_instance_t *mi, jl_value_t *type, jl_method_t *m,
         jl_method_t *const *d, size_t n, int replaced_dispatch, int ambig,
-        size_t max_world, char *morespec)
+        size_t max_world, char *morespec, jl_method_t *skip)
 {
     uint8_t backedge_recursion_flags = 0;
     jl_array_t *backedges = jl_mi_get_backedges_mutate(mi, &backedge_recursion_flags);
@@ -3334,7 +3342,7 @@ static int _invalidate_dispatch_backedges(jl_method_instance_t *mi, jl_value_t *
             jl_value_t *cisect = NULL, *cisect2 = NULL;
             JL_GC_PUSH2(&cisect, &cisect2);
             replaced_edge = jl_type_intersection2(type, callsig, &cisect, &cisect2) &&
-                            is_replacing(ambig, type, m, d, n, cisect, cisect2, morespec);
+                            is_replacing(ambig, type, m, d, n, cisect, cisect2, morespec, skip);
             JL_GC_POP();
         }
         else if (invokeTypes) {
@@ -3342,7 +3350,7 @@ static int _invalidate_dispatch_backedges(jl_method_instance_t *mi, jl_value_t *
             if (jl_egal(invokeTypes, jl_get_ci_mi(caller)->def.method->sig))
                 replaced_edge = 0; // if invokeTypes == m.sig, then the only way to change this invoke is to replace the method itself
             else
-                replaced_edge = jl_subtype(invokeTypes, type) && is_replacing(ambig, type, m, d, n, invokeTypes, NULL, morespec);
+                replaced_edge = jl_subtype(invokeTypes, type) && is_replacing(ambig, type, m, d, n, invokeTypes, NULL, morespec, skip);
         }
         else {
             replaced_edge = replaced_dispatch;
@@ -4170,12 +4178,13 @@ static int invalidate_intersecting(jl_value_t *type, jl_method_t *method,
                 // We could instead work to sort this into 3 groups `morespecific .. ambiguous .. lesspecific`, with `type` in ambiguous,
                 // such that everything in `morespecific` dominates everything in `ambiguous`, and everything in `ambiguous` dominates everything in `lessspecific`
                 // And then compute where each isect falls, and whether it changed group--necessitating invalidation--or not.
-                int replaced_dispatch = is_replacing(ambig, type, m, d, n, *isect, *isect2, morespec);
+                jl_method_t *skip = replay ? method : NULL;
+                int replaced_dispatch = is_replacing(ambig, type, m, d, n, *isect, *isect2, morespec, skip);
                 // found that this specialization dispatch got replaced by m
                 // call invalidate_backedges(mi, max_world, "jl_method_table_insert");
                 // but ignore invoke-type edges
                 int invalidatedmi = (!replay || membership_walk_invalidates) ?
-                    _invalidate_dispatch_backedges(mi, type, m, d, n, replaced_dispatch, ambig, max_world, morespec) : 0;
+                    _invalidate_dispatch_backedges(mi, type, m, d, n, replaced_dispatch, ambig, max_world, morespec, skip) : 0;
                 if (replaced_dispatch) {
                     if (stats)
                         stats->spec_invalidations++;
@@ -4494,8 +4503,8 @@ static void membership_superset_sets(jl_value_t *set_instance, size_t entry_min_
         size_t l = jl_svec_len(list);
         for (size_t j = 0; j < l; j++) {
             jl_membership_t *en = (jl_membership_t*)jl_svecref(list, j);
-            if (en->min_world > entry_min_world)
-                continue; // not visible in the world this walk answers for
+            if (en->min_world > entry_min_world || jl_atomic_load_relaxed(&en->max_world) < entry_min_world)
+                continue; // not live in the world this walk answers for (a retired entry is live in none)
             if (!jl_subtype(S, (jl_value_t*)en->member))
                 continue;
             jl_value_t *Y = en->instance;
@@ -7905,8 +7914,8 @@ static jl_value_t *ml_matches_i(jl_methtable_t *mt, jl_methcache_t *mc,
                               int intersections, size_t world, int cache_result,
                               size_t *min_valid, size_t *max_valid, int *ambig, jl_value_t **cells_out)
 {
-    if (world > jl_atomic_load_acquire(&jl_world_counter))
-        return jl_nothing; // the future is not enumerable
+    // the wrappers refuse a world past the counter; the strict-mode check at a membership asks the
+    // next world under the world counter's lock, where nothing else can enter it (compiler §5.4)
     JL_TIMING(METHOD_MATCH, METHOD_MATCH);
     int has_ambiguity = 0;
     jl_value_t *unw = jl_unwrap_unionall((jl_value_t*)type);
@@ -8234,15 +8243,22 @@ static jl_value_t *ml_matches_i(jl_methtable_t *mt, jl_methcache_t *mc,
     return env.t;
 }
 
-// §8 (exploration §2.3, review M10): the order-independent ambiguity report at a
-// membership declaration. A member of X and Y with a function holding a method
-// at both and nothing more specific is a real ambiguity at that member: Julia's
-// own dispatch raises it at the call; we warn now, at the declaration, where the
-// whole picture exists. WARN-ONLY contract (W4-10): this runs under
-// world_counter_lock — nothing here may throw; jl_printf/jl_static_show only.
-static void membership_ambig_warn(jl_method_t *m, jl_value_t *X, jl_value_t *Y,
-                                  jl_value_t *member, jl_value_t *joint)
+// The order-independent ambiguity report at a membership (compiler §5.4). A member of X and Y with a
+// function holding a method at both and nothing more specific is a real ambiguity at that member:
+// Julia's own dispatch raises it at the call. It runs under world_counter_lock and throws nothing:
+// without strict mode it warns, at the declaration, where the whole picture exists; under strict mode
+// jl_declare_membership asks it for its findings before the counter advances and refuses the entry.
+// Each finding is svec(method at X, X, Y, member, joint signature).
+static void membership_ambig_found(jl_array_t *found, jl_method_t *m, jl_value_t *X, jl_value_t *Y,
+                                   jl_value_t *member, jl_value_t *joint)
 {
+    if (found) {
+        jl_value_t *f = (jl_value_t*)jl_svec(5, (jl_value_t*)m, X, Y, member, joint ? joint : jl_nothing);
+        JL_GC_PUSH1(&f);
+        jl_array_ptr_1d_push(found, f);
+        JL_GC_POP();
+        return;
+    }
     jl_printf(JL_STDERR, "WARNING: method %s", jl_symbol_name(m->name));
     jl_printf(JL_STDERR, " at ");
     jl_static_show(JL_STDERR, X);
@@ -8302,15 +8318,19 @@ static jl_value_t *sig_at_member(jl_value_t *sig, jl_typename_t *tn, jl_value_t 
 
 // whether mX and mY are ambiguous at the call types `q` (the member in place of their sets):
 // Base.isambiguous's rule, at q. Both match q, neither is more specific than the other, and no
-// matching method more specific than both covers q.
+// matching method more specific than both covers q. The search reads the method table, never a
+// dispatch cache: a cache entry made before the membership may still answer for the call types
+// (compiler §5.5). It may ask the world after the counter's, under world_counter_lock.
 static int ambiguous_at(jl_methtable_t *mt, jl_method_t *mX, jl_method_t *mY, jl_value_t *q, size_t world)
 {
     if (jl_method_morespecific(mX, mY) || jl_method_morespecific(mY, mX))
         return 0;
     size_t min_valid = 1, max_valid = ~(size_t)0;
     int ambig = 0;
-    jl_value_t *res = ml_matches(mt, jl_method_table->cache, (jl_tupletype_t*)q, -1, 1, 1,
-                                 world, 0, &min_valid, &max_valid, &ambig);
+    size_t last_mq = jl_set_membership_query_world(world);
+    jl_value_t *res = ml_matches_i(mt, NULL, (jl_tupletype_t*)q, -1, 1, 1,
+                                   world, 0, &min_valid, &max_valid, &ambig, NULL);
+    jl_set_membership_query_world(last_mq);
     if (!jl_is_array(res))
         return 0;
     JL_GC_PUSH1(&res);
@@ -8330,8 +8350,10 @@ static int ambiguous_at(jl_methtable_t *mt, jl_method_t *mX, jl_method_t *mY, jl
     return hasX && hasY && !dominated;
 }
 
-JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t *set_instance,
-                                                 size_t entry_min_world)
+// the ambiguities at `member` once it is a member of `set_instance` (an entry published at
+// `entry_min_world`): pushed to `found`, or warned where `found` is NULL
+static void membership_ambiguities(jl_value_t *member, jl_value_t *set_instance,
+                                   size_t entry_min_world, jl_array_t *found)
 {
     (void)set_instance; // published by the caller, so it is in the member's own TypeName list below
     if (!jl_atomic_load_relaxed(&allow_new_worlds))
@@ -8352,8 +8374,8 @@ JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t 
     jl_svec_t *list = jl_typename_memberships(mtn);
     for (size_t i = 0; i < (size_t)jl_svec_len(list) && jl_array_nrows(sets) < 16; i++) {
         jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
-        if (en->min_world > entry_min_world)
-            continue;
+        if (en->min_world > entry_min_world || jl_atomic_load_relaxed(&en->max_world) < entry_min_world)
+            continue; // not live at the entry's world (a retired entry is live in none)
         int joins = member_ground ? jl_subtype(member, (jl_value_t*)en->member)
                                   : jl_egal(member, (jl_value_t*)en->member);
         if (!joins)
@@ -8425,7 +8447,7 @@ JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t 
                                 // the joint method: the two signatures' intersection, where the
                                 // two sets meet as All{X, Y} (§4.9); at the member where it is empty
                                 gc[4] = jl_type_intersection((jl_value_t*)mX->sig, (jl_value_t*)mY->sig);
-                                membership_ambig_warn(mX, X, Y, member, gc[4] != jl_bottom_type ? gc[4] : gc[3]);
+                                membership_ambig_found(found, mX, X, Y, member, gc[4] != jl_bottom_type ? gc[4] : gc[3]);
                                 jl_array_ptr_1d_push(warned, fX);
                             }
                         }
@@ -8492,7 +8514,7 @@ JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t 
                         if (!suppressed) {
                             // the joint method, as for a concrete member
                             gc[4] = jl_type_intersection((jl_value_t*)mX->sig, (jl_value_t*)mY->sig);
-                            membership_ambig_warn(mX, X, Y, member, gc[4] != jl_bottom_type ? gc[4] : gc[6]);
+                            membership_ambig_found(found, mX, X, Y, member, gc[4] != jl_bottom_type ? gc[4] : gc[6]);
                             jl_array_ptr_1d_push(warned, fX);
                             gc[4] = NULL;
                         }
@@ -8504,6 +8526,18 @@ JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t 
         }
     }
     JL_GC_POP();
+}
+
+JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t *set_instance,
+                                                 size_t entry_min_world)
+{
+    membership_ambiguities(member, set_instance, entry_min_world, NULL);
+}
+
+JL_DLLEXPORT void jl_membership_ambiguities(jl_value_t *member, jl_value_t *set_instance,
+                                            size_t entry_min_world, jl_array_t *found)
+{
+    membership_ambiguities(member, set_instance, entry_min_world, found);
 }
 
 // see if it might be possible to construct an instance of `typ`

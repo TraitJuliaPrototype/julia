@@ -1047,6 +1047,9 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
                                               size_t entry_min_world);
 JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t *set_instance,
                                                  size_t entry_min_world);
+// the report's findings, each svec(method at X, X, Y, member, joint signature), pushed to `found`
+JL_DLLEXPORT void jl_membership_ambiguities(jl_value_t *member, jl_value_t *set_instance,
+                                            size_t entry_min_world, jl_array_t *found);
 // the walk's counters, by index (see jl_membership_stat in gf.c)
 JL_DLLEXPORT size_t jl_membership_stat(int which);
 jl_datatype_t *jl_new_uninitialized_datatype(void);
