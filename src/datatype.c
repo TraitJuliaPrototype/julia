@@ -1151,10 +1151,15 @@ static jl_value_t *strict_ambiguity_message(jl_value_t *member, jl_value_t *set_
     for (size_t i = 0; i < jl_array_nrows(found); i++) {
         jl_svec_t *f = (jl_svec_t*)jl_array_ptr_ref(found, i);
         jl_method_t *m = (jl_method_t*)jl_svecref(f, 0);
+        jl_svec_t *tied = (jl_svec_t*)jl_svecref(f, 2);
         jl_printf(s, "\n  method %s at ", jl_symbol_name(m->name));
-        jl_static_show(s, jl_svecref(f, 1));
-        jl_printf(s, " and ");
-        jl_static_show(s, jl_svecref(f, 2));
+        jl_static_show(s, (jl_value_t*)m->sig);
+        jl_printf(s, " with the method at ");
+        for (size_t k = 0; k < jl_svec_len(tied); k++) {
+            if (k > 0)
+                jl_printf(s, " and ");
+            jl_static_show(s, jl_svecref(tied, k));
+        }
         jl_value_t *joint = jl_svecref(f, 4);
         if (joint != jl_nothing) {
             jl_printf(s, ": a method at ");
