@@ -6995,13 +6995,14 @@ void jl_call_module_end_hook(jl_module_t *m)
     JL_GC_POP();
 }
 
-// whether a type or a type on its supertype chain holds membership entries
+// whether a type or a type on its supertype chain holds membership entries, or has an open set
+// as its declared supertype (a member by its definition, whose declaration the hook asks for)
 static int chain_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT
 {
     if (!jl_is_datatype(t))
         return 0;
     for (jl_datatype_t *dt = (jl_datatype_t*)t; dt != jl_any_type; dt = dt->super)
-        if (jl_svec_len(jl_typename_memberships(dt->name)) != 0)
+        if (jl_svec_len(jl_typename_memberships(dt->name)) != 0 || (dt->super != NULL && dt->super->name->open_set))
             return 1;
     return 0;
 }
@@ -7105,7 +7106,7 @@ static void member_hook_at_dispatch(jl_tupletype_t *tt, size_t world)
                 continue;
             jl_value_t *a = jl_tparam(tt, i);
             if (!chain_has_memberships(a))
-                continue; // a declared subtype, or no member at all
+                continue; // no member at all
             roots[1] = jl_member_hook;
             roots[2] = a;
             roots[3] = ((jl_datatype_t*)p)->name->wrapper;
