@@ -242,6 +242,35 @@ static void register_candidate(jl_typename_t *set, jl_value_t *T)
 // member pattern reads it. Written under the world counter's lock; a list is replaced, never mutated.
 jl_genericmemory_t *jl_set_entries JL_GLOBALLY_ROOTED = NULL;
 
+// The entries images activated in this session, in order (compiler §9): the library rebuilds the records
+// of a membership's check from them (traits §5.10). An svec replaced copy-on-write under the world
+// counter's lock, read without a lock; never written into an image.
+_Atomic(jl_svec_t*) jl_activated_entries JL_GLOBALLY_ROOTED = NULL;
+
+static void note_activated(jl_membership_t *en)
+{
+    jl_svec_t *old = jl_atomic_load_relaxed(&jl_activated_entries);
+    size_t n = old ? jl_svec_len(old) : 0;
+    jl_svec_t *nw = jl_alloc_svec_uninit(n + 1);
+    for (size_t i = 0; i < n; i++)
+        jl_svecset(nw, i, jl_svecref(old, i));
+    jl_svecset(nw, n, (jl_value_t*)en);
+    jl_atomic_store_release(&jl_activated_entries, nw);
+}
+
+JL_DLLEXPORT size_t jl_activated_memberships_count(void)
+{
+    jl_svec_t *l = jl_atomic_load_acquire(&jl_activated_entries);
+    return l ? jl_svec_len(l) : 0;
+}
+
+// the list as it is (immutable): the caller reads from its own cursor
+JL_DLLEXPORT jl_value_t *jl_activated_memberships(void)
+{
+    jl_svec_t *l = jl_atomic_load_acquire(&jl_activated_entries);
+    return l ? (jl_value_t*)l : (jl_value_t*)jl_emptysvec;
+}
+
 static void index_entry(jl_membership_t *en)
 {
     jl_array_t *nw = NULL;
@@ -731,6 +760,10 @@ void jl_activate_memberships(jl_array_t *list, size_t world)
             jl_printf(JL_STDERR, " is refused: the member is in the set at another instance already\n");
             continue;
         }
+        // every entry in force is in its set's index and in the session's list of activated entries,
+        // also one an image keeps on its own TypeName, which is on that TypeName's list already
+        index_entry(en);
+        note_activated(en);
         jl_svec_t *old = jl_typename_memberships(home);
         int present = 0;
         for (size_t k = 0; k < jl_svec_len(old) && !present; k++)
@@ -743,7 +776,6 @@ void jl_activate_memberships(jl_array_t *list, size_t world)
         jl_svecset(nd, jl_svec_len(old), (jl_value_t*)en);
         jl_atomic_store_release(&home->memberships, (jl_svec_t*)nd);
         jl_gc_wb(home, nd);
-        index_entry(en);
     }
     nd = NULL;
     for (size_t i = 0; i + 1 < n; i += 2) {

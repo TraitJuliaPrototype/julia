@@ -463,6 +463,7 @@ void jl_call_module_end_hook(jl_module_t *m);
 extern jl_array_t *jl_declared_memberships JL_GLOBALLY_ROOTED; // this session's, for images (datatype.c)
 extern jl_genericmemory_t *jl_set_candidates JL_GLOBALLY_ROOTED; // the sets' candidates (datatype.c)
 extern jl_genericmemory_t *jl_set_entries JL_GLOBALLY_ROOTED; // the entries at each set (datatype.c)
+extern _Atomic(jl_svec_t*) jl_activated_entries JL_GLOBALLY_ROOTED; // the entries images activated (datatype.c)
 extern jl_genericmemory_t *jl_attributed_cache JL_GLOBALLY_ROOTED; // Core.attributed_call's cache (builtins.c)
 extern _Atomic(jl_genericmemory_t*) jl_attributed_fast JL_GLOBALLY_ROOTED; // its table of the latest answers (builtins.c)
 extern jl_genericmemory_t *jl_set_cells JL_GLOBALLY_ROOTED; // each set's membership cells (datatype.c)
