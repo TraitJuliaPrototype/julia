@@ -1265,6 +1265,10 @@ static void jl_write_module(jl_serializer_state *s, uintptr_t item, jl_module_t 
     arraylist_push(&s->relocs_list, (void*)backref_id(s, jl_options.strip_metadata ? jl_empty_sym : m->file , s->link_ids_relocs));
     if (jl_options.strip_metadata)
         newm->line = 0;
+    // a trimmed image has no facts policy (compiler §2.6): the binary's runtime, which does not
+    // know that the image was trimmed, finds every module plain
+    if (jl_options.trim)
+        newm->facts = 2;
     newm->usings_backedges = NULL;
     arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings_backedges)));
     arraylist_push(&s->relocs_list, (void*)backref_id(s, get_replaceable_field(&m->usings_backedges, 1), s->link_ids_relocs));
