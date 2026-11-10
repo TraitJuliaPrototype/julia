@@ -8350,8 +8350,21 @@ static int ambiguous_at(jl_methtable_t *mt, jl_method_t *mX, jl_method_t *mY, jl
     return hasX && hasY && !dominated;
 }
 
-// the ambiguities at `member` once it is a member of `set_instance` (an entry published at
-// `entry_min_world`): pushed to `found`, or warned where `found` is NULL
+// whether both methods applied at the call types `q` in the world before the entry: then the
+// ambiguity between them is not the membership's (compiler §5.4). The world before is the counter's
+// at a declaration, enumerable under the world counter's lock.
+static int pair_predates(jl_value_t *q, jl_method_t *mX, jl_method_t *mY, size_t entry_min_world)
+{
+    if (entry_min_world <= 1)
+        return 0;
+    size_t mq = jl_set_membership_query_world(entry_min_world - 1);
+    int r = jl_subtype(q, (jl_value_t*)mX->sig) && jl_subtype(q, (jl_value_t*)mY->sig);
+    jl_set_membership_query_world(mq);
+    return r;
+}
+
+// the ambiguities the membership of `member` in `set_instance` (an entry published at
+// `entry_min_world`) creates: pushed to `found`, or warned where `found` is NULL
 static void membership_ambiguities(jl_value_t *member, jl_value_t *set_instance,
                                    size_t entry_min_world, jl_array_t *found)
 {
@@ -8443,7 +8456,8 @@ static void membership_ambiguities(jl_value_t *member, jl_value_t *set_instance,
                         if (gc[3] != NULL && gc[4] != NULL) {
                             gc[3] = jl_type_intersection(gc[3], gc[4]);
                             if (gc[3] != jl_bottom_type &&
-                                ambiguous_at(mtX, mX, mY, gc[3], entry_min_world)) {
+                                ambiguous_at(mtX, mX, mY, gc[3], entry_min_world) &&
+                                !pair_predates(gc[3], mX, mY, entry_min_world)) {
                                 // the joint method: the two signatures' intersection, where the
                                 // two sets meet as All{X, Y} (§4.9); at the member where it is empty
                                 gc[4] = jl_type_intersection((jl_value_t*)mX->sig, (jl_value_t*)mY->sig);
@@ -8467,7 +8481,8 @@ static void membership_ambiguities(jl_value_t *member, jl_value_t *set_instance,
                         }
                         gc[6] = jl_type_intersection(gc[3], gc[4]);
                         gc[3] = gc[4] = NULL;
-                        if (gc[6] == jl_bottom_type || !ambiguous_at(mtX, mX, mY, gc[6], entry_min_world)) {
+                        if (gc[6] == jl_bottom_type || !ambiguous_at(mtX, mX, mY, gc[6], entry_min_world) ||
+                            pair_predates(gc[6], mX, mY, entry_min_world)) {
                             gc[6] = NULL;
                             continue;
                         }
