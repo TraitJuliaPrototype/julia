@@ -5665,8 +5665,10 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayR
                         Value *r = emit_jlcall(ctx, invoke_for_ci(codeinst), track_pjlvalue(ctx, literal_pointer_val(ctx, (jl_value_t*)mi)), argv, nargs, julia_call2);
                         result = mark_julia_type(ctx, r, true, rt);
                     }
-                    else if (ctx.codeinst && jl_ci_has_result_edge(ctx.codeinst, mi)) {
-                        // a result edge: through the code slot (compiler §3.3)
+                    else if (ctx.codeinst && !jl_options.trim && jl_ci_has_result_edge(ctx.codeinst, mi)) {
+                        // a result edge: through the code slot (compiler §3.3); a trimmed build
+                        // binds the callee's address (compiler §2.6), which also keeps the callee
+                        // in the image
                         result = emit_slot_call(ctx, codeinst, mi, specsig, argv, nargs, rt);
                     }
                     else {
