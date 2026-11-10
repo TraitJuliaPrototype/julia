@@ -75,6 +75,15 @@ function record_match_memberships!(sv::InferenceState, applicable::Vector{Method
     return nothing
 end
 
+function member_check_failed(sv::InferenceState, applicable::Vector{MethodMatchTarget})
+    failed = false
+    for target in applicable
+        m = target.match
+        failed |= ccall(:jl_member_note_use, Cint, (Any, Any, Any), m.spec_types, m.method, sv.linfo) != 0
+    end
+    return failed
+end
+
 # A match through `Callable{A, S}` rests on the member's own methods (compiler §7.4): the code holds
 # an edge to the member's dispatch at `A`, and is invalidated with it.
 function record_callable_dispatch!(sv::InferenceState, @nospecialize(spec), @nospecialize(sig))
@@ -356,6 +365,13 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     # the guard of a call a later membership could change (compiler §5.6)
     gcells, grt = call_shadows(matches, sv)
     sv isa InferenceState && record_match_memberships!(sv, applicable)
+    # a member's check (compiler §10.4): inference reads the answers and runs no check. A call at a
+    # member whose check failed is left to dispatch, which raises the failure; a member with no answer
+    # is noted, and the compile queue asks the hook before the code runs
+    if sv isa InferenceState && interp isa NativeInterpreter && member_check_failed(sv, applicable)
+        add_remark!(interp, sv, "Call at a member whose check failed: left to dispatch")
+        return Future(CallMeta(Any, Any, unedged_effects(interp), attributed_info(NoCallInfo(), amask, adyn, acast, false)))
+    end
     # Concrete-only functions refuse to commit (and record no backedge) when any
     # applicable match has a non-concrete signature, regardless of scope. This is the
     # generalization of the top-level `!isdispatchtuple` bail below to a per-function opt-in.

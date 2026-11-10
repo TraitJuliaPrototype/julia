@@ -479,6 +479,7 @@ static jl_code_instance_t *jl_method_inferred_with_abi(jl_method_instance_t *mi 
 }
 
 jl_mutex_t jl_typeinf_lock;
+int jl_member_queue_drain(void);
 
 // run type inference on lambda "mi" for given argument types.
 // returns the inferred source, and may cache the result in mi
@@ -594,6 +595,10 @@ jl_code_instance_t *jl_type_infer_policy(jl_method_instance_t *mi, size_t world,
 
     JL_GC_POP();
     JL_GC_POP();
+    // the member hook in the compile queue (compiler §10.4): outside inference and its lock, before
+    // the code runs. A use that failed its check is inferred again, left to dispatch.
+    if ((ct->reentrant_timing & 0b1110) == 0 && jl_member_queue_drain() > 0)
+        return jl_type_infer_policy(mi, world, source_mode, trim_mode, facts);
 #endif
 
     return ci;
@@ -7067,6 +7072,249 @@ static void member_hook_uncache_member(jl_value_t *member)
     JL_UNLOCK(&mc->writelock);
 }
 
+// The state of a member's check per (member type, set) (compiler §10.4): passed (true), failed
+// (false) or in progress (nothing). A table from the member type to a vector of set, state pairs.
+// Inference reads it and never runs a check: a call it resolves at a member with no answer is noted
+// in `jl_member_pending` (member type, set, the MethodInstance being inferred), and the compile queue
+// asks the hook for each before the code runs.
+jl_genericmemory_t *jl_member_states JL_GLOBALLY_ROOTED = NULL;
+jl_array_t *jl_member_pending JL_GLOBALLY_ROOTED = NULL;
+// (member type, set, MethodInstance) of the code inferred with a failed check's use left to dispatch:
+// compiled again once the check passes
+jl_array_t *jl_member_failed_users JL_GLOBALLY_ROOTED = NULL;
+jl_mutex_t jl_member_state_lock;
+
+static jl_value_t *member_state_get(jl_value_t *T, jl_value_t *X) JL_NOTSAFEPOINT
+{
+    if (jl_member_states == NULL)
+        return NULL;
+    jl_value_t *v = jl_eqtable_get(jl_member_states, T, NULL);
+    if (v == NULL)
+        return NULL;
+    jl_array_t *a = (jl_array_t*)v;
+    for (size_t i = 0; i + 1 < jl_array_nrows(a); i += 2)
+        if (jl_array_ptr_ref(a, i) == X)
+            return jl_array_ptr_ref(a, i + 1);
+    return NULL;
+}
+
+// with the lock held
+static void member_state_put(jl_value_t *T, jl_value_t *X, jl_value_t *state)
+{
+    if (jl_member_states == NULL)
+        jl_member_states = (jl_genericmemory_t*)jl_an_empty_memory_any;
+    jl_array_t *a = (jl_array_t*)jl_eqtable_get(jl_member_states, T, NULL);
+    if (a == NULL) {
+        a = jl_alloc_vec_any(0);
+        JL_GC_PUSH1(&a);
+        jl_member_states = jl_eqtable_put(jl_member_states, T, (jl_value_t*)a, NULL);
+        JL_GC_POP();
+    }
+    for (size_t i = 0; i + 1 < jl_array_nrows(a); i += 2) {
+        if (jl_array_ptr_ref(a, i) == X) {
+            jl_array_ptr_set(a, i + 1, state);
+            return;
+        }
+    }
+    jl_array_ptr_1d_push(a, X);
+    jl_array_ptr_1d_push(a, state);
+}
+
+static void member_state_set(jl_value_t *T, jl_value_t *X, jl_value_t *state)
+{
+    JL_LOCK(&jl_member_state_lock);
+    member_state_put(T, X, state);
+    JL_UNLOCK(&jl_member_state_lock);
+}
+
+// with the lock held
+static void member_triple_push(jl_array_t **list, jl_value_t *T, jl_value_t *X, jl_value_t *mi)
+{
+    if (*list == NULL)
+        *list = jl_alloc_vec_any(0);
+    jl_array_t *l = *list;
+    for (size_t i = 0; i + 2 < jl_array_nrows(l); i += 3)
+        if (jl_array_ptr_ref(l, i) == T && jl_array_ptr_ref(l, i + 1) == X && jl_array_ptr_ref(l, i + 2) == mi)
+            return;
+    jl_array_ptr_1d_push(l, T);
+    jl_array_ptr_1d_push(l, X);
+    jl_array_ptr_1d_push(l, mi);
+}
+
+static int chain_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
+static void member_hook_uncache(jl_tupletype_t *tt);
+static void member_hook_uncache_member(jl_value_t *member);
+
+// Inference, at a call it resolves to the method `m` at the signature `spec`, from the code of
+// `caller`: 1 where a member's check has failed, so the call is left to dispatch, which raises the
+// failure. A member with no answer yet is noted for the compile queue.
+JL_DLLEXPORT int jl_member_note_use(jl_value_t *spec, jl_method_t *m, jl_value_t *caller)
+{
+    if (jl_member_hook == NULL || !jl_has_open_set_in(m->sig))
+        return 0;
+    spec = jl_unwrap_unionall(spec);
+    jl_value_t *sig = jl_unwrap_unionall((jl_value_t*)m->sig);
+    if (!jl_is_datatype(spec) || !jl_is_datatype(sig))
+        return 0;
+    size_t n = jl_nparams(spec), ns = jl_nparams(sig);
+    int failed = 0;
+    for (size_t i = 1; i < n && ns > 0; i++) {
+        size_t j = i < ns ? i : ns - 1;
+        jl_value_t *p = jl_tparam(sig, j);
+        if (jl_is_vararg(p))
+            p = jl_unwrap_vararg(p);
+        else if (i >= ns)
+            break;
+        if (p == NULL)
+            continue;
+        if (jl_is_typevar(p))
+            p = ((jl_tvar_t*)p)->ub;
+        p = jl_unwrap_unionall(p);
+        if (!jl_is_datatype(p) || !((jl_datatype_t*)p)->name->open_set)
+            continue;
+        jl_value_t *a = jl_tparam(spec, i);
+        if (!jl_is_concrete_type(a) || !chain_has_memberships(a))
+            continue;
+        jl_value_t *X = ((jl_datatype_t*)p)->name->wrapper;
+        JL_LOCK(&jl_member_state_lock);
+        jl_value_t *st = member_state_get(a, X);
+        if (st == jl_false) {
+            failed = 1;
+            if (jl_is_method_instance(caller))
+                member_triple_push(&jl_member_failed_users, a, X, caller);
+        }
+        else if (st != jl_true)
+            member_triple_push(&jl_member_pending, a, X, caller);
+        JL_UNLOCK(&jl_member_state_lock);
+    }
+    // the method cache's entry that the matching made for this call: lowered, so the call left to
+    // dispatch misses and asks the hook, which raises the failure
+    if (failed && jl_is_concrete_type(spec))
+        member_hook_uncache((jl_tupletype_t*)spec);
+    return failed;
+}
+
+// A failed check: the code inferred with the member's use resolved is invalidated, with its callers.
+static void member_invalidate_user(jl_value_t *user)
+{
+    if (user == NULL || !jl_is_method_instance(user))
+        return;
+    jl_method_instance_t *mi = (jl_method_instance_t*)user;
+    size_t world = jl_atomic_load_acquire(&jl_world_counter);
+    jl_code_instance_t *ci = jl_atomic_load_relaxed(&mi->cache);
+    while (ci != NULL) {
+        if (jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0 && jl_atomic_load_relaxed(&ci->min_world) <= world)
+            invalidate_code_instance(ci, world - 1, 1);
+        ci = jl_atomic_load_relaxed(&ci->next);
+    }
+}
+
+static void member_failed_user(jl_value_t *T, jl_value_t *X, jl_value_t *user)
+{
+    if (!jl_is_method_instance(user))
+        return;
+    JL_LOCK(&jl_member_state_lock);
+    member_triple_push(&jl_member_failed_users, T, X, user);
+    JL_UNLOCK(&jl_member_state_lock);
+    member_invalidate_user(user);
+}
+
+// A check that failed has passed: the code compiled with its use left to dispatch is invalidated, so
+// that it is compiled again with the use resolved.
+static void member_passed_after_failure(jl_value_t *T, jl_value_t *X)
+{
+    jl_array_t *l = jl_member_failed_users, *users = NULL;
+    if (l == NULL)
+        return;
+    JL_GC_PUSH1(&users);
+    users = jl_alloc_vec_any(0);
+    JL_LOCK(&jl_member_state_lock);
+    l = jl_member_failed_users;
+    size_t k = 0, n = jl_array_nrows(l);
+    for (size_t i = 0; i + 2 < n; i += 3) {
+        if (jl_array_ptr_ref(l, i) == T && jl_array_ptr_ref(l, i + 1) == X) {
+            jl_array_ptr_1d_push(users, jl_array_ptr_ref(l, i + 2));
+        }
+        else {
+            for (int j = 0; j < 3; j++)
+                jl_array_ptr_set(l, k + j, jl_array_ptr_ref(l, i + j));
+            k += 3;
+        }
+    }
+    if (k < n)
+        jl_array_del_end(l, n - k);
+    JL_UNLOCK(&jl_member_state_lock);
+    for (size_t i = 0; i < jl_array_nrows(users); i++)
+        member_invalidate_user(jl_array_ptr_ref(users, i));
+    JL_GC_POP();
+}
+
+// The compile queue (compiler §10.4): when inference has returned, and before the code it resolved
+// runs, the hook is asked for each member noted. It runs in the latest world with no lock held. A
+// failure is kept; the code that noted the pair is invalidated, and its next inference leaves the
+// use to dispatch. A pair whose check is in progress waits for it. Returns the number of uses that
+// failed.
+int jl_member_queue_drain(void)
+{
+    if (jl_member_pending == NULL || jl_array_nrows(jl_member_pending) == 0)
+        return 0;
+    jl_array_t *list = NULL;
+    JL_LOCK(&jl_member_state_lock);
+    list = jl_member_pending;
+    jl_member_pending = NULL;
+    JL_UNLOCK(&jl_member_state_lock);
+    if (list == NULL)
+        return 0;
+    jl_value_t **roots;
+    JL_GC_PUSHARGS(roots, 5);
+    roots[0] = (jl_value_t*)list;
+    int nfail = 0, ran = 0;
+    jl_task_t *ct = jl_current_task;
+    for (size_t i = 0; i + 2 < jl_array_nrows(list); i += 3) {
+        jl_value_t *T = jl_array_ptr_ref(list, i), *X = jl_array_ptr_ref(list, i + 1);
+        roots[4] = jl_array_ptr_ref(list, i + 2);
+        jl_value_t *hook = jl_member_hook;
+        JL_LOCK(&jl_member_state_lock);
+        jl_value_t *st = member_state_get(T, X);
+        if (st == jl_nothing)
+            member_triple_push(&jl_member_pending, T, X, roots[4]);
+        else if (st == NULL && hook != NULL)
+            member_state_put(T, X, jl_nothing);
+        JL_UNLOCK(&jl_member_state_lock);
+        if (st == jl_true || st == jl_nothing || (st == NULL && hook == NULL))
+            continue;
+        if (st == jl_false) {
+            member_failed_user(T, X, roots[4]);
+            nfail++;
+            continue;
+        }
+        roots[1] = hook;
+        roots[2] = T;
+        roots[3] = X;
+        size_t last_age = ct->world_age;
+        ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
+        int ok = 1;
+        JL_TRY {
+            jl_apply(&roots[1], 3);
+        }
+        JL_CATCH {
+            ok = 0;
+        }
+        ct->world_age = last_age;
+        ran = 1;
+        member_state_set(T, X, ok ? jl_true : jl_false);
+        if (!ok) {
+            member_hook_uncache_member(T); // the entries the check's own matching made
+            member_failed_user(T, X, roots[4]);
+            nfail++;
+        }
+    }
+    JL_GC_POP();
+    if (ran)
+        nfail += jl_member_queue_drain(); // the uses that waited for a check that ran here
+    return nfail;
+}
+
 // At dispatch, before the instance lookup of a call that a method at a set serves: for each
 // argument at a position the method types by a set, and a member through a membership, the
 // library checks the member at its first use. The hook runs in the latest world with no lock
@@ -7113,15 +7361,32 @@ static void member_hook_at_dispatch(jl_tupletype_t *tt, size_t world)
             jl_task_t *ct = jl_current_task;
             size_t last_age = ct->world_age;
             ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
+            // the check's state (above): a member that passed is asked again and stays; a check
+            // reached again while it runs leaves the state to the one that runs
+            JL_LOCK(&jl_member_state_lock);
+            jl_value_t *st = member_state_get(roots[2], roots[3]);
+            if (st == NULL || st == jl_false)
+                member_state_put(roots[2], roots[3], jl_nothing);
+            JL_UNLOCK(&jl_member_state_lock);
             JL_TRY {
                 jl_apply(&roots[1], 3);
             }
             JL_CATCH {
+                if (st != jl_nothing)
+                    member_state_set(roots[2], roots[3], jl_false);
                 member_hook_uncache(tt);
                 member_hook_uncache_member(roots[2]);
+                ct->world_age = last_age;
+                jl_member_queue_drain();
                 jl_rethrow();
             }
             ct->world_age = last_age;
+            if (st == NULL || st == jl_false) {
+                member_state_set(roots[2], roots[3], jl_true);
+                if (st == jl_false)
+                    member_passed_after_failure(roots[2], roots[3]);
+                jl_member_queue_drain();
+            }
         }
     }
     JL_GC_POP();

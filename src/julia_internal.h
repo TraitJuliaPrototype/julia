@@ -451,6 +451,10 @@ extern jl_array_t *open_set_methods JL_GLOBALLY_ROOTED;
 extern jl_array_t *jl_code_slot_fallbacks JL_GLOBALLY_ROOTED;   // the code slot's last resorts (gf.c)
 // the member hook (gf.c, compiler §10.4), rooted alongside it
 extern jl_value_t *jl_member_hook JL_GLOBALLY_ROOTED;
+extern jl_genericmemory_t *jl_member_states JL_GLOBALLY_ROOTED; // the checks' states (gf.c)
+extern jl_array_t *jl_member_pending JL_GLOBALLY_ROOTED;
+extern jl_array_t *jl_member_failed_users JL_GLOBALLY_ROOTED;
+extern jl_mutex_t jl_member_state_lock;
 extern jl_value_t *jl_fully_typed_hook JL_GLOBALLY_ROOTED;
 extern jl_value_t *jl_method_deletion_hook JL_GLOBALLY_ROOTED;
 void jl_call_deletion_hook(jl_method_t *m);

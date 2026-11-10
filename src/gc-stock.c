@@ -2910,6 +2910,9 @@ static void gc_mark_roots(jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT
     gc_try_claim_and_push(mq, open_set_methods, NULL); // the set->methods index (gf.c)
     gc_heap_snapshot_record_gc_roots((jl_value_t*)open_set_methods, "open_set_methods");
     gc_try_claim_and_push(mq, jl_member_hook, NULL); // the member hook (gf.c)
+    gc_try_claim_and_push(mq, jl_member_states, NULL); // the member checks' states (gf.c)
+    gc_try_claim_and_push(mq, jl_member_pending, NULL);
+    gc_try_claim_and_push(mq, jl_member_failed_users, NULL);
     gc_try_claim_and_push(mq, jl_fully_typed_hook, NULL); // fully typed mode's hook (gf.c)
     gc_heap_snapshot_record_gc_roots(jl_member_hook, "member_hook");
     gc_try_claim_and_push(mq, jl_method_definition_hook, NULL); // the library's hooks (gf.c)
