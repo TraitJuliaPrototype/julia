@@ -296,6 +296,8 @@ function rtsite_target(interp::AbstractInterpreter, args::Vector{Any}, src::Code
     argtypes = Any[]
     for a in args
         applicable(argextype, a, src, sptypes) || return nothing
+        # an argument that is no value of the IR (an expression nested in the call): no target
+        a isa Expr && !(a.head === :static_parameter || a.head === :boundscheck || a.head === :copyast) && return nothing
         t = widenconst(argextype(a, src, sptypes))
         t === Bottom && return nothing
         push!(argtypes, t)
