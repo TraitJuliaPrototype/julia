@@ -655,6 +655,8 @@ JL_DLLEXPORT int jl_membership_final(jl_value_t *S, jl_value_t *X)
     if (abstract_member(S)) {
         // an abstract type (open issue 169): no subtype of it is in X while their intersection has no
         // type in the world; its final cell opens when one joins
+        // (at an abstract type the answer stays unsettled while a declarer loads and for a type or set
+        // of Main: gate n2_open_abstract gave a wrong method with it settled there; compiler C-88)
         if (!module_loaded(xn->module) || !type_declarers_loaded(S, 0))
             return 0;
         size_t world = jl_membership_query_world();
@@ -664,8 +666,9 @@ JL_DLLEXPORT int jl_membership_final(jl_value_t *S, jl_value_t *X)
     }
     if (!jl_is_concrete_type(S) || jl_is_type_type(S) || ((jl_datatype_t*)S)->name->never_member)
         return 0;
-    if (!module_loaded(xn->module) || !type_declarers_loaded(S, 0))
-        return 0;
+    // a non-membership is relied on wherever it holds, while a declarer loads and for a type or set of
+    // Main too (W-140, stage 2): the code records the pair's cell, and a membership declared later
+    // invalidates it, as a method definition invalidates its callers
     return !jl_subtype(S, xn->wrapper);
 }
 
