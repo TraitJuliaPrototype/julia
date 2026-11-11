@@ -382,6 +382,55 @@ JL_DLLEXPORT int jl_set_enumerable(jl_value_t *set)
     return 1;
 }
 
+// The concrete types a family has been instantiated at (compiler §7.6): its TypeName's caches.
+JL_DLLEXPORT jl_value_t *jl_typename_concrete_instances(jl_value_t *tnv)
+{
+    jl_array_t *out = jl_alloc_vec_any(0);
+    if (!jl_is_typename(tnv))
+        return (jl_value_t*)out;
+    jl_typename_t *tn = (jl_typename_t*)tnv;
+    jl_svec_t *caches[2] = { jl_atomic_load_relaxed(&tn->cache), jl_atomic_load_relaxed(&tn->linearcache) };
+    JL_GC_PUSH1(&out);
+    for (int c = 0; c < 2; c++) {
+        jl_svec_t *cache = caches[c];
+        if (cache == NULL)
+            continue;
+        for (size_t i = 0; i < jl_svec_len(cache); i++) {
+            jl_value_t *T = jl_svecref(cache, i);
+            if (T != NULL && T != jl_nothing && jl_is_datatype(T) && jl_is_concrete_type(T))
+                jl_array_ptr_1d_push(out, T);
+        }
+    }
+    JL_GC_POP();
+    return (jl_value_t*)out;
+}
+
+// The member patterns of a set's entries in force (compiler §7.6), but the set's own box entry: a
+// concrete type, a family `S{T} where T`, an abstract type, a set instance.
+JL_DLLEXPORT jl_value_t *jl_set_member_patterns(jl_value_t *set)
+{
+    jl_value_t *uw = jl_unwrap_unionall(set);
+    jl_array_t *out = jl_alloc_vec_any(0);
+    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->open_set || jl_set_entries == NULL)
+        return (jl_value_t*)out;
+    jl_array_t *list = (jl_array_t*)jl_eqtable_get(jl_set_entries, (jl_value_t*)((jl_datatype_t*)uw)->name, NULL);
+    if (list == NULL)
+        return (jl_value_t*)out;
+    JL_GC_PUSH2(&out, &list);
+    for (size_t i = 0; i < jl_array_nrows(list); i++) {
+        jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i);
+        if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
+            continue;
+        jl_value_t *mu = jl_unwrap_unionall(en->member);
+        if (jl_is_datatype(mu) && ((jl_datatype_t*)mu)->name->module == jl_core_module &&
+                ((jl_datatype_t*)mu)->name->name == jl_symbol("Dynamic"))
+            continue;
+        jl_array_ptr_1d_push(out, en->member);
+    }
+    JL_GC_POP();
+    return (jl_value_t*)out;
+}
+
 JL_DLLEXPORT jl_value_t *jl_candidates_of(jl_value_t *set)
 {
     jl_value_t *uw = jl_unwrap_unionall(set);

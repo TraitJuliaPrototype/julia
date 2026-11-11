@@ -274,6 +274,50 @@ const MAX_CLOSED_SPLITS = 64
 "A closed build (compiler §7.6): `--trim`. The members of every set are those the build has."
 closed_build() = JLOptions().trim != 0
 
+# The members of a set in a closed build (compiler §7.6): each entry's concrete type; of a family
+# `S{T} where T`, the concrete instantiations the build has made (the type's own cache); of a subset,
+# its members. `nothing` where they cannot be listed: an abstract type's subtypes.
+function closed_candidates(@nospecialize(X), depth::Int = 0)
+    depth > 4 && return nothing
+    out = Any[]
+    pats = ccall(:jl_set_member_patterns, Any, (Any,), X)::Vector{Any}
+    for m in pats
+        if isconcretetype(m)
+            any(c -> c === m, out) || push!(out, m)
+            continue
+        end
+        u = unwrap_unionall(m)
+        u isa DataType || return nothing
+        if ccall(:jl_is_open_set, Cint, (Any,), u) != 0
+            sub = closed_candidates(u.name.wrapper, depth + 1)
+            sub === nothing && return nothing
+            for c in sub
+                any(d -> d === c, out) || push!(out, c)
+            end
+        elseif isabstracttype(u)
+            return nothing
+        else
+            for T in ccall(:jl_typename_concrete_instances, Any, (Any,), u.name)::Vector{Any}
+                T <: m || continue
+                any(d -> d === T, out) || push!(out, T)
+            end
+        end
+    end
+    return out
+end
+# the number of members each closed split was inferred with: where a later instantiation adds one, the
+# build infers the noted instances again (`closed_candidates_grew`)
+const CLOSED_CANDIDATE_COUNTS = IdDict{Any,Int}()
+function closed_candidates_grew()
+    grew = false
+    for (X, n) in CLOSED_CANDIDATE_COUNTS
+        c = closed_candidates(X)
+        c === nothing && continue
+        length(c) > n && (grew = true)
+    end
+    return grew
+end
+
 # Code inferred while a closed build loads its program saw the members declared until then: a method
 # at a set checked at its definition saw none. The instances whose inference met an operation's call
 # at a set are noted here, and inferred again when the build compiles, with every member
@@ -320,10 +364,18 @@ function operation_split_type(@nospecialize(atype))
             X = (u.parameters[1]::DataType).parameters[1]
         end
         (ccall(:jl_is_open_set, Cint, (Any,), X) != 0 || ccall(:jl_has_contract, Cint, (Any,), X) != 0) || continue
-        cands = ccall(:jl_candidates_of, Any, (Any,), X)::Vector{Any}
         # a closed build (`--trim`, compiler §7.6) has every member: the split is over all of them,
         # where the set's members can be listed
-        closed = closed_build() && ccall(:jl_set_enumerable, Cint, (Any,), X) != 0
+        cands = nothing
+        closed = false
+        if closed_build() && ccall(:jl_is_open_set, Cint, (Any,), X) != 0
+            cands = closed_candidates(X.name.wrapper)
+            if cands !== nothing
+                closed = true
+                CLOSED_CANDIDATE_COUNTS[X.name.wrapper] = length(cands)
+            end
+        end
+        cands === nothing && (cands = ccall(:jl_candidates_of, Any, (Any,), X)::Vector{Any})
         U = Union{}
         n = 0
         for C in cands

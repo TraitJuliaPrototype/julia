@@ -2020,33 +2020,50 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
         latest > 0 && closed_build_reinfer!(latest)
     end
 
+    reverse!(sort!(worlds))
     codeinfos = []
-    workqueue = CompilationQueue(; interp = nothing)
-    for this_world in reverse!(sort!(worlds))
-        workqueue = CompilationQueue(workqueue;
-            interp = NativeInterpreter(this_world; inf_params)
+    rounds = 0
+    while true
+        # (a closed build's rounds: see below)
+        empty!(CLOSED_CANDIDATE_COUNTS)
+        invokelatest_queue = CompilationQueue(;
+            interp = NativeInterpreter(get_world_counter(); inf_params)
         )
+        codeinfos = []
+        workqueue = CompilationQueue(; interp = nothing)
+        for this_world in worlds
+            workqueue = CompilationQueue(workqueue;
+                interp = NativeInterpreter(this_world; inf_params)
+            )
 
-        append!(workqueue, methods)
-        # memberships are asked in the world the code is compiled for, as `jl_type_infer` asks them:
-        # this function runs in the compiler's own world, where no membership of the program exists
-        mq = ccall(:jl_set_membership_query_world, UInt, (UInt,), this_world)
-        try
-            compile!(codeinfos, workqueue; invokelatest_queue, external_linkage)
-        finally
-            ccall(:jl_set_membership_query_world, UInt, (UInt,), mq)
+            append!(workqueue, methods)
+            # memberships are asked in the world the code is compiled for, as `jl_type_infer` asks them:
+            # this function runs in the compiler's own world, where no membership of the program exists
+            mq = ccall(:jl_set_membership_query_world, UInt, (UInt,), this_world)
+            try
+                compile!(codeinfos, workqueue; invokelatest_queue, external_linkage)
+            finally
+                ccall(:jl_set_membership_query_world, UInt, (UInt,), mq)
+            end
         end
-    end
 
-    if invokelatest_queue !== nothing
-        # This queue is intentionally aliased, to handle e.g. a `finalizer` calling `Core.finalizer`
-        # (it will enqueue into itself and immediately drain)
-        mq = ccall(:jl_set_membership_query_world, UInt, (UInt,), get_inference_world(invokelatest_queue.interp::NativeInterpreter))
-        try
-            compile!(codeinfos, invokelatest_queue; invokelatest_queue, external_linkage)
-        finally
-            ccall(:jl_set_membership_query_world, UInt, (UInt,), mq)
+        if invokelatest_queue !== nothing
+            # This queue is intentionally aliased, to handle e.g. a `finalizer` calling `Core.finalizer`
+            # (it will enqueue into itself and immediately drain)
+            mq = ccall(:jl_set_membership_query_world, UInt, (UInt,), get_inference_world(invokelatest_queue.interp::NativeInterpreter))
+            try
+                compile!(codeinfos, invokelatest_queue; invokelatest_queue, external_linkage)
+            finally
+                ccall(:jl_set_membership_query_world, UInt, (UInt,), mq)
+            end
         end
+
+        # A closed build (compiler §7.6): compiling makes types, and a family's new instantiation is a
+        # new member of its set. Where a split was inferred with fewer members than the set now has, the
+        # noted instances are inferred again, until no round adds one.
+        (trim_mode != TRIM_NO && latest > 0 && rounds < 8 && closed_candidates_grew()) || break
+        rounds += 1
+        closed_build_reinfer!(latest)
     end
 
     if trim_mode != TRIM_NO && trim_mode != TRIM_UNSAFE
