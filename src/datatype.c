@@ -1460,6 +1460,10 @@ JL_DLLEXPORT void jl_set_open_set(jl_value_t *T)
         jl_errorf("%s is published already: a set is open from its declaration", jl_symbol_name(tn->name));
     tn->open_set = 1;
     dt->has_open_set = 1;
+    // every set is closed after load (compiler §4.8; W-140, stage 1): a non-membership is final once
+    // the pair's declarers have loaded, and a membership declared later invalidates as a method does
+    tn->closed_after_load = 1;
+    jl_atomic_store_relaxed(&any_closed_after_load, 1);
     jl_svec_t *cache = jl_atomic_load_relaxed(&tn->cache);
     for (size_t i = 0; i < jl_svec_len(cache); i++) {
         jl_value_t *t = jl_svecref(cache, i);
