@@ -315,12 +315,85 @@ const MAX_CLOSED_SPLITS = 64
 "A closed build (compiler §7.6): `--trim`. The members of every set are those the build has."
 closed_build() = JLOptions().trim != 0
 
-# The members of a set in a closed build (compiler §7.6): each entry's concrete type; of a family
-# `S{T} where T`, the concrete instantiations the build has made (the type's own cache); of a subset,
-# its members. `nothing` where they cannot be listed: an abstract type's subtypes.
-function closed_candidates(@nospecialize(X), depth::Int = 0)
+# The types a closed build forgets, and where (compiler §7.6): the concrete type of each value its
+# compiled code passes to a place whose type does not keep it (a field, an array's element, a variable,
+# an argument of an instance compiled at such a type, a result), with that place's type. A value reaches
+# code typed by a set from a place typed under the set, or from a wider place through a test that
+# narrows it to the set (`x::X`, `x isa X`): the build's entries into the set. So a family's members,
+# and an abstract type's, are the types under it that the build forgets at a type under the set, or
+# under a type some entry narrows from: the members by use. In the order found (`closed_note_used!`).
+const CLOSED_USED_TYPES = Any[]                  # the types, in the order found
+const CLOSED_USED_AT = IdDict{Any,Vector{Any}}() # each with the types of the places it was forgotten at
+const CLOSED_USED_PAIRS = RefValue{Int}(0)
+const CLOSED_ENTRIES = Any[]                     # (W, E): a test narrows a value typed W to E
+const CLOSED_CANDIDATES_MEMO = IdDict{Any,Any}()
+# a type that keeps its values' types: concrete, or a union of such
+closed_keeps_type(@nospecialize(T)) =
+    T isa Union ? (closed_keeps_type(T.a) && closed_keeps_type(T.b)) : (T isa DataType && isconcretetype(T))
+function note_used_type!(@nospecialize(T), @nospecialize(P))
+    if T isa Union
+        note_used_type!(T.a, P)
+        note_used_type!(T.b, P)
+    elseif P isa Union
+        note_used_type!(T, P.a)
+        note_used_type!(T, P.b)
+    elseif T isa DataType && isconcretetype(T) && P isa Type && !closed_keeps_type(P) && T <: P
+        at = get(CLOSED_USED_AT, T, nothing)
+        if at === nothing
+            at = Any[]
+            CLOSED_USED_AT[T] = at
+            push!(CLOSED_USED_TYPES, T)
+        end
+        for Q in at
+            Q === P && return nothing
+        end
+        push!(at, P)
+        CLOSED_USED_PAIRS[] += 1
+    end
+    return nothing
+end
+# a test that narrows a value typed `W` to `E`, neither keeping the value's type
+function note_closed_entry!(@nospecialize(W), @nospecialize(E))
+    if E isa Union
+        note_closed_entry!(W, E.a)
+        note_closed_entry!(W, E.b)
+        return nothing
+    end
+    (W isa Type && E isa Type) || return nothing
+    (closed_keeps_type(W) || closed_keeps_type(E) || W <: E) && return nothing
+    for i = 1:2:length(CLOSED_ENTRIES)
+        CLOSED_ENTRIES[i] === W && CLOSED_ENTRIES[i + 1] === E && return nothing
+    end
+    push!(CLOSED_ENTRIES, W, E)
+    CLOSED_USED_PAIRS[] += 1
+    return nothing
+end
+function closed_used_reset!()
+    empty!(CLOSED_ENTRIES)
+    empty!(CLOSED_USED_TYPES)
+    empty!(CLOSED_USED_AT)
+    CLOSED_USED_PAIRS[] = 0
+    empty!(CLOSED_CANDIDATES_MEMO)
+    return nothing
+end
+
+# The members of a set in a closed build (compiler §7.6): each entry's concrete type; of an entry at a
+# family `S{T} where T` or at an abstract type, the types under it that the build forgets at a type
+# under the set; of a subset, its members.
+function closed_candidates(@nospecialize(X), depth::Int = 0, @nospecialize(top = X))
     depth > 4 && return nothing
+    if depth == 0
+        memo = get(CLOSED_CANDIDATES_MEMO, X, missing)
+        memo === missing || return memo::Union{Nothing,Vector{Any}}
+    end
     out = Any[]
+    # the wider types some test narrows to a type under the set
+    wider = Any[]
+    for i = 1:2:length(CLOSED_ENTRIES)
+        CLOSED_ENTRIES[i + 1] <: top || continue
+        W = CLOSED_ENTRIES[i]
+        any(w -> w === W, wider) || push!(wider, W)
+    end
     pats = ccall(:jl_set_member_patterns, Any, (Any,), X)::Vector{Any}
     for m in pats
         if isconcretetype(m)
@@ -330,20 +403,25 @@ function closed_candidates(@nospecialize(X), depth::Int = 0)
         u = unwrap_unionall(m)
         u isa DataType || return nothing
         if ccall(:jl_is_open_set, Cint, (Any,), u) != 0
-            sub = closed_candidates(u.name.wrapper, depth + 1)
+            sub = closed_candidates(u.name.wrapper, depth + 1, top)
             sub === nothing && return nothing
             for c in sub
                 any(d -> d === c, out) || push!(out, c)
             end
-        elseif isabstracttype(u)
-            return nothing
         else
-            for T in ccall(:jl_typename_concrete_instances, Any, (Any,), u.name)::Vector{Any}
+            for T in CLOSED_USED_TYPES
                 T <: m || continue
-                any(d -> d === T, out) || push!(out, T)
+                any(d -> d === T, out) && continue
+                for P in CLOSED_USED_AT[T]
+                    if P <: top || any(W -> P <: W, wider)
+                        push!(out, T)
+                        break
+                    end
+                end
             end
         end
     end
+    depth == 0 && (CLOSED_CANDIDATES_MEMO[X] = out)
     return out
 end
 # the number of members each closed split was inferred with: where a later instantiation adds one, the
@@ -372,6 +450,8 @@ function closed_barrier_split(argtypes::Vector{Any}, bits::UInt32)
         (u isa DataType && ccall(:jl_is_open_set, Cint, (Any,), u) != 0) || continue
         cands = closed_candidates(u.name.wrapper)
         cands === nothing && continue
+        # (the count before the test: a set with no member yet gains them in a later round)
+        CLOSED_CANDIDATE_COUNTS[u.name.wrapper] = length(cands)
         U = Union{}
         n = 0
         for C in cands
@@ -380,7 +460,6 @@ function closed_barrier_split(argtypes::Vector{Any}, bits::UInt32)
             n += 1
         end
         (0 < n <= MAX_CLOSED_SPLITS) || continue
-        CLOSED_CANDIDATE_COUNTS[u.name.wrapper] = length(cands)
         return (i, U)
     end
     return nothing
@@ -396,14 +475,16 @@ function note_closed_operation!(sv::AbsIntState)
     mi isa MethodInstance && push!(CLOSED_OPERATION_INSTANCES, mi)
     return nothing
 end
-function closed_build_reinfer!(world::UInt)
+function closed_build_reinfer!(world::UInt, stale::Union{Nothing,IdSet{Any}} = nothing)
     for mi in CLOSED_OPERATION_INSTANCES
         isdefined(mi, :cache) || continue
         ci = mi.cache
         while true
-            if ci.owner === nothing && ci.max_world == typemax(UInt) && ci.min_world < world
+            # (also code that begins in the build's world: a round's own, inferred with fewer members)
+            if ci.owner === nothing && ci.max_world == typemax(UInt) && ci.min_world <= world
                 ccall(:jl_invalidate_code_instance, Cvoid, (Any, UInt), ci, world - 1)
             end
+            stale === nothing || push!(stale, ci)
             isdefined(ci, :next) || break
             ci = ci.next
         end
@@ -526,9 +607,9 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     # it runs (a cast `compiled_for` on a value known by its trait) branches over the set's members
     # instead, each branch the call at the member's type
     if barrier && closed_build() && (amask & ~adyn) != 0
+        note_closed_operation!(sv)
         bsplit = closed_barrier_split(argtypes, amask & ~adyn)
         if bsplit !== nothing
-            note_closed_operation!(sv)
             bi, bU = bsplit::Tuple{Int,Type}
             newargs = copy(argtypes)
             newargs[bi] = bU

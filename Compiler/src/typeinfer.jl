@@ -1994,6 +1994,159 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
     return codeinfos
 end
 
+# a value that goes to a place of type `P`, which may not keep its type: noted with `P`; of a constant,
+# also what it holds in fields and elements that do not keep their types (a table built while the
+# program loaded)
+function closed_note_value!(@nospecialize(x), @nospecialize(P), src::CodeInfo, sptypes::Vector{VarState}, argts::Vector{Any})
+    t = argextype(x, src, sptypes, argts)
+    if t isa Const
+        closed_note_constant!(t.val, P, 0)
+    else
+        t = widenconst(t)
+        t isa Type && P isa Type && note_used_type!(t, P)
+    end
+    return nothing
+end
+function closed_note_constant!(@nospecialize(v), @nospecialize(P), depth::Int)
+    T = typeof(v)
+    P isa Type && note_used_type!(T, P)
+    (depth >= 3 || !(T isa DataType)) && return nothing
+    if v isa Array || v isa GenericMemory
+        E = eltype(v)
+        closed_keeps_type(E) && return nothing
+        for i = 1:min(length(v), 4096)
+            isassigned(v, i) && closed_note_constant!(v[i], E, depth + 1)
+        end
+    elseif isstructtype(T) && !(v isa Type) && !(v isa Module) && !(v isa Method) && !(v isa MethodInstance) && !(v isa CodeInstance)
+        for i = 1:fieldcount(T)
+            F = fieldtype(T, i)
+            closed_keeps_type(F) && continue
+            isdefined(v, i) && closed_note_constant!(getfield(v, i), F, depth + 1)
+        end
+    end
+    return nothing
+end
+
+# Between the rounds of a closed build: the round's instances that invoke an instance inferred again
+# are inferred again too, and so on up. A caller kept over an equal result (the code slot, §3.3) would
+# go on invoking the instance with the fewer members.
+function closed_invalidate_callers!(codeinfos::Vector{Any}, stale::IdSet{Any}, world::UInt)
+    changed = true
+    while changed
+        changed = false
+        callee = nothing
+        for item in codeinfos
+            if item isa CodeInstance
+                callee = item
+                continue
+            end
+            (item isa CodeInfo && callee isa CodeInstance && !(callee in stale)) || continue
+            for stmt in item.code
+                isexpr(stmt, :(=)) && (stmt = stmt.args[2])
+                (isexpr(stmt, :invoke) && stmt.args[1] in stale) || continue
+                push!(stale, callee)
+                if callee.owner === nothing && callee.max_world == typemax(UInt)
+                    ccall(:jl_invalidate_code_instance, Cvoid, (Any, UInt), callee, world - 1)
+                end
+                changed = true
+                break
+            end
+        end
+    end
+    return nothing
+end
+
+# After a round of a closed build (compiler §7.6): the types its code forgets, and where, read from each
+# instance's optimized code. Returns whether the round found a new one.
+function closed_note_used!(codeinfos::Vector{Any})
+    n = CLOSED_USED_PAIRS[]
+    rt = Any
+    sptypes = VarState[]
+    spec = nothing
+    for item in codeinfos
+        if item isa CodeInstance
+            rt = item.rettype
+            sptypes = sptypes_from_meth_instance(get_ci_mi(item))
+            spec = unwrap_unionall(get_ci_mi(item).specTypes)
+            continue
+        end
+        item isa CodeInfo || continue
+        src = item
+        tys = src.ssavaluetypes
+        tys isa Vector{Any} || continue
+        # the arguments' types: the code's own, or, for code read back from the cache, the instance's
+        argts = src.slottypes
+        if !(argts isa Vector{Any})
+            argts = Any[]
+            if spec isa DataType
+                for p in spec.parameters
+                    push!(argts, isvarargtype(p) ? Any : p)
+                end
+            end
+            while length(argts) < 64
+                push!(argts, Any)
+            end
+        end
+        code = src.code
+        for i = 1:length(code)
+            stmt = code[i]
+            isexpr(stmt, :(=)) && (stmt = stmt.args[2])
+            if stmt isa ReturnNode
+                isdefined(stmt, :val) && closed_note_value!(stmt.val, rt, src, sptypes, argts)
+            elseif stmt isa PhiNode
+                T = widenconst(tys[i])
+                for k = 1:length(stmt.values)
+                    isassigned(stmt.values, k) && closed_note_value!(stmt.values[k], T, src, sptypes, argts)
+                end
+            elseif stmt isa PiNode
+                # a value of a known type taken at a type that does not keep it (`x::Shape` at a `Circle`);
+                # and a test that narrows a wider value to a type under a set: an entry into the set
+                closed_note_value!(stmt.val, widenconst(stmt.typ), src, sptypes, argts)
+                note_closed_entry!(widenconst(argextype(stmt.val, src, sptypes, argts)), widenconst(stmt.typ))
+            elseif isexpr(stmt, :new)
+                T = widenconst(tys[i])
+                if T isa DataType && isconcretetype(T)
+                    for k = 2:length(stmt.args)
+                        k - 1 <= fieldcount(T) || break
+                        closed_note_value!(stmt.args[k], fieldtype(T, k - 1), src, sptypes, argts)
+                    end
+                end
+            elseif isexpr(stmt, :invoke)
+                edge = stmt.args[1]
+                mi = edge isa CodeInstance ? get_ci_mi(edge) : edge
+                spec = mi isa MethodInstance ? unwrap_unionall(mi.specTypes) : nothing
+                (spec isa DataType && !isempty(spec.parameters)) || continue
+                np = length(spec.parameters)
+                for k = 2:length(stmt.args)
+                    P = spec.parameters[min(k - 1, np)]
+                    isvarargtype(P) && (P = unwrapva(P))
+                    closed_note_value!(stmt.args[k], P, src, sptypes, argts)
+                end
+            elseif isexpr(stmt, :call)
+                ft = widenconst(argextype(stmt.args[1], src, sptypes, argts))
+                ft <: Core.Builtin || continue
+                f = singleton_type(ft)
+                if f === typeassert && length(stmt.args) >= 3
+                    closed_note_value!(stmt.args[2], widenconst(tys[i]), src, sptypes, argts)
+                    note_closed_entry!(widenconst(argextype(stmt.args[2], src, sptypes, argts)), widenconst(tys[i]))
+                elseif (f === Core.memoryrefset! || f === Core.memoryrefswap!) && length(stmt.args) >= 3
+                    R = widenconst(argextype(stmt.args[2], src, sptypes, argts))
+                    R isa DataType && R <: GenericMemoryRef && closed_note_value!(stmt.args[3], R.parameters[2], src, sptypes, argts)
+                elseif (f === setfield! || f === Core.swapfield!) && length(stmt.args) >= 4
+                    O = widenconst(argextype(stmt.args[2], src, sptypes, argts))
+                    nm = argextype(stmt.args[3], src, sptypes, argts)
+                    if O isa DataType && isconcretetype(O) && nm isa Const && nm.val isa Symbol && fieldindex(O, nm.val, false) != 0
+                        closed_note_value!(stmt.args[4], fieldtype(O, nm.val), src, sptypes, argts)
+                    end
+                end
+            end
+        end
+    end
+    grew = CLOSED_USED_PAIRS[] > n
+    grew && empty!(CLOSED_CANDIDATES_MEMO)
+    return grew
+end
+
 # This is a bridge for the C code calling `jl_typeinf_func()` on set of Method matches
 # The trim_mode can be any of:
 const TRIM_NO = 0x0
@@ -2017,6 +2170,7 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
             w > latest && (latest = w)
         end
         latest > 0 && closed_build_reinfer!(latest)
+        closed_used_reset!()
     end
 
     reverse!(sort!(worlds))
@@ -2057,12 +2211,53 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
             end
         end
 
-        # A closed build (compiler §7.6): compiling makes types, and a family's new instantiation is a
-        # new member of its set. Where a split was inferred with fewer members than the set now has, the
-        # noted instances are inferred again, until no round adds one.
-        (trim_mode != TRIM_NO && latest > 0 && rounds < 8 && closed_candidates_grew()) || break
+        # A closed build (compiler §7.6): a family's members, and an abstract type's, are the types the
+        # build uses, read from the round's code. Where a split was inferred with fewer members than its
+        # set now has, the noted instances are inferred again, until no round adds one.
+        # (memberships are asked in the build's world here too: this function's own has none of them)
+        (trim_mode != TRIM_NO && latest > 0) || break
+        mq = ccall(:jl_set_membership_query_world, UInt, (UInt,), latest)
+        again = false
+        try
+            closed_note_used!(codeinfos)
+            again = rounds < 16 && closed_candidates_grew()
+        finally
+            ccall(:jl_set_membership_query_world, UInt, (UInt,), mq)
+        end
+        again || break
         rounds += 1
-        closed_build_reinfer!(latest)
+        stale = IdSet{Any}()
+        closed_build_reinfer!(latest, stale)
+        closed_invalidate_callers!(codeinfos, stale, latest)
+    end
+    # the build's report of its sets (compiler §7.6), asked for by `JULIA_CLOSED_BUILD_REPORT`
+    if trim_mode != TRIM_NO && latest > 0 && ccall(:getenv, Ptr{UInt8}, (Ptr{UInt8},), "JULIA_CLOSED_BUILD_REPORT") != C_NULL
+        mq = ccall(:jl_set_membership_query_world, UInt, (UInt,), latest)
+        Core.println(Core.stderr, "closed build: ", rounds + 1, " rounds, ", length(CLOSED_USED_TYPES),
+                     " types forgotten, ", length(CLOSED_ENTRIES) ÷ 2, " entries by a test")
+        for (X, n) in CLOSED_CANDIDATE_COUNTS
+            c = closed_candidates(X)
+            Core.println(Core.stderr, "  ", X, ": split with ", n, " members; it has ", c === nothing ? "?" : length(c))
+            c === nothing || for T in c
+                Core.println(Core.stderr, "    ", T)
+            end
+        end
+        # the types forgotten at a place typed by a set, with the places
+        for T in CLOSED_USED_TYPES
+            for P in CLOSED_USED_AT[T]
+                ccall(:jl_has_open_set, Cint, (Any,), P) != 0 && Core.println(Core.stderr, "  forgotten: ", T, " at ", P)
+            end
+        end
+        nci = 0; nsrc = 0; ntyped = 0
+        for item in codeinfos
+            item isa CodeInstance && (nci += 1)
+            if item isa CodeInfo
+                nsrc += 1
+                item.ssavaluetypes isa Vector{Any} && (ntyped += 1)
+            end
+        end
+        Core.println(Core.stderr, "  instances ", nci, ", with code ", nsrc, ", with statement types ", ntyped)
+        ccall(:jl_set_membership_query_world, UInt, (UInt,), mq)
     end
 
     if trim_mode != TRIM_NO && trim_mode != TRIM_UNSAFE
