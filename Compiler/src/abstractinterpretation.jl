@@ -749,6 +749,20 @@ function attributed_match(m::MethodMatch, mask::UInt32, dyn::UInt32)
             (isvarargtype(p) || isconcretetype(p)) || (dispatch = true)
         end
     end
+    if dispatch && closed_build() && m.fully_covers && uspec isa DataType
+        # a closed build (compiler §7.6) leaves no call to dispatch on a trait argument when it runs:
+        # where the call does not know the member, it runs the instance compiled once, whose operations
+        # branch over the members
+        for i = 1:min(32, length(uspec.parameters) - 1)
+            bit = UInt32(1) << (i - 1)
+            (traits & bit) != 0 && (dbits & bit) == 0 || continue
+            p = uspec.parameters[i + 1]
+            (isvarargtype(p) || isconcretetype(p)) && continue
+            mask |= bit
+            dyn |= bit
+        end
+        dispatch = false
+    end
     w = ccall(:jl_attribute_sig, Any, (Any, Any, UInt32, UInt32), spec, method, mask, dyn)
     w === spec && return (m, dispatch)
     sp = ccall(:jl_type_intersection_with_env, Any, (Any, Any), w, method.sig)::SimpleVector
