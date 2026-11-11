@@ -453,6 +453,8 @@ extern jl_array_t *jl_code_slot_fallbacks JL_GLOBALLY_ROOTED;   // the code slot
 extern jl_value_t *jl_member_hook JL_GLOBALLY_ROOTED;
 extern jl_genericmemory_t *jl_member_states JL_GLOBALLY_ROOTED; // the checks' states (gf.c)
 extern jl_array_t *jl_member_pending JL_GLOBALLY_ROOTED;
+void jl_member_checks_activated(jl_array_t *checks);
+jl_array_t *jl_member_checks_passed_here(void);
 extern jl_array_t *jl_member_failed_users JL_GLOBALLY_ROOTED;
 extern jl_mutex_t jl_member_state_lock;
 extern jl_value_t *jl_fully_typed_hook JL_GLOBALLY_ROOTED;

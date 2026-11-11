@@ -3531,6 +3531,17 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
                 jl_array_ptr_1d_push(ext_memberships, (jl_value_t*)en);
             }
         }
+        // and the member checks that passed while the image was built (lowering §11), after a pair
+        // whose home is `nothing`: [..., nothing, [member type, set, ...]]
+        {
+            jl_array_t *checks = jl_member_checks_passed_here();
+            JL_GC_PUSH1(&checks);
+            if (jl_array_nrows(checks) > 0) {
+                jl_array_ptr_1d_push(ext_memberships, jl_nothing);
+                jl_array_ptr_1d_push(ext_memberships, (jl_value_t*)checks);
+            }
+            JL_GC_POP();
+        }
 
         if (!emit_split) {
             write_int32(f, 0); // No clone_targets
@@ -4535,6 +4546,17 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
             }
             // the library's image hook (compiler §10.1): the methods it returns stay inactive
             extext_methods = jl_call_image_methods_hook(extext_methods, pkgname);
+            // the member checks the image keeps (lowering §11): the last pair, its home `nothing`
+            {
+                size_t nm = jl_array_nrows(ext_memberships);
+                if (nm >= 2 && jl_array_ptr_ref(ext_memberships, nm - 2) == jl_nothing) {
+                    jl_array_t *checks = (jl_array_t*)jl_array_ptr_ref(ext_memberships, nm - 1);
+                    JL_GC_PUSH1(&checks);
+                    jl_array_del_end(ext_memberships, 2);
+                    jl_member_checks_activated(checks);
+                    JL_GC_POP();
+                }
+            }
             // the memberships the image's modules declared (compiler §9)
             int new_memberships = jl_array_nrows(ext_memberships) > 0;
             JL_LOCK(&world_counter_lock);

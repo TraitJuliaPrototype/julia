@@ -6974,6 +6974,85 @@ static int chain_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
 static void member_hook_uncache(jl_tupletype_t *tt);
 static void member_hook_uncache_member(jl_value_t *member);
 
+// The checks an image keeps (lowering §11). The pairs (member type, set) whose check passed and that
+// images brought into this session are listed under the key `nothing` of `jl_member_states`, in
+// order: the library makes their records again from it, and an image built here leaves them out.
+static jl_array_t *member_checks_activated_list(int create)
+{
+    if (jl_member_states == NULL) {
+        if (!create)
+            return NULL;
+        jl_member_states = (jl_genericmemory_t*)jl_an_empty_memory_any;
+    }
+    jl_array_t *a = (jl_array_t*)jl_eqtable_get(jl_member_states, jl_nothing, NULL);
+    if (a == NULL && create) {
+        a = jl_alloc_vec_any(0);
+        JL_GC_PUSH1(&a);
+        jl_member_states = jl_eqtable_put(jl_member_states, jl_nothing, (jl_value_t*)a, NULL);
+        JL_GC_POP();
+    }
+    return a;
+}
+
+// the pairs (member type, set) of an image's kept checks: passed in this session too, from here on
+void jl_member_checks_activated(jl_array_t *checks)
+{
+    JL_LOCK(&jl_member_state_lock);
+    jl_array_t *act = member_checks_activated_list(1);
+    for (size_t i = 0; i + 1 < jl_array_nrows(checks); i += 2) {
+        jl_value_t *T = jl_array_ptr_ref(checks, i), *X = jl_array_ptr_ref(checks, i + 1);
+        if (member_state_get(T, X) == jl_true)
+            continue;
+        member_state_put(T, X, jl_true);
+        jl_array_ptr_1d_push(act, T);
+        jl_array_ptr_1d_push(act, X);
+    }
+    JL_UNLOCK(&jl_member_state_lock);
+}
+
+// the same list, for the library: [member type, set, ...] in the order the images brought them
+JL_DLLEXPORT jl_value_t *jl_activated_member_checks(void)
+{
+    JL_LOCK(&jl_member_state_lock);
+    jl_array_t *act = member_checks_activated_list(1);
+    JL_UNLOCK(&jl_member_state_lock);
+    return (jl_value_t*)act;
+}
+
+// the pairs whose check passed in this session, not brought by an image: what an image built here keeps
+jl_array_t *jl_member_checks_passed_here(void)
+{
+    jl_array_t *out = jl_alloc_vec_any(0);
+    JL_GC_PUSH1(&out);
+    JL_LOCK(&jl_member_state_lock);
+    jl_array_t *act = member_checks_activated_list(0);
+    if (jl_member_states != NULL) {
+        jl_genericmemory_t *t = jl_member_states;
+        for (size_t k = 0; k + 1 < t->length; k += 2) {
+            jl_value_t *T = jl_genericmemory_ptr_ref(t, k);
+            jl_value_t *v = jl_genericmemory_ptr_ref(t, k + 1);
+            if (T == NULL || v == NULL || T == jl_nothing)
+                continue;
+            jl_array_t *a = (jl_array_t*)v;
+            for (size_t i = 0; i + 1 < jl_array_nrows(a); i += 2) {
+                if (jl_array_ptr_ref(a, i + 1) != jl_true)
+                    continue;
+                jl_value_t *X = jl_array_ptr_ref(a, i);
+                int brought = 0;
+                for (size_t j = 0; act != NULL && j + 1 < jl_array_nrows(act) && !brought; j += 2)
+                    brought = jl_array_ptr_ref(act, j) == T && jl_array_ptr_ref(act, j + 1) == X;
+                if (!brought) {
+                    jl_array_ptr_1d_push(out, T);
+                    jl_array_ptr_1d_push(out, X);
+                }
+            }
+        }
+    }
+    JL_UNLOCK(&jl_member_state_lock);
+    JL_GC_POP();
+    return out;
+}
+
 // Inference, at a call it resolves to the method `m` at the signature `spec`, from the code of
 // `caller`: 1 where a member's check has failed, so the call is left to dispatch, which raises the
 // failure. A member with no answer yet is noted for the compile queue.

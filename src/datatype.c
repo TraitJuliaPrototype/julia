@@ -382,29 +382,6 @@ JL_DLLEXPORT int jl_set_enumerable(jl_value_t *set)
     return 1;
 }
 
-// The concrete types a family has been instantiated at (compiler §7.6): its TypeName's caches.
-JL_DLLEXPORT jl_value_t *jl_typename_concrete_instances(jl_value_t *tnv)
-{
-    jl_array_t *out = jl_alloc_vec_any(0);
-    if (!jl_is_typename(tnv))
-        return (jl_value_t*)out;
-    jl_typename_t *tn = (jl_typename_t*)tnv;
-    jl_svec_t *caches[2] = { jl_atomic_load_relaxed(&tn->cache), jl_atomic_load_relaxed(&tn->linearcache) };
-    JL_GC_PUSH1(&out);
-    for (int c = 0; c < 2; c++) {
-        jl_svec_t *cache = caches[c];
-        if (cache == NULL)
-            continue;
-        for (size_t i = 0; i < jl_svec_len(cache); i++) {
-            jl_value_t *T = jl_svecref(cache, i);
-            if (T != NULL && T != jl_nothing && jl_is_datatype(T) && jl_is_concrete_type(T))
-                jl_array_ptr_1d_push(out, T);
-        }
-    }
-    JL_GC_POP();
-    return (jl_value_t*)out;
-}
-
 // The member patterns of a set's entries in force (compiler §7.6), but the set's own box entry: a
 // concrete type, a family `S{T} where T`, an abstract type, a set instance.
 JL_DLLEXPORT jl_value_t *jl_set_member_patterns(jl_value_t *set)
