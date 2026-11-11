@@ -359,6 +359,33 @@ function closed_candidates_grew()
     return grew
 end
 
+# The first argument that is `Compiled` (bit `i - 2` of `bits`) and typed by a set whose members a closed
+# build can list, with the union of those members (compiler §7.6); `nothing` where there is none.
+function closed_barrier_split(argtypes::Vector{Any}, bits::UInt32)
+    for i = 2:min(length(argtypes), 33)
+        (bits & (UInt32(1) << (i - 2))) != 0 || continue
+        a = argtypes[i]
+        isvarargtype(a) && break
+        T = widenconst(a)
+        (isconcretetype(T) || has_free_typevars(T)) && continue
+        u = unwrap_unionall(T)
+        (u isa DataType && ccall(:jl_is_open_set, Cint, (Any,), u) != 0) || continue
+        cands = closed_candidates(u.name.wrapper)
+        cands === nothing && continue
+        U = Union{}
+        n = 0
+        for C in cands
+            C <: T || continue
+            U = Union{U, C}
+            n += 1
+        end
+        (0 < n <= MAX_CLOSED_SPLITS) || continue
+        CLOSED_CANDIDATE_COUNTS[u.name.wrapper] = length(cands)
+        return (i, U)
+    end
+    return nothing
+end
+
 # Code inferred while a closed build loads its program saw the members declared until then: a method
 # at a set checked at its definition saw none. The instances whose inference met an operation's call
 # at a set are noted here, and inferred again when the build compiles, with every member
@@ -456,7 +483,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
                                   sv::AbsIntState, max_methods::Int;
                                   attr::Tuple{UInt32,UInt32} = (UInt32(0), UInt32(0)),
                                   max_union_splitting::Int = InferenceParams(interp).max_union_splitting,
-                                  operation::Bool = true)
+                                  operation::Bool = true, barrier::Bool = true)
     𝕃ₚ, 𝕃ᵢ = ipo_lattice(interp), typeinf_lattice(interp)
     ⊑ₚ, ⊔ₚ, ⊔ᵢ  = partialorder(𝕃ₚ), join(𝕃ₚ), join(𝕃ᵢ)
     argtypes = arginfo.argtypes
@@ -495,6 +522,27 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     # carries, else the method's; each match is inferred at the instance that runs
     amask, adyn = call_attributes(attr, arginfo.fargs, sv)
     acast = attr[1] != 0
+    # a closed build (compiler §7.6): a call that would dispatch on an argument `Compiled` at a set when
+    # it runs (a cast `compiled_for` on a value known by its trait) branches over the set's members
+    # instead, each branch the call at the member's type
+    if barrier && closed_build() && (amask & ~adyn) != 0
+        bsplit = closed_barrier_split(argtypes, amask & ~adyn)
+        if bsplit !== nothing
+            note_closed_operation!(sv)
+            bi, bU = bsplit::Tuple{Int,Type}
+            newargs = copy(argtypes)
+            newargs[bi] = bU
+            call = abstract_call_gf_by_type(interp, func, ArgInfo(nothing, newargs), si,
+                                            argtypes_to_type(newargs), sv, max_methods; attr = (amask, adyn),
+                                            max_union_splitting = MAX_CLOSED_SPLITS,
+                                            operation, barrier = false)::Future
+            return Future{CallMeta}(call, interp, sv) do call, _, _
+                rt = widenconst(call.rt)
+                rt === Union{} && return call
+                CallMeta(call.rt, call.exct, call.effects, SplitCallInfo(call.info, rt, true), call.refinements)
+            end
+        end
+    end
     matches, adispatch = attributed_matches(find_method_matches(interp, argtypes, atype; max_methods, max_union_splitting), amask, adyn)
     # (a call left to dispatch on a trait argument when it runs is one a later member may resolve)
     adispatch && closed_build() && note_closed_operation!(sv)
@@ -3479,6 +3527,20 @@ function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
         return Future(_hasmethod_tfunc(interp, argtypes, sv))
     elseif f === Core.keep && la == 2
         return Future(abstract_keep(fargs, argtypes, sv))
+    elseif f === Core._cast_compiled && la == 2
+        # a cast to `Compiled` (compiler §6.9) passes a `Dynamic{Z}`'s object, a member of `Z`. A
+        # `Dynamic{Z}` is a member of a set `X` only where `Z <: X` (lowering §2), so at a value typed
+        # by a set the result is of that set: the cast loses no type
+        T = widenconst(argtypes[2])
+        u = unwrap_unionall(T)
+        if u isa DataType && !isconcretetype(T) && ccall(:jl_is_open_set, Cint, (Any,), u) != 0
+            call = abstract_call_gf_by_type(interp, f, arginfo, si, argtypes_to_type(argtypes), sv, max_methods)::Future
+            return Future{CallMeta}(call, interp, sv) do call, _, _
+                rt = call.rt
+                widenconst(rt) <: T || (rt = T)
+                CallMeta(rt, call.exct, call.effects, call.info, call.refinements)
+            end
+        end
     end
     atype = argtypes_to_type(argtypes)
     return abstract_call_gf_by_type(interp, f, arginfo, si, atype, sv, max_methods; attr)::Future

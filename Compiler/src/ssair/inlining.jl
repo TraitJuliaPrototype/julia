@@ -1442,6 +1442,7 @@ function process_simple!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::Int, flag
     if is_builtin(optimizer_lattice(state.interp), sig)
         let f = sig.f
             if (f !== Core.invoke &&
+                f !== Core.attributed_call && # a cast's call (compiler §6.9): `handle_attributed_call!`
                 f !== Core.finalizer &&
                 f !== modifyfield! &&
                 f !== Core.modifyglobal! &&
@@ -1861,6 +1862,24 @@ function handle_attributed_call!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::I
             bits = Int(info.mask) | (Int(info.dyn) << 32)
             ir[SSAValue(idx)][:stmt] = Expr(:call, GlobalRef(Core, :attributed_call), bits, cur.args...)
         end
+        return nothing
+    end
+    if info.cast && inner isa SplitCallInfo
+        # a closed build's branches over the members of the cast argument's set (compiler §7.6): the
+        # call itself, split as an operation's is
+        newstmt = Expr(:call, stmt.args[3:end]...)
+        nsig = call_sig(ir, newstmt)
+        nsig === nothing && return nothing
+        # the branches test the value's type themselves: an argument typed by a set with parameters
+        # (`Column{T} where T`) is taken as `Any`, so that the call's signature is a tuple type
+        for i = 2:length(nsig.argtypes)
+            widenconst(nsig.argtypes[i]) isa UnionAll && (nsig.argtypes[i] = Any)
+        end
+        ir[SSAValue(idx)][:stmt] = newstmt
+        n = length(todo)
+        handle_call!(todo, ir, idx, newstmt, inner, flag, nsig, state)
+        # not split: the builtin's call again
+        length(todo) == n && ir[SSAValue(idx)][:stmt] === newstmt && (ir[SSAValue(idx)][:stmt] = stmt)
         return nothing
     end
     if info.cast
