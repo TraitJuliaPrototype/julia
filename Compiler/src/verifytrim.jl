@@ -279,6 +279,7 @@ function may_dispatch(@nospecialize ftyp)
                Core.invoke isa ftyp ||
                Core.invoke_in_world isa ftyp ||
                Core.invokelatest isa ftyp ||
+               Core.attributed_call isa ftyp ||     # a call that dispatches with its arguments' attributes
                Core.finalizer isa ftyp ||
                Core.modifyfield! isa ftyp ||
                Core.modifyglobal! isa ftyp ||
@@ -373,6 +374,9 @@ function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance,
                     error = "trim verification not yet implemented for builtin `Core.invoke_in_world`"
                 elseif Core.invokelatest isa ftyp
                     error = "trim verification not yet implemented for builtin `Core.invokelatest`"
+                elseif Core.attributed_call isa ftyp
+                    # a call left to dispatch with its arguments' attributes (compiler §6.3)
+                    error = "unresolved call (with its arguments' attributes)"
                 elseif Core.modifyfield! isa ftyp
                     error = "trim verification not yet implemented for builtin `Core.modifyfield!`"
                 elseif Core.modifyglobal! isa ftyp

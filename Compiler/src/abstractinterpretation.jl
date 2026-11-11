@@ -268,6 +268,37 @@ function declared_field_in(@nospecialize(c), name::Symbol, depth::Int)
 end
 
 const MAX_OPERATION_SPLITS = 4
+# the members a closed build splits an operation's call over; past it the call stays dynamic, and the
+# build's verifier refuses it
+const MAX_CLOSED_SPLITS = 64
+"A closed build (compiler §7.6): `--trim`. The members of every set are those the build has."
+closed_build() = JLOptions().trim != 0
+
+# Code inferred while a closed build loads its program saw the members declared until then: a method
+# at a set checked at its definition saw none. The instances whose inference met an operation's call
+# at a set are noted here, and inferred again when the build compiles, with every member
+# (`closed_build_reinfer!`).
+const CLOSED_OPERATION_INSTANCES = IdSet{MethodInstance}()
+function note_closed_operation!(sv::AbsIntState)
+    mi = frame_instance(sv)
+    mi isa MethodInstance && push!(CLOSED_OPERATION_INSTANCES, mi)
+    return nothing
+end
+function closed_build_reinfer!(world::UInt)
+    for mi in CLOSED_OPERATION_INSTANCES
+        isdefined(mi, :cache) || continue
+        ci = mi.cache
+        while true
+            if ci.owner === nothing && ci.max_world == typemax(UInt) && ci.min_world < world
+                ccall(:jl_invalidate_code_instance, Cvoid, (Any, UInt), ci, world - 1)
+            end
+            isdefined(ci, :next) || break
+            ci = ci.next
+        end
+    end
+    empty!(CLOSED_OPERATION_INSTANCES)
+    return nothing
+end
 
 # The split of an operation's call (compiler §7.2): the first argument typed by a set instance, an
 # intersection or a closed abstract type with a contract, and the union of the first
@@ -290,16 +321,25 @@ function operation_split_type(@nospecialize(atype))
         end
         (ccall(:jl_is_open_set, Cint, (Any,), X) != 0 || ccall(:jl_has_contract, Cint, (Any,), X) != 0) || continue
         cands = ccall(:jl_candidates_of, Any, (Any,), X)::Vector{Any}
+        # a closed build (`--trim`, compiler §7.6) has every member: the split is over all of them,
+        # where the set's members can be listed
+        closed = closed_build() && ccall(:jl_set_enumerable, Cint, (Any,), X) != 0
         U = Union{}
         n = 0
         for C in cands
-            n >= MAX_OPERATION_SPLITS && break
+            (closed || n < MAX_OPERATION_SPLITS) || break
             C <: p || continue
             U = Union{U, C}
             n += 1
         end
+        if closed && n > 0 && u === X && ccall(:jl_is_open_set, Cint, (Any,), X) != 0
+            # and the box of a value kept `Dynamic` (traits §7.7), which the set's own method opens
+            D = Core.Dynamic{p}
+            D <: p && (U = Union{U, D}; n += 1)
+        end
         n == 0 && return nothing
-        return (i, U)
+        n <= MAX_CLOSED_SPLITS || return nothing
+        return (i, U, closed)
     end
     return nothing
 end
@@ -321,7 +361,9 @@ end
 function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(func),
                                   arginfo::ArgInfo, si::StmtInfo, @nospecialize(atype),
                                   sv::AbsIntState, max_methods::Int;
-                                  attr::Tuple{UInt32,UInt32} = (UInt32(0), UInt32(0)))
+                                  attr::Tuple{UInt32,UInt32} = (UInt32(0), UInt32(0)),
+                                  max_union_splitting::Int = InferenceParams(interp).max_union_splitting,
+                                  operation::Bool = true)
     𝕃ₚ, 𝕃ᵢ = ipo_lattice(interp), typeinf_lattice(interp)
     ⊑ₚ, ⊔ₚ, ⊔ᵢ  = partialorder(𝕃ₚ), join(𝕃ₚ), join(𝕃ᵢ)
     argtypes = arginfo.argtypes
@@ -330,14 +372,17 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
     end
     # an operation of a set at a receiver typed by the set (compiler §7.1, §7.2)
-    drt = declared_operation_result(interp, argtypes, atype)
+    # (not at a split's own branches: the union of its candidates holds the box `Dynamic{X}`, a type
+    # with a set in it, and is the split already)
+    drt = operation ? declared_operation_result(interp, argtypes, atype) : nothing
     if drt !== nothing
+        closed_build() && note_closed_operation!(sv)
         split = operation_split_type(atype)
         split === nothing && return Future(CallMeta(drt, Any, Effects(), DeclaredResultInfo(drt)))
         # asserted, as the compiler's own results are: inferred while the compiler bootstraps itself,
         # an untyped index made `newargs[i]` a dynamic call whose edges any new integer constructor
         # invalidated, and the compiler with it
-        i, U = split::Tuple{Int,Type}
+        i, U, closed = split::Tuple{Int,Type,Bool}
         newargs = copy(argtypes)
         newargs[i] = U
         # each branch knows the value's type, a candidate: the argument is `Compiled` there, so a branch
@@ -345,16 +390,21 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         # case is the candidate, never the set (which would cover the values past the candidates)
         sbit = i - 2 < 32 ? UInt32(1) << (i - 2) : UInt32(0)
         call = abstract_call_gf_by_type(interp, func, ArgInfo(nothing, newargs), si,
-                                        argtypes_to_type(newargs), sv, max_methods; attr = (sbit, UInt32(0)))::Future
+                                        argtypes_to_type(newargs), sv, max_methods; attr = (sbit, UInt32(0)),
+                                        max_union_splitting = closed ? MAX_CLOSED_SPLITS :
+                                                              InferenceParams(interp).max_union_splitting,
+                                        operation = false)::Future
         return Future{CallMeta}(call, interp, sv) do call, _, _
-            CallMeta(drt, Any, Effects(), SplitCallInfo(call.info, drt))
+            CallMeta(drt, Any, Effects(), SplitCallInfo(call.info, drt, closed))
         end
     end
     # each trait argument's attribute (compiler §6.3): a cast's, the one an argument of this frame
     # carries, else the method's; each match is inferred at the instance that runs
     amask, adyn = call_attributes(attr, arginfo.fargs, sv)
     acast = attr[1] != 0
-    matches, adispatch = attributed_matches(find_method_matches(interp, argtypes, atype; max_methods), amask, adyn)
+    matches, adispatch = attributed_matches(find_method_matches(interp, argtypes, atype; max_methods, max_union_splitting), amask, adyn)
+    # (a call left to dispatch on a trait argument when it runs is one a later member may resolve)
+    adispatch && closed_build() && note_closed_operation!(sv)
     if isa(matches, FailedMethodMatch)
         add_remark!(interp, sv, matches.reason)
         return Future(CallMeta(Any, Any, unedged_effects(interp), attributed_info(NoCallInfo(), amask, adyn, acast, false)))

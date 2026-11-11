@@ -1631,7 +1631,10 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
             split_case_edge!(state.edges, item)
         end
     end
-    handle_cases!(todo, ir, idx, stmt, atype, cases, fallback_rt === nothing ? handled_all_cases : false,
+    # in a closed build (compiler §7.6) the split is over every member: past its branches the call
+    # raises the `MethodError`, and no call is left to dispatch when the program runs
+    closed = split && (info::SplitCallInfo).closed && handled_all_cases
+    handle_cases!(todo, ir, idx, stmt, atype, cases, fallback_rt === nothing ? handled_all_cases : closed,
                   fallback_rt === nothing ? fully_covered : false, joint_effects, fallback_rt, table)
 end
 

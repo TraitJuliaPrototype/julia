@@ -354,6 +354,34 @@ JL_DLLEXPORT void jl_register_candidate(jl_value_t *set, jl_value_t *T)
 }
 
 // the set's candidates now, in declaration order (a list never mutated; empty where none)
+// Whether a set's members can be listed (compiler §7.6): an open set whose every entry in force names
+// a concrete type. A pattern's members, an abstract type's and a subset's join the candidates at their
+// first use, which a closed build cannot wait for.
+JL_DLLEXPORT int jl_set_enumerable(jl_value_t *set)
+{
+    jl_value_t *uw = jl_unwrap_unionall(set);
+    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->open_set || jl_set_entries == NULL)
+        return 0;
+    jl_array_t *list = (jl_array_t*)jl_eqtable_get(jl_set_entries, (jl_value_t*)((jl_datatype_t*)uw)->name, NULL);
+    if (list == NULL)
+        return 0;
+    for (size_t i = 0; i < jl_array_nrows(list); i++) {
+        jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i);
+        if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
+            continue;
+        if (jl_is_concrete_type(en->member))
+            continue;
+        // the box of a value kept `Dynamic` (the set's own entry `Dynamic{Z} where Z<:X`) is no member
+        // to list: the split takes it as its last branch
+        jl_value_t *mu = jl_unwrap_unionall(en->member);
+        if (jl_is_datatype(mu) && ((jl_datatype_t*)mu)->name->module == jl_core_module &&
+                ((jl_datatype_t*)mu)->name->name == jl_symbol("Dynamic"))
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
 JL_DLLEXPORT jl_value_t *jl_candidates_of(jl_value_t *set)
 {
     jl_value_t *uw = jl_unwrap_unionall(set);

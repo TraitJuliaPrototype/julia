@@ -121,7 +121,9 @@ dispatch in the caller's world and record none, so an invalidation below a candi
 struct SplitCallInfo <: CallInfo
     info::CallInfo
     rt::Any
+    closed::Bool    # a closed build's split over every member of a set whose members can be listed (§7.6)
 end
+SplitCallInfo(info::CallInfo, @nospecialize(rt)) = SplitCallInfo(info, rt, false)
 add_edges_impl(::Vector{Any}, ::SplitCallInfo) = nothing
 nsplit_impl(info::SplitCallInfo) = nsplit(info.info)
 getsplit_impl(info::SplitCallInfo, idx::Int) = getsplit(info.info, idx)
