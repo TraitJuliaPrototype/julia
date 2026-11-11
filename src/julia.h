@@ -607,6 +607,7 @@ typedef struct {
     _Atomic(uint64_t) max_world;       // lowered once, when the membership is redeclared
     jl_value_t *JL_NONNULL declarer; // Module: for ownership and the store's identity
     jl_value_t *JL_NONNULL by;       // the forwarding field name, or Nothing
+    jl_value_t *JL_NONNULL method;   // the membership's method of Core.implements (W-141), or Nothing
 } jl_membership_t;
 
 // a membership cell (compiler §5.6): whether `member` has joined the set, read by the guards of

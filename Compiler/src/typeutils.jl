@@ -73,9 +73,20 @@ function negative_fold_blocked(@nospecialize(a), @nospecialize(b), sv::Union{Not
     cells = ccall(:jl_membership_final_cells, Any, (Any, Any), a, b)
     cells isa SimpleVector || return true
     for c in cells
-        any(x -> x === c, sv.edges) || push!(sv.edges, c)
+        add_absence_edge!(sv.edges, c)
     end
     return false
+end
+# The edge of a negative the code relied on (W-141; compiler §4.8): the signature of `Core.implements` at
+# the pair, with no method. As a call that found no method, it holds a backedge at the method table
+# (`sig, Core.methodtable`) and is validated by a lookup (`0, sig`).
+function add_absence_edge!(edges::Vector{Any}, @nospecialize(sig))
+    for i in 2:length(edges)
+        edges[i] === Core.methodtable && edges[i-1] === sig && return nothing
+    end
+    push!(edges, sig, Core.methodtable)
+    push!(edges, 0, sig)
+    return nothing
 end
 function positive_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
     (ccall(:jl_has_open_set, Cint, (Any,), a) != 0 || ccall(:jl_has_open_set, Cint, (Any,), b) != 0) || return false
@@ -99,9 +110,24 @@ function record_memberships!(sv::InferenceState, @nospecialize(a), @nospecialize
     isempty(entries) && return false
     for e in entries
         e = e::Core.MembershipEntry
+        getfield(e, :method) isa Method || return false
+    end
+    for e in entries
+        e = e::Core.MembershipEntry
         # the fields by the builtin, which infers their declared type (the atomic `getproperty` did not)
         update_valid_age!(sv, WorldRange(getfield(e, :min_world), getfield(e, :max_world, :monotonic)))
-        any(x -> x === e, sv.edges) || push!(sv.edges, e)
+        # the edge is the membership's method (W-141), held as an `invoke` at its own signature: it is
+        # validated as any method is, and takes no backedge
+        m = getfield(e, :method)::Method
+        edges = sv.edges
+        found = false
+        for i in 2:length(edges)
+            if edges[i] === m && edges[i-1] === m.sig
+                found = true
+                break
+            end
+        end
+        found || push!(edges, m.sig, m)
     end
     return true
 end

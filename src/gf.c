@@ -2557,6 +2557,27 @@ static void open_set_walk_names(jl_value_t *v, jl_method_t *m, int depth)
 // list of methods (a SimpleVector, replaced). The declared results of a function's methods are read from it (§7.1).
 jl_genericmemory_t *jl_func_set_methods JL_GLOBALLY_ROOTED = NULL;
 
+// `Core.implements` (W-141): each membership has a method of it, and a folded negative an edge at its
+// signature. Its type, once Core defines it.
+static jl_value_t *jl_implements_ft JL_GLOBALLY_ROOTED = NULL;
+JL_DLLEXPORT jl_value_t *jl_implements_functype(void)
+{
+    if (jl_implements_ft == NULL && jl_core_module != NULL) {
+        jl_value_t *f = jl_get_global(jl_core_module, jl_symbol("implements"));
+        if (f != NULL)
+            jl_implements_ft = jl_typeof(f);
+    }
+    return jl_implements_ft;
+}
+int jl_is_implements_sig(jl_value_t *sig)
+{
+    jl_value_t *u = jl_unwrap_unionall(sig);
+    if (!jl_is_datatype(u) || !jl_is_tuple_type(u) || jl_nparams(u) < 1)
+        return 0;
+    jl_value_t *ft = jl_implements_functype();
+    return ft != NULL && jl_tparam0(u) == ft;
+}
+
 static void index_func_set_method(jl_method_t *m)
 {
     jl_value_t *sig = jl_unwrap_unionall(m->sig);
@@ -2597,6 +2618,8 @@ JL_DLLEXPORT jl_value_t *jl_func_methods_at_sets(jl_value_t *ft)
 static void jl_index_open_set_methods(jl_method_t *m)
 {
     if (!jl_has_open_set_in((jl_value_t*)m->sig)) // one bit; false for every Base method (I3)
+        return;
+    if (jl_is_implements_sig(m->sig)) // a membership's method is no method at a set (W-141)
         return;
     open_set_walk_names((jl_value_t*)m->sig, m, 0);
 }
@@ -4129,7 +4152,7 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     assert(jl_is_method(method));
     // a method at a set joins its function's list (compiler §7.1); a method of
     // an image is activated here without being added
-    if (jl_has_open_set_in((jl_value_t*)method->sig)) {
+    if (jl_has_open_set_in((jl_value_t*)method->sig) && !jl_is_implements_sig(method->sig)) {
         JL_LOCK(&open_set_methods_lock);
         index_func_set_method(method);
         JL_UNLOCK(&open_set_methods_lock);
@@ -5397,8 +5420,7 @@ static int ci_valid_in(jl_code_instance_t *ci, size_t world, arraylist_t *stack)
 
 static int edge_is_single(jl_value_t *e) JL_NOTSAFEPOINT
 {
-    return jl_is_method_instance(e) || jl_is_method(e) || jl_is_binding(e) ||
-        jl_typetagis(e, jl_membership_cell_type) || jl_typetagis(e, jl_membership_type);
+    return jl_is_method_instance(e) || jl_is_method(e) || jl_is_binding(e);
 }
 
 // Revalidates a marked CodeInstance in the latest world `world`, depth first; a cycle fails. Each of

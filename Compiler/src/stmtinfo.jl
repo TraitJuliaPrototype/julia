@@ -132,7 +132,7 @@ function _add_edges_impl(edges::Vector{Any}, info::MethodMatchInfo, mi_edge::Boo
     cells = info.results.cells
     if cells !== nothing
         for c in cells::SimpleVector
-            any(x -> x === c, edges) || push!(edges, c)
+            add_absence_edge!(edges, c)
         end
     end
     if !fully_covering(info)

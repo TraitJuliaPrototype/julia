@@ -4089,9 +4089,9 @@ void jl_init_types(void) JL_GC_DISABLED
     // the membership entry (compiler §4.2); mutable, since a redeclaration lowers
     // the old entry's max_world (its one atomic field)
     jl_membership_type = jl_new_datatype(jl_symbol("MembershipEntry"), jl_core_module, jl_any_type, jl_emptysvec,
-        jl_perm_symsvec(8, "set", "member", "instance", "receiver", "min_world", "max_world", "declarer", "by"),
-        jl_svec(8, jl_any_type, jl_any_type, jl_any_type, jl_any_type, jl_uint64_type, jl_uint64_type, jl_any_type, jl_any_type),
-        jl_emptysvec, 0, 1, 8);
+        jl_perm_symsvec(9, "set", "member", "instance", "receiver", "min_world", "max_world", "declarer", "by", "method"),
+        jl_svec(9, jl_any_type, jl_any_type, jl_any_type, jl_any_type, jl_uint64_type, jl_uint64_type, jl_any_type, jl_any_type, jl_any_type),
+        jl_emptysvec, 0, 1, 9);
     {
         const static uint32_t membership_atomicfields[1] = { 1u << 5 };
         jl_membership_type->name->atomicfields = membership_atomicfields;

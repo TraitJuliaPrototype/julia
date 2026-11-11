@@ -239,27 +239,6 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
                         min_valid2, max_valid2 = verify_call(sig, initial.callees, j+2, nmatches, world, fully_covers, matches)
                         j += 2 + nmatches
                         edge = sig
-                    elseif edge isa Core.MembershipCell
-                        # a final cell (compiler §4.8, §9): the code holds until the pair's
-                        # membership, if one is in force here
-                        j += 1
-                        min_valid2 = UInt(1)
-                        max_valid2 = typemax(UInt)
-                        if getfield(edge, :isfinal) != 0x00
-                            opened = @atomic :monotonic edge.min_world
-                            opened == typemax(UInt) || (max_valid2 = opened - 1)
-                        end
-                    elseif edge isa Core.MembershipEntry
-                        # a positive membership the code folded (compiler §3.1, §9): valid from
-                        # the entry's world in this session, if it is in force here
-                        j += 1
-                        if ccall(:jl_membership_in_force, Cint, (Any,), edge) != 0
-                            min_valid2 = edge.min_world
-                            max_valid2 = @atomic :monotonic edge.max_world
-                        else
-                            min_valid2 = UInt(1)
-                            max_valid2 = UInt(0)
-                        end
                     elseif edge isa Core.Binding
                         j += 1
                         min_valid2 = minworld

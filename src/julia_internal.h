@@ -477,9 +477,6 @@ extern jl_genericmemory_t *jl_func_set_methods JL_GLOBALLY_ROOTED; // each funct
 extern jl_value_t *jl_split_table_miss_func JL_GLOBALLY_ROOTED; // the split tables' miss (gf.c, compiler §7.3)
 JL_DLLEXPORT jl_value_t *jl_call_shadows(jl_value_t *tt, jl_value_t *m0, int allow_final);
 // membership cells (compiler §5.6, datatype.c)
-JL_DLLEXPORT jl_value_t *jl_membership_cell(jl_value_t *member, jl_value_t *set);
-void jl_membership_cell_register(jl_membership_cell_t *cell);
-void jl_membership_update_cells(jl_value_t *set_instance, size_t world);
 void jl_activate_memberships(jl_array_t *list, size_t world);
 void jl_memberships_activated(jl_array_t *list, size_t world);
 JL_DLLEXPORT extern arraylist_t jl_linkage_blobs; // external linkage: sysimg/pkgimages
@@ -1512,6 +1509,10 @@ JL_DLLEXPORT jl_genericmemory_t *jl_idtable_rehash(jl_genericmemory_t *a, size_t
 _Atomic(jl_value_t*) *jl_table_peek_bp(jl_genericmemory_t *a, jl_value_t *key) JL_NOTSAFEPOINT;
 
 JL_DLLEXPORT jl_method_t *jl_new_method_uninit(jl_module_t*);
+jl_method_t *jl_new_membership_method(jl_module_t *module, jl_value_t *sig); // W-141
+JL_DLLEXPORT jl_value_t *jl_implements_functype(void); // W-141: typeof(Core.implements), or NULL
+int jl_is_implements_sig(jl_value_t *sig); // W-141
+JL_DLLEXPORT jl_value_t *jl_gf_invoke_lookup(jl_value_t *types, jl_value_t *mt, size_t world);
 
 jl_module_t *jl_new_module_(jl_sym_t *name, jl_module_t *parent, uint8_t default_using_core, uint8_t self_name);
 jl_module_t *jl_add_standard_imports(jl_module_t *m);

@@ -173,7 +173,7 @@ static int names_foreign_var(jl_value_t *v, jl_value_t *pattern)
 // the entry's world range, so it stays invisible until the caller publishes `world`
 static jl_value_t *publish_entry(jl_typename_t *tn, jl_typename_t *setname, jl_value_t *member,
                                  jl_value_t *set_instance, jl_value_t *declarer, jl_value_t *by,
-                                 jl_value_t *receiver, size_t world)
+                                 jl_value_t *receiver, size_t world, jl_value_t *method)
 {
     jl_value_t *entry_v = jl_gc_alloc(jl_current_task->ptls, sizeof(jl_membership_t),
                                       jl_membership_type);
@@ -189,6 +189,7 @@ static jl_value_t *publish_entry(jl_typename_t *tn, jl_typename_t *setname, jl_v
     jl_membership_changed(world);   // a redeclaration's old entry ends at world - 1 too
     entry->declarer = declarer;
     entry->by = by;
+    entry->method = method;
     jl_svec_t *old = jl_typename_memberships(tn);
     nd = (jl_value_t*)jl_alloc_svec_uninit(jl_svec_len(old) + 1);
     jl_svec_t *newsvec = (jl_svec_t*)nd;
@@ -464,24 +465,6 @@ static int intersection_met(jl_value_t *member, jl_typename_t *setname, size_t w
     return met;
 }
 
-static int cell_holds(jl_value_t *member, jl_typename_t *setname, size_t world);
-
-// a cell's state: a final cell of an abstract type holds where its intersection with the set is met
-static int cell_holds_as(jl_value_t *member, jl_typename_t *setname, int isfinal, size_t world)
-{
-    if (isfinal && abstract_member(member))
-        return intersection_met(member, setname, world);
-    return cell_holds(member, setname, world);
-}
-
-static int cell_holds(jl_value_t *member, jl_typename_t *setname, size_t world)
-{
-    if (member == (jl_value_t*)jl_datatype_type || member == (jl_value_t*)jl_unionall_type ||
-        member == (jl_value_t*)jl_uniontype_type)
-        return jl_set_meets_kinds(setname, world);
-    return jl_membership_holds_at(member, setname->wrapper, world);
-}
-
 static void cells_list_add(jl_typename_t *setname, jl_value_t *cell)
 {
     jl_svec_t *old = jl_set_cells ? (jl_svec_t*)jl_eqtable_get(jl_set_cells, (jl_value_t*)setname, NULL) : NULL;
@@ -497,9 +480,32 @@ static void cells_list_add(jl_typename_t *setname, jl_value_t *cell)
     JL_GC_POP();
 }
 
-// The cell of the member type `member` and the set `set` (a set, or its TypeName): one per pair in a
-// session, made on demand, a guard's (isfinal 0) or a final negative's (1, compiler §4.8). Its world is
-// the membership's where `member` is a member already.
+// The signature at which a negative of the pair (`member`, the set `set`) is relied on (W-141; compiler
+// §4.8): `Tuple{typeof(implements), Type{<:X}, Type{S}}`, with `Type{<:S}` for an abstract type, whose
+// negative says that no type under it is in the set. A membership's method that meets it ends the code
+// that recorded it, as a method ends a call that found none. One object per pair in a session, so that
+// a frame's edges compare by identity.
+static jl_value_t *absence_sig(jl_value_t *member, jl_typename_t *setname)
+{
+    jl_value_t *ft = jl_implements_functype();
+    if (ft == NULL)
+        jl_error("Core.implements is not defined");
+    jl_value_t *tvx = NULL, *tvm = NULL, *px = NULL, *pm = NULL, *sig = NULL;
+    JL_GC_PUSH5(&tvx, &tvm, &px, &pm, &sig);
+    tvx = (jl_value_t*)jl_new_typevar(jl_symbol("X"), jl_bottom_type, setname->wrapper);
+    px = jl_apply_type1((jl_value_t*)jl_type_type, tvx);
+    if (abstract_member(member))
+        tvm = (jl_value_t*)jl_new_typevar(jl_symbol("S"), jl_bottom_type, member);
+    pm = jl_apply_type1((jl_value_t*)jl_type_type, tvm ? tvm : member);
+    jl_value_t *params[3] = {ft, px, pm};
+    sig = jl_apply_tuple_type_v(params, 3);
+    if (tvm)
+        sig = jl_new_struct(jl_unionall_type, tvm, sig);
+    sig = jl_new_struct(jl_unionall_type, tvx, sig);
+    JL_GC_POP();
+    return sig;
+}
+
 static jl_value_t *membership_cell(jl_value_t *member, jl_value_t *set, int isfinal)
 {
     jl_typename_t *setname;
@@ -508,64 +514,33 @@ static jl_value_t *membership_cell(jl_value_t *member, jl_value_t *set, int isfi
     else {
         jl_value_t *u = jl_unwrap_unionall(set);
         if (!jl_is_datatype(u) || !((jl_datatype_t*)u)->name->open_set)
-            jl_error("a membership cell is of a set");
+            jl_error("a membership's absence is asked of a set");
         setname = ((jl_datatype_t*)u)->name;
     }
-    jl_value_t *cell = NULL;
-    JL_GC_PUSH1(&cell);
+    jl_value_t *sig = NULL;
+    JL_GC_PUSH1(&sig);
     JL_LOCK(&cells_lock);
+    // the session's signatures at this set: [member, signature, ...]
     jl_svec_t *list = jl_set_cells ? (jl_svec_t*)jl_eqtable_get(jl_set_cells, (jl_value_t*)setname, NULL) : NULL;
-    for (size_t i = 0; list != NULL && i < jl_svec_len(list); i++) {
-        jl_membership_cell_t *c = (jl_membership_cell_t*)jl_svecref(list, i);
-        if (c->isfinal == isfinal && (c->member == member || jl_types_equal(c->member, member))) {
-            cell = (jl_value_t*)c;
+    for (size_t i = 0; list != NULL && i + 1 < jl_svec_len(list); i += 2) {
+        jl_value_t *m = jl_svecref(list, i);
+        if (m == member || jl_types_equal(m, member)) {
+            sig = jl_svecref(list, i + 1);
             break;
         }
     }
-    if (cell == NULL) {
-        cell = jl_gc_alloc(jl_current_task->ptls, sizeof(jl_membership_cell_t), jl_membership_cell_type);
-        jl_membership_cell_t *c = (jl_membership_cell_t*)cell;
-        c->member = member;
-        c->set = (jl_value_t*)setname;
-        c->backedges = NULL;
-        c->isfinal = isfinal;
-        size_t world = jl_atomic_load_acquire(&jl_world_counter);
-        jl_atomic_store_relaxed(&c->min_world, cell_holds_as(member, setname, isfinal, world) ? (uint64_t)world : ~(uint64_t)0);
-        cells_list_add(setname, cell);
+    if (sig == NULL) {
+        sig = absence_sig(member, setname);
+        cells_list_add(setname, member);
+        cells_list_add(setname, sig);
     }
     JL_UNLOCK(&cells_lock);
     JL_GC_POP();
-    return cell;
+    return sig;
 }
 JL_DLLEXPORT jl_value_t *jl_membership_final_cell(jl_value_t *member, jl_value_t *set)
 {
     return membership_cell(member, set, 1);
-}
-
-// A CodeInstance relied on the final negative of a final cell's pair (compiler §4.8): the cell's opening
-// invalidates it. Where the cell is open already, the code is invalid from the cell's world.
-JL_DLLEXPORT void jl_membership_final_cell_add_backedge(jl_value_t *cellv, jl_code_instance_t *caller)
-{
-    jl_membership_cell_t *c = (jl_membership_cell_t*)cellv;
-    if (!c->isfinal)
-        return;
-    JL_LOCK(&cells_lock);
-    uint64_t opened = jl_atomic_load_relaxed(&c->min_world);
-    if (opened == ~(uint64_t)0) {
-        if (c->backedges == NULL) {
-            c->backedges = jl_alloc_vec_any(0);
-            jl_gc_wb(c, c->backedges);
-        }
-        size_t n = jl_array_nrows(c->backedges), i;
-        for (i = 0; i < n; i++)
-            if (jl_array_ptr_ref(c->backedges, i) == (jl_value_t*)caller)
-                break;
-        if (i == n)
-            jl_array_ptr_1d_push(c->backedges, (jl_value_t*)caller);
-    }
-    JL_UNLOCK(&cells_lock);
-    if (opened != ~(uint64_t)0 && jl_atomic_load_relaxed(&caller->max_world) >= opened)
-        jl_invalidate_code_instance(caller, (size_t)opened - 1);
 }
 
 // A module is loaded once its package has finished loading (compiler §4.8): it, or a module it is
@@ -660,74 +635,6 @@ JL_DLLEXPORT jl_value_t *jl_membership_final_cells(jl_value_t *a, jl_value_t *b)
     jl_value_t *out = (c1 && c2) ? (jl_value_t*)jl_svec2(c1, c2) : (jl_value_t*)jl_svec1(c1 ? c1 : c2);
     JL_GC_POP();
     return out;
-}
-
-// The final cells a membership just opened (under cells_lock): their dependents are invalidated once
-// the lock is released, from the opening world on (compiler §4.8).
-static void final_cells_invalidate(arraylist_t *opened, size_t world)
-{
-    for (size_t i = 0; i < opened->len; i++) {
-        jl_membership_cell_t *c = (jl_membership_cell_t*)opened->items[i];
-        JL_LOCK(&cells_lock);
-        jl_array_t *be = c->backedges;
-        c->backedges = NULL;
-        JL_UNLOCK(&cells_lock);
-        if (be == NULL)
-            continue;
-        JL_GC_PUSH1(&be);
-        for (size_t j = 0; j < jl_array_nrows(be); j++)
-            jl_invalidate_code_instance((jl_code_instance_t*)jl_array_ptr_ref(be, j), world - 1);
-        JL_GC_POP();
-    }
-}
-
-// A cell an image brings (compiler §9): registered with this session's cells, its world this session's.
-void jl_membership_cell_register(jl_membership_cell_t *cell)
-{
-    JL_LOCK(&cells_lock);
-    jl_typename_t *setname = (jl_typename_t*)cell->set;
-    size_t world = jl_atomic_load_acquire(&jl_world_counter);
-    jl_atomic_store_release(&cell->min_world,
-        cell_holds_as(cell->member, setname, cell->isfinal, world) ? (uint64_t)world : ~(uint64_t)0);
-    cells_list_add(setname, (jl_value_t*)cell);
-    JL_UNLOCK(&cells_lock);
-}
-
-// After a membership in `set_instance` is published in `world`: the cells of that set, and of every
-// set it joins, whose member is now a member, hold from `world`. Called under the world counter's lock.
-void jl_membership_update_cells(jl_value_t *set_instance, size_t world)
-{
-    jl_value_t *u = jl_unwrap_unionall(set_instance);
-    if (!jl_is_datatype(u) || jl_set_cells == NULL)
-        return;
-    jl_typename_t *from = ((jl_datatype_t*)u)->name;
-    arraylist_t opened;
-    arraylist_new(&opened, 0);
-    JL_LOCK(&cells_lock);
-    jl_genericmemory_t *table = jl_set_cells;
-    for (size_t k = 0; k + 1 < table->length; k += 2) {
-        jl_value_t *key = jl_genericmemory_ptr_ref(table, k);
-        jl_value_t *val = jl_genericmemory_ptr_ref(table, k + 1);
-        if (key == NULL || val == NULL)
-            continue;
-        jl_typename_t *setname = (jl_typename_t*)key;
-        if (setname != from && !jl_typename_reaches(from, setname, world))
-            continue;
-        jl_svec_t *list = (jl_svec_t*)val;
-        for (size_t i = 0; i < jl_svec_len(list); i++) {
-            jl_membership_cell_t *c = (jl_membership_cell_t*)jl_svecref(list, i);
-            if (jl_atomic_load_relaxed(&c->min_world) != ~(uint64_t)0)
-                continue;
-            if (cell_holds_as(c->member, setname, c->isfinal, world)) {
-                jl_atomic_store_release(&c->min_world, (uint64_t)world);
-                if (c->isfinal)
-                    arraylist_push(&opened, c);
-            }
-        }
-    }
-    JL_UNLOCK(&cells_lock);
-    final_cells_invalidate(&opened, world);
-    arraylist_free(&opened);
 }
 
 // The memberships declared in this session, as [home TypeName, entry, ...]. A package image
@@ -855,7 +762,6 @@ void jl_memberships_activated(jl_array_t *list, size_t world)
         jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i + 1);
         if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
             continue;
-        jl_membership_update_cells(en->instance, world);
         jl_membership_dispatch_walk(en->member, en->instance, world);
         if (!collect) {
             jl_membership_ambiguity_report(en->member, en->instance, world);
@@ -1255,6 +1161,31 @@ static jl_value_t *ambiguity_message(const char *head, jl_value_t *member, jl_va
     return msg;
 }
 
+static jl_value_t *instance_body(jl_value_t *inst, jl_value_t *pattern);
+
+// The signature of a membership's method (W-141): `Tuple{typeof(implements), Type{X}, Type{S}}` under
+// the member pattern's variables; `Type{<:S}` for an abstract member, every type under which is a member.
+static jl_value_t *membership_method_sig(jl_value_t *member, jl_value_t *set_instance)
+{
+    jl_value_t *ft = jl_implements_functype();
+    jl_value_t *pattern = jl_unwrap_unionall(member);
+    if (ft == NULL || !jl_is_datatype(pattern))
+        return NULL;
+    jl_value_t *tvm = NULL, *px = NULL, *pm = NULL, *sig = NULL;
+    JL_GC_PUSH4(&tvm, &px, &pm, &sig);
+    px = jl_apply_type1((jl_value_t*)jl_type_type, instance_body(set_instance, member));
+    if (((jl_datatype_t*)pattern)->name->abstract)
+        tvm = (jl_value_t*)jl_new_typevar(jl_symbol("S"), jl_bottom_type, pattern);
+    pm = jl_apply_type1((jl_value_t*)jl_type_type, tvm ? tvm : pattern);
+    jl_value_t *params[3] = {ft, px, pm};
+    sig = jl_apply_tuple_type_v(params, 3);
+    if (tvm)
+        sig = jl_new_struct(jl_unionall_type, tvm, sig);
+    sig = jl_rewrap_unionall(sig, member);
+    JL_GC_POP();
+    return sig;
+}
+
 // Declare `member` a member of the set `set_instance` names (compiler §4.2-§4.6).
 // The library checks ownership and the contract first; the runtime checks what
 // keeps subtyping sound: an open set, no cycle among sets, one instance per member.
@@ -1290,6 +1221,21 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         jl_error("a membership's forwarding field is a Symbol or nothing");
     if (names_foreign_var(set_instance, member))
         jl_error("a membership's set instance names a type variable its member pattern does not");
+    // the membership's method (W-141): made and added to the table here, activated below in the
+    // entry's world, under the same lock
+    jl_value_t *msig = NULL;
+    jl_method_t *mmeth = NULL;
+    jl_typemap_entry_t *mentry = NULL;
+    jl_value_t *entry = NULL;
+    jl_array_t *ended = NULL, *found = NULL;
+    jl_value_t *msg = NULL;
+    JL_GC_PUSH7(&msig, &mmeth, &mentry, &entry, &ended, &found, &msg);
+    msig = membership_method_sig(member, set_instance);
+    if (msig != NULL) {
+        mmeth = jl_new_membership_method(jl_is_module(declarer) ? (jl_module_t*)declarer : jl_main_module, msig);
+        if (mmeth != NULL)
+            mentry = jl_method_table_add(jl_method_table, mmeth, NULL);
+    }
     JL_LOCK(&world_counter_lock);
     if (!jl_atomic_load_relaxed(&allow_new_worlds)) {
         JL_UNLOCK(&world_counter_lock);
@@ -1309,10 +1255,6 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     // the same pattern at the same inputs.
     int redeclare = 0;
     int strict = jl_atomic_load_relaxed(&strict_memberships);
-    jl_value_t *entry = NULL;
-    jl_array_t *ended = NULL, *found = NULL;
-    jl_value_t *msg = NULL;
-    JL_GC_PUSH4(&entry, &ended, &found, &msg);
     if (jl_is_concrete_type(member)) {
         size_t mq = jl_set_membership_query_world(world);
         entry = set_at_inputs(setname, (jl_datatype_t*)setuw);
@@ -1365,7 +1307,8 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     }
     // what the ambiguity search reads: the member's list and the set's entries. The entry begins at
     // min_world, past every task's world until the counter advances (§4.3)
-    entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world);
+    entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world,
+                          mmeth != NULL ? (jl_value_t*)mmeth : jl_nothing);
     index_entry((jl_membership_t*)entry);
     if (strict) {
         // strict mode (traits §12.3): the ambiguities the entry makes, asked in its world before the
@@ -1392,11 +1335,18 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         jl_declared_memberships = jl_alloc_vec_any(0);
     jl_array_ptr_1d_push(jl_declared_memberships, (jl_value_t*)home);
     jl_array_ptr_1d_push(jl_declared_memberships, entry);
+    if (mentry != NULL) {
+        // the method begins in the entry's world; its insertion ends the code that relied on the
+        // pair's absence, through the table's backedges (W-141)
+        size_t mqm = jl_set_membership_query_world(min_world);
+        jl_atomic_store_relaxed(&mmeth->primary_world, min_world);
+        jl_method_table_activate(mentry);
+        jl_set_membership_query_world(mqm);
+    }
     jl_atomic_store_release(&jl_world_counter, min_world);
     // the stopgap (compiler C-18): replay dispatch for the methods the member can now
     // reach, then report the ambiguities, both at the entry's world
     size_t mq = jl_set_membership_query_world(min_world);
-    jl_membership_update_cells(set_instance, min_world);
     jl_membership_dispatch_walk(member, set_instance, min_world);
     jl_membership_ambiguity_report(member, set_instance, min_world);
     jl_set_membership_query_world(mq);

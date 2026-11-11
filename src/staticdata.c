@@ -727,19 +727,6 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
             }
         }
     }
-    if (jl_typetagis(v, jl_membership_cell_type)) {
-        // a final cell's dependents (compiler §4.8): a package image drops them, and its validation adds
-        // back those of its code that hold; the system image keeps those it keeps, pruned below
-        jl_membership_cell_t *c = (jl_membership_cell_t*)v;
-        if (s->incremental || jl_options.trim || jl_options.strip_ir) {
-            record_field_change((jl_value_t**)&c->backedges, NULL);
-        }
-        else {
-            jl_value_t *backedges = get_replaceable_field((jl_value_t**)&c->backedges, 1);
-            if (backedges)
-                jl_queue_for_serialization_(s, (jl_value_t*)((jl_array_t*)backedges)->ref.mem, 0, 1);
-        }
-    }
     if (s->incremental && jl_is_globalref(v)) {
         jl_globalref_t *gr = (jl_globalref_t*)v;
         if (jl_object_in_image((jl_value_t*)gr->mod)) {
@@ -1728,14 +1715,6 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                     jl_atomic_store_relaxed(&newentry->min_world, 1);
                     jl_atomic_store_relaxed(&newentry->max_world, 0);
                 }
-            }
-            else if (s->incremental && jl_typetagis(v, jl_membership_cell_type)) {
-                // a membership cell (compiler §5.6, §9) joins the loading session's cells, with its
-                // world: listed to be registered at load
-                assert(f == s->s);
-                jl_membership_cell_t *nc = (jl_membership_cell_t*)&s->s->buf[reloc_offset];
-                jl_atomic_store_relaxed(&nc->min_world, ~(uint64_t)0);
-                arraylist_push(&s->fixup_objs, (void*)reloc_offset);
             }
             else if (s->incremental && jl_typetagis(v, jl_membership_type)) {
                 // an entry the image's modules declared is in force from the world it is activated
@@ -3212,11 +3191,6 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
                 jl_value_t *backedges = get_replaceable_field((jl_value_t**)&b->backedges, 1);
                 jl_prune_binding_backedges((jl_array_t*)backedges);
             }
-            else if (jl_typetagis(v, jl_membership_cell_type)) {
-                jl_membership_cell_t *c = (jl_membership_cell_t*)v;
-                jl_value_t *backedges = get_replaceable_field((jl_value_t**)&c->backedges, 1);
-                jl_prune_binding_backedges((jl_array_t*)backedges);
-            }
             else if (jl_is_mtable(v)) {
                 jl_methtable_t *mt = (jl_methtable_t*)v;
                 jl_value_t *backedges = get_replaceable_field((jl_value_t**)&mt->backedges, 1);
@@ -4309,9 +4283,6 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         if (jl_typetagis(obj, jl_typemap_entry_type) || jl_is_method(obj) || jl_is_code_instance(obj)) {
             jl_array_ptr_1d_push(*internal_methods, obj);
             assert(s.incremental);
-        }
-        else if (jl_typetagis(obj, jl_membership_cell_type)) {
-            jl_membership_cell_register((jl_membership_cell_t*)obj);
         }
         else if (jl_is_method_instance(obj)) {
             jl_method_instance_t *newobj = jl_specializations_get_or_insert((jl_method_instance_t*)obj);

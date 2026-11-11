@@ -440,6 +440,12 @@ struct ArgumentError <: Exception
     msg::AbstractString
 end
 
+# A membership is a method of `implements` (W-141): `S <: X` by a membership holds where it has a method
+# at `(Type{X}, Type{S})`. The runtime defines the method when a membership is declared; its body is
+# the template's.
+function implements end
+_implements_body(@nospecialize(X), @nospecialize(S)) = nothing
+
 # A member of the set `X` kept with the attribute `Dynamic` (compiler §6.9; traits §7.7): an ordinary
 # struct with no rule of subtyping. The library declares its memberships and defines its methods.
 struct Dynamic{X}
