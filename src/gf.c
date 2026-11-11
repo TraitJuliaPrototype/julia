@@ -8528,8 +8528,9 @@ static void membership_ambig_found(jl_array_t *found, jl_method_t *m, jl_value_t
         JL_GC_POP();
         return;
     }
+    // a signature prints as a call, `f(X, Int64)`, not as its tuple type (traits §6.3, §11.3)
     jl_printf(JL_STDERR, "WARNING: method %s at ", jl_symbol_name(m->name));
-    jl_static_show(JL_STDERR, (jl_value_t*)m->sig);
+    jl_static_show_func_sig(JL_STDERR, (jl_value_t*)m->sig);
     jl_printf(JL_STDERR, " is ambiguous for ");
     jl_static_show(JL_STDERR, member);
     jl_printf(JL_STDERR, ", a member of ");
@@ -8538,11 +8539,11 @@ static void membership_ambig_found(jl_array_t *found, jl_method_t *m, jl_value_t
     for (size_t i = 0; i < jl_svec_len(tied); i++) {
         if (i > 0)
             jl_printf(JL_STDERR, " and ");
-        jl_static_show(JL_STDERR, jl_svecref(tied, i));
+        jl_static_show_func_sig(JL_STDERR, jl_svecref(tied, i));
     }
     if (joint) {
         jl_printf(JL_STDERR, "; a method at ");
-        jl_static_show(JL_STDERR, joint);
+        jl_static_show_func_sig(JL_STDERR, joint);
         jl_printf(JL_STDERR, " would resolve it");
     }
     jl_printf(JL_STDERR, "\n");
