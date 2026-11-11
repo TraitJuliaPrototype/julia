@@ -1077,13 +1077,7 @@ JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src)
                         m->facts = (m->facts & 3) | 8;
                 }
             }
-            if (nargs == 1 && jl_exprarg(st, 0) == (jl_value_t*)jl_symbol("serves_no_member")) {
-                // a method at a set that serves no member, so it can only raise there (compiler §5.6,
-                // §6.8; open issue 158 (a)): no shadow, read before the method's insertion
-                m->declared_covers |= 2;
-                st = jl_nothing;
-            }
-            else if (nargs == 1 && (jl_exprarg(st, 0) == (jl_value_t*)jl_facts_boundary_sym ||
+            if (nargs == 1 && (jl_exprarg(st, 0) == (jl_value_t*)jl_facts_boundary_sym ||
                                jl_exprarg(st, 0) == (jl_value_t*)jl_facts_always_sym)) {
                 // the method's policy (compiler §2.2): a boundary, or always facts
                 m->facts = (m->facts & ~3) | (jl_exprarg(st, 0) == (jl_value_t*)jl_facts_always_sym ? 2 : 1);

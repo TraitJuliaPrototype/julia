@@ -240,9 +240,8 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
                         j += 2 + nmatches
                         edge = sig
                     elseif edge isa Core.MembershipCell
-                        # a guard's cell (compiler §5.6, §9): registered at load, it invalidates nothing
-                        # (and bounds no world, so the log does not name it as a cause); a final cell
-                        # (§4.8): the code holds until the pair's membership, if one is in force here
+                        # a final cell (compiler §4.8, §9): the code holds until the pair's
+                        # membership, if one is in force here
                         j += 1
                         min_valid2 = UInt(1)
                         max_valid2 = typemax(UInt)

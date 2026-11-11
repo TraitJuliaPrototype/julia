@@ -117,7 +117,7 @@ end
 # a call's info whose edges stay result edges where the call is emitted as an `:invoke`: dispatch
 # alone, with no constant result used in place of the callee's own
 function plain_call_info(@nospecialize info)
-    while info isa SplitCallInfo || info isa GuardedCallInfo || info isa AttributedCallInfo
+    while info isa SplitCallInfo || info isa AttributedCallInfo
         info = info.info
     end
     info isa MethodMatchInfo && return true
@@ -948,8 +948,7 @@ function Base.iterate(it::ForwardToBackedgeIterator, i::Int = 1)
             return ((nothing, item), i + 1)
         elseif isa(item, Core.MembershipEntry) || isa(item, Core.MembershipCell)
             # a positive membership the code folded (compiler §3.1): it never ends while the
-            # code is valid (§4.3), so it takes no backedge; a membership cell (§5.6) is read by the
-            # code's guard, which a membership never invalidates; a final cell (§4.8) keeps its
+            # code is valid (§4.3), so it takes no backedge; a final cell (§4.8) keeps its
             # dependents itself (`store_backedges`)
             i += 1
             continue

@@ -111,6 +111,47 @@ function record_callable_dispatch!(sv::InferenceState, @nospecialize(spec), @nos
     end
     return nothing
 end
+# A method at `Callable{A, S}` that the call does not match rests on the absence of the argument's own
+# methods at `A` (compiler §7.4): the code holds an edge to the argument's dispatch at `A`, so a method
+# of the argument's type defined later, which can begin the membership, invalidates it as any method
+# does. Where `A` names the method's variables, the edge is to every call of the argument.
+function record_callable_absences!(sv::InferenceState, @nospecialize(matches))
+    infos = matches isa MethodMatches ? MethodMatchInfo[matches.info] : matches.info.split
+    cname = unwrap_unionall(Core.Callable).name
+    for info in infos
+        s = unwrap_unionall(info.atype)
+        (s isa DataType && length(s.parameters) >= 2) || continue
+        ms = ccall(:jl_func_methods_at_sets, Any, (Any,), s.parameters[1])::SimpleVector
+        for k = 1:length(ms)
+            mz = ms[k]::Method
+            matched = false
+            for m in info.results.matches
+                (m::MethodMatch).method === mz && (matched = true; break)
+            end
+            matched && continue
+            d = unwrap_unionall(mz.sig)
+            d isa DataType || continue
+            for i = 2:min(length(s.parameters), length(d.parameters))
+                di = d.parameters[i]
+                di isa TypeVar && (di = di.ub)
+                du = unwrap_unionall(di)
+                du isa DataType || continue
+                du.name === cname || continue
+                F = s.parameters[i]
+                (isa(F, DataType) && isconcretetype(F)) || continue
+                A = length(du.parameters) == 2 ? du.parameters[1] : nothing
+                etype = (A isa DataType && A <: Tuple && !has_free_typevars(A)) ?
+                    Tuple{F, A.parameters...} : Tuple{F, Vararg{Any}}
+                r = findall(etype, method_table(sv.interp); limit = -1)
+                r === nothing && continue
+                einfo = MethodMatchInfo(r, Core.methodtable, etype, any(m::MethodMatch -> m.fully_covers, r))
+                add_edges!(sv.edges, einfo)
+                update_valid_age!(sv, r.valid_worlds)
+            end
+        end
+    end
+    return nothing
+end
 any_ambig(result::MethodLookupResult) = result.ambig
 any_ambig(info::MethodMatchInfo) = any_ambig(info.results)
 any_ambig(m::MethodMatches) = any_ambig(m.info)
@@ -464,9 +505,8 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
 
     (; valid_worlds, applicable) = matches
     update_valid_age!(sv, valid_worlds) # need to record the negative world now, since even if we don't generate any useful information, inlining might want to add an invoke edge and it won't have this information anymore
-    # the guard of a call a later membership could change (compiler §5.6)
-    gcells, grt = call_shadows(matches, sv)
     sv isa InferenceState && record_match_memberships!(sv, applicable)
+    sv isa InferenceState && record_callable_absences!(sv, matches)
     # a member's check (compiler §10.4): inference reads the answers and runs no check. A call at a
     # member whose check failed is left to dispatch, which raises the failure; a member with no answer
     # is noted, and the compile queue asks the hook before the code runs
@@ -701,13 +741,6 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         end
 
         rettype, exctype, effects = state.rettype, state.exctype, state.all_effects
-        if !isempty(gcells)
-            # a guarded call: the selected method's result or a shadowing method's (compiler §5.6)
-            retinfo = GuardedCallInfo(retinfo, gcells)
-            rettype = rettype ⊔ₚ grt
-            exctype = Any
-            effects = Effects()
-        end
         gfresult[] = CallMeta(rettype, exctype, effects,
                               attributed_info(retinfo, amask, adyn, acast, adispatch), state.slotrefinements)
         return true
@@ -860,41 +893,6 @@ function attributed_matches(m::UnionSplitMethodMatches, mask::UInt32, dyn::UInt3
     end
     changed || return (m, dispatch)
     return (UnionSplitMethodMatches(applicable, m.applicable_argtypes, UnionSplitInfo(infos), m.valid_worlds), dispatch)
-end
-
-# The shadows of a call (compiler §5.6): for each signature the call is inferred at, the membership
-# cells of the arguments whose type could join a set at which another method would then be selected,
-# and those methods' declared results. A pair whose negative is final (compiler §4.8) needs no guard:
-# the frame records its final cell instead, where there is a frame to record it in.
-function call_shadows(matches::Union{MethodMatches,UnionSplitMethodMatches}, sv::AbsIntState)
-    infos = matches isa MethodMatches ? MethodMatchInfo[matches.info] : matches.info.split
-    allow_final = sv isa InferenceState
-    cells = Any[]
-    rt = Bottom
-    for info in infos
-        m0 = nothing
-        for m in info.results.matches
-            if (m::MethodMatch).fully_covers
-                m0 = m.method
-                break
-            end
-        end
-        sh = ccall(:jl_call_shadows, Any, (Any, Any, Cint), info.atype, m0, allow_final)::SimpleVector
-        isempty(sh) && continue
-        cs = sh[1]::SimpleVector
-        rs = sh[2]::SimpleVector
-        for c in sh[3]::SimpleVector
-            fedges = (sv::InferenceState).edges
-            any(x -> x === c, fedges) || push!(fedges, c)
-        end
-        for i = 1:length(cs)
-            c = cs[i]
-            any(x -> x === c, cells) || push!(cells, c)
-            r = rs[i]
-            rt = isa(r, Type) ? tmerge(JLTypeLattice(), rt, r) : Any
-        end
-    end
-    return cells, rt
 end
 
 attributed_info(@nospecialize(info::CallInfo), mask::UInt32, dyn::UInt32, cast::Bool, dispatch::Bool) =

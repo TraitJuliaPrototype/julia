@@ -60,10 +60,9 @@ struct UnionSplit
     bbs::Vector{Int}
     fallback_rt::Any # an operation's split (compiler §7.2): its declared result, else nothing
     table::Any       # and the table of its last branch (§7.3), or nothing for the dynamic call
-    guard::Vector{Any} # a guarded call's cells (§5.6): each case also requires every one closed
     UnionSplit(handled_all_cases::Bool, fully_covered::Bool, atype::DataType, cases::Vector{InliningCase},
-               @nospecialize(fallback_rt = nothing), @nospecialize(table = nothing), guard::Vector{Any} = Any[]) =
-        new(handled_all_cases, fully_covered, atype, cases, Int[], fallback_rt, table, guard)
+               @nospecialize(fallback_rt = nothing), @nospecialize(table = nothing)) =
+        new(handled_all_cases, fully_covered, atype, cases, Int[], fallback_rt, table)
 end
 
 struct InliningEdgeTracker
@@ -610,23 +609,12 @@ assuming their order stays the same post-discovery in `ml_matches`.
 function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::Vector{Any},
                                union_split::UnionSplit, boundscheck::Symbol,
                                todo_bbs::Vector{Tuple{Int,Int}}, interp::AbstractInterpreter)
-    (; handled_all_cases, fully_covered, atype, cases, bbs, fallback_rt, table, guard) = union_split
+    (; handled_all_cases, fully_covered, atype, cases, bbs, fallback_rt, table) = union_split
     stmt, typ, line = compact.result[idx][:stmt], compact.result[idx][:type], compact.result[idx][:line]
     join_bb = bbs[end]
     pn = PhiNode()
     local bb = compact.active_result_bb
     ncases = length(cases)
-    # a guarded call (compiler §5.6): its cases run while every cell is closed, its world `typemax`;
-    # once a membership opens one, the call dispatches when it runs
-    gcond = true
-    for cell in guard
-        w = insert_node_here!(compact, NewInstruction(
-            Expr(:call, GlobalRef(Core, :getfield), cell, QuoteNode(:min_world), QuoteNode(:monotonic)), UInt64, line))
-        c = insert_node_here!(compact, NewInstruction(
-            Expr(:call, GlobalRef(Core, :(===)), w, typemax(UInt64)), Bool, line))
-        gcond = gcond === true ? c :
-            insert_node_here!(compact, NewInstruction(Expr(:call, and_int, gcond, c), Bool, line))
-    end
     @assert length(bbs) >= ncases
     for i = 1:ncases
         ithcase = cases[i]
@@ -637,9 +625,6 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
         nparams = fieldcount(atype)
         @assert nparams == fieldcount(mtype)
         if !(i == ncases && fully_covered && handled_all_cases)
-            if gcond !== true
-                cond = gcond
-            end
             for i = 1:nparams
                 aft, mft = fieldtype(atype, i), fieldtype(mtype, i)
                 # If this is always true, we don't need to check for it
@@ -1583,11 +1568,6 @@ end
 function handle_call!(todo::Vector{Pair{Int,Any}},
     ir::IRCode, idx::Int, stmt::Expr, @nospecialize(info::CallInfo), flag::UInt32, sig::Signature,
     state::InliningState)
-    guard = nothing
-    if info isa GuardedCallInfo
-        guard = info.cells
-        info = info.info
-    end
     # an operation's split (compiler §7.2, open issue 167): its cases' edges are collected apart, and a
     # branch keeps its edge only where it is inlined or stays a direct call
     split = info isa SplitCallInfo
@@ -1601,13 +1581,6 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
     cases, handled_all_cases, fully_covered, joint_effects = cases
     atype = argtypes_to_type(sig.argtypes)
     atype === Union{} && return nothing # accidentally actually unreachable
-    if guard !== nothing
-        # a guarded call (compiler §5.6): its cases behind the guard, the dynamic call past it
-        split && append!(state.edges, estate.edges)
-        (isa(atype, DataType) && !isempty(cases) && all(c -> isa(c.sig, DataType), cases)) || return nothing
-        push!(todo, idx=>UnionSplit(false, fully_covered, atype, cases, nothing, nothing, guard))
-        return nothing
-    end
     # an operation's split (compiler §7.2): never fully covered, its branches asserted
     fallback_rt = split ? info.rt : nothing
     if fallback_rt !== nothing && isempty(cases)

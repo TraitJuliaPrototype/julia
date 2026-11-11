@@ -560,10 +560,6 @@ static jl_value_t *membership_cell(jl_value_t *member, jl_value_t *set, int isfi
     JL_GC_POP();
     return cell;
 }
-JL_DLLEXPORT jl_value_t *jl_membership_cell(jl_value_t *member, jl_value_t *set)
-{
-    return membership_cell(member, set, 0);
-}
 JL_DLLEXPORT jl_value_t *jl_membership_final_cell(jl_value_t *member, jl_value_t *set)
 {
     return membership_cell(member, set, 1);
@@ -655,10 +651,6 @@ JL_DLLEXPORT int jl_membership_final(jl_value_t *S, jl_value_t *X)
     if (abstract_member(S)) {
         // an abstract type (open issue 169): no subtype of it is in X while their intersection has no
         // type in the world; its final cell opens when one joins
-        // (at an abstract type the answer stays unsettled while a declarer loads and for a type or set
-        // of Main: gate n2_open_abstract gave a wrong method with it settled there; compiler C-88)
-        if (!module_loaded(xn->module) || !type_declarers_loaded(S, 0))
-            return 0;
         size_t world = jl_membership_query_world();
         if (world == 0)
             world = jl_atomic_load_acquire(&jl_world_counter);
@@ -710,27 +702,6 @@ static void final_cells_invalidate(arraylist_t *opened, size_t world)
             jl_invalidate_code_instance((jl_code_instance_t*)jl_array_ptr_ref(be, j), world - 1);
         JL_GC_POP();
     }
-}
-
-// After a method of the callable type `f` is activated in `world`: Callable's cells of `f` whose
-// membership the method begins open (compiler §5.6, §7.4). Called under the world counter's lock.
-void jl_membership_update_callable_cells(jl_value_t *f, size_t world)
-{
-    if (jl_set_cells == NULL || jl_callable_type == NULL)
-        return;
-    jl_typename_t *cname = ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type))->name;
-    JL_LOCK(&cells_lock);
-    jl_svec_t *list = (jl_svec_t*)jl_eqtable_get(jl_set_cells, (jl_value_t*)cname, NULL);
-    for (size_t i = 0; list != NULL && i < jl_svec_len(list); i++) {
-        jl_membership_cell_t *c = (jl_membership_cell_t*)jl_svecref(list, i);
-        if (jl_atomic_load_relaxed(&c->min_world) != ~(uint64_t)0)
-            continue;
-        if (c->member != f && !jl_types_equal(c->member, f))
-            continue;
-        if (cell_holds(c->member, cname, world))
-            jl_atomic_store_release(&c->min_world, (uint64_t)world);
-    }
-    JL_UNLOCK(&cells_lock);
 }
 
 // A cell an image brings (compiler §9): registered with this session's cells, its world this session's.
@@ -971,7 +942,19 @@ static int member_meets_others(jl_value_t *m, jl_value_t *comps, size_t skip)
         if (k == skip)
             continue;
         jl_value_t *c = jl_tparam(comps, k);
-        if (jl_is_concrete_type(m) ? !jl_subtype(m, c) : jl_has_empty_intersection(m, c))
+        jl_array_t *fv = NULL;
+        JL_GC_PUSH2(&c, &fv);
+        // a component of an intersection under a `where` (`All{AbstractVector{T}, X} where T`) names
+        // the variable free: it is closed over it here, each component by itself, which errs toward
+        // "met" (no type is a subtype of a type with a free variable)
+        if (jl_has_free_typevars(c)) {
+            fv = jl_find_free_typevars(c);
+            for (size_t j = jl_array_nrows(fv); j-- > 0; )
+                c = jl_type_unionall((jl_tvar_t*)jl_array_ptr_ref(fv, j), c);
+        }
+        int out = jl_is_concrete_type(m) ? !jl_subtype(m, c) : jl_has_empty_intersection(m, c);
+        JL_GC_POP();
+        if (out)
             return 0;
     }
     return 1;

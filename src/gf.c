@@ -2515,6 +2515,13 @@ static void open_set_walk_names(jl_value_t *v, jl_method_t *m, int depth)
     v = jl_unwrap_unionall(v);
     if (depth > 8)
         return;
+    if (jl_is_typevar(v)) {
+        // `f(c::C) where C <: X{T}`: the variable's bound names the set. Without this arm the method
+        // was indexed under no set, the membership's walk never replayed it, and a call cached before
+        // the membership kept its answer (gate m2_parametric_replay, `pc`)
+        open_set_walk_names(((jl_tvar_t*)v)->ub, m, depth + 1);
+        return;
+    }
     if (jl_is_vararg(v)) {
         open_set_walk_names(jl_unwrap_vararg(v), m, depth + 1);
         return;
@@ -2547,7 +2554,7 @@ static void open_set_walk_names(jl_value_t *v, jl_method_t *m, int depth)
 // called from jl_method_table_add. this is the only writer, and it runs before
 // insert takes world_counter_lock, so the lock stays the innermost nest (W4-10).
 // Each function's methods at an argument typed by a set (compiler §5.6): the function's TypeName to a
-// list of methods (a SimpleVector, replaced). The shadow query of a call reads its function's list.
+// list of methods (a SimpleVector, replaced). The declared results of a function's methods are read from it (§7.1).
 jl_genericmemory_t *jl_func_set_methods JL_GLOBALLY_ROOTED = NULL;
 
 static void index_func_set_method(jl_method_t *m)
@@ -2571,6 +2578,20 @@ static void index_func_set_method(jl_method_t *m)
         jl_func_set_methods = jl_alloc_memory_any(16);
     jl_func_set_methods = jl_eqtable_put(jl_func_set_methods, (jl_value_t*)fname, (jl_value_t*)nw, NULL);
     JL_GC_POP();
+}
+
+// A function's methods at sets (a SimpleVector, empty where it has none): inference reads the methods
+// at `Callable` that a call does not match (compiler §7.4).
+JL_DLLEXPORT jl_value_t *jl_func_methods_at_sets(jl_value_t *ft)
+{
+    ft = jl_unwrap_unionall(ft);
+    if (!jl_is_datatype(ft) || jl_func_set_methods == NULL)
+        return (jl_value_t*)jl_emptysvec;
+    jl_value_t *ms = NULL;
+    JL_LOCK(&open_set_methods_lock);
+    ms = jl_eqtable_get(jl_func_set_methods, (jl_value_t*)((jl_datatype_t*)ft)->name, NULL);
+    JL_UNLOCK(&open_set_methods_lock);
+    return ms ? ms : (jl_value_t*)jl_emptysvec;
 }
 
 static void jl_index_open_set_methods(jl_method_t *m)
@@ -2606,24 +2627,6 @@ JL_DLLEXPORT jl_value_t *jl_open_set_methods_of(jl_value_t *set)
     JL_UNLOCK(&open_set_methods_lock);
     JL_GC_POP();
     return (jl_value_t*)out;
-}
-
-static int is_set_type(jl_value_t *t) JL_NOTSAFEPOINT
-{
-    if (jl_is_typevar(t))
-        t = ((jl_tvar_t*)t)->ub;
-    t = jl_unwrap_unionall(t);
-    return jl_is_datatype(t) && (((jl_datatype_t*)t)->name->open_set || jl_is_all_type(t));
-}
-
-// whether an argument of type `a` could meet the declared type `d`: now, or by a later membership
-static int could_meet(jl_value_t *a, jl_value_t *d)
-{
-    if (jl_is_typevar(d))
-        d = ((jl_tvar_t*)d)->ub;
-    if (!jl_has_empty_intersection(a, d))
-        return 1;
-    return is_set_type(d) && jl_could_join(a, d);
 }
 
 // the declared type of the method signature `sig` at argument `i`: a varargs tail's element there
@@ -2670,151 +2673,6 @@ static void set_names_in(jl_value_t *t, arraylist_t *out, int depth) JL_NOTSAFEP
     }
     for (size_t k = 0; k < jl_nparams(t); k++)
         set_names_in(jl_tparam(t, k), out, depth + 1);
-}
-
-// Whether the call with argument types `tt`, which selects `m0` (or none), has a shadow at argument
-// `i` by the method `mz` (compiler §5.6): `mz` declares there a type that names a set (the set, a
-// union's arm, an intersection, a parameter), which the argument's concrete type does not meet now
-// but could by a later membership; `m0` takes the argument as `Any` or at a type naming a set (a
-// method matched through the type's own supertypes is more specific than one at a set); `mz`'s other
-// arguments could meet the call's.
-// A method that can only raise at the members of the sets it is at (compiler §5.6, §6.8): its declared
-// result is `Union{}`, or it serves no member (`declared_covers` bit 1, a body's `serves_no_member` meta)
-static int method_raises_only(jl_method_t *m) JL_NOTSAFEPOINT
-{
-    return m->declared_result == (jl_value_t*)jl_bottom_type || (m->declared_covers & 2);
-}
-
-static int shadow_at(jl_value_t *tt, jl_method_t *m0, jl_method_t *mz, size_t i)
-{
-    // open issue 158 (a): a method that can only raise at a member is no shadow: dispatched, it
-    // throws as the pruned arm would
-    if (method_raises_only(mz))
-        return 0;
-    jl_value_t *zsig = jl_unwrap_unionall(mz->sig);
-    if (!jl_is_datatype(zsig) || !jl_is_datatype(tt))
-        return 0;
-    size_t np = jl_nparams(tt), nz = jl_nparams(zsig);
-    if (!(mz->isva ? np >= nz - 1 : np == nz) || i >= np)
-        return 0;
-    jl_value_t *d = sig_arg(zsig, i, mz->isva);
-    if (d == NULL || !jl_has_open_set_in(d))
-        return 0;
-    jl_value_t *s = jl_tparam(tt, i);
-    // a kind of type object is never a member, but its values can be (compiler §4.10)
-    int kind = s == (jl_value_t*)jl_datatype_type || s == (jl_value_t*)jl_unionall_type ||
-               s == (jl_value_t*)jl_uniontype_type;
-    if (jl_is_vararg(s) || !jl_is_concrete_type(s) || (((jl_datatype_t*)s)->name->never_member && !kind))
-        return 0;
-    jl_value_t *db = jl_is_typevar(d) ? ((jl_tvar_t*)d)->ub : d;
-    // a kind meets the set now where the set takes a type value already: the method is a match
-    if ((kind ? !jl_has_empty_intersection(s, db) : jl_subtype(s, db)) || !jl_could_join(s, db))
-        return 0;
-    jl_value_t *m0sig = m0 ? jl_unwrap_unionall(m0->sig) : NULL;
-    if (m0sig != NULL && jl_is_datatype(m0sig)) {
-        jl_value_t *d0 = sig_arg(m0sig, i, m0->isva);
-        if (d0 != NULL && jl_is_typevar(d0))
-            d0 = ((jl_tvar_t*)d0)->ub;
-        if (d0 != NULL && d0 != (jl_value_t*)jl_any_type && !jl_has_open_set_in(d0))
-            return 0; // matched through the type's own supertypes
-    }
-    // the other arguments, the function's own type included: the methods at sets indexed under `Type`
-    // are every type's constructors, whose first argument (`Type{X}`) tells them apart
-    for (size_t j = 0; j < np; j++) {
-        jl_value_t *dj = sig_arg(zsig, j, mz->isva);
-        if (j == i || dj == NULL || jl_is_vararg(jl_tparam(tt, j)))
-            continue;
-        if (!could_meet(jl_tparam(tt, j), dj))
-            return 0;
-    }
-    return 1;
-}
-
-// The shadows of a call (compiler §5.6): the call has argument types `tt` and selects `m0` (or none).
-// A shadow is an argument whose concrete type could later join a set at which another method of the
-// function could then be selected, where `m0` takes that argument as `Any` or at a set (a method
-// matched through the type's own supertypes is more specific than any method at a set). Returned
-// as svec(cells, results, finals): the cell of each (argument type, set), which the call's guard reads,
-// and each shadowing method's declared result, `Any` where it declares none; and, where `allow_final`,
-// the final cell of each pair whose negative is final (compiler §4.8), which needs no guard and which
-// the caller records as an edge. Empty where there is none.
-JL_DLLEXPORT jl_value_t *jl_call_shadows(jl_value_t *tt, jl_value_t *m0v, int allow_final)
-{
-    if (!jl_is_datatype(tt) || !jl_is_tuple_type(tt) || jl_nparams(tt) < 2 || jl_func_set_methods == NULL)
-        return (jl_value_t*)jl_emptysvec;
-    jl_value_t *ft = jl_unwrap_unionall(jl_tparam0(tt));
-    if (!jl_is_datatype(ft))
-        return (jl_value_t*)jl_emptysvec;
-    jl_svec_t *ms = NULL;
-    JL_LOCK(&open_set_methods_lock);
-    ms = (jl_svec_t*)jl_eqtable_get(jl_func_set_methods, (jl_value_t*)((jl_datatype_t*)ft)->name, NULL);
-    JL_UNLOCK(&open_set_methods_lock);
-    if (ms == NULL)
-        return (jl_value_t*)jl_emptysvec;
-    jl_method_t *m0 = jl_is_method(m0v) ? (jl_method_t*)m0v : NULL;
-    size_t np = jl_nparams(tt);
-    jl_array_t *cells = NULL, *results = NULL, *finals = NULL;
-    jl_value_t *cell = NULL, *r = NULL;
-    JL_GC_PUSH6(&ms, &cells, &results, &cell, &r, &finals);
-    for (size_t k = 0; k < jl_svec_len(ms); k++) {
-        jl_method_t *mz = (jl_method_t*)jl_svecref(ms, k);
-        if (mz == m0)
-            continue;
-        jl_value_t *zsig = jl_unwrap_unionall(mz->sig);
-        if (!jl_is_datatype(zsig))
-            continue;
-        for (size_t i = 1; i < np; i++) {
-            if (!shadow_at(tt, m0, mz, i))
-                continue;
-            jl_value_t *s = jl_tparam(tt, i);
-            if (cells == NULL) {
-                cells = jl_alloc_vec_any(0);
-                results = jl_alloc_vec_any(0);
-                finals = jl_alloc_vec_any(0);
-            }
-            // a cell for each set the declared type names: a membership in any of them opens the guard
-            arraylist_t names;
-            arraylist_new(&names, 0);
-            set_names_in(sig_arg(zsig, i, mz->isva), &names, 0);
-            for (size_t k = 0; k < names.len; k++) {
-                jl_typename_t *zn = (jl_typename_t*)names.items[k];
-                if (allow_final && jl_membership_final(s, zn->wrapper)) {
-                    // a final non-member (compiler §4.8): no guard, the final cell an edge
-                    cell = jl_membership_final_cell(s, (jl_value_t*)zn);
-                    jl_array_ptr_1d_push(finals, cell);
-                    continue;
-                }
-                cell = jl_membership_cell(s, (jl_value_t*)zn);
-                jl_array_ptr_1d_push(cells, cell);
-                r = mz->declared_result ? mz->declared_result : (jl_value_t*)jl_any_type;
-                // a declared result that names the method's static parameters (`Tuple{T, Any}` at
-                // `Iterable{T}`) is not instantiated at the call: the shadow's result is `Any`, never a
-                // type with a free variable in the caller's result
-                if (jl_has_free_typevars(r))
-                    r = (jl_value_t*)jl_any_type;
-                jl_array_ptr_1d_push(results, r);
-            }
-            arraylist_free(&names);
-        }
-    }
-    jl_value_t *out = (jl_value_t*)jl_emptysvec;
-    if (cells != NULL && (jl_array_nrows(cells) > 0 || jl_array_nrows(finals) > 0)) {
-        size_t n = jl_array_nrows(cells), nf = jl_array_nrows(finals);
-        jl_svec_t *cs = jl_alloc_svec(n), *rs = NULL, *fs = NULL;
-        JL_GC_PUSH3(&cs, &rs, &fs);
-        rs = jl_alloc_svec(n);
-        fs = jl_alloc_svec(nf);
-        for (size_t i = 0; i < n; i++) {
-            jl_svecset(cs, i, jl_array_ptr_ref(cells, i));
-            jl_svecset(rs, i, jl_array_ptr_ref(results, i));
-        }
-        for (size_t i = 0; i < nf; i++)
-            jl_svecset(fs, i, jl_array_ptr_ref(finals, i));
-        out = (jl_value_t*)jl_svec(3, cs, rs, fs);
-        JL_GC_POP();
-    }
-    JL_GC_POP();
-    return out;
 }
 
 // used by §7/§8: copy out the methods indexed under `tn`
@@ -2920,7 +2778,7 @@ JL_DLLEXPORT void jl_method_set_declared_result(jl_method_t *m, jl_value_t *rt, 
 
 // The methods at open sets of the function type `ft` that carry a declared result covering
 // every member: what inference reads at a receiver typed by a set (compiler §7.1). Read from the
-// function's list of methods at sets (the shadow query's), so the cost is the function's own methods.
+// function's list of methods at sets, so the cost is the function's own methods.
 JL_DLLEXPORT jl_value_t *jl_declared_methods_of(jl_value_t *ft)
 {
     jl_array_t *out = jl_alloc_vec_any(0);
@@ -3497,10 +3355,8 @@ struct _typename_invalidate_backedge {
     size_t n;
     size_t max_world;
     int invalidated;
-    jl_method_t *setmethod; // C-73: a method at an open set being inserted (not a replay), else NULL
+    jl_method_t *skip; // a membership's replay: the replayed method, whose own entry is live in the table; else NULL
 };
-
-static int shadow_at(jl_value_t *tt, jl_method_t *m0, jl_method_t *mz, size_t i);
 
 static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *env0)
 {
@@ -3535,6 +3391,8 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
             for (size_t j = 0; j < env->n; j++) {
                 jl_method_t *m = env->d[j];
                 JL_GC_PROMISE_ROOTED(m);
+                if (m == env->skip)
+                    continue; // the replayed method is the one that now applies, not a previous match
                 if (jl_subtype(*env->isect, m->sig) || (*env->isect2 && jl_subtype(*env->isect2, m->sig))) {
                     // We now know that there actually was a previous
                     // method for this part of the type intersection.
@@ -3544,13 +3402,6 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
                     }
                 }
             }
-        }
-        else if (env->setmethod != NULL && jl_is_datatype(backedgetyp)) {
-            // C-73 (compiler §5.6): the edge's concrete argument is not a member of the new method's set,
-            // so the exact intersection is empty; but it could join later, and the caller that pruned this
-            // arm (no method there) holds no guard for it. Invalidated, it compiles again with the guard.
-            for (size_t k = 1; k < jl_nparams(backedgetyp) && !missing; k++)
-                missing = shadow_at(backedgetyp, NULL, env->setmethod, k);
         }
         *env->isect = *env->isect2 = NULL;
         if (missing) {
@@ -4093,10 +3944,10 @@ cleanup:
 // replayed method's own typemap entry is live and shows up in d[] (skip it), and the
 // dispatch_bits publish (which activate does at the end of an insertion) does not
 // run. stats, when non-NULL, counts the walk's volume for §5.M2's log.
-// Whether a membership's dispatch walk invalidates compiled code (compiler §5.5, §5.6): it lowers the
-// dispatch caches either way. Code compiled with guards needs no invalidation, so a membership
-// invalidates nothing; the stopgap C-18 invalidated the callers it could change.
-static int membership_walk_invalidates = 0;
+// A membership's dispatch walk invalidates compiled code as a method's insertion does (compiler §5.5;
+// W-140): each method at the set is replayed at the member, and the callers whose selection it changes
+// are invalidated. It lowers the dispatch caches too.
+static int membership_walk_invalidates = 1;
 JL_DLLEXPORT int jl_set_membership_walk_invalidates(int on)
 {
     int last = membership_walk_invalidates;
@@ -4244,47 +4095,6 @@ static int invalidate_intersecting(jl_value_t *type, jl_method_t *method,
 }
 
 
-// A method at a set defined after code that calls its function at a type that could join the set:
-// that code took no guard for it (compiler §5.6), so the callers of each instance of the function the
-// method shadows are invalidated, and compile again with the guard.
-static void invalidate_unguarded_callers(jl_method_t *mz, size_t world, size_t max_world)
-{
-    jl_value_t *zsig = jl_unwrap_unionall(mz->sig);
-    if (!jl_is_datatype(zsig) || jl_nparams(zsig) == 0)
-        return;
-    jl_value_t *tt = NULL, *ms = NULL, *specs = NULL;
-    JL_GC_PUSH3(&tt, &ms, &specs);
-    tt = (jl_value_t*)jl_svec2(jl_tparam0(zsig), jl_wrap_vararg((jl_value_t*)jl_any_type, NULL, 1, 0));
-    tt = (jl_value_t*)jl_apply_tuple_type((jl_svec_t*)tt, 1);
-    size_t min_valid = 1, max_valid = ~(size_t)0;
-    ms = jl_matching_methods((jl_tupletype_t*)tt, jl_nothing, -1, 1, max_world, &min_valid, &max_valid, NULL); // the methods before this one
-    if (jl_is_array(ms)) {
-        for (size_t k = 0; k < jl_array_nrows((jl_array_t*)ms); k++) {
-            jl_method_t *m2 = ((jl_method_match_t*)jl_array_ptr_ref((jl_array_t*)ms, k))->method;
-            if (m2 == mz)
-                continue;
-            specs = jl_atomic_load_relaxed(&m2->specializations);
-            size_t l = jl_is_svec(specs) ? jl_svec_len(specs) : 1;
-            for (size_t i = 0; i < l; i++) {
-                jl_value_t *v = jl_is_svec(specs) ? jl_svecref(specs, i) : specs;
-                if (v == NULL || v == jl_nothing || !jl_is_method_instance(v))
-                    continue;
-                jl_method_instance_t *mi = (jl_method_instance_t*)v;
-                jl_value_t *st = mi->specTypes;
-                if (!jl_is_datatype(st))
-                    continue;
-                for (size_t a = 1; a < jl_nparams(st); a++) {
-                    if (shadow_at(st, m2, mz, a)) {
-                        invalidate_backedges(mi, max_world, "jl_method_table_insert (a method at a set)");
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    JL_GC_POP();
-}
-
 void jl_method_table_activate(jl_typemap_entry_t *newentry)
 {
     JL_TIMING(ADD_METHOD, ADD_METHOD);
@@ -4292,7 +4102,7 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     jl_methtable_t *mt = jl_method_get_table(method);
     assert(jl_is_mtable(mt));
     assert(jl_is_method(method));
-    // a method at a set joins its function's list, for the shadow query (compiler §5.6); a method of
+    // a method at a set joins its function's list (compiler §7.1); a method of
     // an image is activated here without being added
     if (jl_has_open_set_in((jl_value_t*)method->sig)) {
         JL_LOCK(&open_set_methods_lock);
@@ -4421,22 +4231,12 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
 
     jl_methcache_t *mc = jl_method_table->cache;
     JL_LOCK(&mc->writelock);
-    // compiler §5.6: a method at an open set reaches the missing edges of arms its set could later
-    // shadow; a method that can only raise at a member is no shadow
-    jl_method_t *setmethod = (jl_has_open_set_in((jl_value_t*)method->sig) &&
-                              !method_raises_only(method)) ? method : NULL;
-    struct _typename_invalidate_backedge typename_env = {type, type, &isect, &isect2, d, n, max_world, invalidated, setmethod};
+    struct _typename_invalidate_backedge typename_env = {type, type, &isect, &isect2, d, n, max_world, invalidated, NULL};
     invalidate_missing_backedges(&typename_env);
     invalidated |= typename_env.invalidated;
-    if (jl_has_open_set_in((jl_value_t*)method->sig))
-        invalidate_unguarded_callers(method, world, max_world);
-    // a method of a callable type can begin its membership in Callable (compiler §7.4); a match
-    // through Callable reads the methods' worlds for its range (§5.3), so no entry's world changes
-    {
-        jl_value_t *msig = jl_unwrap_unionall((jl_value_t*)method->sig);
-        if (jl_is_datatype(msig) && jl_nparams(msig) > 0)
-            jl_membership_update_callable_cells(jl_tparam0(msig), world);
-    }
+    // a method of a callable type can begin its membership in Callable (compiler §7.4): a match through
+    // Callable reads the methods' worlds for its range (§5.3), so no entry's world changes, and code
+    // that relied on the membership's absence holds an edge to the type's dispatch, invalidated above
     if (oldmi && jl_array_nrows(oldmi)) {
         // drop leafcache and search mc->cache and drop anything that might overlap with the new method
         // this is very cheap, so we don't mind being very conservative at over-approximating this
@@ -4972,7 +4772,7 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
         // fix 4: intersections walk under the substituted sig, but the missing-edge
         // winner question answers with m's original sig (identical on the
         // conservative path, where type == m->sig already).
-        struct _typename_invalidate_backedge typename_env = {type, (jl_value_t*)m->sig, &gc[8], &gc[9], d, n, max_world, invalidated, NULL};
+        struct _typename_invalidate_backedge typename_env = {type, (jl_value_t*)m->sig, &gc[8], &gc[9], d, n, max_world, invalidated, m};
         if (membership_walk_invalidates) {
             invalidate_missing_backedges(&typename_env);
             invalidated |= typename_env.invalidated;
