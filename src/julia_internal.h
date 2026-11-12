@@ -1509,8 +1509,8 @@ JL_DLLEXPORT jl_genericmemory_t *jl_idtable_rehash(jl_genericmemory_t *a, size_t
 _Atomic(jl_value_t*) *jl_table_peek_bp(jl_genericmemory_t *a, jl_value_t *key) JL_NOTSAFEPOINT;
 
 JL_DLLEXPORT jl_method_t *jl_new_method_uninit(jl_module_t*);
-jl_method_t *jl_new_membership_method(jl_module_t *module, jl_value_t *sig, jl_value_t *ret); // W-141
-jl_value_t *jl_declare_membership_method(jl_method_t *m); // W-141: a method of Core.implements declares its membership
+jl_method_t *jl_new_membership_method(jl_module_t *module, jl_value_t *sig); // W-141
+void jl_membership_method_retire(jl_method_t *m, size_t world); // W-141: a membership refused at an image's load
 JL_DLLEXPORT jl_value_t *jl_implements_functype(void); // W-141: typeof(Core.implements), or NULL
 int jl_is_implements_sig(jl_value_t *sig); // W-141
 JL_DLLEXPORT jl_value_t *jl_gf_invoke_lookup(jl_value_t *types, jl_value_t *mt, size_t world);
