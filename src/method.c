@@ -1541,6 +1541,15 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
     m->line = line;
     jl_method_set_source(m, f);
 
+    // a method of `Core.implements` is a membership's declaration (W-141): the runtime reads the pair
+    // from its signature and the receiver from its body, and adds it with the entry, in one world
+    if (!external_mt && jl_is_implements_sig(m->sig)) {
+        jl_declare_membership_method(m);
+        if (jl_newmeth_tracer)
+            jl_call_tracer(jl_newmeth_tracer, (jl_value_t*)m);
+        JL_GC_POP();
+        return m;
+    }
     // the library's definition hook (compiler §10.1): it may refuse the method before it is visible
     jl_call_definition_hook(m, 0);
     jl_method_table_insert(mt, m, NULL);
@@ -1832,7 +1841,7 @@ int nroots_with_key(jl_method_t *m, uint64_t key)
 
 // A membership's method (W-141): `implements(::Type{X}, ::Type{S})` with the signature `sig`, in the
 // declarer's module, not yet in the table. Its body is the template's (`Core._implements_body`).
-jl_method_t *jl_new_membership_method(jl_module_t *module, jl_value_t *sig)
+jl_method_t *jl_new_membership_method(jl_module_t *module, jl_value_t *sig, jl_value_t *ret)
 {
     jl_value_t *tf = jl_get_global(jl_core_module, jl_symbol("_implements_body"));
     if (tf == NULL)
@@ -1851,6 +1860,13 @@ jl_method_t *jl_new_membership_method(jl_module_t *module, jl_value_t *sig)
     jl_method_t *tm = (jl_method_t*)tmv;
     src = jl_is_code_info(tm->source) ? jl_copy_code_info((jl_code_info_t*)tm->source)
                                       : jl_uncompress_ir(tm, NULL, (jl_value_t*)tm->source);
+    // the body returns the receiver: nothing, or the forwarding field's name (`:none` for no receiver)
+    size_t nst = jl_array_nrows(src->code);
+    if (nst > 0 && jl_is_returnnode(jl_array_ptr_ref(src->code, nst - 1))) {
+        tmv = jl_is_symbol(ret) ? jl_new_struct(jl_quotenode_type, ret) : ret;
+        tmv = jl_new_struct(jl_returnnode_type, tmv);
+        jl_array_ptr_set(src->code, nst - 1, tmv);
+    }
     m = jl_new_method_uninit(module);
     m->external_mt = NULL;
     m->sig = sig;

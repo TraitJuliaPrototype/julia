@@ -1189,9 +1189,93 @@ static jl_value_t *membership_method_sig(jl_value_t *member, jl_value_t *set_ins
 // Declare `member` a member of the set `set_instance` names (compiler §4.2-§4.6).
 // The library checks ownership and the contract first; the runtime checks what
 // keeps subtyping sound: an open set, no cycle among sets, one instance per member.
+static jl_value_t *declare_membership(jl_value_t *member, jl_value_t *set_instance,
+                                      jl_value_t *declarer, jl_value_t *by,
+                                      jl_value_t *receiver, jl_method_t *given);
 JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *set_instance,
                                                jl_value_t *declarer, jl_value_t *by,
                                                jl_value_t *receiver)
+{
+    return declare_membership(member, set_instance, declarer, by, receiver, NULL);
+}
+
+// A method of `Core.implements` defined by a program (W-141): `implements(::Type{X}, ::Type{S}) = nothing`
+// declares `S` a member of `X`; under `where` variables a family; `::Type{<:S}` for an abstract `S`,
+// every type under which is a member; a body that returns a field's name forwards to that field.
+jl_value_t *jl_declare_membership_method(jl_method_t *m)
+{
+    jl_value_t *u = jl_unwrap_unionall(m->sig);
+    if (!jl_is_datatype(u) || jl_nparams(u) != 3 || !jl_is_type_type(jl_tparam(u, 1)))
+        jl_error("a membership's method is implements(::Type{X}, ::Type{S})");
+    jl_value_t *inst = jl_tparam0(jl_tparam(u, 1));
+    jl_value_t *p2 = jl_tparam(u, 2);
+    // `::Type{<:S}` is `Type{T} where T<:S` at the argument
+    if (jl_is_unionall(p2) && jl_is_type_type(((jl_unionall_t*)p2)->body) &&
+        jl_tparam0(((jl_unionall_t*)p2)->body) == (jl_value_t*)((jl_unionall_t*)p2)->var)
+        p2 = ((jl_unionall_t*)p2)->body;
+    if (!jl_is_type_type(p2))
+        jl_error("a membership's method is implements(::Type{X}, ::Type{S})");
+    jl_value_t *P = jl_tparam0(p2);
+    jl_tvar_t *wide = NULL;
+    jl_value_t *member = NULL, *by = jl_nothing, *receiver = (jl_value_t*)jl_symbol("self"), *canon = NULL;
+    jl_code_info_t *src = NULL;
+    JL_GC_PUSH5(&member, &by, &receiver, &canon, &src);
+    if (jl_is_typevar(P)) {
+        wide = (jl_tvar_t*)P;
+        if (wide->lb != jl_bottom_type)
+            jl_error("a membership's method is implements(::Type{X}, ::Type{S})");
+        member = wide->ub;
+    }
+    else
+        member = P;
+    if (!jl_is_datatype(member) || !jl_is_type(inst))
+        jl_error("a membership's method is implements(::Type{X}, ::Type{S}), with S a type or a pattern of one");
+    // the member pattern under the method's variables that it names, innermost last
+    arraylist_t vars;
+    arraylist_new(&vars, 0);
+    for (jl_value_t *w = m->sig; jl_is_unionall(w); w = ((jl_unionall_t*)w)->body)
+        arraylist_push(&vars, ((jl_unionall_t*)w)->var);
+    for (size_t i = vars.len; i > 0; i--) {
+        jl_tvar_t *v = (jl_tvar_t*)vars.items[i - 1];
+        if (v != wide && jl_has_typevar(member, v))
+            member = jl_new_struct(jl_unionall_type, (jl_value_t*)v, member);
+    }
+    arraylist_free(&vars);
+    // the receiver, from the body: `nothing`, or a field's name
+    src = jl_is_code_info(m->source) ? (jl_code_info_t*)m->source : jl_uncompress_ir(m, NULL, (jl_value_t*)m->source);
+    size_t nst = jl_array_nrows(src->code);
+    jl_value_t *last = nst > 0 ? jl_array_ptr_ref(src->code, nst - 1) : NULL;
+    jl_value_t *rv = last != NULL && jl_is_returnnode(last) ? jl_returnnode_value(last) : NULL;
+    if (rv != NULL && jl_is_ssavalue(rv)) {
+        size_t id = ((jl_ssavalue_t*)rv)->id;
+        rv = id >= 1 && id <= nst ? jl_array_ptr_ref(src->code, id - 1) : NULL;
+    }
+    // `nothing` is written as a global's name
+    if (rv != NULL && jl_is_globalref(rv) && jl_globalref_name(rv) == jl_symbol("nothing"))
+        rv = jl_nothing;
+    if (rv != NULL && jl_is_quotenode(rv))
+        rv = jl_quotenode_value(rv);
+    if (rv == NULL || (rv != jl_nothing && !jl_is_symbol(rv)))
+        jl_error("a membership's method returns nothing, or the name of the field it forwards to");
+    if (rv == (jl_value_t*)jl_symbol("none"))
+        receiver = rv;
+    else if (jl_is_symbol(rv)) {
+        receiver = (jl_value_t*)jl_symbol("field");
+        by = rv;
+    }
+    // the one spelling of a pair (the insertion's cost depends on it): Type{S} for a type that has no
+    // subtypes of its own, Type{<:S} for an abstract one
+    canon = membership_method_sig(member, inst);
+    if (canon == NULL || !jl_types_equal(canon, m->sig))
+        jl_error("a membership's method names a concrete member as ::Type{S} and an abstract one as ::Type{<:S}");
+    jl_value_t *entry = declare_membership(member, inst, (jl_value_t*)m->module, by, receiver, m);
+    JL_GC_POP();
+    return entry;
+}
+
+static jl_value_t *declare_membership(jl_value_t *member, jl_value_t *set_instance,
+                                      jl_value_t *declarer, jl_value_t *by,
+                                      jl_value_t *receiver, jl_method_t *given)
 {
     if (!jl_is_type(member))
         jl_error("a membership's member must be a type");
@@ -1230,11 +1314,19 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     jl_array_t *ended = NULL, *found = NULL;
     jl_value_t *msg = NULL;
     JL_GC_PUSH7(&msig, &mmeth, &mentry, &entry, &ended, &found, &msg);
-    msig = membership_method_sig(member, set_instance);
-    if (msig != NULL) {
-        mmeth = jl_new_membership_method(jl_is_module(declarer) ? (jl_module_t*)declarer : jl_main_module, msig);
-        if (mmeth != NULL)
-            mentry = jl_method_table_add(jl_method_table, mmeth, NULL);
+    if (given != NULL) {
+        mmeth = given;
+        mentry = jl_method_table_add(jl_method_table, mmeth, NULL);
+    }
+    else {
+        msig = membership_method_sig(member, set_instance);
+        if (msig != NULL) {
+            mmeth = jl_new_membership_method(jl_is_module(declarer) ? (jl_module_t*)declarer : jl_main_module, msig,
+                                             receiver == (jl_value_t*)jl_symbol("self") ? jl_nothing :
+                                             receiver == (jl_value_t*)jl_symbol("field") ? by : receiver);
+            if (mmeth != NULL)
+                mentry = jl_method_table_add(jl_method_table, mmeth, NULL);
+        }
     }
     JL_LOCK(&world_counter_lock);
     if (!jl_atomic_load_relaxed(&allow_new_worlds)) {

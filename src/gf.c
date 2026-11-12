@@ -3761,6 +3761,8 @@ static void lower_callable_dispatch(jl_method_t *method, size_t max_world)
 
 JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
 {
+    if (jl_is_implements_sig(method->sig))
+        jl_error("a membership's method cannot be deleted: taking a membership back is not built (W-141)");
     jl_call_deletion_hook(method); // strict mode may refuse it (compiler §10.2)
     jl_methtable_t *mt = jl_method_get_table(method);
     jl_typemap_entry_t *methodentry = do_typemap_search(mt, method);

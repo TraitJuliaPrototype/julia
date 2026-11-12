@@ -116,18 +116,21 @@ function record_memberships!(sv::InferenceState, @nospecialize(a), @nospecialize
         e = e::Core.MembershipEntry
         # the fields by the builtin, which infers their declared type (the atomic `getproperty` did not)
         update_valid_age!(sv, WorldRange(getfield(e, :min_world), getfield(e, :max_world, :monotonic)))
-        # the edge is the membership's method (W-141), held as an `invoke` at its own signature: it is
-        # validated as any method is, and takes no backedge
+        # the edge is the membership's method (W-141), held as an `invoke` edge at the method's own
+        # signature: validated as any method is, with a backedge on the method's instance
         m = getfield(e, :method)::Method
+        msig = m.sig
+        sparams = (ccall(:jl_type_intersection_with_env, Any, (Any, Any), msig, msig)::SimpleVector)[2]::SimpleVector
+        mi = specialize_method(m, msig, sparams)
         edges = sv.edges
         found = false
         for i in 2:length(edges)
-            if edges[i] === m && edges[i-1] === m.sig
+            if edges[i] === mi && edges[i-1] === msig
                 found = true
                 break
             end
         end
-        found || push!(edges, m.sig, m)
+        found || push!(edges, msig, mi)
     end
     return true
 end
