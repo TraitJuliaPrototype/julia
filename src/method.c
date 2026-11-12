@@ -1544,7 +1544,9 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
     // a method of `Core.implements` is a membership's declaration (W-141): the runtime reads the pair
     // from its signature and the receiver from its body, and adds it with the entry, in one world
     if (!external_mt && jl_is_implements_sig(m->sig)) {
+        jl_call_definition_hook(m, 0);   // the library's rules for a method: a pirate's is refused where the scope says so
         jl_declare_membership_method(m);
+        jl_call_definition_hook(m, 1);
         if (jl_newmeth_tracer)
             jl_call_tracer(jl_newmeth_tracer, (jl_value_t*)m);
         JL_GC_POP();

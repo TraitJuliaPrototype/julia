@@ -84,7 +84,6 @@
     XX(genericmemoryref_typename, jl_typename_t*) \
     XX(memoryref_uint8_type, jl_value_t*) \
     XX(membership_type, jl_datatype_t*) \
-    XX(membership_cell_type, jl_datatype_t*) \
     XX(all_type, jl_unionall_t*) \
     XX(callable_type, jl_unionall_t*) \
     XX(methoderror_type, jl_datatype_t*) \

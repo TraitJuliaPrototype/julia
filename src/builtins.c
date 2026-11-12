@@ -2865,7 +2865,6 @@ void jl_init_primitives(void) JL_GC_DISABLED
     add_builtin("nothing", (jl_value_t*)jl_nothing);
     add_builtin("TypeName", (jl_value_t*)jl_typename_type);
     add_builtin("MembershipEntry", (jl_value_t*)jl_membership_type);
-    add_builtin("MembershipCell", (jl_value_t*)jl_membership_cell_type);
     add_builtin("DataType", (jl_value_t*)jl_datatype_type);
     add_builtin("TypeVar", (jl_value_t*)jl_tvar_type);
     add_builtin("UnionAll", (jl_value_t*)jl_unionall_type);

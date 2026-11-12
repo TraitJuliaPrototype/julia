@@ -4096,16 +4096,6 @@ void jl_init_types(void) JL_GC_DISABLED
         const static uint32_t membership_atomicfields[1] = { 1u << 5 };
         jl_membership_type->name->atomicfields = membership_atomicfields;
     }
-    // the membership cell (compiler §5.6): its world is the one atomic field
-    jl_membership_cell_type = jl_new_datatype(jl_symbol("MembershipCell"), jl_core_module, jl_any_type, jl_emptysvec,
-        jl_perm_symsvec(5, "member", "set", "min_world", "backedges", "isfinal"),
-        jl_svec(5, jl_any_type, jl_any_type, jl_uint64_type, jl_any_type, jl_uint8_type),
-        jl_emptysvec, 0, 1, 2);
-    {
-        const static uint32_t cell_atomicfields[1] = { 1u << 2 };
-        jl_membership_cell_type->name->atomicfields = cell_atomicfields;
-    }
-
     // complete builtin type metadata
     jl_uint8pointer_type = (jl_datatype_t*)jl_apply_type1((jl_value_t*)jl_pointer_type, (jl_value_t*)jl_uint8_type);
     jl_svecset(jl_datatype_type->types, 5, jl_voidpointer_type);

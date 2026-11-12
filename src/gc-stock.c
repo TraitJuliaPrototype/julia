@@ -2928,7 +2928,7 @@ static void gc_mark_roots(jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT
     gc_try_claim_and_push(mq, jl_atomic_load_relaxed(&jl_activated_entries), NULL); // the entries images activated
     gc_try_claim_and_push(mq, jl_attributed_cache, NULL); // Core.attributed_call's cache (builtins.c)
     gc_try_claim_and_push(mq, jl_atomic_load_relaxed(&jl_attributed_fast), NULL); // its table of the latest answers
-    gc_try_claim_and_push(mq, jl_set_cells, NULL); // each set's membership cells (datatype.c)
+    gc_try_claim_and_push(mq, jl_absence_sigs, NULL); // each set's absence signatures (datatype.c)
     gc_try_claim_and_push(mq, jl_func_set_methods, NULL); // each function's methods at sets (gf.c)
     gc_try_claim_and_push(mq, jl_code_slot_fallbacks, NULL); // the code slot's last resorts (gf.c)
     gc_heap_snapshot_record_gc_roots((jl_value_t*)jl_declared_memberships, "declared_memberships");

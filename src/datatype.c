@@ -433,11 +433,11 @@ JL_DLLEXPORT jl_value_t *jl_candidates_of(jl_value_t *set)
     return r ? r : (jl_value_t*)jl_alloc_vec_any(0);
 }
 
-// Membership cells (compiler §5.6), each set's TypeName to a list of its cells (a SimpleVector,
-// replaced, never mutated). A guard reads a cell's world; a membership that makes the cell's member
-// a member of the set, or of a set that joins it, writes it once.
-jl_genericmemory_t *jl_set_cells JL_GLOBALLY_ROOTED = NULL;
-static jl_mutex_t cells_lock;
+// The signatures at which a pair's absence is relied on (W-141; compiler §4.8): each set's TypeName to
+// a list [member, signature, ...] (a SimpleVector, replaced, never mutated). One signature per pair in a
+// session; the functions below keep the name "cell" of what they replaced.
+jl_genericmemory_t *jl_absence_sigs JL_GLOBALLY_ROOTED = NULL;
+static jl_mutex_t absence_lock;
 
 // whether `member` is a member of the set `setname` in `world`, at any instance of it; for a kind of
 // type object, which is never a member, whether the set takes some of its values (compiler §4.10)
@@ -465,18 +465,18 @@ static int intersection_met(jl_value_t *member, jl_typename_t *setname, size_t w
     return met;
 }
 
-static void cells_list_add(jl_typename_t *setname, jl_value_t *cell)
+static void absence_list_add(jl_typename_t *setname, jl_value_t *cell)
 {
-    jl_svec_t *old = jl_set_cells ? (jl_svec_t*)jl_eqtable_get(jl_set_cells, (jl_value_t*)setname, NULL) : NULL;
+    jl_svec_t *old = jl_absence_sigs ? (jl_svec_t*)jl_eqtable_get(jl_absence_sigs, (jl_value_t*)setname, NULL) : NULL;
     size_t n = old ? jl_svec_len(old) : 0;
     jl_svec_t *nw = jl_alloc_svec_uninit(n + 1);
     JL_GC_PUSH1(&nw);
     for (size_t i = 0; i < n; i++)
         jl_svecset(nw, i, jl_svecref(old, i));
     jl_svecset(nw, n, cell);
-    if (jl_set_cells == NULL)
-        jl_set_cells = jl_alloc_memory_any(16);
-    jl_set_cells = jl_eqtable_put(jl_set_cells, (jl_value_t*)setname, (jl_value_t*)nw, NULL);
+    if (jl_absence_sigs == NULL)
+        jl_absence_sigs = jl_alloc_memory_any(16);
+    jl_absence_sigs = jl_eqtable_put(jl_absence_sigs, (jl_value_t*)setname, (jl_value_t*)nw, NULL);
     JL_GC_POP();
 }
 
@@ -506,7 +506,7 @@ static jl_value_t *absence_sig(jl_value_t *member, jl_typename_t *setname)
     return sig;
 }
 
-static jl_value_t *membership_cell(jl_value_t *member, jl_value_t *set, int isfinal)
+static jl_value_t *membership_absence(jl_value_t *member, jl_value_t *set)
 {
     jl_typename_t *setname;
     if (jl_is_typename(set))
@@ -519,9 +519,9 @@ static jl_value_t *membership_cell(jl_value_t *member, jl_value_t *set, int isfi
     }
     jl_value_t *sig = NULL;
     JL_GC_PUSH1(&sig);
-    JL_LOCK(&cells_lock);
+    JL_LOCK(&absence_lock);
     // the session's signatures at this set: [member, signature, ...]
-    jl_svec_t *list = jl_set_cells ? (jl_svec_t*)jl_eqtable_get(jl_set_cells, (jl_value_t*)setname, NULL) : NULL;
+    jl_svec_t *list = jl_absence_sigs ? (jl_svec_t*)jl_eqtable_get(jl_absence_sigs, (jl_value_t*)setname, NULL) : NULL;
     for (size_t i = 0; list != NULL && i + 1 < jl_svec_len(list); i += 2) {
         jl_value_t *m = jl_svecref(list, i);
         if (m == member || jl_types_equal(m, member)) {
@@ -531,16 +531,16 @@ static jl_value_t *membership_cell(jl_value_t *member, jl_value_t *set, int isfi
     }
     if (sig == NULL) {
         sig = absence_sig(member, setname);
-        cells_list_add(setname, member);
-        cells_list_add(setname, sig);
+        absence_list_add(setname, member);
+        absence_list_add(setname, sig);
     }
-    JL_UNLOCK(&cells_lock);
+    JL_UNLOCK(&absence_lock);
     JL_GC_POP();
     return sig;
 }
 JL_DLLEXPORT jl_value_t *jl_membership_final_cell(jl_value_t *member, jl_value_t *set)
 {
-    return membership_cell(member, set, 1);
+    return membership_absence(member, set);
 }
 
 // A module is loaded once its package has finished loading (compiler §4.8): it, or a module it is

@@ -141,7 +141,7 @@ static void get_tags(jl_value_t **tags[NUM_TAGS])
     INSERT_TAG(jl_func_set_methods);
     INSERT_TAG(jl_set_candidates);
     INSERT_TAG(jl_set_entries);
-    INSERT_TAG(jl_set_cells);
+    INSERT_TAG(jl_absence_sigs);
     // the split tables' miss: code compiled once reaches it before Base's __init__ runs, and while
     // an image is generated, when no __init__ runs (compiler §7.3)
     INSERT_TAG(jl_split_table_miss_func);

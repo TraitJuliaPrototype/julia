@@ -2030,30 +2030,6 @@ JL_DLLEXPORT jl_value_t *jl_membership_entries_for(jl_value_t *S, jl_value_t *X,
     return (jl_value_t*)r;
 }
 
-// whether an entry is in force in this session: on its home TypeName's list (an image's entry is
-// once activated) and not ended. Validation of a loaded image's record asks it (compiler §9).
-JL_DLLEXPORT int jl_membership_in_force(jl_value_t *e) JL_NOTSAFEPOINT
-{
-    jl_membership_t *en = (jl_membership_t*)e;
-    if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
-        return 0;
-    jl_value_t *p = jl_unwrap_unionall(en->member);
-    if (!jl_is_datatype(p))
-        return 0;
-    jl_typename_t *home = ((jl_datatype_t*)p)->name;
-    if (home == jl_type_typename && jl_nparams(p) == 1) {
-        jl_value_t *s = jl_unwrap_unionall(jl_tparam0(p));
-        if (!jl_is_datatype(s))
-            return 0;
-        home = ((jl_datatype_t*)s)->name;
-    }
-    jl_svec_t *list = jl_typename_memberships(home);
-    for (size_t i = 0; i < jl_svec_len(list); i++)
-        if (jl_svecref(list, i) == e)
-            return 1;
-    return 0;
-}
-
 // Subtyping by declared supertypes and parameters alone, for normal forms (compiler §4.9): no
 // membership entry is live in world 1, since each is declared in a later one.
 JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b)

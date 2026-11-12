@@ -610,21 +610,6 @@ typedef struct {
     jl_value_t *JL_NONNULL method;   // the membership's method of Core.implements (W-141), or Nothing
 } jl_membership_t;
 
-// a membership cell (compiler §5.6): whether `member` has joined the set, read by the guards of
-// compiled calls that a membership of `member` in the set could change. `min_world` is ~0 until an
-// entry makes `member` a member of the set, then the world it holds from.
-typedef struct {
-    JL_DATA_TYPE
-    jl_value_t *JL_NONNULL member;   // the member type: a concrete type
-    jl_value_t *JL_NONNULL set;      // the set's TypeName
-    _Atomic(uint64_t) min_world;
-    // a final cell's dependents (compiler §4.8): the CodeInstances that relied on the pair's final
-    // negative; NULL for a guard's cell, and dropped from a package image (re-added at its validation)
-    jl_array_t *backedges;
-    // a final cell (compiler §4.8): its opening invalidates its backedges; a guard's cell (0), which a
-    // guard reads, invalidates nothing
-    uint8_t isfinal;
-} jl_membership_cell_t;
 
 typedef struct {
     JL_DATA_TYPE
