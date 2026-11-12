@@ -686,6 +686,13 @@ void jl_activate_memberships(jl_array_t *list, size_t world)
         if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
             continue;   // superseded while the image was built: never in force
         en->min_world = world;
+        if (jl_is_method(en->method) &&
+            !(jl_atomic_load_relaxed(&((jl_method_t*)en->method)->dispatch_status) & METHOD_SIG_LATEST_WHICH)) {
+            // its method was not activated: the library's image hook left it inactive (compiler §10.1),
+            // as strict mode does with a pirate's membership. The membership is in force in no world
+            jl_atomic_store_release(&en->max_world, world - 1);
+            continue;
+        }
         if (activation_conflicts(en, world)) {
             // refused as at a declaration: never in force, and said (C-35)
             jl_atomic_store_release(&en->max_world, world - 1);
@@ -1186,6 +1193,16 @@ static jl_value_t *membership_method_sig(jl_value_t *member, jl_value_t *set_ins
     sig = jl_rewrap_unionall(sig, member);
     JL_GC_POP();
     return sig;
+}
+
+// The signature of the method a membership of the pair would have (§5.6), for the library's check
+// before a pirate's membership under strict mode (compiler §10.2); `nothing` where it has none.
+JL_DLLEXPORT jl_value_t *jl_membership_method_sig(jl_value_t *member, jl_value_t *set_instance)
+{
+    if (!jl_is_type(member) || !jl_is_type(set_instance))
+        return jl_nothing;
+    jl_value_t *sig = membership_method_sig(member, set_instance);
+    return sig == NULL ? jl_nothing : sig;
 }
 
 // Declare `member` a member of the set `set_instance` names (compiler §4.2-§4.6).

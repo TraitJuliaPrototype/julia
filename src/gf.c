@@ -4747,6 +4747,45 @@ static void membership_visit_function(jl_typemap_t *map, jl_value_t *search, siz
     JL_GC_POP();
 }
 
+// What a membership's walk would replay, for the library's check before a pirate's membership under
+// strict mode (compiler §10.2): [method, signature, ...], each method at the set or at a set it joins,
+// with its signature at the member in the set's place; `nothing` where the walk has no such signature
+// and passes over the whole method. It reads the current world and changes nothing.
+JL_DLLEXPORT jl_value_t *jl_membership_replay_sigs(jl_value_t *member, jl_value_t *set_instance)
+{
+    jl_array_t *sets = NULL, *out = NULL;
+    jl_value_t *ms = NULL, *sub = NULL;
+    JL_GC_PUSH4(&sets, &out, &ms, &sub);
+    sets = jl_alloc_vec_any(0);
+    out = jl_alloc_vec_any(0);
+    JL_LOCK(&world_counter_lock);
+    membership_superset_sets(set_instance, jl_atomic_load_relaxed(&jl_world_counter), sets);
+    for (size_t s = 0; s < jl_array_nrows(sets); s++) {
+        jl_value_t *Yuw = jl_unwrap_unionall(jl_array_ptr_ref(sets, s));
+        if (!jl_is_datatype(Yuw))
+            continue;
+        ms = (jl_value_t*)jl_methods_at_set(((jl_datatype_t*)Yuw)->name);
+        for (size_t i = 0; i < jl_array_nrows((jl_array_t*)ms); i++) {
+            jl_value_t *m = jl_array_ptr_ref((jl_array_t*)ms, i);
+            size_t k;
+            for (k = 0; k < jl_array_nrows(out); k += 2)
+                if (jl_array_ptr_ref(out, k) == m)
+                    break;
+            if (k < jl_array_nrows(out))
+                continue;
+            int clean = 1;
+            sub = membership_subst_sig((jl_method_t*)m, sets, member, &clean);
+            if (clean == 2)
+                continue; // the method names the set only at other instances
+            jl_array_ptr_1d_push(out, m);
+            jl_array_ptr_1d_push(out, clean && sub != NULL ? sub : jl_nothing);
+        }
+    }
+    JL_UNLOCK(&world_counter_lock);
+    JL_GC_POP();
+    return (jl_value_t*)out;
+}
+
 JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *set_instance,
                                               size_t entry_min_world)
 {
