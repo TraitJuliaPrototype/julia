@@ -6868,7 +6868,17 @@ void jl_call_definition_hook(jl_method_t *m, int after)
     args[0] = jl_method_definition_hook;
     args[1] = (jl_value_t*)m;
     args[2] = after ? jl_true : jl_false;
-    call_library_hook(args, 3);
+    // a check's error that the hook returns is raised here, so that its first frame is the
+    // definition's line and not the library's (compiler §10.1; traits §11.3)
+    jl_value_t *r = call_library_hook(args, 3);
+    if (r != NULL && r != jl_nothing) {
+        args[0] = r;
+        jl_value_t *ext = jl_get_global(jl_core_module, jl_symbol("Exception"));
+        if (ext != NULL && jl_isa(r, ext)) {
+            JL_GC_POP();
+            jl_throw(r);
+        }
+    }
     JL_GC_POP();
 }
 

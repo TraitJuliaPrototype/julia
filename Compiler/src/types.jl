@@ -398,12 +398,16 @@ struct NativeInterpreter <: AbstractInterpreter
     crossings::Int
     # `return_type`'s run-time answers: every method inferred plainly, under an owner of its own (§1.4)
     plainrt::Bool
+    # the closed build's check in a session (compiler §7.6, §2.7): the owner of its code, or `nothing`.
+    # It infers by a closed build's rules, every method plainly, into a cache of its own
+    closed::Any
 end
 
 function NativeInterpreter(world::UInt = get_world_counter();
                            inf_params::InferenceParams = InferenceParams(),
                            opt_params::OptimizationParams = OptimizationParams(),
-                           facts::Bool = false, crossings::Int = 0, plainrt::Bool = false)
+                           facts::Bool = false, crossings::Int = 0, plainrt::Bool = false,
+                           @nospecialize(closed = nothing))
     curr_max_world = get_world_counter()
     # Sometimes the caller is lazy and passes typemax(UInt).
     # we cap it to the current world age for correctness
@@ -416,7 +420,8 @@ function NativeInterpreter(world::UInt = get_world_counter();
     method_table = CachedMethodTable(InternalMethodTable(world))
     inf_cache = Vector{InferenceResult}() # Initially empty cache
     codegen = IdDict{CodeInstance,CodeInfo}()
-    return NativeInterpreter(world, method_table, inf_cache, codegen, inf_params, opt_params, facts && !plainrt, crossings, plainrt)
+    closed === nothing || (plainrt = true)
+    return NativeInterpreter(world, method_table, inf_cache, codegen, inf_params, opt_params, facts && !plainrt, crossings, plainrt, closed)
 end
 
 # Quickly and easily satisfy the AbstractInterpreter API contract
@@ -426,7 +431,7 @@ get_inference_world(interp::NativeInterpreter) = interp.world
 get_inference_cache(interp::NativeInterpreter) = interp.inf_cache
 # code of either policy is cached under Julia's own owner, with the policy in its flags (compiler §2.3);
 # `return_type`'s run-time answers under one of their own (§1.4)
-cache_owner(interp::NativeInterpreter) = interp.plainrt ? :plain_rt : nothing
+cache_owner(interp::NativeInterpreter) = interp.closed !== nothing ? interp.closed : interp.plainrt ? :plain_rt : nothing
 
 # the policy of the code an interpreter makes and looks up under Julia's own owner (compiler §2.3): 0
 # plain, 1 facts, -1 the policy the runtime reaches a method with

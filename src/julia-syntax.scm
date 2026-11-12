@@ -1194,7 +1194,6 @@
          (dcl   (and (pair? name) (eq? (car name) '|::|)))
          (rett  (if dcl (caddr name) '(core Any)))
          (name  (if dcl (cadr name) name)))
-    (check-not-cast-name (if (and (pair? name) (eq? (car name) 'call)) (cadr name) name))
     (cond ((and (length= e 2) (or (symbol? name) (globalref? name)))
            (if (not (valid-name? name))
                (error (string "invalid function name \"" name "\"")))
@@ -1491,7 +1490,6 @@
   (error "unimplemented or unsupported atomic declaration"))
 
 (define (expand-local-or-global-decl e)
-  (check-not-cast-name (cadr e))
   (if (and (or (symbol? (cadr e)) (globalref? (cadr e))) (length= e 2))
       e
       (expand-forms (expand-decls (car e) (cdr e)))))
@@ -1537,7 +1535,6 @@
 
 (define (expand-assignment e (const? #f))
   (define lhs (cadr e))
-  (check-not-cast-name lhs)
   (define (function-lhs? lhs)
     (and (pair? lhs)
          (or (eq? (car lhs) 'call)
@@ -1829,29 +1826,42 @@
           (cons (cons (car e) (map arg-to-temp (cdr e)))
                 (reverse a))))))
 
-;; the casts (compiler §6.9): `compiled_for(x)` and `with_dynamic(x)`, reserved names written as an
-;; argument of the call they decide
+;; the casts (compiler §6.9): `compiled_for(x)` and `with_dynamic(x)`, written as an argument of the
+;; call they decide. The names are not reserved: a call is a cast's where the name is bound to Core's
+;; cast, and the ordinary call of whatever else the name is bound to (a package's own function, a local)
 (define cast-names '(compiled_for with_dynamic))
 (define (cast-arg? x)
   (and (pair? x) (eq? (car x) 'call) (length= x 3) (memq (cadr x) cast-names)))
-(define (check-not-cast-name name)
-  (if (memq name cast-names)
-      (error (string "\"" name "\" is a cast, reserved as ccall is: it cannot be defined or assigned"))))
+;; the call of a cast's name as an ordinary call (`(block name)` is the name, and no cast to this pass)
+(define (uncast a)
+  (if (cast-arg? a) `(call (block ,(cadr a)) ,(caddr a)) a))
+(define (cast-bound-tests args)
+  (define (uses? name) (any (lambda (a) (and (cast-arg? a) (eq? (cadr a) name))) args))
+  (append (if (uses? 'compiled_for) '((call (core ===) compiled_for (core compiled_for))) '())
+          (if (uses? 'with_dynamic) '((call (core ===) with_dynamic (core with_dynamic))) '())))
 
-;; f(compiled_for(x), with_dynamic(y), z) => Core.attributed_call(bits, f, Core._cast_compiled(x), y, z):
-;; the low 32 bits name the arguments a cast decides, the high 32 those that are `Dynamic`
+;; f(compiled_for(x), with_dynamic(y), z) =>
+;;   if compiled_for === Core.compiled_for && with_dynamic === Core.with_dynamic
+;;       Core.attributed_call(bits, f, Core._cast_compiled(x), y, z)
+;;   else f(compiled_for(x), with_dynamic(y), z) end
+;; the low 32 bits name the arguments a cast decides, the high 32 those that are `Dynamic`. A cast in a
+;; call with keyword arguments or a splat, or past the 32nd argument, is left as the call of its name,
+;; which raises where the name is Core's cast
 (define (lower-cast-call f args)
   (if (or (any kwarg? args) (has-parameters? args) (any vararg? args))
-      (error "a cast in a call with keyword arguments or a splatted argument is not supported yet"))
+      `(call ,f ,@(map uncast args))
+      (let* ((tests (cast-bound-tests args))
+             (test  (if (length= tests 1) (car tests) `(&& ,@tests))))
+        `(if ,test ,(lower-cast-call- f args) (call ,f ,@(map uncast args))))))
+
+(define (lower-cast-call- f args)
   ;; bit (k - 1) for argument k; the bits as an Int, the dynamic half shifted by 32
   (let loop ((as args) (bit 1) (mask 0) (dyn 0) (out '()))
     (if (null? as)
         `(call (core attributed_call) ,(+ mask (* dyn 4294967296)) ,f ,@(reverse out))
         (let ((a (car as)))
           (cond ((> bit 2147483648)
-                 (if (cast-arg? a)
-                     (error "a cast decides one of a call's first 32 arguments")
-                     (loop (cdr as) (* bit 2) mask dyn (cons a out))))
+                 (loop (cdr as) (* bit 2) mask dyn (cons (uncast a) out)))
                 ((and (cast-arg? a) (eq? (cadr a) 'compiled_for))
                  (loop (cdr as) (* bit 2) (+ mask bit) dyn
                        (cons `(call (core _cast_compiled) ,(caddr a)) out)))
@@ -2747,9 +2757,7 @@
    (lambda (e)
      (if (length> e 2)
          (let ((f (cadr e)))
-           (cond ((memq f cast-names)
-                  (error (string "\"" (deparse e) "\": a cast is written as an argument of the call it decides")))
-                 ((any cast-arg? (cddr e))
+           (cond ((any cast-arg? (cddr e))
                   (expand-forms (lower-cast-call f (cddr e))))
                  ((dotop-named? f)
                   (expand-fuse-broadcast '() `(|.| ,(undotop f) (tuple ,@(cddr e)))))
