@@ -1320,11 +1320,22 @@ static jl_module_t *module_package(jl_module_t *m) JL_NOTSAFEPOINT
     return p == jl_main_module ? m : p;
 }
 
+// a `where` variable bounded by a set stands for its bound as an argument's declared type (compiler §6.2)
+static jl_value_t *trait_arg_decl(jl_value_t *decl_i) JL_NOTSAFEPOINT
+{
+    int depth = 0;
+    while (jl_is_typevar(decl_i) && depth++ < 8)
+        decl_i = ((jl_tvar_t*)decl_i)->ub;
+    return decl_i;
+}
+
 static int is_trait_arg_type(jl_value_t *decl_i) JL_NOTSAFEPOINT
 {
     // a set or an intersection, also where its type names the method's variables (`X{T}`): compiled
-    // once at its instance with those variables' values (compiler §6.2; C-54). A `where` variable
-    // bounded by a set is the value's own type.
+    // once at its instance with those variables' values (compiler §6.2). A `where` variable bounded
+    // by a set (`x::C` with `C <: X`) takes the attribute as the set does: compiled once, the
+    // variable is read from the value when the code runs (W-148).
+    decl_i = trait_arg_decl(decl_i);
     if (jl_is_typevar(decl_i))
         return 0;
     jl_value_t *u = jl_unwrap_unionall(decl_i);
@@ -1394,6 +1405,22 @@ static int type_is_own(jl_value_t *elt, jl_module_t *setmod) JL_NOTSAFEPOINT
     return type_is_own_(elt, setmod != NULL ? module_package(setmod) : NULL, 0);
 }
 
+// whether two lists of static parameters differ only where the first holds a variable bounded by a set:
+// the widened signature of an instance compiled once does not fix such a variable (W-148)
+static int sparams_differ_at_trait_vars(jl_svec_t *widened, jl_svec_t *exact) JL_NOTSAFEPOINT
+{
+    if (jl_svec_len(widened) != jl_svec_len(exact))
+        return 0;
+    for (size_t i = 0; i < jl_svec_len(widened); i++) {
+        jl_value_t *w = jl_svecref(widened, i);
+        if (jl_egal(w, jl_svecref(exact, i)))
+            continue;
+        if (!jl_is_typevar(w) || !is_trait_arg_type(w))
+            return 0;
+    }
+    return 1;
+}
+
 // The arguments of `m` that a call with argument types `tt` compiles once (compiler §6.3, steps 3 to
 // 5, resolved at the method): the method's `@nospecialize` and `@specialize` at the argument; the
 // module's `dynamic` option; the set's default, except for a value of Julia's own types or the set's
@@ -1428,7 +1455,7 @@ static uint32_t effective_nospecialize(jl_method_t *m, jl_tupletype_t *tt, int s
             dyn = 1;                                              // 3: the module's `dynamic`
         else {
             jl_module_t *setmod = NULL;
-            int d = set_default_attribute(decl_i, &setmod);
+            int d = set_default_attribute(trait_arg_decl(decl_i), &setmod);
             jl_value_t *elt = jl_tparam(tt, i);
             // 4: the set's default; 3 is `Dynamic` for Julia's own types too (`IO`, §7.5)
             if (d != 0 && !jl_is_vararg(elt) && (d == 3 || !type_is_own(elt, setmod)))
@@ -1581,7 +1608,7 @@ static void jl_compilation_sig(
             // a trait argument whose type names the method's variables (`X{T}`): compiled once at that
             // instance with the variables' values from the match, the erased key (compiler §6.2; C-54)
             if (is_trait_arg_type(decl_i) && sparams != NULL && jl_svec_len(sparams) > 0 && jl_is_unionall(decl)) {
-                type_i = jl_instantiate_type_in_env(decl_i, (jl_unionall_t*)decl, jl_svec_data(sparams));
+                type_i = jl_instantiate_type_in_env(trait_arg_decl(decl_i), (jl_unionall_t*)decl, jl_svec_data(sparams));
                 if (!jl_has_free_typevars(type_i)) {
                     if (type_i != elt) {
                         if (!*newparams) *newparams = jl_svec_copy(tt->parameters);
@@ -1814,7 +1841,7 @@ JL_DLLEXPORT int jl_isa_compileable_sig(
         // or, where that type names the method's variables, its instance with their values (C-54)
         if (i_arg > 0 && i_arg <= 32 && (trait_bits & (1u << (i_arg - 1))) && jl_has_free_typevars(decl_i) &&
                 is_trait_arg_type(elt) && !jl_has_free_typevars(elt) &&
-                ((jl_datatype_t*)jl_unwrap_unionall(elt))->name == ((jl_datatype_t*)jl_unwrap_unionall(decl_i))->name &&
+                ((jl_datatype_t*)jl_unwrap_unionall(elt))->name == ((jl_datatype_t*)jl_unwrap_unionall(trait_arg_decl(decl_i)))->name &&
                 jl_subtype(elt, type_i))
             continue;
 
@@ -2040,6 +2067,13 @@ jl_method_instance_t *cache_method(
         assert(temp != (jl_value_t*)jl_bottom_type); (void)temp;
         if (jl_egal((jl_value_t*)newparams, (jl_value_t*)sparams)) {
             cache_with_orig = !issubty;
+            compilationsig = (jl_datatype_t*)temp2;
+        }
+        else if (attr_widened && sparams_differ_at_trait_vars(newparams, sparams)) {
+            // an argument typed by a `where` variable bounded by a set, compiled once (compiler §6.2;
+            // W-148): the instance does not know the variable, and its code reads it from the value
+            temp3 = (jl_value_t*)newparams;
+            sparams = newparams;
             compilationsig = (jl_datatype_t*)temp2;
         }
         newparams = NULL;
@@ -5296,7 +5330,7 @@ JL_DLLEXPORT jl_value_t *jl_attribute_sig(jl_value_t *tt, jl_method_t *m, uint32
     for (size_t i = 1; i < np && i <= 32; i++) {
         if (!(nospec & (1u << (i - 1))))
             continue;
-        decl_i = jl_nth_slot_type(m->sig, i);
+        decl_i = trait_arg_decl(jl_nth_slot_type(m->sig, i));   // a `where` variable stands for its bound (W-148)
         if (jl_has_free_typevars(decl_i)) {
             // a declared type that names the method's variables (`X{T}`, C-54): its instance with their
             // values from the call, or the type over them where the call does not fix them

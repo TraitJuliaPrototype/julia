@@ -1037,6 +1037,7 @@ end
 # run the optimization work
 function optimize(interp::AbstractInterpreter, opt::OptimizationState, caller::InferenceResult)
     @zone "CC: OPTIMIZER" ir = run_passes_ipo_safe(opt.src, opt)
+    ir = resolve_runtime_sparams!(ir, opt.linfo)
     ir = insert_fully_typed_check!(ir, interp, opt.linfo, caller)
     ipo_dataflow_analysis!(interp, opt, ir, caller)
     finishopt!(interp, opt, ir)
