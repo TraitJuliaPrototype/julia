@@ -1705,15 +1705,20 @@ struct CompilationQueue
     tocompile::Vector{QueueItems}
     inspected::IdSet{QueueItems}
     interp::Union{AbstractInterpreter,Nothing}
+    # per method, the instances queued because an invoke names them and not their code (`collectinvokes!`)
+    named::IdDict{Any,Int}
 
     CompilationQueue(;
         interp::Union{AbstractInterpreter,Nothing}
-    ) = new(QueueItems[], IdSet{QueueItems}(), interp)
+    ) = new(QueueItems[], IdSet{QueueItems}(), interp, IdDict{Any,Int}())
 
     CompilationQueue(queue::CompilationQueue;
         interp::Union{AbstractInterpreter,Nothing}
-    ) = new(empty!(queue.tocompile), empty!(queue.inspected), interp)
+    ) = new(empty!(queue.tocompile), empty!(queue.inspected), interp, empty!(queue.named))
 end
+# An invoke that names its instance is followed for at most this many instances of one method: a call
+# that inference limited (a recursion over growing types) names a new instance at each step
+const MAX_NAMED_INSTANCES = 4
 
 Base.push!(queue::CompilationQueue, item) = push!(queue.tocompile, item)
 Base.append!(queue::CompilationQueue, items) = append!(queue.tocompile, items)
@@ -1765,10 +1770,19 @@ function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vec
                      !(external_linkage && ci_from_image(edge) && ci_has_invoke(edge)))
                 push!(workqueue, edge)
             elseif instances && edge isa MethodInstance
-                # (a build's queue only: the JIT's queue holds code instances) an invoke that names its instance and not its code: a body inlined from an image's
-                # cache, where code instances are stored as their method instances. The instance is
-                # compiled as any other target
-                push!(workqueue, edge)
+                # (a build's queue only: the JIT's queue holds code instances) an invoke that names
+                # its instance and not its code: a body inlined from an image's cache, where code
+                # instances are stored as their method instances. The instance is compiled as any
+                # other target. A call that inference limited names its instance too, a new one at
+                # each step of a recursion over growing types: a method's instances are followed
+                # up to a bound, and past it the invoke stays unresolved
+                if !isinspected(workqueue, edge)
+                    n = get(workqueue.named, edge.def, 0)
+                    if n < MAX_NAMED_INSTANCES
+                        workqueue.named[edge.def] = n + 1
+                        push!(workqueue, edge)
+                    end
+                end
             end
         end
         if invokelatest_queue !== nothing && isexpr(stmt, :invoke)
