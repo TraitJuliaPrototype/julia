@@ -468,6 +468,11 @@ keep(@nospecialize(x)) = x
 # raises `MethodError`; the compiler inserts the check where it cannot prove them
 _callable_argcheck(@nospecialize(f), @nospecialize(A), @nospecialize(args...)) =
     (isa(args, A) || throw_methoderror(f, args...); nothing)
+# a call of an argument declared `Callable{A, S}` (compiler §7.4), as inference reads it in the method's
+# code: the arguments are of `A` or the call raises `MethodError`, and the result is asserted to `S`,
+# whatever the code knows of the function (compiled for its type, or with the function a constant)
+_callable_call(::Type{A}, ::Type{S}, f::F, args::Vararg{Any,N}) where {A,S,F,N} =
+    (@inline; isa(args, A) || throw_methoderror(f, args...); typeassert(f(args...), S))
 struct UndefKeywordError <: Exception
     var::Symbol
 end

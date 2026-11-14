@@ -151,7 +151,66 @@ function retrieve_code_info(mi::MethodInstance, world::UInt)
     end
     if c isa CodeInfo
         c.parent = mi
+        callable_argument_calls!(c, mi)
         return c
+    end
+    return nothing
+end
+
+"""
+A call of an argument declared `Callable{A, S}` is read as `Core._callable_call(A, S, f, args...)`
+(compiler §7.4): the arguments checked against `A`, the result asserted to `S`. The declaration
+decides it, not what an instance knows of the function: an instance compiled for the function's type,
+or one that has the function as a constant, calls the function's own method, and still checks. `A`
+and `S` are taken with the instance's values of the method's variables; a declaration that still
+names a variable there, an argument the body assigns, and a call with a splat are left as written.
+"""
+function callable_argument_calls!(c::CodeInfo, mi::MethodInstance)
+    m = mi.def
+    m isa Method || return nothing
+    msig = m.sig
+    sig = unwrap_unionall(msig)
+    sig isa DataType || return nothing
+    cname = (unwrap_unionall(Core.Callable)::DataType).name
+    decls = nothing
+    for i in 2:length(sig.parameters)
+        d = sig.parameters[i]
+        isvarargtype(d) && break
+        depth = 0
+        while d isa TypeVar && depth < 8
+            d = d.ub
+            depth += 1
+        end
+        du = unwrap_unionall(d)
+        (du isa DataType && du.name === cname && length(du.parameters) == 2) || continue
+        A = du.parameters[1]
+        S = du.parameters[2]
+        if msig isa UnionAll && (has_free_typevars(A) || has_free_typevars(S))
+            sp = mi.sparam_vals
+            A = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), A, msig, sp)
+            S = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), S, msig, sp)
+        end
+        (A isa Type && S isa Type && !has_free_typevars(A) && !has_free_typevars(S) && A <: Tuple) || continue
+        S === Any && A === Tuple && continue
+        decls === nothing && (decls = IdDict{Int,Any}())
+        decls[i] = svec(A, S)
+    end
+    decls === nothing && return nothing
+    code = c.code
+    # an argument the body assigns is no longer the declared value
+    for stmt in code
+        if isexpr(stmt, :(=)) && stmt.args[1] isa SlotNumber
+            delete!(decls, (stmt.args[1]::SlotNumber).id)
+        end
+    end
+    isempty(decls) && return nothing
+    for stmt in code
+        e = isexpr(stmt, :(=)) ? stmt.args[2] : stmt
+        (isexpr(e, :call) && e.args[1] isa SlotNumber) || continue
+        AS = get(decls, (e.args[1]::SlotNumber).id, nothing)
+        AS === nothing && continue
+        AS = AS::SimpleVector
+        e.args = Any[GlobalRef(Core, :_callable_call), AS[1], AS[2], e.args...]
     end
     return nothing
 end
