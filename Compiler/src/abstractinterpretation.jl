@@ -141,6 +141,11 @@ function record_callable_absences!(interp::AbstractInterpreter, sv::AbsIntState,
                 F = s.parameters[i]
                 (isa(F, DataType) && isconcretetype(F)) || continue
                 A = length(du.parameters) == 2 ? du.parameters[1] : nothing
+                # where `A` names the method's variables, the call's other arguments give their values:
+                # the edge is at that `A`. A method the other arguments cannot reach takes the call
+                # whatever the argument's methods: no edge
+                A = callable_absence_args(A, s, d, mz.sig, i)
+                A === Union{} && continue
                 etype = (A isa DataType && A <: Tuple && !has_free_typevars(A)) ?
                     Tuple{F, A.parameters...} : Tuple{F, Vararg{Any}}
                 r = findall(etype, method_table(interp); limit = -1)
@@ -152,6 +157,35 @@ function record_callable_absences!(interp::AbstractInterpreter, sv::AbsIntState,
         end
     end
     return nothing
+end
+# The argument types `A` of a method's `Callable{A, S}` at position `i`, with the method's variables
+# as the call's other arguments fix them (compiler §7.4): the call `s` and the method's signature `d`
+# (unwrapped, of `msig`) are intersected with position `i` left open. `Union{}` where they do not
+# meet: the method cannot take the call, whatever `A`. `nothing` where a variable stays open.
+function callable_absence_args(@nospecialize(A), s::DataType, d::DataType, @nospecialize(msig), i::Int)
+    sp = Any[s.parameters...]
+    dp = Any[d.parameters...]
+    closed = A isa DataType && A <: Tuple && !has_free_typevars(A)
+    (i <= length(sp) && i <= length(dp)) || return closed ? A : nothing
+    (isvarargtype(sp[i]) || isvarargtype(dp[i])) && return closed ? A : nothing
+    sp[i] = Any
+    dp[i] = Any
+    callt = Tuple{sp...}
+    methodt = rewrap_unionall(Tuple{dp...}, msig)
+    ti_env = ccall(:jl_type_intersection_with_env, Any, (Any, Any), callt, methodt)::SimpleVector
+    ti_env[1] === Union{} && return Union{}
+    closed && return A
+    (A isa Type && msig isa UnionAll) || return nothing
+    env = ti_env[2]::SimpleVector
+    n = 0
+    u = methodt
+    while u isa UnionAll
+        n += 1
+        u = u.body
+    end
+    length(env) == n || return nothing
+    A2 = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), A, methodt, env)
+    return (A2 isa DataType && A2 <: Tuple && !has_free_typevars(A2)) ? A2 : nothing
 end
 any_ambig(result::MethodLookupResult) = result.ambig
 any_ambig(info::MethodMatchInfo) = any_ambig(info.results)
@@ -599,8 +633,11 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
                                         max_union_splitting = closed ? MAX_CLOSED_SPLITS :
                                                               InferenceParams(interp).max_union_splitting,
                                         operation = false)::Future
+        # (the declared result in a box: a closure over a type is a closure type of its own per type,
+        # compiled in each session for each declared result)
+        drtbox = RefValue{Any}(drt)
         return Future{CallMeta}(call, interp, sv) do call, _, _
-            CallMeta(drt, Any, Effects(), SplitCallInfo(call.info, drt, closed))
+            CallMeta(drtbox[], Any, Effects(), SplitCallInfo(call.info, drtbox[], closed))
         end
     end
     # each trait argument's attribute (compiler §6.3): a cast's, the one an argument of this frame
@@ -3621,9 +3658,10 @@ function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
         u = unwrap_unionall(T)
         if u isa DataType && !isconcretetype(T) && ccall(:jl_is_open_set, Cint, (Any,), u) != 0
             call = abstract_call_gf_by_type(interp, f, arginfo, si, argtypes_to_type(argtypes), sv, max_methods)::Future
+            Tbox = RefValue{Any}(T)        # (as the split's declared result: no closure type per type)
             return Future{CallMeta}(call, interp, sv) do call, _, _
                 rt = call.rt
-                widenconst(rt) <: T || (rt = T)
+                widenconst(rt) <: Tbox[] || (rt = Tbox[])
                 CallMeta(rt, call.exct, call.effects, call.info, call.refinements)
             end
         end
