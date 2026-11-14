@@ -994,9 +994,23 @@ function attributed_match(m::MethodMatch, mask::UInt32, dyn::UInt32, closed_rule
     traits = ccall(:jl_trait_arg_bits, UInt32, (Any,), method)
     traits == 0 && return (m, false)
     spec = m.spec_types
+    uspec = unwrap_unionall(spec)
+    if closed_rules && uspec isa DataType
+        # A closed build compiles for the type wherever the call knows it (compiler §7.6): the set's
+        # default and the module's options choose what a session compiles once, and a build has no
+        # later caller to save for. A cast, an attribute the value carries and the method's own
+        # `@nospecialize` stand.
+        nospec = method.nospecialize % UInt32
+        for i = 1:min(32, length(uspec.parameters) - 1)
+            bit = UInt32(1) << (i - 1)
+            (traits & bit) != 0 && (mask & bit) == 0 && (nospec & bit) == 0 || continue
+            p = uspec.parameters[i + 1]
+            (!isvarargtype(p) && isconcretetype(p)) || continue
+            mask |= bit
+        end
+    end
     dbits = ccall(:jl_attribute_dynamic_bits, UInt32, (Any, Any, UInt32, UInt32), spec, method, mask, dyn)
     dispatch = false
-    uspec = unwrap_unionall(spec)
     if uspec isa DataType
         for i = 1:min(32, length(uspec.parameters) - 1)
             bit = UInt32(1) << (i - 1)
@@ -1082,7 +1096,7 @@ function abstract_attributed_call(interp::AbstractInterpreter, arginfo::ArgInfo,
     dyn = (bits >> 32) % UInt32 & mask
     newfargs = fargs === nothing ? nothing : fargs[3:end]
     newargtypes = argtypes[3:end]
-    ft = widenconst(argtypes[3])
+    ft = widenslotwrapper(argtypes[3])      # (a parametric type's constructor is a constant, not a singleton type)
     f = singleton_type(ft)
     newarginfo = ArgInfo(newfargs, newargtypes)
     call = if f === nothing || isa(f, Builtin)
