@@ -275,6 +275,31 @@ function same_result_edges(a::CodeInstance, b::CodeInstance)
     return true
 end
 
+# A CodeInstance in the cache whose code can stand for `callee`'s in `world` (compiler §3.3): of the
+# same instance, owner, policy and result type, valid there, and with the same result edges. Every
+# entry of the chain is a candidate, compiled ones first: an instance holds entries made by other
+# requests (an image's, a revalidation's), and the first by its ABI need not record the same edges.
+# `callee` itself where there is none.
+function equivalent_cached_ci(callee::CodeInstance, world::UInt)
+    head = ccall(:jl_get_ci_equiv, Any, (Any, UInt), callee, world)::CodeInstance
+    head === callee && return callee
+    found = nothing
+    c = head
+    while true
+        if c !== callee && isdefined(c, :inferred) && c.def === callee.def && c.owner === callee.owner &&
+                (c.owner !== nothing || ci_policy_facts(c) == ci_policy_facts(callee)) &&
+                c.rettype === callee.rettype &&
+                c.min_world <= world <= c.max_world &&
+                same_result_edges(c, callee)
+            ci_has_invoke(c) && return c
+            found === nothing && (found = c)
+        end
+        isdefined(c, :next) || break
+        c = c.next
+    end
+    return found === nothing ? callee : found
+end
+
 function finish!(interp::AbstractInterpreter, caller::InferenceState, validation_world::UInt, time_before::UInt64)
     result = caller.result
     edges = result_edges(interp, caller)
@@ -1877,8 +1902,8 @@ function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UIn
         sptypes = sptypes_from_meth_instance(mi)
         collectinvokes!(workqueue, src, sptypes)
         if iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), mi, callee))
-            cached = ccall(:jl_get_ci_equiv, Any, (Any, UInt), callee, get_inference_world(workqueue.interp))::CodeInstance
-            if cached === callee || !same_result_edges(cached, callee)
+            cached = equivalent_cached_ci(callee, get_inference_world(workqueue.interp))
+            if cached === callee
                 # make sure callee is gc-rooted and cached, as required by jl_add_codeinst_to_jit
                 code_cache(workqueue.interp)[mi] = callee
             else
@@ -1986,8 +2011,8 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
                 end
                 # try to reuse an existing CodeInstance from before to avoid making duplicates in the cache
                 if iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), mi, callee))
-                    cached = ccall(:jl_get_ci_equiv, Any, (Any, UInt), callee, world)::CodeInstance
-                    if cached === callee || !same_result_edges(cached, callee)
+                    cached = equivalent_cached_ci(callee, world)
+                    if cached === callee
                         code_cache(interp)[mi] = callee
                     else
                         # Use an existing CI from the cache, if there is available one that is compatible
