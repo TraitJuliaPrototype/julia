@@ -1844,21 +1844,50 @@
 ;;   if compiled_for === Core.compiled_for && with_dynamic === Core.with_dynamic
 ;;       Core.attributed_call(bits, f, Core._cast_compiled(x), y, z)
 ;;   else f(compiled_for(x), with_dynamic(y), z) end
-;; the low 32 bits name the arguments a cast decides, the high 32 those that are `Dynamic`. A cast in a
-;; call with keyword arguments or a splat, or past the 32nd argument, is left as the call of its name,
-;; which raises where the name is Core's cast
+;; the low 32 bits name the arguments a cast decides, the high 32 those that are `Dynamic`.
+;; With keyword arguments the cast call is Core.attributed_call(bits, Core.kwcall, kws, f, args...),
+;; its bits two places up: the keywords' container and `f` are kwcall's first two arguments.
+;; A cast in a call with a splatted argument, as a keyword's value, or past the 32nd argument, is left
+;; as the call of its name, which raises where the name is Core's cast
 (define (lower-cast-call f args)
-  (if (or (any kwarg? args) (has-parameters? args) (any vararg? args))
-      `(call ,f ,@(map uncast args))
-      (let* ((tests (cast-bound-tests args))
-             (test  (if (length= tests 1) (car tests) `(&& ,@tests))))
-        `(if ,test ,(lower-cast-call- f args) (call ,f ,@(map uncast args))))))
+  (define (plain) `(call ,f ,@(map uncast args)))
+  (define (with-test castcall)
+    (let* ((tests (cast-bound-tests args))
+           (test  (if (length= tests 1) (car tests) `(&& ,@tests))))
+      `(if ,test ,castcall ,(plain))))
+  (cond ((any vararg? (if (has-parameters? args) (cdr args) args))
+         (plain))
+        ((and (has-parameters? args) (null? (cdar args)) (not (any kwarg? args)))
+         ;; an empty parameters block: the call without it
+         (lower-cast-call f (cdr args)))
+        ((or (any kwarg? args) (has-parameters? args))
+         (let* ((para (if (has-parameters? args) (list (car args)) '()))
+                (rest (if (has-parameters? args) (cdr args) args))
+                (pos  (filter (lambda (a) (not (kwarg? a))) rest)))
+           (if (or (not (any cast-arg? pos)) (length> pos 30))
+               (plain)
+               ;; the positional arguments with the casts applied, the keywords as written
+               (let* ((cast  (cast-args pos 4))   ; kwcall's third argument is the first positional
+                      (bits  (car cast))
+                      (cpos  (cdr cast))
+                      (cargs (let loop ((as rest) (cp cpos) (out '()))
+                               (cond ((null? as) (reverse out))
+                                     ((kwarg? (car as)) (loop (cdr as) cp (cons (uncast-kw (car as)) out)))
+                                     (else (loop (cdr as) (cdr cp) (cons (car cp) out)))))))
+                 (with-test (lower-kw-call f (append para cargs) bits))))))
+        (else
+         (with-test (let ((cast (cast-args args 1)))
+                      `(call (core attributed_call) ,(car cast) ,f ,@(cdr cast)))))))
 
-(define (lower-cast-call- f args)
-  ;; bit (k - 1) for argument k; the bits as an Int, the dynamic half shifted by 32
-  (let loop ((as args) (bit 1) (mask 0) (dyn 0) (out '()))
+;; a keyword whose value is written as a cast: the call of the cast's name
+(define (uncast-kw a) `(kw ,(cadr a) ,(uncast (caddr a))))
+
+;; the arguments with the casts applied, and the attribute bits as an Int: bit `first` for the first
+;; argument; the dynamic half shifted by 32. Returns (bits . args)
+(define (cast-args args first)
+  (let loop ((as args) (bit first) (mask 0) (dyn 0) (out '()))
     (if (null? as)
-        `(call (core attributed_call) ,(+ mask (* dyn 4294967296)) ,f ,@(reverse out))
+        (cons (+ mask (* dyn 4294967296)) (reverse out))
         (let ((a (car as)))
           (cond ((> bit 2147483648)
                  (loop (cdr as) (* bit 2) mask dyn (cons (uncast a) out)))
@@ -1869,7 +1898,8 @@
                  (loop (cdr as) (* bit 2) (+ mask bit) (+ dyn bit) (cons (caddr a) out)))
                 (else (loop (cdr as) (* bit 2) mask dyn (cons a out))))))))
 
-(define (lower-kw-call f args)
+;; `castbits`: the attribute bits of a call with casts (lower-cast-call), or #f
+(define (lower-kw-call f args (castbits #f))
   (let* ((para (if (has-parameters? args) (cdar args) '()))
          (args (if (has-parameters? args) (cdr args) args)))
     (let* ((parg-stmts (remove-argument-side-effects `(call ,f ,@args)))
@@ -1880,13 +1910,23 @@
         ,.(cdr parg-stmts)
         ,(receive
           (kws pargs) (separate kwarg? cargs)
-          (lower-kw-call- fexpr (append! kws para) pargs))))))
+          (lower-kw-call- fexpr (append! kws para) pargs castbits))))))
 
-(define (lower-kw-call- fexpr kw pa)
+(define (lower-kw-call- fexpr kw pa (castbits #f))
+  ;; the keyword call, and the call without keywords; with casts, each through Core.attributed_call
+  ;; (without keywords the bits are two places down again)
+  (define (kwcall-form f pa kw-container)
+    (if castbits
+        `(call (core attributed_call) ,castbits (core kwcall) ,kw-container ,f ,@pa)
+        `(call (core kwcall) ,kw-container ,f ,@pa)))
+  (define (call-form f pa)
+    (if castbits
+        `(call (core attributed_call) ,(div0 castbits 4) ,f ,@pa)
+        `(call ,f ,@pa)))
   (define (kwcall-unless-empty f pa kw-container-test kw-container)
     `(if (call (top isempty) ,kw-container-test)
-         (call ,f ,@pa)
-         (call (core kwcall) ,kw-container ,f ,@pa)))
+         ,(call-form f pa)
+         ,(kwcall-form f pa kw-container)))
 
   (let ((f            (if (sym-ref? fexpr) fexpr (make-ssavalue)))
         (kw-container (make-ssavalue)))
@@ -1900,7 +1940,7 @@
                                            #t))
       ,(if (every vararg? kw)
            (kwcall-unless-empty f pa kw-container kw-container)
-           `(call (core kwcall) ,kw-container ,f ,@pa)))))
+           (kwcall-form f pa kw-container)))))
 
 ;; convert `a+=b` to `a=a+b`
 (define (expand-update-operator- op op= lhs rhs declT)
