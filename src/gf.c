@@ -4476,6 +4476,134 @@ static int membership_param_meets(jl_value_t *Y, jl_value_t *uw, jl_value_t *msi
     return meets;
 }
 
+// Is the variable of `ua` a parameter of the type in its body, with the bound the type declares:
+// the variable of the type's own wrapper (`Cell`, written without parameters)?
+static int declared_parameter(jl_unionall_t *ua) JL_NOTSAFEPOINT
+{
+    jl_value_t *body = jl_unwrap_unionall((jl_value_t*)ua);
+    if (!jl_is_datatype(body) || jl_is_tuple_type(body))
+        return 0;
+    for (jl_value_t *w = ((jl_datatype_t*)body)->name->wrapper; jl_is_unionall(w); w = ((jl_unionall_t*)w)->body)
+        if (((jl_unionall_t*)w)->var == ua->var)
+            return 1;
+    return 0;
+}
+
+// The part of the type `v`, at a covariant place of a signature, that a new member adds: `v` with
+// each walked set it names replaced by the member's core `memb`.
+// - A union's parts and a tuple's components are covariant places. A `Vararg` whose element names
+//   the set is many places: it fails.
+// - A type's own parameter with the bound the type declares (`Cell` for `struct Cell{C<:X}`) is bound
+//   anew, below the substituted bound: no type with the member there could be made before the
+//   membership, so no code and no cache entry is at one. A bound that the signature sets
+//   (`Box{<:X}`) fails: `Box{Union{S, T}}` was made before and is under it only now.
+// - `in_bound`: `v` is the bound of a variable that is no type's declared parameter (one of the
+//   signature's, or `S` in `Type{<:Cell}`). A set replaced there outside a declared parameter fails
+//   for the same reason.
+// - An intersection `All{…}` that names the set gives the member (it may not be in the other sets:
+//   more is replayed, nothing missed).
+// - A parameter of any other type does not vary: only that type is under it, whoever joins the set.
+// `*did` counts the places where a set was replaced. `*fail` is set where the shape cannot be followed (a set
+// in a variable's lower bound, or deeper than 8): the caller takes the conservative path.
+static jl_value_t *membership_subst_nested(jl_value_t *v, jl_array_t *sets, jl_value_t *memb,
+                                           jl_value_t *msig, int *did, int *fail, int depth, int in_bound)
+{
+    if (v == NULL || *fail || jl_is_typevar(v))
+        return v;
+    if (depth > 8) {
+        for (size_t s = 0; s < jl_array_nrows(sets); s++) {
+            jl_value_t *Yuw = jl_unwrap_unionall(jl_array_ptr_ref(sets, s));
+            if (set_name_nested(v, ((jl_datatype_t*)Yuw)->name, 1, 1))
+                *fail = 1;
+        }
+        return v;
+    }
+    jl_value_t *a = NULL, *b = NULL, *r = v;
+    JL_GC_PUSH3(&a, &b, &r);
+    if (jl_is_uniontype(v)) {
+        jl_uniontype_t *u = (jl_uniontype_t*)v;
+        a = membership_subst_nested(u->a, sets, memb, msig, did, fail, depth + 1, in_bound);
+        b = membership_subst_nested(u->b, sets, memb, msig, did, fail, depth + 1, in_bound);
+        if (!*fail && (a != u->a || b != u->b)) {
+            jl_value_t *pair[2] = {a, b};
+            r = jl_type_union(pair, 2);
+        }
+    }
+    else if (jl_is_vararg(v)) {
+        jl_vararg_t *va = (jl_vararg_t*)v;
+        if (va->T != NULL) {
+            // a call has the member in any of the places, beside other members: no one signature
+            int d = 0;
+            a = membership_subst_nested(va->T, sets, memb, msig, &d, fail, depth + 1, in_bound);
+            if (d > 0 || a != va->T)
+                *fail = 1;
+        }
+    }
+    else if (jl_is_unionall(v)) {
+        jl_unionall_t *ua = (jl_unionall_t*)v;
+        jl_tvar_t *tv = ua->var;
+        for (size_t s = 0; s < jl_array_nrows(sets); s++) {
+            jl_value_t *Yuw = jl_unwrap_unionall(jl_array_ptr_ref(sets, s));
+            if (set_name_nested(tv->lb, ((jl_datatype_t*)Yuw)->name, 1, 1))
+                *fail = 1;
+        }
+        // the bound of a type's own parameter, as the type declares it (`Cell` for
+        // `struct Cell{C<:X}`): a type with the member there could not be made before
+        // any other variable (`Box{<:X}`, `Type{<:Cell}`): a set replaced in its bound outside a
+        // declared parameter fails (`Box{Union{S, T}}` was made before the membership)
+        a = membership_subst_nested(tv->ub, sets, memb, msig, did, fail, depth + 1, !declared_parameter(ua));
+        b = membership_subst_nested(ua->body, sets, memb, msig, did, fail, depth + 1, in_bound);
+        if (!*fail) {
+            if (a != tv->ub) {
+                a = (jl_value_t*)jl_new_typevar(tv->name, tv->lb, a);
+                b = jl_substitute_var(b, tv, a);
+                r = jl_type_unionall((jl_tvar_t*)a, b);
+            }
+            else if (b != ua->body) {
+                r = jl_type_unionall(tv, b);
+            }
+        }
+    }
+    else if (jl_is_datatype(v)) {
+        jl_datatype_t *dt = (jl_datatype_t*)v;
+        if (jl_is_all_type(v) || dt->name->open_set) {
+            // the set itself, or an intersection's component
+            jl_value_t *tup = jl_is_all_type(v) ? jl_tparam0(v) : NULL;
+            size_t nc = tup == NULL ? 1 : jl_is_tuple_type(tup) ? jl_nparams(tup) : 0;
+            for (size_t k = 0; k < nc && r == v; k++) {
+                jl_value_t *c = tup == NULL ? v : jl_unwrap_unionall(jl_tparam(tup, k));
+                if (!jl_is_datatype(c))
+                    continue;
+                for (size_t s = 0; s < jl_array_nrows(sets); s++) {
+                    jl_value_t *Y = jl_array_ptr_ref(sets, s);
+                    if (((jl_datatype_t*)jl_unwrap_unionall(Y))->name == ((jl_datatype_t*)c)->name &&
+                            membership_param_meets(Y, c, msig)) {
+                        if (in_bound)
+                            *fail = 1; // the bound of a signature's variable: see the caller
+                        *did += 1;
+                        r = memb;
+                        break;
+                    }
+                }
+            }
+        }
+        else if (jl_is_tuple_type(v)) {
+            size_t np = jl_nparams(dt);
+            int changed = 0;
+            a = (jl_value_t*)jl_alloc_svec(np);
+            for (size_t i = 0; i < np; i++) {
+                b = membership_subst_nested(jl_tparam(dt, i), sets, memb, msig, did, fail, depth + 1, in_bound);
+                changed |= b != jl_tparam(dt, i);
+                jl_svecset(a, i, b);
+            }
+            if (!*fail && changed)
+                r = (jl_value_t*)jl_apply_tuple_type((jl_svec_t*)a, 0);
+        }
+    }
+    JL_GC_POP();
+    return r;
+}
+
 static jl_value_t *membership_subst_sig(jl_method_t *m, jl_array_t *sets,
                                         jl_value_t *member, int *clean)
 {
@@ -4511,8 +4639,14 @@ static jl_value_t *membership_subst_sig(jl_method_t *m, jl_array_t *sets,
     jl_svec_t *newparams = jl_alloc_svec(n);
     jl_datatype_t *tuple = NULL;
     jl_value_t *res = NULL;
-    JL_GC_PUSH3(&newparams, &tuple, &res);
+    jl_svec_t *newvars = NULL; // the signature's variables bound anew below a substituted bound
+    jl_value_t *tmp = NULL;
+    JL_GC_PUSH5(&newparams, &tuple, &res, &newvars, &tmp);
+    newvars = jl_alloc_svec(mvars_n);
     size_t nreplaced = 0;
+    size_t nnested = 0;      // of them, below a position's top
+    int var_done[16] = {0};  // the signature's variables replaced at a position of their own
+    volatile int thrown = 0;
     for (size_t i = 0; i < n; i++) {
         jl_value_t *p = jl_tparam(mbd, i);
         jl_value_t *uw = jl_is_vararg(p) ? jl_unwrap_vararg(p) : jl_unwrap_unionall(p);
@@ -4545,6 +4679,9 @@ static jl_value_t *membership_subst_sig(jl_method_t *m, jl_array_t *sets,
                 jl_svecset(newparams, i, memb);
                 replaced = 1;
                 nreplaced++;
+                if (!jl_is_vararg(p) && jl_is_typevar(p))
+                    for (size_t k = 0; k < mvars_n; k++)
+                        var_done[k] |= mvars[k] == p;
                 break;
             }
             if (named && !replaced) { // only other instances of the set at this position
@@ -4553,16 +4690,57 @@ static jl_value_t *membership_subst_sig(jl_method_t *m, jl_array_t *sets,
             }
         }
         if (!replaced) {
-            for (size_t s = 0; s < jl_array_nrows(sets); s++) {
-                jl_value_t *Yuw = jl_unwrap_unionall(jl_array_ptr_ref(sets, s));
-                if (set_name_nested(p, ((jl_datatype_t*)Yuw)->name, 1, 1)) {
-                    *clean = 0;
-                    JL_GC_POP();
-                    return NULL;
-                }
+            // the set below this position (compiler §5.5): substituted where the shape allows
+            int did = 0, fail = 0;
+            JL_TRY {
+                tmp = membership_subst_nested(p, sets, memb, msig, &did, &fail, 1, 0);
             }
-            jl_svecset(newparams, i, p);
+            JL_CATCH {
+                thrown = 1;
+            }
+            if (fail || thrown) {
+                *clean = 0;
+                JL_GC_POP();
+                return NULL;
+            }
+            jl_svecset(newparams, i, tmp);
+            nreplaced += did;
+            nnested += did;
         }
+    }
+    // a variable of the signature whose bound names the set below its top (`S <: D{<:X}`)
+    for (size_t i = 0; i < mvars_n; i++) {
+        jl_tvar_t *tv = (jl_tvar_t*)mvars[i];
+        int did = 0, fail = 0;
+        for (size_t s = 0; s < jl_array_nrows(sets); s++) {
+            jl_value_t *Yuw = jl_unwrap_unionall(jl_array_ptr_ref(sets, s));
+            if (set_name_nested(tv->lb, ((jl_datatype_t*)Yuw)->name, 1, 1))
+                fail = 1;
+        }
+        if (var_done[i])
+            continue; // replaced at its own position; elsewhere it keeps its bound, which covers more
+        JL_TRY {
+            tmp = membership_subst_nested(tv->ub, sets, memb, msig, &did, &fail, 1, 1);
+            if (!fail && did)
+                jl_svecset(newvars, i, jl_new_typevar(tv->name, tv->lb, tmp));
+        }
+        JL_CATCH {
+            thrown = 1;
+        }
+        if (fail || thrown) {
+            *clean = 0;
+            JL_GC_POP();
+            return NULL;
+        }
+        nreplaced += did;
+        nnested += did;
+    }
+    // The member in one place: the types the membership adds under the signature. With the set in
+    // several places, a new call has the member in any one of them, which one signature does not say.
+    if (nnested > 0 && nreplaced > 1) {
+        *clean = 0;
+        JL_GC_POP();
+        return NULL;
     }
     if (nreplaced == 0) {
         // m names the set at top level only at instances the member is not of (else the
@@ -4575,7 +4753,22 @@ static jl_value_t *membership_subst_sig(jl_method_t *m, jl_array_t *sets,
     tuple = (jl_datatype_t*)jl_apply_tuple_type(newparams, 0);
     res = (jl_value_t*)tuple; // each jl_new_struct below allocates across the previous step
     for (size_t i = mvars_n; i-- > 0;) {
-        jl_unionall_t *na = (jl_unionall_t*)jl_new_struct(jl_unionall_type, mvars[i], res);
+        jl_value_t *var = mvars[i];
+        if (jl_svecref(newvars, i) != NULL) {
+            JL_TRY {
+                res = jl_substitute_var(res, (jl_tvar_t*)var, jl_svecref(newvars, i));
+            }
+            JL_CATCH {
+                thrown = 1;
+            }
+            if (thrown) {
+                *clean = 0;
+                JL_GC_POP();
+                return NULL;
+            }
+            var = jl_svecref(newvars, i);
+        }
+        jl_unionall_t *na = (jl_unionall_t*)jl_new_struct(jl_unionall_type, var, res);
         res = (jl_value_t*)na;
     }
     for (size_t i = membvars_n; i-- > 0;) {
