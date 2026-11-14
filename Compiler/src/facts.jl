@@ -155,7 +155,7 @@ function policy_interp(interp::NativeInterpreter, facts::Bool; nested::Bool = tr
     world = get_inference_world(interp)
     return NativeInterpreter(world, CachedMethodTable(InternalMethodTable(world)), InferenceResult[],
                              interp.codegen, InferenceParams(interp), OptimizationParams(interp),
-                             facts, interp.crossings + Int(nested), false)
+                             facts, interp.crossings + Int(nested), false, nothing, nothing)
 end
 
 "Whether `interp` infers `mi`'s top frame under the other policy than its method's (facts F-24)."

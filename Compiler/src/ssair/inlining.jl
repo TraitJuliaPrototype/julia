@@ -484,10 +484,11 @@ end
 """
 The table for the last branch of an operation's split at `sig` (the call `f(x, args...)`) with
 declared result `rt` (compiler §7.3): `nothing` where the call takes Julia's dynamic dispatch instead
-(a function of a type not concrete, more than `MAX_SPLIT_TABLE_ARGS` arguments, a trimmed program).
+(a function of a type not concrete, more than `MAX_SPLIT_TABLE_ARGS` arguments, a closed build or its
+check).
 """
-function split_fallback_table(sig::Signature, @nospecialize(rt))
-    JLOptions().trim == 0 || return nothing
+function split_fallback_table(sig::Signature, @nospecialize(rt), closed::Bool)
+    closed && return nothing
     ats = sig.argtypes
     length(ats) >= 2 || return nothing
     n = length(ats) - 2
@@ -1588,7 +1589,7 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
         handle_declared_result!(ir, idx, stmt, DeclaredResultInfo(fallback_rt))
         return nothing
     end
-    table = fallback_rt === nothing ? nothing : split_fallback_table(sig, fallback_rt)
+    table = fallback_rt === nothing ? nothing : split_fallback_table(sig, fallback_rt, closed_build(state.interp))
     if split
         for i in 1:length(cases)
             c = cases[i]

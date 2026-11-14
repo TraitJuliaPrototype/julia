@@ -311,6 +311,14 @@ function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance,
                     push!(errors, false => CallMissing(codeinst, codeinfo, sptypes, i, "unresolved `Threads.@threads` loop body"))
                 end
             end
+            if edge isa MethodInstance
+                # (an invoke that names its instance: resolved where the build compiled the instance)
+                ci = get(caches, edge, nothing)
+                if ci isa CodeInstance
+                    haskey(parents, ci) || (parents[ci] = (codeinst, i))
+                    continue
+                end
+            end
             if edge isa CodeInstance
                 haskey(parents, edge) || (parents[edge] = (codeinst, i))
                 edge in inspected && continue
@@ -441,9 +449,10 @@ end
 
 ## entry-point ##
 
-function get_verify_typeinf_trim(codeinfos::Vector{Any})
+function get_verify_typeinf_trim(codeinfos::Vector{Any}, @nospecialize(owner = nothing))
     this_world = get_world_counter()
-    interp = NativeInterpreter(this_world)
+    # (a check's verifier looks methods up as the check inferred them: through its overlay)
+    interp = owner === nothing ? NativeInterpreter(this_world) : NativeInterpreter(this_world; closed = owner)
     inspected = IdSet{CodeInstance}()
     caches = IdDict{MethodInstance,CodeInstance}()
     errors = ErrorList()
@@ -452,7 +461,7 @@ function get_verify_typeinf_trim(codeinfos::Vector{Any})
         item = codeinfos[i]
         if item isa CodeInstance
             push!(inspected, item)
-            if item.owner === nothing && item.min_world <= this_world <= item.max_world
+            if item.owner === owner && item.min_world <= this_world <= item.max_world
                 mi = get_ci_mi(item)
                 if mi === item.def
                     caches[mi] = item

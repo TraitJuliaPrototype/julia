@@ -1564,7 +1564,8 @@ function ci_has_source(interp::AbstractInterpreter, code::CodeInstance)
     if isa(inf, String)
         inf = _uncompressed_ir(code, inf)
     end
-    if code.owner === nothing
+    if code.owner === nothing || (interp isa NativeInterpreter && code.owner === cache_owner(interp))
+        # (also the code of a closed build's check, §2.7: the native interpreter's, under its own owner)
         if isa(inf, CodeInfo)
             codegen[code] = inf
             return true
@@ -1748,7 +1749,8 @@ is_threads_call_def(@nospecialize def) = def isa Method && is_base_threads_metho
 # collect a list of all code that is needed along with CodeInstance to codegen it fully
 function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vector{VarState};
                          invokelatest_queue::Union{CompilationQueue,Nothing} = nothing,
-                         external_linkage::Bool = false)
+                         external_linkage::Bool = false,
+                         instances::Bool = false)
     src = ci.code
     for i = 1:length(src)
         stmt = src[i]
@@ -1761,6 +1763,11 @@ function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vec
             if edge isa CodeInstance && isdefined(edge, :inferred) &&
                     (isexpr(stmt, :invoke_modify) ||
                      !(external_linkage && ci_from_image(edge) && ci_has_invoke(edge)))
+                push!(workqueue, edge)
+            elseif instances && edge isa MethodInstance
+                # (a build's queue only: the JIT's queue holds code instances) an invoke that names its instance and not its code: a body inlined from an image's
+                # cache, where code instances are stored as their method instances. The instance is
+                # compiled as any other target
                 push!(workqueue, edge)
             end
         end
@@ -1952,7 +1959,7 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             markinspected!(workqueue, callee)
             if src isa CodeInfo
                 sptypes = sptypes_from_meth_instance(mi)
-                collectinvokes!(workqueue, src, sptypes; invokelatest_queue, external_linkage)
+                collectinvokes!(workqueue, src, sptypes; invokelatest_queue, external_linkage, instances = true)
                 # an image holds the code a facts run-time site reaches whatever the values (compiler §9)
                 if invokelatest_queue !== nothing && callee.owner === nothing && ci_policy_facts(callee)
                     for target in rtsite_targets(interp, src, sptypes)
@@ -2017,7 +2024,7 @@ end
 # Between the rounds of a closed build: the round's instances that invoke an instance inferred again
 # are inferred again too, and so on up. A caller kept over an equal result (the code slot, §3.3) would
 # go on invoking the instance with the fewer members.
-function closed_invalidate_callers!(codeinfos::Vector{Any}, stale::IdSet{Any}, world::UInt)
+function closed_invalidate_callers!(codeinfos::Vector{Any}, stale::IdSet{Any}, world::UInt, @nospecialize(owner = nothing))
     changed = true
     while changed
         changed = false
@@ -2032,7 +2039,7 @@ function closed_invalidate_callers!(codeinfos::Vector{Any}, stale::IdSet{Any}, w
                 isexpr(stmt, :(=)) && (stmt = stmt.args[2])
                 (isexpr(stmt, :invoke) && stmt.args[1] in stale) || continue
                 push!(stale, callee)
-                if callee.owner === nothing && callee.max_world == typemax(UInt)
+                if callee.owner === owner && callee.max_world == typemax(UInt)
                     ccall(:jl_invalidate_code_instance, Cvoid, (Any, UInt), callee, world - 1)
                 end
                 changed = true
@@ -2251,6 +2258,57 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
         verify_typeinf_trim(codeinfos, trim_mode == TRIM_UNSAFE_WARN)
     end
     return codeinfos
+end
+
+"""
+    closed_check(mis::Vector{Any}, world::UInt, overlay = nothing) -> (errors, parents)
+
+The closed build's check, run in a session (compiler §2.7, §7.6): the method instances `mis` and what
+they reach are inferred by a closed build's rules, every method plainly, in the build's rounds, into
+a cache of their own, and verified by the build's verifier. `errors` lists the calls a build from
+`mis` would refuse (`TrimVerifier.CallMissing`, each with `false` for an error, `true` for a call
+that only raises); `parents` gives each instance's caller. The session's code is not touched: the
+check's code has an owner of its own, a fresh object. `overlay` holds the methods the build replaces
+in Base: the check infers and verifies with them laid over the session's.
+"""
+function closed_check(mis::Vector{Any}, world::UInt, overlay::Union{Nothing,MethodTable} = nothing)
+    owner = ClosedCheck(overlay)
+    inf_params = InferenceParams(; force_enable_inference = true)
+    mq = ccall(:jl_set_membership_query_world, UInt, (UInt,), world)
+    codeinfos = []
+    try
+        empty!(CLOSED_OPERATION_INSTANCES)
+        closed_used_reset!()
+        rounds = 0
+        while true
+            empty!(CLOSED_CANDIDATE_COUNTS)
+            codeinfos = []
+            interp = NativeInterpreter(world; inf_params, closed = owner)
+            latest_queue = CompilationQueue(; interp)
+            workqueue = CompilationQueue(; interp)
+            append!(workqueue, mis)
+            compile!(codeinfos, workqueue; invokelatest_queue = latest_queue, external_linkage = false)
+            compile!(codeinfos, latest_queue; invokelatest_queue = latest_queue, external_linkage = false)
+            closed_note_used!(codeinfos)
+            (rounds < 16 && closed_candidates_grew()) || break
+            rounds += 1
+            stale = IdSet{Any}()
+            closed_build_reinfer!(world, stale, owner)
+            closed_invalidate_callers!(codeinfos, stale, world, owner)
+        end
+        return Core._call_in_world(_verify_trim_world_age[], TrimVerifier.get_verify_typeinf_trim, codeinfos, owner)
+    finally
+        # the check's code ends with the check
+        for item in codeinfos
+            if item isa CodeInstance && item.owner === owner && item.max_world == typemax(UInt)
+                ccall(:jl_invalidate_code_instance, Cvoid, (Any, UInt), item, world - 1)
+            end
+        end
+        empty!(CLOSED_OPERATION_INSTANCES)
+        closed_used_reset!()
+        empty!(CLOSED_CANDIDATE_COUNTS)
+        ccall(:jl_set_membership_query_world, UInt, (UInt,), mq)
+    end
 end
 
 const _verify_trim_world_age = RefValue{UInt}(typemax(UInt))

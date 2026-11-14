@@ -64,13 +64,14 @@ end
 
 # A match through a membership entry rests on it: the entries join the frame's record
 # (compiler §3.1, §4.8), beside the dispatch edge the match gives.
-function record_match_memberships!(sv::InferenceState, applicable::Vector{MethodMatchTarget})
+function record_match_memberships!(interp::AbstractInterpreter, sv::AbsIntState, applicable::Vector{MethodMatchTarget})
     for target in applicable
         m = target.match
         sig = m.method.sig
         ccall(:jl_has_open_set, Cint, (Any,), sig) == 0 && continue
-        record_memberships!(sv, m.spec_types, sig)
-        record_callable_dispatch!(sv, m.spec_types, sig)
+        # (a positive membership is recorded in an inference frame: its world is the frame's, C-51)
+        sv isa InferenceState && record_memberships!(sv, m.spec_types, sig)
+        record_callable_dispatch!(interp, sv, m.spec_types, sig)
     end
     return nothing
 end
@@ -86,7 +87,7 @@ end
 
 # A match through `Callable{A, S}` rests on the member's own methods (compiler §7.4): the code holds
 # an edge to the member's dispatch at `A`, and is invalidated with it.
-function record_callable_dispatch!(sv::InferenceState, @nospecialize(spec), @nospecialize(sig))
+function record_callable_dispatch!(interp::AbstractInterpreter, sv::AbsIntState, @nospecialize(spec), @nospecialize(sig))
     s = unwrap_unionall(spec)
     d = unwrap_unionall(sig)
     # each narrowed on its own: inference narrows only the second of `(a isa T && b isa T) || return`
@@ -103,7 +104,7 @@ function record_callable_dispatch!(sv::InferenceState, @nospecialize(spec), @nos
         A = du.parameters[1]
         (isa(F, DataType) && isconcretetype(F) && A isa DataType && A <: Tuple && !has_free_typevars(A)) || continue
         atype = Tuple{F, A.parameters...}
-        matches = findall(atype, method_table(sv.interp); limit = -1)
+        matches = findall(atype, method_table(interp); limit = -1)
         matches === nothing && continue
         info = MethodMatchInfo(matches, Core.methodtable, atype, any(m::MethodMatch -> m.fully_covers, matches))
         add_edges!(sv.edges, info)
@@ -115,7 +116,7 @@ end
 # methods at `A` (compiler §7.4): the code holds an edge to the argument's dispatch at `A`, so a method
 # of the argument's type defined later, which can begin the membership, invalidates it as any method
 # does. Where `A` names the method's variables, the edge is to every call of the argument.
-function record_callable_absences!(sv::InferenceState, @nospecialize(matches))
+function record_callable_absences!(interp::AbstractInterpreter, sv::AbsIntState, @nospecialize(matches))
     infos = matches isa MethodMatches ? MethodMatchInfo[matches.info] : matches.info.split
     cname = unwrap_unionall(Core.Callable).name
     for info in infos
@@ -142,7 +143,7 @@ function record_callable_absences!(sv::InferenceState, @nospecialize(matches))
                 A = length(du.parameters) == 2 ? du.parameters[1] : nothing
                 etype = (A isa DataType && A <: Tuple && !has_free_typevars(A)) ?
                     Tuple{F, A.parameters...} : Tuple{F, Vararg{Any}}
-                r = findall(etype, method_table(sv.interp); limit = -1)
+                r = findall(etype, method_table(interp); limit = -1)
                 r === nothing && continue
                 einfo = MethodMatchInfo(r, Core.methodtable, etype, any(m::MethodMatch -> m.fully_covers, r))
                 add_edges!(sv.edges, einfo)
@@ -314,6 +315,9 @@ const MAX_OPERATION_SPLITS = 4
 const MAX_CLOSED_SPLITS = 64
 "A closed build (compiler §7.6): `--trim`. The members of every set are those the build has."
 closed_build() = JLOptions().trim != 0
+# inference by a closed build's rules: in a build, and in the build's check run in a session (§2.7)
+closed_build(::AbstractInterpreter) = closed_build()
+closed_build(interp::NativeInterpreter) = interp.closed !== nothing || closed_build()
 
 # The types a closed build forgets, and where (compiler §7.6): the concrete type of each value its
 # compiled code passes to a place whose type does not keep it (a field, an array's element, a variable,
@@ -475,16 +479,16 @@ function note_closed_operation!(sv::AbsIntState)
     mi isa MethodInstance && push!(CLOSED_OPERATION_INSTANCES, mi)
     return nothing
 end
-function closed_build_reinfer!(world::UInt, stale::Union{Nothing,IdSet{Any}} = nothing)
+function closed_build_reinfer!(world::UInt, stale::Union{Nothing,IdSet{Any}} = nothing, @nospecialize(owner = nothing))
     for mi in CLOSED_OPERATION_INSTANCES
         isdefined(mi, :cache) || continue
         ci = mi.cache
         while true
             # (also code that begins in the build's world: a round's own, inferred with fewer members)
-            if ci.owner === nothing && ci.max_world == typemax(UInt) && ci.min_world <= world
+            if ci.owner === owner && ci.max_world == typemax(UInt) && ci.min_world <= world
                 ccall(:jl_invalidate_code_instance, Cvoid, (Any, UInt), ci, world - 1)
             end
-            stale === nothing || push!(stale, ci)
+            (stale === nothing || ci.owner !== owner) || push!(stale, ci)
             isdefined(ci, :next) || break
             ci = ci.next
         end
@@ -498,7 +502,7 @@ end
 # `MAX_OPERATION_SPLITS` candidates of its set or type that are of that type (at an intersection, the
 # first component's candidates that are members of all). The candidates are read without an edge: a
 # member registered later reaches the fallback.
-function operation_split_type(@nospecialize(atype))
+function operation_split_type(@nospecialize(atype), closed_rules::Bool)
     tt = unwrap_unionall(atype)::DataType
     # asserted: at an argument typed `Type{Tuple{…}}` (a specialization of the image) the field infers `Any`
     ps = getfield(tt, :parameters)::SimpleVector
@@ -517,7 +521,7 @@ function operation_split_type(@nospecialize(atype))
         # where the set's members can be listed
         cands = nothing
         closed = false
-        if closed_build() && ccall(:jl_is_open_set, Cint, (Any,), X) != 0
+        if closed_rules && ccall(:jl_is_open_set, Cint, (Any,), X) != 0
             cands = closed_candidates(X.name.wrapper)
             if cands !== nothing
                 closed = true
@@ -577,8 +581,8 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     # with a set in it, and is the split already)
     drt = operation ? declared_operation_result(interp, argtypes, atype) : nothing
     if drt !== nothing
-        closed_build() && note_closed_operation!(sv)
-        split = operation_split_type(atype)
+        closed_build(interp) && note_closed_operation!(sv)
+        split = operation_split_type(atype, closed_build(interp))
         split === nothing && return Future(CallMeta(drt, Any, Effects(), DeclaredResultInfo(drt)))
         # asserted, as the compiler's own results are: inferred while the compiler bootstraps itself,
         # an untyped index made `newargs[i]` a dynamic call whose edges any new integer constructor
@@ -606,7 +610,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     # a closed build (compiler §7.6): a call that would dispatch on an argument `Compiled` at a set when
     # it runs (a cast `compiled_for` on a value known by its trait) branches over the set's members
     # instead, each branch the call at the member's type
-    if barrier && closed_build() && (amask & ~adyn) != 0
+    if barrier && closed_build(interp) && (amask & ~adyn) != 0
         note_closed_operation!(sv)
         bsplit = closed_barrier_split(argtypes, amask & ~adyn)
         if bsplit !== nothing
@@ -624,9 +628,9 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
             end
         end
     end
-    matches, adispatch = attributed_matches(find_method_matches(interp, argtypes, atype; max_methods, max_union_splitting), amask, adyn)
+    matches, adispatch = attributed_matches(find_method_matches(interp, argtypes, atype; max_methods, max_union_splitting), amask, adyn, closed_build(interp))
     # (a call left to dispatch on a trait argument when it runs is one a later member may resolve)
-    adispatch && closed_build() && note_closed_operation!(sv)
+    adispatch && closed_build(interp) && note_closed_operation!(sv)
     if isa(matches, FailedMethodMatch)
         add_remark!(interp, sv, matches.reason)
         return Future(CallMeta(Any, Any, unedged_effects(interp), attributed_info(NoCallInfo(), amask, adyn, acast, false)))
@@ -634,8 +638,9 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
 
     (; valid_worlds, applicable) = matches
     update_valid_age!(sv, valid_worlds) # need to record the negative world now, since even if we don't generate any useful information, inlining might want to add an invoke edge and it won't have this information anymore
-    sv isa InferenceState && record_match_memberships!(sv, applicable)
-    sv isa InferenceState && record_callable_absences!(sv, matches)
+    # (in an inference frame, and where the IR interpreter infers the call again: both hold edges)
+    record_match_memberships!(interp, sv, applicable)
+    record_callable_absences!(interp, sv, matches)
     # a member's check (compiler §10.4): inference reads the answers and runs no check. A call at a
     # member whose check failed is left to dispatch, which raises the failure; a member with no answer
     # is noted, and the compile queue asks the hook before the code runs
@@ -946,7 +951,7 @@ end
 # A match inferred at the instance that runs (compiler §6.3): the declared type at each trait argument
 # compiled once. Also whether a trait argument is `Compiled` where the call does not know its type:
 # the call then dispatches on it when it runs.
-function attributed_match(m::MethodMatch, mask::UInt32, dyn::UInt32)
+function attributed_match(m::MethodMatch, mask::UInt32, dyn::UInt32, closed_rules::Bool)
     method = m.method
     ccall(:jl_has_open_set, Cint, (Any,), method.sig) == 0 && return (m, false)
     traits = ccall(:jl_trait_arg_bits, UInt32, (Any,), method)
@@ -963,7 +968,7 @@ function attributed_match(m::MethodMatch, mask::UInt32, dyn::UInt32)
             (isvarargtype(p) || isconcretetype(p)) || (dispatch = true)
         end
     end
-    if dispatch && closed_build() && m.fully_covers && uspec isa DataType
+    if dispatch && closed_rules && m.fully_covers && uspec isa DataType
         # a closed build (compiler §7.6) leaves no call to dispatch on a trait argument when it runs:
         # where the call does not know the member, it runs the instance compiled once, whose operations
         # branch over the members
@@ -982,12 +987,12 @@ function attributed_match(m::MethodMatch, mask::UInt32, dyn::UInt32)
     sp = ccall(:jl_type_intersection_with_env, Any, (Any, Any), w, method.sig)::SimpleVector
     return (MethodMatch(w, sp[2]::SimpleVector, method, m.fully_covers), dispatch)
 end
-function attributed_lookup(r::MethodLookupResult, mask::UInt32, dyn::UInt32)
+function attributed_lookup(r::MethodLookupResult, mask::UInt32, dyn::UInt32, closed_rules::Bool)
     new = nothing
     dispatch = false
     for i = 1:length(r.matches)
         m = r.matches[i]::MethodMatch
-        w, d = attributed_match(m, mask, dyn)
+        w, d = attributed_match(m, mask, dyn, closed_rules)
         dispatch |= d
         if w !== m
             new === nothing && (new = copy(r.matches))
@@ -997,21 +1002,21 @@ function attributed_lookup(r::MethodLookupResult, mask::UInt32, dyn::UInt32)
     new === nothing && return (r, dispatch)
     return (MethodLookupResult(new, r.valid_worlds, r.ambig, r.cells), dispatch)
 end
-attributed_matches(m::FailedMethodMatch, ::UInt32, ::UInt32) = (m, false)
-function attributed_matches(m::MethodMatches, mask::UInt32, dyn::UInt32)
+attributed_matches(m::FailedMethodMatch, ::UInt32, ::UInt32, ::Bool) = (m, false)
+function attributed_matches(m::MethodMatches, mask::UInt32, dyn::UInt32, closed_rules::Bool)
     info = m.info
-    r, dispatch = attributed_lookup(info.results, mask, dyn)
+    r, dispatch = attributed_lookup(info.results, mask, dyn, closed_rules)
     r === info.results && return (m, dispatch)
     newinfo = MethodMatchInfo(r, info.mt, info.atype, info.fullmatch)
     applicable = MethodMatchTarget[MethodMatchTarget(r.matches[i]::MethodMatch, newinfo.edges, i) for i = 1:length(r.matches)]
     return (MethodMatches(applicable, newinfo, m.valid_worlds), dispatch)
 end
-function attributed_matches(m::UnionSplitMethodMatches, mask::UInt32, dyn::UInt32)
+function attributed_matches(m::UnionSplitMethodMatches, mask::UInt32, dyn::UInt32, closed_rules::Bool)
     changed = dispatch = false
     infos = MethodMatchInfo[]
     applicable = MethodMatchTarget[]
     for info in m.info.split
-        r, d = attributed_lookup(info.results, mask, dyn)
+        r, d = attributed_lookup(info.results, mask, dyn, closed_rules)
         dispatch |= d
         changed |= r !== info.results
         newinfo = r === info.results ? info : MethodMatchInfo(r, info.mt, info.atype, info.fullmatch)
