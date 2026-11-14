@@ -2765,7 +2765,11 @@ end
     if isexact_tty && !isa(tty_ub, TypeVar)
         tty_lb = tty_ub # TODO: this would be wrong if !isexact_tty, but instanceof_tfunc doesn't preserve this info
         if !has_free_typevars(tty_lb) && !has_free_typevars(tty_ub)
-            negative_fold_blocked(tty, tty_ub) && return nothing # compiler §4.8: refine neither side
+            if negative_fold_blocked(tty, tty_ub)
+                # compiler §4.8: no negative is folded here. The test itself proves the positive when it
+                # runs: where the set is under what is known of the value, the value is of the set there
+                return (tty_ub <: tty && tty_ub !== tty) ? ConditionalTypes(tty_ub, tty) : nothing
+            end
             thentype = typeintersect(tty, tty_ub)
             if iskindtype(tty_ub) && thentype !== Bottom
                 # `typeintersect` may be unable narrow down `Type`-type
