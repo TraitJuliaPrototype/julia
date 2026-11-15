@@ -2822,8 +2822,9 @@ JL_DLLEXPORT void jl_ci_set_g2(jl_code_instance_t *ci)
     jl_atomic_fetch_or_relaxed(&ci->flags, JL_CI_FLAGS_G2);
 }
 
-// A method's declared result (compiler §6.8). The library sets it on a trait's method for an
-// operation, with `covers` set: each member's serving method is checked to infer within it.
+// A method's declared result (compiler §6.8), as lowering records `f(…)::RT`. An operation's declared result is
+// its entry's in the set's contract (§4.1, `jl_set_contract_operations`), not a method's: `covers` (the method's
+// `declared_covers` bit 0) has no reader.
 JL_DLLEXPORT void jl_method_set_declared_result(jl_method_t *m, jl_value_t *rt, int covers)
 {
     if (!jl_is_type(rt) && !jl_is_typevar(rt))
@@ -2831,34 +2832,6 @@ JL_DLLEXPORT void jl_method_set_declared_result(jl_method_t *m, jl_value_t *rt, 
     m->declared_result = rt;
     jl_gc_wb(m, rt);
     m->declared_covers = (m->declared_covers & ~1) | (covers != 0);
-}
-
-// The methods at open sets of the function type `ft` that carry a declared result covering
-// every member: what inference reads at a receiver typed by a set (compiler §7.1). Read from the
-// function's list of methods at sets, so the cost is the function's own methods.
-JL_DLLEXPORT jl_value_t *jl_declared_methods_of(jl_value_t *ft)
-{
-    jl_array_t *out = jl_alloc_vec_any(0);
-    jl_svec_t *ms = NULL;
-    JL_GC_PUSH2(&out, &ms);
-    jl_value_t *fu = jl_unwrap_unionall(ft);
-    if (jl_is_datatype(fu)) {
-        JL_LOCK(&open_set_methods_lock);
-        if (jl_func_set_methods != NULL)
-            ms = (jl_svec_t*)jl_eqtable_get(jl_func_set_methods, (jl_value_t*)((jl_datatype_t*)fu)->name, NULL);
-        JL_UNLOCK(&open_set_methods_lock);
-    }
-    for (size_t i = 0; ms != NULL && i < jl_svec_len(ms); i++) {
-        jl_method_t *m = (jl_method_t*)jl_svecref(ms, i);
-        if (!(m->declared_covers & 1) || m->declared_result == NULL)
-            continue;
-        jl_value_t *sig = jl_unwrap_unionall(m->sig);
-        if (!jl_is_tuple_type(sig) || jl_nparams(sig) == 0 || !jl_egal(jl_tparam0(sig), ft))
-            continue;
-        jl_array_ptr_1d_push(out, (jl_value_t*)m);
-    }
-    JL_GC_POP();
-    return (jl_value_t*)out;
 }
 
 // the walk's counters (plan §5.M2's log gate): what one declaration cost

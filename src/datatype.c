@@ -101,6 +101,7 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     jl_atomic_store_relaxed(&tn->memberships, jl_emptysvec);
     jl_atomic_store_relaxed(&tn->contract, NULL);
     jl_atomic_store_relaxed(&tn->declared_fields, NULL);
+    jl_atomic_store_relaxed(&tn->operations, NULL);
     return tn;
 }
 
@@ -1547,6 +1548,36 @@ JL_DLLEXPORT void jl_set_declared_fields(jl_value_t *T, jl_value_t *names, jl_va
     }
     jl_gc_wb(tn, df);
     JL_GC_POP();
+}
+
+// Write a set's operations (compiler §4.1), once: an svec of entries svec(f, sig, rt, default), the declared
+// signature a tuple type with the receiver at the set's instance under the set's and the operation's variables,
+// the declared result in the same variables, the default's method or nothing. Inference reads them where a call's
+// receiver is typed by the set (§7.1); no method at the set carries an operation without a default.
+JL_DLLEXPORT void jl_set_contract_operations(jl_value_t *T, jl_value_t *ops)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->open_set)
+        jl_error("only a set has operations");
+    JL_TYPECHK(jl_set_contract_operations, simplevector, ops);
+    size_t n = jl_svec_len(ops);
+    for (size_t i = 0; i < n; i++) {
+        jl_value_t *e = jl_svecref(ops, i);
+        if (!jl_is_svec(e) || jl_svec_len(e) != 4)
+            jl_error("an operation's entry is svec(f, sig, rt, default)");
+        jl_value_t *sig = jl_unwrap_unionall(jl_svecref(e, 1));
+        jl_value_t *rt = jl_svecref(e, 2);
+        if (!jl_is_tuple_type(sig) || jl_nparams(sig) < 2 || (!jl_is_type(rt) && !jl_is_typevar(rt)))
+            jl_error("an operation's declared signature is a tuple type of the function and its arguments, its result a type");
+        jl_value_t *d = jl_svecref(e, 3);
+        if (d != jl_nothing && !jl_is_method(d))
+            jl_error("an operation's default is its method, or nothing");
+    }
+    jl_typename_t *tn = ((jl_datatype_t*)uw)->name;
+    jl_value_t *expected = NULL;
+    if (!jl_atomic_cmpswap(&tn->operations, &expected, ops))
+        jl_errorf("the operations of %s are written once", jl_symbol_name(tn->name));
+    jl_gc_wb(tn, ops);
 }
 
 // Write a set's contract (compiler §4.1), once.

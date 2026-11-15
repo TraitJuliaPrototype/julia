@@ -245,12 +245,13 @@ mutable struct CallInferenceState
     end
 end
 
-# A call of an operation of a set whose receiver's type is the set, or a set or intersection
-# below it, and not a concrete member (compiler §7.1): its result is the operation's declared
-# result, which the trait's method carries with the flag that it covers every member (§6.8). Each
-# such method the call's types fall under bounds the result, so the result is their intersection.
-# The same at a closed abstract type with a contract, whose operations carry their declared results.
-# `nothing` where no argument is typed by a set or such a type, or no such method applies.
+# A call of an operation of a set whose receiver's type is the set, or a set or intersection below it,
+# and not a concrete member (compiler §7.1): its result is the operation's declared result, read from
+# the entries of the set's contract (§4.1), of the sets it joins and of an intersection's components.
+# Each entry whose declared signature the call's types fall under bounds the result, so the result is
+# their intersection. No method at the set is read. The same at a closed abstract type with a contract,
+# whose operations are its methods at the type, each with its declared result. `nothing` where no
+# argument is typed by a set or such a type, or no entry applies.
 function declared_operation_result(interp::AbstractInterpreter, argtypes::Vector{Any}, @nospecialize(atype))
     tt = unwrap_unionall(atype)
     tt isa DataType || return nothing
@@ -263,37 +264,79 @@ function declared_operation_result(interp::AbstractInterpreter, argtypes::Vector
             dft === nothing || return dft
         end
     end
-    # the methods with a declared result: at a set, the function's at sets; at a closed abstract type
-    # with a contract, its contract's operations of the function
+    ft = tt.parameters[1]
+    # the entries of the sets the arguments are typed by; at a closed abstract type with a contract, its
+    # contract's operations of the function
+    entries = nothing
     ms = nothing
     for i = 2:length(tt.parameters)
         p = tt.parameters[i]
         isvarargtype(p) && break
         isconcretetype(p) && continue
         if ccall(:jl_has_open_set, Cint, (Any,), p) != 0
-            ms = ccall(:jl_declared_methods_of, Any, (Any,), tt.parameters[1])::Vector{Any}
-            break
+            entries === nothing && (entries = Any[])
+            operation_entries!(entries, ft, p, 0)
+            continue
         end
+        entries === nothing || continue
         ops = ccall(:jl_contract_operations, Any, (Any,), p)
         if ops isa SimpleVector
             ms = Any[]
             for m in ops
-                (unwrap_unionall((m::Method).sig)::DataType).parameters[1] === tt.parameters[1] && push!(ms, m)
+                (unwrap_unionall((m::Method).sig)::DataType).parameters[1] === ft && push!(ms, m)
             end
             break
         end
     end
+    rt = nothing
+    if entries !== nothing
+        for e in entries
+            e = e::SimpleVector
+            sig = e[2]
+            atype <: sig || continue
+            r = declared_result_at(sig, e[3], atype)
+            rt = rt === nothing ? r : typeintersect(rt, r)
+        end
+        return rt
+    end
     (ms === nothing || isempty(ms)) && return nothing
     world = get_inference_world(interp)
-    rt = nothing
     for m in ms
         m = m::Method
         m.primary_world <= world || continue
         atype <: m.sig || continue
-        r = declared_result_at(m, atype)
+        r = declared_result_at(m.sig, m.declared_result, atype)
         rt = rt === nothing ? r : typeintersect(rt, r)
     end
     return rt
+end
+
+# The entries for the function type `ft` of the sets a type `p` is typed by: a set's own (its TypeName's
+# `operations`), its supertraits' (from the set's own memberships, `jl_supertrait_instances`), each
+# component's of an intersection. The contract is fixed at the declaration and read without an edge.
+function operation_entries!(out::Vector{Any}, @nospecialize(ft), @nospecialize(p), depth::Int)
+    depth > 8 && return out
+    u = unwrap_unionall(p)
+    u isa DataType || return out
+    if u.name === (unwrap_unionall(Core.All)::DataType).name
+        for c in (u.parameters[1]::DataType).parameters
+            operation_entries!(out, ft, c, depth + 1)
+        end
+        return out
+    end
+    ccall(:jl_is_open_set, Cint, (Any,), u) != 0 || return out
+    tn = u.name
+    if isdefined(tn, :operations)
+        for e in tn.operations::SimpleVector
+            e = e::SimpleVector
+            e[1] isa ft || continue
+            any(x -> x === e, out) || push!(out, e)
+        end
+    end
+    for s in ccall(:jl_supertrait_instances, Any, (Any,), u)::Vector{Any}
+        operation_entries!(out, ft, s, depth + 1)
+    end
+    return out
 end
 
 # The declared type of field `name` of a value of type `X`, typed by a set or an intersection and
@@ -583,18 +626,17 @@ function operation_split_type(@nospecialize(atype), closed_rules::Bool)
     return nothing
 end
 
-# the method's declared result at the call's types: its variables instantiated where the call
-# fixes them, else bounded by their bounds
-function declared_result_at(m::Method, @nospecialize(atype))
-    rt = m.declared_result
+# a declared result at the call's types: the declared signature's variables instantiated where the
+# call fixes them, else bounded by their bounds
+function declared_result_at(@nospecialize(sig), @nospecialize(rt), @nospecialize(atype))
     has_free_typevars(rt) || return rt
-    env = ccall(:jl_type_intersection_with_env, Any, (Any, Any), atype, m.sig)::SimpleVector
+    env = ccall(:jl_type_intersection_with_env, Any, (Any, Any), atype, sig)::SimpleVector
     vals = env[2]::SimpleVector
     if all(v -> !isa(v, TypeVar), vals)
-        rt = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), rt, m.sig, vals)
+        rt = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), rt, sig, vals)
         has_free_typevars(rt) || return rt
     end
-    return rewrap_unionall(rt, m.sig)
+    return rewrap_unionall(rt, sig)
 end
 
 function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(func),

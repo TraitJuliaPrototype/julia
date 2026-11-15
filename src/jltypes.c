@@ -3239,20 +3239,21 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_typename_type->name->wrapper = (jl_value_t*)jl_typename_type;
     jl_typename_type->super = jl_any_type;
     jl_typename_type->parameters = jl_emptysvec;
-    jl_typename_type->name->n_uninitialized = 23 - 2; // only name+module are set before the first allocation inside jl_new_typename_in (same reason as the old 19 - 2)
-    jl_typename_type->name->names = jl_perm_symsvec(23, "name", "module", "singletonname",
+    jl_typename_type->name->n_uninitialized = 24 - 2; // only name+module are set before the first allocation inside jl_new_typename_in (same reason as the old 19 - 2)
+    jl_typename_type->name->names = jl_perm_symsvec(24, "name", "module", "singletonname",
                                                     "names", "atomicfields", "constfields",
                                                     "wrapper", "Typeofwrapper", "cache", "linearcache",
                                                     "partial", "hash", "max_args", "n_uninitialized",
                                                     "flags", // "abstract", "mutable", "mayinlinealloc",
                                                     "cache_entry_count", "max_methods", "constprop_heuristic",
-                                                    "concrete_only", "input_params", "memberships", "contract", "declared_fields");
+                                                    "concrete_only", "input_params", "memberships", "contract", "declared_fields",
+                                                    "operations");
     const static uint32_t typename_constfields[1]  = { 0b0000110100001001011 }; // TODO: put back atomicfields and constfields in this list
-    const static uint32_t typename_atomicfields[1] = { 0b0001001001110000000 | (1u << 20) | (1u << 21) | (1u << 22) };
+    const static uint32_t typename_atomicfields[1] = { 0b0001001001110000000 | (1u << 20) | (1u << 21) | (1u << 22) | (1u << 23) };
     jl_typename_type->name->constfields = typename_constfields;
     jl_typename_type->name->atomicfields = typename_atomicfields;
     jl_precompute_memoized_dt(jl_typename_type, 1);
-    jl_typename_type->types = jl_svec(23, jl_symbol_type, jl_any_type /*jl_module_type*/, jl_symbol_type,
+    jl_typename_type->types = jl_svec(24, jl_symbol_type, jl_any_type /*jl_module_type*/, jl_symbol_type,
                                       jl_simplevector_type,
                                       jl_any_type/*jl_voidpointer_type*/, jl_any_type/*jl_voidpointer_type*/,
                                       jl_type_type, jl_simplevector_type, jl_simplevector_type,
@@ -3267,6 +3268,7 @@ void jl_init_types(void) JL_GC_DISABLED
                                       jl_any_type /*jl_bool_type*/,
                                       jl_any_type /*jl_uint8_type*/,
                                       jl_simplevector_type,
+                                      jl_any_type,
                                       jl_any_type,
                                       jl_any_type);
 

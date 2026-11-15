@@ -591,6 +591,10 @@ typedef struct {
     // a set's declared fields, svec(names, types), the types in the wrapper's variables:
     // written once by the library, read by inference (compiler §7.1); nothing until then
     _Atomic(jl_value_t*) declared_fields;
+    // a set's operations (compiler §4.1), an svec of entries svec(f, sig, rt, default): the function, the
+    // declared signature and result as types in the set's and the operation's variables, the default's method
+    // or nothing. Written once by the library at the declaration, read by inference (§7.1); nothing until then
+    _Atomic(jl_value_t*) operations;
 } jl_typename_t;
 
 // one declared membership of a member type in a set (compiler §4.2), kept on the
