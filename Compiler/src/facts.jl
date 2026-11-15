@@ -17,13 +17,44 @@ const MAX_FACT_SPLITS = 4
 const FACT_UNION_SPLITTING = InferenceParams().max_union_splitting
 
 """
-Whether `T` (a call's argument types) is a fact signature (compiler §1.2): a dispatch tuple; a
-tuple whose tuple-typed arguments have unions of concrete element types that split by Julia's cost;
-concrete members followed by a `Vararg` of a concrete member; or a closure's call at kinds.
+Whether `T` (a call's argument types) is a fact signature (compiler §1.2): a call of an owner-only
+function at any signature; a dispatch tuple; a tuple whose tuple-typed arguments have unions of
+concrete element types that split by Julia's cost; concrete members followed by a `Vararg` of a
+concrete member; or a closure's call at kinds.
 """
 is_fact_sig(@nospecialize(T), max_union_splitting::Int = FACT_UNION_SPLITTING) =
-    T isa DataType && (isdispatchtuple(T) || fact_splits_ok(T, max_union_splitting) || vararg_fact(T) ||
+    T isa DataType && (isdispatchtuple(T) || owner_only_call(T) || fact_splits_ok(T, max_union_splitting) || vararg_fact(T) ||
     (T <: Tuple && length(T.parameters) >= 1 && is_closure_type(T.parameters[1]) && kinds_ok(T.parameters)))
+
+"""
+Whether `F` (a function's type) is owner-only (compiler §1.2; facts §1): only its owner may define its
+methods, so a call of it is a fact at any signature (Lemma O with a pirate's wider reading). A function
+of a module whose `owner_only` option is on (a trait module, its submodules included) that the module
+neither exports nor declares `public`, a closure of such a module among them; or a function its owner
+declared so (`jl_set_owner_only`). Read where the call is inferred.
+"""
+function is_owner_only(@nospecialize(F))
+    F isa DataType || return false
+    F <: Function || return false
+    tn = F.name
+    m = tn.module
+    name = tn.singletonname
+    ccall(:jl_binding_owner_only_p, Cint, (Any, Any), m, name) != 0 && return true
+    (ccall(:jl_get_module_trait_options, Cint, (Any,), m) & Cint(64)) != 0 || return false
+    return ccall(:jl_module_public_p, Cint, (Any, Any), m, name) == 0
+end
+
+"A call of an owner-only function: the function's type first, or after a keyword call's `NamedTuple`."
+function owner_only_call(@nospecialize(T))
+    T <: Tuple || return false
+    ps = T.parameters
+    n = length(ps)
+    n >= 1 || return false
+    f = ps[1]
+    isvarargtype(f) && return false
+    f === typeof(Core.kwcall) && return n >= 3 && !isvarargtype(ps[3]) && is_owner_only(ps[3])
+    return is_owner_only(f)
+end
 
 "Concrete members followed by a `Vararg{E}` tail of a concrete member `E`, every element a concrete member."
 function vararg_fact(@nospecialize(T))

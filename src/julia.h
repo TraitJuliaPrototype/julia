@@ -859,7 +859,9 @@ enum jl_binding_flags {
     BINDING_FLAG_PUBLICP                              = 0x4,
     // Set if any methods defined in this module implicitly reference
     // this binding. If not, invalidation is optimized.
-    BINDING_FLAG_ANY_IMPLICIT_EDGES                   = 0x8
+    BINDING_FLAG_ANY_IMPLICIT_EDGES                   = 0x8,
+    // an owner-only function by its owner's declaration (compiler §1.2)
+    BINDING_FLAG_OWNER_ONLY                           = 0x10
 };
 
 typedef struct _jl_binding_t {

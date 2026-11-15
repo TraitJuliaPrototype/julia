@@ -805,7 +805,8 @@ JL_DLLEXPORT int jl_method_fully_typed(jl_method_t *m) JL_NOTSAFEPOINT
     return (o & 32) ? 2 : (o & 16) ? 1 : 0;
 }
 // The trait language's scope options (compiler §2.1), as bits: 1 bounded, 2 no_pirates, 4 dynamic,
-// 8 first_seen; fully typed mode 16 warn, 32 enforce.
+// 8 first_seen; fully typed mode 16 warn, 32 enforce; 64 owner_only (compiler §1.2: the functions the
+// module neither exports nor declares public take methods from their owner only).
 JL_DLLEXPORT void jl_set_module_trait_option(jl_module_t *self, int bit, int value)
 {
     if (value)
@@ -1599,6 +1600,19 @@ JL_DLLEXPORT int jl_module_public_p(jl_module_t *m, jl_sym_t *var)
 {
     jl_binding_t *b = jl_get_module_binding(m, var, 0);
     return b && (jl_atomic_load_relaxed(&b->flags) & BINDING_FLAG_PUBLICP);
+}
+
+// An owner-only function by declaration (compiler §1.2; traits §12.2, `@owner_only`): its methods are
+// its owner's only, exported or not. Kept on the function's binding, beside its public flag.
+JL_DLLEXPORT void jl_set_owner_only(jl_module_t *m, jl_sym_t *var)
+{
+    jl_binding_t *b = jl_get_module_binding(m, var, 1);
+    jl_atomic_fetch_or_relaxed(&b->flags, BINDING_FLAG_OWNER_ONLY);
+}
+JL_DLLEXPORT int jl_binding_owner_only_p(jl_module_t *m, jl_sym_t *var)
+{
+    jl_binding_t *b = jl_get_module_binding(m, var, 0);
+    return b && (jl_atomic_load_relaxed(&b->flags) & BINDING_FLAG_OWNER_ONLY);
 }
 
 uint_t bindingkey_hash(size_t idx, jl_value_t *data)
