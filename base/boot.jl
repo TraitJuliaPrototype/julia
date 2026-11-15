@@ -339,9 +339,9 @@ TypeVar(@nospecialize(n), @nospecialize(lb), @nospecialize(ub)) = _typevar(n::Sy
 # intersections (compiler §4.9): All{X, Y} is the type of the values that are members of each
 # component; the runtime builds it in its normal form as All{Tuple{X, Y}}
 abstract type All{T<:Tuple} end
-# `Callable{A, S}` (compiler §7.4): the functions with a method for a call at the argument types `A`,
-# returning an `S` (checked on return). A set whose memberships the functions' methods decide;
-# the runtime opens it when Core is built.
+# `Callable{A, S}` (compiler §7.4): the functions called with arguments of `A`, returning an `S`. A set whose
+# members are declared: every `Function` by one entry (base/Base.jl), a callable type by its own; the signature
+# is checked at the box, the result on return. The runtime opens it when Core is built, both parameters inputs.
 abstract type Callable{A<:Tuple, S} end
 
 UnionAll(@nospecialize(v), @nospecialize(t)) = ccall(:jl_type_unionall, Any, (Any, Any), v::TypeVar, t)
@@ -470,11 +470,6 @@ keep(@nospecialize(x)) = x
 # raises `MethodError`; the compiler inserts the check where it cannot prove them
 _callable_argcheck(@nospecialize(f), @nospecialize(A), @nospecialize(args...)) =
     (isa(args, A) || throw_methoderror(f, args...); nothing)
-# a call of an argument declared `Callable{A, S}` (compiler §7.4), as inference reads it in the method's
-# code: the arguments are of `A` or the call raises `MethodError`, and the result is asserted to `S`,
-# whatever the code knows of the function (compiled for its type, or with the function a constant)
-_callable_call(::Type{A}, ::Type{S}, f::F, args::Vararg{Any,N}) where {A,S,F,N} =
-    (@inline; isa(args, A) || throw_methoderror(f, args...); typeassert(f(args...), S))
 struct UndefKeywordError <: Exception
     var::Symbol
 end

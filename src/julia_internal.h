@@ -1031,8 +1031,7 @@ JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b);
 // they are in `world`; returns whether t reaches any entry (*lo/*hi untouched if not)
 void jl_membership_changed(size_t world) JL_NOTSAFEPOINT;
 int jl_membership_range_is_fast(size_t world) JL_NOTSAFEPOINT;
-// `sig`, where given, is the signature of the method matched: a match at one that names Callable is
-// narrowed by the call methods of the query's types at those positions (compiler §7.4)
+// `sig`, where given, is the signature of the method matched (no part of the range reads it)
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_t world, size_t *lo, size_t *hi);
 JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
 // whether call types hold an argument met only as an intersection no type of the world is in (datatype.c)

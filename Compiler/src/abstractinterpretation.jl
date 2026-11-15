@@ -71,7 +71,6 @@ function record_match_memberships!(interp::AbstractInterpreter, sv::AbsIntState,
         ccall(:jl_has_open_set, Cint, (Any,), sig) == 0 && continue
         # (a positive membership is recorded in an inference frame: its world is the frame's, C-51)
         sv isa InferenceState && record_memberships!(sv, m.spec_types, sig)
-        record_callable_dispatch!(interp, sv, m.spec_types, sig)
     end
     return nothing
 end
@@ -85,108 +84,6 @@ function member_check_failed(sv::InferenceState, applicable::Vector{MethodMatchT
     return failed
 end
 
-# A match through `Callable{A, S}` rests on the member's own methods (compiler §7.4): the code holds
-# an edge to the member's dispatch at `A`, and is invalidated with it.
-function record_callable_dispatch!(interp::AbstractInterpreter, sv::AbsIntState, @nospecialize(spec), @nospecialize(sig))
-    s = unwrap_unionall(spec)
-    d = unwrap_unionall(sig)
-    # each narrowed on its own: inference narrows only the second of `(a isa T && b isa T) || return`
-    s isa DataType || return nothing
-    d isa DataType || return nothing
-    cname = unwrap_unionall(Core.Callable).name
-    for i = 2:min(length(s.parameters), length(d.parameters))
-        di = d.parameters[i]
-        di isa TypeVar && (di = di.ub)
-        du = unwrap_unionall(di)
-        du isa DataType || continue
-        (du.name === cname && length(du.parameters) == 2) || continue
-        F = s.parameters[i]
-        A = du.parameters[1]
-        (isa(F, DataType) && isconcretetype(F) && A isa DataType && A <: Tuple && !has_free_typevars(A)) || continue
-        atype = Tuple{F, A.parameters...}
-        matches = findall(atype, method_table(interp); limit = -1)
-        matches === nothing && continue
-        info = MethodMatchInfo(matches, Core.methodtable, atype, any(m::MethodMatch -> m.fully_covers, matches))
-        add_edges!(sv.edges, info)
-        update_valid_age!(sv, matches.valid_worlds)
-    end
-    return nothing
-end
-# A method at `Callable{A, S}` that the call does not match rests on the absence of the argument's own
-# methods at `A` (compiler §7.4): the code holds an edge to the argument's dispatch at `A`, so a method
-# of the argument's type defined later, which can begin the membership, invalidates it as any method
-# does. Where `A` names the method's variables, the edge is to every call of the argument.
-function record_callable_absences!(interp::AbstractInterpreter, sv::AbsIntState, @nospecialize(matches))
-    infos = matches isa MethodMatches ? MethodMatchInfo[matches.info] : matches.info.split
-    cname = unwrap_unionall(Core.Callable).name
-    for info in infos
-        s = unwrap_unionall(info.atype)
-        (s isa DataType && length(s.parameters) >= 2) || continue
-        ms = ccall(:jl_func_methods_at_sets, Any, (Any,), s.parameters[1])::SimpleVector
-        for k = 1:length(ms)
-            mz = ms[k]::Method
-            matched = false
-            for m in info.results.matches
-                (m::MethodMatch).method === mz && (matched = true; break)
-            end
-            matched && continue
-            d = unwrap_unionall(mz.sig)
-            d isa DataType || continue
-            for i = 2:min(length(s.parameters), length(d.parameters))
-                di = d.parameters[i]
-                di isa TypeVar && (di = di.ub)
-                du = unwrap_unionall(di)
-                du isa DataType || continue
-                du.name === cname || continue
-                F = s.parameters[i]
-                (isa(F, DataType) && isconcretetype(F)) || continue
-                A = length(du.parameters) == 2 ? du.parameters[1] : nothing
-                # where `A` names the method's variables, the call's other arguments give their values:
-                # the edge is at that `A`. A method the other arguments cannot reach takes the call
-                # whatever the argument's methods: no edge
-                A = callable_absence_args(A, s, d, mz.sig, i)
-                A === Union{} && continue
-                etype = (A isa DataType && A <: Tuple && !has_free_typevars(A)) ?
-                    Tuple{F, A.parameters...} : Tuple{F, Vararg{Any}}
-                r = findall(etype, method_table(interp); limit = -1)
-                r === nothing && continue
-                einfo = MethodMatchInfo(r, Core.methodtable, etype, any(m::MethodMatch -> m.fully_covers, r))
-                add_edges!(sv.edges, einfo)
-                update_valid_age!(sv, r.valid_worlds)
-            end
-        end
-    end
-    return nothing
-end
-# The argument types `A` of a method's `Callable{A, S}` at position `i`, with the method's variables
-# as the call's other arguments fix them (compiler §7.4): the call `s` and the method's signature `d`
-# (unwrapped, of `msig`) are intersected with position `i` left open. `Union{}` where they do not
-# meet: the method cannot take the call, whatever `A`. `nothing` where a variable stays open.
-function callable_absence_args(@nospecialize(A), s::DataType, d::DataType, @nospecialize(msig), i::Int)
-    sp = Any[s.parameters...]
-    dp = Any[d.parameters...]
-    closed = A isa DataType && A <: Tuple && !has_free_typevars(A)
-    (i <= length(sp) && i <= length(dp)) || return closed ? A : nothing
-    (isvarargtype(sp[i]) || isvarargtype(dp[i])) && return closed ? A : nothing
-    sp[i] = Any
-    dp[i] = Any
-    callt = Tuple{sp...}
-    methodt = rewrap_unionall(Tuple{dp...}, msig)
-    ti_env = ccall(:jl_type_intersection_with_env, Any, (Any, Any), callt, methodt)::SimpleVector
-    ti_env[1] === Union{} && return Union{}
-    closed && return A
-    (A isa Type && msig isa UnionAll) || return nothing
-    env = ti_env[2]::SimpleVector
-    n = 0
-    u = methodt
-    while u isa UnionAll
-        n += 1
-        u = u.body
-    end
-    length(env) == n || return nothing
-    A2 = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), A, methodt, env)
-    return (A2 isa DataType && A2 <: Tuple && !has_free_typevars(A2)) ? A2 : nothing
-end
 any_ambig(result::MethodLookupResult) = result.ambig
 any_ambig(info::MethodMatchInfo) = any_ambig(info.results)
 any_ambig(m::MethodMatches) = any_ambig(m.info)
@@ -719,7 +616,6 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     update_valid_age!(sv, valid_worlds) # need to record the negative world now, since even if we don't generate any useful information, inlining might want to add an invoke edge and it won't have this information anymore
     # (in an inference frame, and where the IR interpreter infers the call again: both hold edges)
     record_match_memberships!(interp, sv, applicable)
-    record_callable_absences!(interp, sv, matches)
     # a member's check (compiler §10.4): inference reads the answers and runs no check. A call at a
     # member whose check failed is left to dispatch, which raises the failure; a member with no answer
     # is noted, and the compile queue asks the hook before the code runs

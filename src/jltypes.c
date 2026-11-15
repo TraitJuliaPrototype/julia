@@ -4193,6 +4193,9 @@ void post_boot_hooks(void)
         cb->name->open_set = 1;
         cb->name->default_attribute = 2;
         cb->has_open_set = 1;
+        // both parameters are inputs (§4.6): a function is a member of every instance, by one entry
+        // whose instance leaves them free (Base declares `Function`'s, base/Base.jl)
+        cb->name->input_params = 0x03;
     }
     // an intersection carries the open-set bit, so the bit gates the test for one (julia_internal.h)
     ((jl_datatype_t*)jl_all_type->body)->has_open_set = 1;

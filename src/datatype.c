@@ -887,10 +887,6 @@ static int member_meets_others(jl_value_t *m, jl_value_t *comps, size_t skip)
 // cycles, compiler §4.4), has a member that could be in the other components.
 static int set_entries_meet(jl_typename_t *sname, jl_value_t *comps, size_t skip, size_t world)
 {
-    // `Callable`'s members are the types whose methods match it (compiler §7.4), not entries: any later
-    // method can make one, so an intersection with it, or with a set it joins, is met
-    if (jl_callable_type != NULL && sname == ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type))->name)
-        return 1;
     jl_array_t *list = jl_set_entries == NULL ? NULL : (jl_array_t*)jl_eqtable_get(jl_set_entries, (jl_value_t*)sname, NULL);
     if (list == NULL)
         return 0;

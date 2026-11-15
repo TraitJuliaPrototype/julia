@@ -2635,8 +2635,7 @@ static void index_func_set_method(jl_method_t *m)
     JL_GC_POP();
 }
 
-// A function's methods at sets (a SimpleVector, empty where it has none): inference reads the methods
-// at `Callable` that a call does not match (compiler §7.4).
+// A function's methods at sets (a SimpleVector, empty where it has none).
 JL_DLLEXPORT jl_value_t *jl_func_methods_at_sets(jl_value_t *ft)
 {
     ft = jl_unwrap_unionall(ft);
@@ -2686,51 +2685,6 @@ JL_DLLEXPORT jl_value_t *jl_open_set_methods_of(jl_value_t *set)
     return (jl_value_t*)out;
 }
 
-// the declared type of the method signature `sig` at argument `i`: a varargs tail's element there
-static jl_value_t *sig_arg(jl_value_t *sig, size_t i, int isva) JL_NOTSAFEPOINT
-{
-    size_t n = jl_nparams(sig);
-    if (n == 0)
-        return NULL;
-    if (i < n - 1 || (i == n - 1 && !jl_is_vararg(jl_tparam(sig, n - 1))))
-        return jl_tparam(sig, i);
-    jl_value_t *last = jl_tparam(sig, n - 1);
-    return jl_is_vararg(last) ? jl_unwrap_vararg(last) : NULL;
-}
-
-// the sets named in a declared type: itself, a union's arms, an intersection's components, parameters
-static void set_names_in(jl_value_t *t, arraylist_t *out, int depth) JL_NOTSAFEPOINT
-{
-    if (t == NULL || depth > 8)
-        return;
-    if (jl_is_typevar(t)) {
-        set_names_in(((jl_tvar_t*)t)->ub, out, depth + 1);
-        return;
-    }
-    t = jl_unwrap_unionall(t);
-    if (jl_is_vararg(t)) {
-        set_names_in(jl_unwrap_vararg(t), out, depth + 1);
-        return;
-    }
-    if (jl_is_uniontype(t)) {
-        set_names_in(((jl_uniontype_t*)t)->a, out, depth + 1);
-        set_names_in(((jl_uniontype_t*)t)->b, out, depth + 1);
-        return;
-    }
-    if (!jl_is_datatype(t) || !((jl_datatype_t*)t)->has_open_set)
-        return;
-    jl_typename_t *tn = ((jl_datatype_t*)t)->name;
-    if (tn->open_set) {
-        size_t k;
-        for (k = 0; k < out->len; k++)
-            if (out->items[k] == tn)
-                break;
-        if (k == out->len)
-            arraylist_push(out, tn);
-    }
-    for (size_t k = 0; k < jl_nparams(t); k++)
-        set_names_in(jl_tparam(t, k), out, depth + 1);
-}
 
 // used by §7/§8: copy out the methods indexed under `tn`
 static jl_array_t *jl_methods_at_set(jl_typename_t *tn)
@@ -3661,71 +3615,6 @@ JL_DLLEXPORT void jl_disable_new_worlds(void)
     JL_GC_POP();
 }
 
-// A method of the callable type `f` deleted can end its membership in Callable (compiler §7.4): the
-// dispatch cache entries that selected a method at Callable for `f` are lowered, so the next call
-// looks up again. Under the world counter's lock.
-struct lower_callable_env {
-    jl_value_t *f;
-    size_t max_world;
-    jl_typename_t *cname;
-};
-static int cache_entry_through_callable(jl_typemap_entry_t *e, struct lower_callable_env *env)
-{
-    jl_value_t *v = e->func.value;
-    jl_method_t *m = jl_is_method_instance(v) ? ((jl_method_instance_t*)v)->def.method :
-                     jl_is_method(v) ? (jl_method_t*)v : NULL;
-    if (m == NULL || !jl_is_method(m) || !jl_has_open_set_in(m->sig))
-        return 0;
-    jl_value_t *sv = jl_unwrap_unionall((jl_value_t*)e->sig), *d = jl_unwrap_unionall(m->sig);
-    if (!jl_is_datatype(sv) || !jl_is_datatype(d))
-        return 0;
-    int hit = 0;
-    for (size_t i = 1; i < jl_nparams(sv) && !hit; i++) {
-        if (jl_tparam(sv, i) != env->f)
-            continue;
-        jl_value_t *di = sig_arg(d, i, m->isva);
-        arraylist_t names;
-        arraylist_new(&names, 0);
-        set_names_in(di, &names, 0);
-        for (size_t k = 0; k < names.len; k++)
-            hit |= names.items[k] == env->cname;
-        arraylist_free(&names);
-    }
-    return hit;
-}
-static int lower_callable_entry(jl_typemap_entry_t *e, void *closure0)
-{
-    struct lower_callable_env *env = (struct lower_callable_env*)closure0;
-    if (jl_atomic_load_relaxed(&e->max_world) > env->max_world && cache_entry_through_callable(e, env))
-        jl_atomic_store_relaxed(&e->max_world, env->max_world);
-    return 1;
-}
-static void lower_callable_dispatch(jl_method_t *method, size_t max_world)
-{
-    if (jl_callable_type == NULL)
-        return;
-    jl_value_t *msig = jl_unwrap_unionall(method->sig);
-    if (!jl_is_datatype(msig) || jl_nparams(msig) == 0)
-        return;
-    jl_value_t *f = jl_tparam0(msig);
-    if (!jl_is_concrete_type(f))
-        return;
-    struct lower_callable_env env = {f, max_world,
-        ((jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type))->name};
-    jl_methcache_t *mc = jl_method_table->cache;
-    JL_LOCK(&mc->writelock);
-    jl_typemap_visitor(jl_atomic_load_relaxed(&mc->cache), lower_callable_entry, (void*)&env);
-    jl_genericmemory_t *leafcache = jl_atomic_load_relaxed(&mc->leafcache);
-    for (size_t i = 1; i < leafcache->length; i += 2) {
-        jl_value_t *entry = jl_genericmemory_ptr_ref(leafcache, i);
-        while (entry != NULL && entry != jl_nothing) {
-            lower_callable_entry((jl_typemap_entry_t*)entry, (void*)&env);
-            entry = (jl_value_t*)jl_atomic_load_relaxed(&((jl_typemap_entry_t*)entry)->next);
-        }
-    }
-    JL_UNLOCK(&mc->writelock);
-}
-
 // A membership that an image's load refuses (compiler §9; W-141): its method, activated at `world`
 // with the image's methods, is live in no world, as its entry is. Called before `world` is published,
 // under the world counter's lock.
@@ -3760,7 +3649,6 @@ JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
         jl_value_t *oldkind = deep_ending_push("deletion", (jl_value_t*)method, &oldcause);
         jl_method_table_invalidate(method, world, 1);
         deep_ending_pop(oldkind, oldcause);
-        lower_callable_dispatch(method, world);
         jl_atomic_store_release(&jl_world_counter, world + 1);
     }
     JL_UNLOCK(&world_counter_lock);
@@ -4269,9 +4157,6 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     struct _typename_invalidate_backedge typename_env = {type, type, &isect, &isect2, d, n, max_world, invalidated, NULL};
     invalidate_missing_backedges(&typename_env);
     invalidated |= typename_env.invalidated;
-    // a method of a callable type can begin its membership in Callable (compiler §7.4): a match through
-    // Callable reads the methods' worlds for its range (§5.3), so no entry's world changes, and code
-    // that relied on the membership's absence holds an edge to the type's dispatch, invalidated above
     if (oldmi && jl_array_nrows(oldmi)) {
         // drop leafcache and search mc->cache and drop anything that might overlap with the new method
         // this is very cheap, so we don't mind being very conservative at over-approximating this
