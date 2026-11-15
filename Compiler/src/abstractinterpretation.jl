@@ -2819,6 +2819,39 @@ end
     return ConditionalTypes(thentype, elsetype)
 end
 
+# A store's or an assertion's type test that holds at the value's type (a field's type for `setfield!`,
+# an element's for `memoryrefset!`, the asserted type), recorded with the membership entries it rests
+# on: code generation emits no run-time test for the statement (compiler §4.8)
+function prove_type_test!(@nospecialize(f), argtypes::Vector{Any}, sv::AbsIntState)
+    sv isa InferenceState || return nothing
+    if f === typeassert && length(argtypes) == 3
+        expected, isexact = instanceof_tfunc(argtypes[3], true)
+        isexact || return nothing
+        v = argtypes[2]
+    elseif f === setfield! && 4 <= length(argtypes) <= 5
+        s = widenconst(argtypes[2])
+        name = argtypes[3]
+        (s isa DataType && isconcretetype(s) && name isa Const) || return nothing
+        idx = try_compute_fieldidx(s, name.val)
+        idx === nothing && return nothing
+        expected = fieldtype(s, idx)
+        v = argtypes[4]
+    elseif f === memoryrefset! && length(argtypes) == 5
+        m = widenconst(argtypes[2])
+        m isa DataType || return nothing
+        expected = memoryref_elemtype(m)
+        v = argtypes[3]
+    else
+        return nothing
+    end
+    vt = widenconst(v)
+    (expected isa Type && !has_free_typevars(expected) && expected !== Union{}) || return nothing
+    (vt <: expected && isnotbrokensubtype(vt, expected)) || return nothing
+    positive_fold_blocked(vt, expected, sv) && return nothing
+    add_curr_ssaflag!(sv, IR_FLAG_TYPES_PROVEN)
+    return nothing
+end
+
 function abstract_call_builtin(interp::AbstractInterpreter, f::Builtin, (; fargs, argtypes)::ArgInfo,
                                sv::AbsIntState)
     @nospecialize f
@@ -2851,6 +2884,7 @@ function abstract_call_builtin(interp::AbstractInterpreter, f::Builtin, (; fargs
     ft = popfirst!(argtypes)
     rt = builtin_tfunction(interp, f, argtypes, sv)
     pushfirst!(argtypes, ft)
+    rt === Bottom || !isa(fargs, Vector{Any}) || prove_type_test!(f, argtypes, sv)
     if has_mustalias(𝕃ᵢ) && f === getfield && isa(fargs, Vector{Any}) && la ≥ 3
         a3 = argtypes[3]
         if isa(a3, Const)
@@ -4063,7 +4097,7 @@ function abstract_eval_new(interp::AbstractInterpreter, e::Expr, sstate::Stateme
                 ft = fieldtype(rt, i)
                 nothrow && (nothrow = ⊑(𝕃ᵢ, at, ft))
                 # a field's test that holds through a membership entry is relied on with an edge on
-                # the entry, as `isa`'s positive is; code generation then emits no test (compiler §4.8)
+                # the entry, as `isa`'s positive is (compiler §4.8)
                 nothrow && (nothrow = !positive_fold_blocked(widenconst(at), ft, sv))
                 at = tmeet(𝕃ᵢ, at, ft)
                 at === Bottom && return RTEffects(Bottom, TypeError, EFFECTS_THROWS)
@@ -4078,6 +4112,8 @@ function abstract_eval_new(interp::AbstractInterpreter, e::Expr, sstate::Stateme
                 end
                 ats[i] = at
             end
+            # every field's test proved: code generation emits none of them
+            nothrow && add_curr_ssaflag!(sv, IR_FLAG_TYPES_PROVEN)
             if fcount == nargs && consistent === ALWAYS_TRUE && allconst && nothrow
                 argvals = Vector{Any}(undef, nargs)
                 for j in 1:nargs

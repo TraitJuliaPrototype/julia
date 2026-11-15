@@ -1977,14 +1977,17 @@ static std::pair<Value*, bool> emit_isa(jl_codectx_t &ctx, const jl_cgval_t &x, 
     jl_value_t *intersected_type = type;
     if (x.constant) {
         // a membership flips this answer in another world: keep the runtime
-        // check when the pair is membership-relevant (compiler §4.8)
+        // check when the pair is membership-relevant (compiler §4.8), unless inference
+        // proved the statement's tests with the entries recorded
         bool v = jl_isa(x.constant, type);
-        if (!(v ? jl_subtype_via_membership(jl_typeof(x.constant), type)
+        if (!(v ? !ctx.types_proven && jl_subtype_via_membership(jl_typeof(x.constant), type)
                 : jl_membership_flip_possible(jl_typeof(x.constant), type)))
             known_isa = v;
     }
     else if (jl_is_not_broken_subtype(x.typ, type) && jl_subtype(x.typ, type) &&
-             !jl_subtype_via_membership(x.typ, type)) {
+             (ctx.types_proven || !jl_subtype_via_membership(x.typ, type))) {
+        // a positive through a membership entry is decided where inference proved the
+        // statement's tests, the entry recorded as an edge (compiler §4.8)
         known_isa = true;
     } else {
         intersected_type = jl_type_intersection(x.typ, type);
@@ -4309,7 +4312,7 @@ static jl_cgval_t emit_setfield(jl_codectx_t &ctx,
         maybe_null, modifyop, fname, nullptr, nullptr);
 }
 
-static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t nargs, ArrayRef<jl_cgval_t> argv, bool is_promotable, bool fields_proven)
+static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t nargs, ArrayRef<jl_cgval_t> argv, bool is_promotable)
 {
     ++EmittedNewStructs;
     assert(jl_is_datatype(ty));
@@ -4371,11 +4374,7 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
                 jl_cgval_t fval_info = argv[i];
 
                 std::optional<IRBuilderBase::InsertPointGuard> savedIP;
-                // a test inference proved (through a membership entry, with its edge) is not
-                // emitted; a test only it could not decide, or that fails here, is
-                if (!(fields_proven && jl_is_not_broken_subtype(fval_info.typ, jtype) &&
-                      jl_subtype(fval_info.typ, jtype)))
-                    emit_typecheck(ctx, fval_info, jtype, "new");
+                emit_typecheck(ctx, fval_info, jtype, "new");
                 fval_info = update_julia_type(ctx, fval_info, jtype);
                 if (fval_info.typ == jl_bottom_type)
                     return jl_cgval_t();

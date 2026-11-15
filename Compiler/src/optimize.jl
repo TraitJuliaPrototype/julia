@@ -50,6 +50,10 @@ const IR_FLAG_UNUSED      = one(UInt32) << 17
 const IR_FLAG_EFIIMO      = one(UInt32) << 18
 # This statement is :inaccessiblememonly == INACCESSIBLEMEM_OR_ARGMEMONLY
 const IR_FLAG_INACCESSIBLEMEM_OR_ARGMEM = one(UInt32) << 19
+# Inference proved this statement's type tests (`new`'s field tests, a store's value test, a
+# `typeassert`), recording the membership entries those that hold through one rest on: code
+# generation emits no run-time test for them (compiler §4.8)
+const IR_FLAG_TYPES_PROVEN = one(UInt32) << 20
 
 const NUM_IR_FLAGS = 3 # sync with julia.h
 

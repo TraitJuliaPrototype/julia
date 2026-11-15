@@ -1986,6 +1986,8 @@ public:
     jl_code_instance_t *codeinst = NULL;
     jl_value_t *rettype = NULL;
     jl_code_info_t *source = NULL;
+    // the statement being emitted carries IR_FLAG_TYPES_PROVEN (compiler §4.8)
+    bool types_proven = false;
     jl_array_t *code = NULL;
     size_t min_world = 0;
     size_t max_world = -1;
@@ -2148,7 +2150,7 @@ static CallInst *emit_jlcall(jl_codectx_t &ctx, JuliaFunction<> *theFptr, Value 
                              ArrayRef<jl_cgval_t> args, size_t nargs, JuliaFunction<> *trampoline);
 static Value *emit_f_is(jl_codectx_t &ctx, const jl_cgval_t &arg1, const jl_cgval_t &arg2,
                         Value *nullcheck1 = nullptr, Value *nullcheck2 = nullptr);
-static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t nargs, ArrayRef<jl_cgval_t> argv, bool is_promotable=false, bool fields_proven=false);
+static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t nargs, ArrayRef<jl_cgval_t> argv, bool is_promotable=false);
 static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayRef<jl_cgval_t> argv, size_t nargs, jl_value_t *rt, bool always_inline);
 
 static Value *literal_pointer_val(jl_codectx_t &ctx, jl_value_t *p);
@@ -6820,18 +6822,11 @@ static jl_cgval_t emit_expr(jl_codectx_t &ctx, jl_value_t *expr, ssize_t ssaidx_
             argv[i] = emit_expr(ctx, args[i]);
         }
         jl_value_t *ty = argv[0].typ;
-        // inference proved every field's test where it flagged the statement as one that cannot
-        // throw; a test that holds through a membership entry it proved with an edge on the
-        // entry (compiler §4.8), so no test is emitted for it
-        bool fields_proven = false;
-        if (ssaidx_0based >= 0 && ctx.source && jl_is_array(ctx.source->ssaflags) &&
-                (size_t)ssaidx_0based < jl_array_dim0(ctx.source->ssaflags))
-            fields_proven = (jl_array_data(ctx.source->ssaflags, uint32_t)[ssaidx_0based] & IR_FLAG_NOTHROW) != 0;
         if (jl_is_type_type(ty) &&
                 jl_is_datatype(jl_tparam0(ty)) &&
                 jl_is_concrete_type(jl_tparam0(ty))) {
             assert(nargs <= jl_datatype_nfields(jl_tparam0(ty)) + 1);
-            jl_cgval_t res = emit_new_struct(ctx, jl_tparam0(ty), nargs - 1, ArrayRef<jl_cgval_t>(argv).drop_front(), is_promotable, fields_proven);
+            jl_cgval_t res = emit_new_struct(ctx, jl_tparam0(ty), nargs - 1, ArrayRef<jl_cgval_t>(argv).drop_front(), is_promotable);
             if (is_promotable && res.promotion_point && res.promotion_ssa==-1)
                 res.promotion_ssa = ssaidx_0based;
             return res;
@@ -9884,7 +9879,13 @@ static jl_llvm_functions_t
             }
         }
         else {
+            // the statement's type tests that inference proved, those through a membership entry
+            // with the entry recorded: decided here (compiler §4.8)
+            ctx.types_proven = jl_is_array(ctx.source->ssaflags) &&
+                (size_t)cursor < jl_array_dim0(ctx.source->ssaflags) &&
+                (jl_array_data(ctx.source->ssaflags, uint32_t)[cursor] & IR_FLAG_TYPES_PROVEN) != 0;
             emit_stmtpos(ctx, stmt, cursor);
+            ctx.types_proven = false;
             mallocVisitStmt(nullptr, have_dbg_update);
         }
         find_next_stmt(cursor + 1);
