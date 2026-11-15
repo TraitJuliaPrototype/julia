@@ -4309,7 +4309,7 @@ static jl_cgval_t emit_setfield(jl_codectx_t &ctx,
         maybe_null, modifyop, fname, nullptr, nullptr);
 }
 
-static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t nargs, ArrayRef<jl_cgval_t> argv, bool is_promotable)
+static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t nargs, ArrayRef<jl_cgval_t> argv, bool is_promotable, bool fields_proven)
 {
     ++EmittedNewStructs;
     assert(jl_is_datatype(ty));
@@ -4371,7 +4371,11 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
                 jl_cgval_t fval_info = argv[i];
 
                 std::optional<IRBuilderBase::InsertPointGuard> savedIP;
-                emit_typecheck(ctx, fval_info, jtype, "new");
+                // a test inference proved (through a membership entry, with its edge) is not
+                // emitted; a test only it could not decide, or that fails here, is
+                if (!(fields_proven && jl_is_not_broken_subtype(fval_info.typ, jtype) &&
+                      jl_subtype(fval_info.typ, jtype)))
+                    emit_typecheck(ctx, fval_info, jtype, "new");
                 fval_info = update_julia_type(ctx, fval_info, jtype);
                 if (fval_info.typ == jl_bottom_type)
                     return jl_cgval_t();

@@ -380,6 +380,9 @@ function new_expr_effect_flags(𝕃ₒ::AbstractLattice, args::Vector{Any}, src:
             return (false, false, false)
         end
         ⊑(𝕃ₒ, eT, fT) || return (false, false, false)
+        # through a membership entry only where inference recorded the entry (compiler §4.8): this
+        # pass has no frame to record it in, so the statement keeps the flags inference gave it
+        positive_fold_blocked(widenconst(eT), fT) && return (false, false, false)
     end
     return (false, true, true)
 end

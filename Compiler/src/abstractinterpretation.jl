@@ -4062,6 +4062,9 @@ function abstract_eval_new(interp::AbstractInterpreter, e::Expr, sstate::Stateme
                 at = widenslotwrapper(abstract_eval_value(interp, e.args[i+1], sstate, sv))
                 ft = fieldtype(rt, i)
                 nothrow && (nothrow = ⊑(𝕃ᵢ, at, ft))
+                # a field's test that holds through a membership entry is relied on with an edge on
+                # the entry, as `isa`'s positive is; code generation then emits no test (compiler §4.8)
+                nothrow && (nothrow = !positive_fold_blocked(widenconst(at), ft, sv))
                 at = tmeet(𝕃ᵢ, at, ft)
                 at === Bottom && return RTEffects(Bottom, TypeError, EFFECTS_THROWS)
                 if ismutable && !isconst(rt, i)
@@ -4075,7 +4078,7 @@ function abstract_eval_new(interp::AbstractInterpreter, e::Expr, sstate::Stateme
                 end
                 ats[i] = at
             end
-            if fcount == nargs && consistent === ALWAYS_TRUE && allconst
+            if fcount == nargs && consistent === ALWAYS_TRUE && allconst && nothrow
                 argvals = Vector{Any}(undef, nargs)
                 for j in 1:nargs
                     argvals[j] = (ats[j]::Const).val
