@@ -743,15 +743,15 @@ void jl_activate_memberships(jl_array_t *list, size_t world)
 
 // Strict mode (traits §12.3): the ambiguities that images' memberships met at activation, one
 // message each, until the library takes and reports them.
-static jl_array_t *activation_ambiguities JL_GLOBALLY_ROOTED = NULL;
+jl_array_t *jl_activation_ambiguities JL_GLOBALLY_ROOTED = NULL; // rooted in the collectors' lists (gc-stock.c, gc-mmtk.c)
 static _Atomic(int) strict_memberships;
 static jl_value_t *ambiguity_message(const char *head, jl_value_t *member, jl_value_t *set_instance,
                                      jl_array_t *found);
 JL_DLLEXPORT jl_value_t *jl_take_activation_ambiguities(void)
 {
     JL_LOCK(&world_counter_lock);
-    jl_value_t *a = activation_ambiguities ? (jl_value_t*)activation_ambiguities : jl_nothing;
-    activation_ambiguities = NULL;
+    jl_value_t *a = jl_activation_ambiguities ? (jl_value_t*)jl_activation_ambiguities : jl_nothing;
+    jl_activation_ambiguities = NULL;
     JL_UNLOCK(&world_counter_lock);
     return a;
 }
@@ -783,9 +783,9 @@ void jl_memberships_activated(jl_array_t *list, size_t world)
         jl_membership_ambiguities(en->member, en->instance, world, found);
         if (jl_array_nrows(found) > 0) {
             msg = ambiguity_message("the membership of ", en->member, en->instance, found);
-            if (activation_ambiguities == NULL)
-                activation_ambiguities = jl_alloc_vec_any(0);
-            jl_array_ptr_1d_push(activation_ambiguities, msg);
+            if (jl_activation_ambiguities == NULL)
+                jl_activation_ambiguities = jl_alloc_vec_any(0);
+            jl_array_ptr_1d_push(jl_activation_ambiguities, msg);
         }
     }
     JL_GC_POP();

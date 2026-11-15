@@ -4978,7 +4978,9 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
         if (!jl_is_mtable(mt))
             continue;
         int clean = 1;
-        jl_value_t *substsing = membership_subst_sig(m, sets, member, &clean);
+        // rooted at once: the member's signature can be a fresh UnionAll, and the search type below
+        // allocates (open issue 189: unrooted, a collection there left the typemap entry a freed object)
+        jl_value_t *substsing = gc[5] = membership_subst_sig(m, sets, member, &clean);
         if (clean == 2)
             continue; // m names the set only at other instances: the membership does not reach it
         membership_stats.replays++;
