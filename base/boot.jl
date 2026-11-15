@@ -410,7 +410,8 @@ struct DomainError <: Exception
     val
     msg::AbstractString
     DomainError(@nospecialize(val)) = (@noinline; new(val, ""))
-    DomainError(@nospecialize(val), @nospecialize(msg)) = (@noinline; new(val, msg))
+    # the message by its type: its conversion to the field's type is then at a concrete signature
+    DomainError(@nospecialize(val), msg) = (@noinline; new(val, msg))
 end
 struct TypeError <: Exception
     # `func` is the name of the builtin function that encountered a type error,
@@ -424,9 +425,10 @@ struct TypeError <: Exception
     got
     TypeError(func, context, @nospecialize(expected::Type), @nospecialize(got)) =
         new(func, context, expected, got)
+    # built here, not by a call of the constructor above at a value whose type it does not know
+    TypeError(where, @nospecialize(expected::Type), @nospecialize(got)) =
+        new(Symbol(where), "", expected, got)
 end
-TypeError(where, @nospecialize(expected::Type), @nospecialize(got)) =
-    TypeError(Symbol(where), "", expected, got)
 struct InexactError <: Exception
     func::Symbol
     args
@@ -912,7 +914,9 @@ function is_top_bit_set(x::Union{Int8,UInt8})
 end
 
 # n.b. This function exists for CUDA to overload to configure error behavior (see #48097)
-throw_inexacterror(func::Symbol, to, val) = throw(InexactError(func, to, val))
+# It takes the type it reports as `::Type{T}`: its call of `InexactError` is then at a concrete
+# signature, and the error path holds no edge at a type it does not know.
+throw_inexacterror(func::Symbol, ::Type{T}, val) where {T} = throw(InexactError(func, T, val))
 
 function check_sign_bit(::Type{To}, x) where {To}
     @inline
