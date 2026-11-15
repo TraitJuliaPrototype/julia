@@ -214,7 +214,9 @@ function edges_satisfy_g2(edges::SimpleVector, own::Union{CodeInstance,IdSet{Any
             # its G2 bit (`JL_CI_FLAGS_G2`)
             (getfield(e, :flags, :monotonic)::UInt8 & 0x10) == 0x00 && return false
         elseif e isa MethodInstance
-            is_own(own, e) || return false
+            # a membership's method, which a positive answer through an entry rests on (compiler §4.8,
+            # §5.6): a fact, ended only by its declarer, as an absence edge's pair is begun only by one
+            (is_own(own, e) || is_membership_mi(e)) || return false
         end
     end
     for (invokesig, item) in ForwardToBackedgeIterator(edges)
@@ -236,6 +238,14 @@ end
 "Whether `sig` is an absence edge's: `Core.implements` at a pair (compiler §4.8)."
 function is_absence_sig(@nospecialize(sig))
     b = unwrap_unionall(sig)
+    return b isa DataType && length(b.parameters) == 3 && b.parameters[1] === typeof(Core.implements)
+end
+
+"Whether `mi` is an instance of a membership's method, `Core.implements` at a pair (compiler §5.6)."
+function is_membership_mi(mi::MethodInstance)
+    def = mi.def
+    def isa Method || return false
+    b = unwrap_unionall(def.sig)
     return b isa DataType && length(b.parameters) == 3 && b.parameters[1] === typeof(Core.implements)
 end
 
