@@ -557,7 +557,6 @@ JL_DLLEXPORT void jl_gc_scan_vm_specific_roots(RootsWorkClosure* closure)
     add_node_to_roots_buffer(closure, &buf, &len, (jl_value_t*)jl_atomic_load_relaxed(&jl_attributed_fast)); // its table of the latest answers
     add_node_to_roots_buffer(closure, &buf, &len, jl_absence_sigs); // each set's absence signatures (datatype.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_func_set_methods); // each function's methods at sets (gf.c)
-    add_node_to_roots_buffer(closure, &buf, &len, jl_code_slot_fallbacks); // the code slot's last resorts (gf.c)
 
     // constants
     add_node_to_roots_buffer(closure, &buf, &len, jl_emptytuple_type);
