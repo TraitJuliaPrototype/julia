@@ -459,7 +459,7 @@ typedef struct _jl_opaque_closure_t {
 #define JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR   0b0010
 #define JL_CI_FLAGS_FROM_IMAGE               0b0100
 #define JL_CI_FLAGS_NATIVE_CACHE_VALID       0b1000
-#define JL_CI_FLAGS_G2                      0b010000  // its record satisfies G2 (compiler §3.2)
+#define JL_CI_FLAGS_G2                      0b010000  // deep G2: its record, and every callee's, at any depth (compiler §3.2)
 #define JL_CI_FLAGS_FACTS                   0b100000  // compiled by facts (compiler §2.3)
 #define JL_CI_FLAGS_MARKED                  0b1000000 // marked for revalidation: max_world lowered as by an invalidation (compiler §3.3)
 

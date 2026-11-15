@@ -139,22 +139,6 @@ end
 
 edge_mi(@nospecialize e) = e isa CodeInstance ? get_ci_mi(e) : e isa MethodInstance ? e : nothing
 
-"The MethodInstances and Methods that a result's code inlined, from its debug information; `nothing` where its code is gone."
-function inlined_of_result(@nospecialize src)
-    defs = IdSet{Any}()
-    if src isa OptimizationState
-        opt = src.optresult
-        inlined_defs!(defs, opt === nothing ? src.src.debuginfo.edges : opt.ir.debuginfo.edges)
-    elseif src isa IRCode
-        inlined_defs!(defs, src.debuginfo.edges)
-    elseif src isa CodeInfo
-        inlined_defs!(defs, src.debuginfo.edges)
-    else
-        return nothing
-    end
-    return defs
-end
-
 """
     slot_result_edges(caller, src, edges) -> Union{Nothing, SimpleVector}
 
@@ -300,7 +284,8 @@ function equivalent_cached_ci(callee::CodeInstance, world::UInt)
     return found === nothing ? callee : found
 end
 
-function finish!(interp::AbstractInterpreter, caller::InferenceState, validation_world::UInt, time_before::UInt64)
+function finish!(interp::AbstractInterpreter, caller::InferenceState, validation_world::UInt, time_before::UInt64;
+                 in_cycle::Bool = false)
     result = caller.result
     edges = result_edges(interp, caller)
     #@assert last(result.valid_worlds) <= get_world_counter() || isempty(edges)
@@ -368,8 +353,9 @@ function finish!(interp::AbstractInterpreter, caller::InferenceState, validation
         ccall(:jl_update_codeinst, Cvoid, (Any, Any, Int32, UInt, UInt, UInt32, Any, Float64, Float64, Float64, Any, Any),
             ci, inferred_result, const_flag, min_world, max_world, ipo_effects,
             result.analysis_results, time_total, caller.time_caches, time_self_ns * 1e-9, debuginfo, edges)
-        # G2 as a predicate, for code of either policy (compiler §3.2)
-        edges_satisfy_g2(edges, inlined_defs!(IdSet{Any}(), debuginfo.edges)) && ccall(:jl_ci_set_g2, Cvoid, (Any,), ci)
+        # deep G2, for code of either policy (compiler §3.2); a cycle's members are decided together
+        # once all are finished (`finish_cycle`)
+        in_cycle || set_g2!(ci, edges)
         if is_cached(caller) # CACHE_MODE_GLOBAL
             cache_result!(interp, result, ci)
         end
@@ -512,9 +498,20 @@ function finish_cycle(::AbstractInterpreter, frames::Vector{AbsIntState}, cyclei
         caller.time_start = time_start
         caller.time_caches = time_caches
         caller.time_paused = time_paused
-        finish!(caller.interp, caller, validation_world, time_before)
+        finish!(caller.interp, caller, validation_world, time_before; in_cycle = true)
         if isdefined(caller.result, :ci)
             push!(cis, caller.result.ci)
+        end
+    end
+    # deep G2 (compiler §3.2): the cycle is decided as one, every member or none
+    own = IdSet{Any}()
+    for ci in cis
+        push!(own, ci)
+        push!(own, get_ci_mi(ci))
+    end
+    if all(ci -> edges_satisfy_g2(ci.edges, own), cis)
+        for ci in cis
+            ccall(:jl_ci_set_g2, Cvoid, (Any,), ci)
         end
     end
     if cycletop.parentid != 0
@@ -1274,10 +1271,9 @@ function codeinst_as_edge(interp::AbstractInterpreter, sv::InferenceState, @nosp
     ci = CodeInstance(mi, cache_owner(interp), Any, Any, nothing, nothing, zero(Int32),
         min_world, max_world, zero(UInt32), nothing, nothing, edges)
     set_code_policy!(ci, interp)
-    # G2 as a predicate (compiler §3.2), as for a cached result: a caller that inlines this result
-    # reads the bit on this edge
-    inlined = inlined_of_result(sv.result.src)
-    inlined === nothing || (edges_satisfy_g2(edges, inlined) && ccall(:jl_ci_set_g2, Cvoid, (Any,), ci))
+    # deep G2 (compiler §3.2), as for a cached result: a caller that holds this edge reads its bit. An
+    # instance whose edges are bindings only carries it, whether or not its code is kept
+    set_g2!(ci, edges)
     if max_world == typemax(UInt)
         # if we can record all of the backedges in the global reverse-cache,
         # we can now widen our applicability in the global cache too

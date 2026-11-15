@@ -2816,7 +2816,7 @@ JL_DLLEXPORT void *jl_split_table_ptr(jl_value_t *tbl, jl_value_t *T)
     return jl_unbox_voidpointer(fp);
 }
 
-// G2 as a predicate (compiler §3.2): set once a CodeInstance's record is finished and satisfies it.
+// G2 as a predicate (compiler §3.2): set once a CodeInstance is finished and is deep G2.
 JL_DLLEXPORT void jl_ci_set_g2(jl_code_instance_t *ci)
 {
     jl_atomic_fetch_or_relaxed(&ci->flags, JL_CI_FLAGS_G2);

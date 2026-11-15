@@ -196,26 +196,32 @@ function typeinf_other_policy(interp::NativeInterpreter, method::Method, mi::Met
 end
 
 """
-Whether a record satisfies G2 (compiler §3.2): every dispatch edge is at a fact signature, and every
-inlined callee's own record satisfies G2, since its code is part of the caller's (C-46). `inlined` holds
-the inlined callees' MethodInstances and Methods, from the code's debug information. An invoke at a
-declared signature is not gated; a binding edge is not a dispatch.
+Whether a record is deep G2 (compiler §3.2): every dispatch edge is at a fact signature, and every
+callee among its edges is a CodeInstance that carries the G2 bit. A callee finishes before its
+callers and its bit is final then, so the edges' own bits decide the class, with no walk. `own` is the
+CodeInstance itself, or the members of its inference cycle (their CodeInstances and MethodInstances),
+which are judged as one: an edge to a member counts, whether it names the member's CodeInstance or its
+MethodInstance. Another CodeInstance of the same MethodInstance is judged by its bit. Any other callee
+named by its MethodInstance alone is outside the class: its backedge carries whatever code it gets.
+An absence edge (the signature of `Core.implements` at a pair, compiler §4.8) needs nothing more: only
+a membership of the pair, by an owner of the trait or the type or by a pirate, breaks it (facts §10). An edge that names a Method alone names no code. An invoke at a declared signature is
+not gated; a binding edge is not a dispatch.
 """
-function edges_satisfy_g2(edges::SimpleVector, inlined::IdSet{Any})
-    if !isempty(inlined)
-        for e in edges
-            e isa CodeInstance || continue
-            mi = get_ci_mi(e)
-            (mi in inlined || mi.def in inlined) || continue
-            # its G2 bit (`JL_CI_FLAGS_G2`); one not yet set, as in a cycle, is not G2
+function edges_satisfy_g2(edges::SimpleVector, own::Union{CodeInstance,IdSet{Any}})
+    for e in edges
+        if e isa CodeInstance
+            is_own(own, e) && continue
+            # its G2 bit (`JL_CI_FLAGS_G2`)
             (getfield(e, :flags, :monotonic)::UInt8 & 0x10) == 0x00 && return false
+        elseif e isa MethodInstance
+            is_own(own, e) || return false
         end
     end
     for (invokesig, item) in ForwardToBackedgeIterator(edges)
         if item isa Core.Binding
             continue
         elseif item isa MethodTable
-            is_fact_sig(invokesig) || return false
+            (is_fact_sig(invokesig) || is_absence_sig(invokesig)) || return false
         elseif item isa MethodInstance
             # an `invoke` edge is skipped; an ordinary call is checked at its own signature: a call
             # that reached an instance wider than its match carries that signature (`CallSigBackedge`),
@@ -226,6 +232,20 @@ function edges_satisfy_g2(edges::SimpleVector, inlined::IdSet{Any})
     end
     return true
 end
+
+"Whether `sig` is an absence edge's: `Core.implements` at a pair (compiler §4.8)."
+function is_absence_sig(@nospecialize(sig))
+    b = unwrap_unionall(sig)
+    return b isa DataType && length(b.parameters) == 3 && b.parameters[1] === typeof(Core.implements)
+end
+
+is_own(own::CodeInstance, e::CodeInstance) = own === e
+is_own(own::CodeInstance, e::MethodInstance) = get_ci_mi(own) === e
+is_own(own::IdSet{Any}, @nospecialize(e)) = e in own
+
+"Set the G2 bit of `ci` where its record is deep G2 (compiler §3.2)."
+set_g2!(ci::CodeInstance, edges::SimpleVector) =
+    (edges_satisfy_g2(edges, ci) && ccall(:jl_ci_set_g2, Cvoid, (Any,), ci); nothing)
 
 # Fully typed mode (compiler §2.7): a method that asks for it is compiled by facts; where its code at a
 # signature holds a run-time site, itself or in a callee, the optimizer puts a call of `jl_not_fully_typed` at the code's start, which reaches
