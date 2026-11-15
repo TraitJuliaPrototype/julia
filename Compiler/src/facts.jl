@@ -214,7 +214,9 @@ function edges_satisfy_g2(edges::SimpleVector, own::Union{CodeInstance,IdSet{Any
             # its G2 bit (`JL_CI_FLAGS_G2`)
             (getfield(e, :flags, :monotonic)::UInt8 & 0x10) == 0x00 && return false
         elseif e isa MethodInstance
-            is_own(own, e) || return false
+            # a folded positive membership names its membership's method by its instance, which has no
+            # code (compiler §5.6): a membership edge, which the class allows (§3.2)
+            is_own(own, e) || is_membership_mi(e) || return false
         end
     end
     for (invokesig, item) in ForwardToBackedgeIterator(edges)
@@ -222,6 +224,8 @@ function edges_satisfy_g2(edges::SimpleVector, own::Union{CodeInstance,IdSet{Any
             continue
         elseif item isa MethodTable
             (is_fact_sig(invokesig) || is_absence_sig(invokesig)) || return false
+        elseif item isa MethodInstance && is_membership_mi(item)
+            continue
         elseif item isa MethodInstance
             # an `invoke` edge is skipped; an ordinary call is checked at its own signature: a call
             # that reached an instance wider than its match carries that signature (`CallSigBackedge`),
@@ -232,6 +236,9 @@ function edges_satisfy_g2(edges::SimpleVector, own::Union{CodeInstance,IdSet{Any
     end
     return true
 end
+
+"Whether `mi` is an instance of a membership's method, which a folded positive's edge names (compiler §5.6)."
+is_membership_mi(mi::MethodInstance) = (m = mi.def; m isa Method && is_absence_sig(m.sig))
 
 "Whether `sig` is an absence edge's: `Core.implements` at a pair (compiler §4.8)."
 function is_absence_sig(@nospecialize(sig))
