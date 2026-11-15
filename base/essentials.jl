@@ -555,7 +555,7 @@ function rewrap_unionall(@nospecialize(t), @nospecialize(u))
     if !isa(u, UnionAll)
         return t
     end
-    return UnionAll(u.var, rewrap_unionall(t, u.body))
+    return invoke(UnionAll, Tuple{Any, Any}, getfield(u, :var), invoke(rewrap_unionall, Tuple{Any, Any}, t, getfield(u, :body)))
 end
 
 function rewrap_unionall(t::Core.TypeofVararg, @nospecialize(u))
@@ -604,7 +604,7 @@ end
 
 function unwrapva(@nospecialize(t))
     isa(t, Core.TypeofVararg) || return t
-    return isdefined(t, :T) ? t.T : Any
+    return isdefined(t, :T) ? getfield(t, :T) : Any
 end
 
 function unconstrain_vararg_length(va::Core.TypeofVararg)

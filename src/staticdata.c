@@ -3501,6 +3501,9 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
                 jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(jl_declared_memberships, i + 1);
                 if (jl_object_in_image((jl_value_t*)en) || jl_object_in_image(en->declarer))
                     continue;
+                // an entry that ended (redeclared, or taken back) is not written (compiler §9)
+                if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
+                    continue;
                 jl_array_ptr_1d_push(ext_memberships, home);
                 jl_array_ptr_1d_push(ext_memberships, (jl_value_t*)en);
             }

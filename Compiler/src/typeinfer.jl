@@ -128,6 +128,8 @@ function finish!(interp::AbstractInterpreter, caller::InferenceState, validation
                  in_cycle::Bool = false)
     result = caller.result
     edges = result_edges(interp, caller)
+    # a callee named by its instance alone names its code where it exists now (compiler §3.2)
+    edges = name_callee_code(interp, result.linfo, edges, result.valid_worlds)
     #@assert last(result.valid_worlds) <= get_world_counter() || isempty(edges)
     if caller.cache_mode === CACHE_MODE_LOCAL
         @assert !isdefined(result, :ci)
@@ -1092,7 +1094,7 @@ function codeinst_as_edge(interp::AbstractInterpreter, sv::InferenceState, @nosp
     if max_world >= get_world_counter()
         max_world = typemax(UInt)
     end
-    edges = Core.svec(sv.edges...)
+    edges = name_callee_code(interp, mi, Core.svec(sv.edges...), sv.world.valid_worlds)
     if existing_edge isa CodeInstance
         # return an existing_edge, if the existing edge has more restrictions already (more edges and narrower worlds)
         if existing_edge.min_world >= min_world &&

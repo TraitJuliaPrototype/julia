@@ -480,6 +480,15 @@ JL_DLLEXPORT jl_value_t *jl_call_shadows(jl_value_t *tt, jl_value_t *m0, int all
 // membership cells (compiler §5.6, datatype.c)
 void jl_activate_memberships(jl_array_t *list, size_t world);
 void jl_memberships_activated(jl_array_t *list, size_t world);
+// what a definition ended, by class (compiler §10.2; gf.c)
+extern jl_array_t *jl_deep_endings JL_GLOBALLY_ROOTED;
+extern jl_array_t *jl_activation_ambiguities JL_GLOBALLY_ROOTED; // strict mode's findings at an image's activation (datatype.c)
+JL_DLLEXPORT jl_value_t *jl_deep_ending_push(const char *kind, jl_value_t *cause, jl_value_t **oldcause);
+JL_DLLEXPORT void jl_deep_ending_pop(jl_value_t *oldkind, jl_value_t *oldcause);
+// a membership taken back (compiler §4.3, §5.5; gf.c)
+JL_DLLEXPORT void jl_membership_method_end(jl_method_t *m, size_t world);
+JL_DLLEXPORT void jl_membership_removal_walk(jl_value_t *member, jl_value_t *set_instance, size_t world);
+JL_DLLEXPORT void jl_member_states_forget(jl_value_t *member, jl_typename_t *setname);
 JL_DLLEXPORT extern arraylist_t jl_linkage_blobs; // external linkage: sysimg/pkgimages
 JL_DLLEXPORT extern arraylist_t jl_image_relocs;  // external linkage: sysimg/pkgimages
 JL_DLLEXPORT extern arraylist_t jl_top_mods;  // external linkage: sysimg/pkgimages

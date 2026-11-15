@@ -238,6 +238,33 @@ static void register_candidate(jl_typename_t *set, jl_value_t *T)
     JL_GC_POP();
 }
 
+// a member taken back leaves its set's candidates (compiler §4.3, §7.2), a pattern's every member with
+// it: the list replaced without them. Called under the world counter's lock, so no declaration adds one
+// meanwhile.
+static void unregister_candidates(jl_typename_t *set, jl_value_t *member)
+{
+    jl_array_t *old = NULL, *nw = NULL;
+    JL_GC_PUSH2(&old, &nw);
+    JL_LOCK(&candidates_lock);
+    old = jl_set_candidates ? (jl_array_t*)jl_eqtable_get(jl_set_candidates, (jl_value_t*)set, NULL) : NULL;
+    JL_UNLOCK(&candidates_lock);
+    size_t n = old ? jl_array_nrows(old) : 0;
+    int concrete = jl_is_concrete_type(member);
+    nw = jl_alloc_vec_any(0);
+    for (size_t i = 0; i < n; i++) {
+        jl_value_t *T = jl_array_ptr_ref(old, i);
+        int drop = T == member || (!concrete && jl_is_type(T) && jl_subtype(T, member));
+        if (!drop)
+            jl_array_ptr_1d_push(nw, T);
+    }
+    if (n > 0 && jl_array_nrows(nw) < n) {
+        JL_LOCK(&candidates_lock);
+        jl_set_candidates = jl_eqtable_put(jl_set_candidates, (jl_value_t*)set, (jl_value_t*)nw, NULL);
+        JL_UNLOCK(&candidates_lock);
+    }
+    JL_GC_POP();
+}
+
 // The entries at each set (compiler §4.6): a set's TypeName to a Vector{Any} of the entries whose
 // set it is, declared in this session or activated from an image, in force or ended. The check of a
 // member pattern reads it. Written under the world counter's lock; a list is replaced, never mutated.
@@ -743,15 +770,15 @@ void jl_activate_memberships(jl_array_t *list, size_t world)
 
 // Strict mode (traits §12.3): the ambiguities that images' memberships met at activation, one
 // message each, until the library takes and reports them.
-static jl_array_t *activation_ambiguities JL_GLOBALLY_ROOTED = NULL;
+jl_array_t *jl_activation_ambiguities JL_GLOBALLY_ROOTED = NULL; // rooted in the collectors' lists (gc-stock.c, gc-mmtk.c)
 static _Atomic(int) strict_memberships;
 static jl_value_t *ambiguity_message(const char *head, jl_value_t *member, jl_value_t *set_instance,
                                      jl_array_t *found);
 JL_DLLEXPORT jl_value_t *jl_take_activation_ambiguities(void)
 {
     JL_LOCK(&world_counter_lock);
-    jl_value_t *a = activation_ambiguities ? (jl_value_t*)activation_ambiguities : jl_nothing;
-    activation_ambiguities = NULL;
+    jl_value_t *a = jl_activation_ambiguities ? (jl_value_t*)jl_activation_ambiguities : jl_nothing;
+    jl_activation_ambiguities = NULL;
     JL_UNLOCK(&world_counter_lock);
     return a;
 }
@@ -771,7 +798,10 @@ void jl_memberships_activated(jl_array_t *list, size_t world)
         jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i + 1);
         if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
             continue;
+        jl_value_t *oldcause = NULL;
+        jl_value_t *oldkind = jl_deep_ending_push("membership", en->method != jl_nothing ? en->method : (jl_value_t*)en, &oldcause);
         jl_membership_dispatch_walk(en->member, en->instance, world);
+        jl_deep_ending_pop(oldkind, oldcause);
         if (!collect) {
             jl_membership_ambiguity_report(en->member, en->instance, world);
             continue;
@@ -780,9 +810,9 @@ void jl_memberships_activated(jl_array_t *list, size_t world)
         jl_membership_ambiguities(en->member, en->instance, world, found);
         if (jl_array_nrows(found) > 0) {
             msg = ambiguity_message("the membership of ", en->member, en->instance, found);
-            if (activation_ambiguities == NULL)
-                activation_ambiguities = jl_alloc_vec_any(0);
-            jl_array_ptr_1d_push(activation_ambiguities, msg);
+            if (jl_activation_ambiguities == NULL)
+                jl_activation_ambiguities = jl_alloc_vec_any(0);
+            jl_array_ptr_1d_push(jl_activation_ambiguities, msg);
         }
     }
     JL_GC_POP();
@@ -1351,6 +1381,9 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         jl_declared_memberships = jl_alloc_vec_any(0);
     jl_array_ptr_1d_push(jl_declared_memberships, (jl_value_t*)home);
     jl_array_ptr_1d_push(jl_declared_memberships, entry);
+    // what the membership ends of the deep class is the membership's, named by its method (compiler §10.2)
+    jl_value_t *oldcause = NULL;
+    jl_value_t *oldkind = jl_deep_ending_push("membership", mmeth != NULL ? (jl_value_t*)mmeth : entry, &oldcause);
     if (mmeth != NULL) {
         // the method begins in the entry's world; its insertion ends the code that relied on the
         // pair's absence, through the table's backedges (W-141). No refusal is past this point
@@ -1365,11 +1398,81 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     // reach, then report the ambiguities, both at the entry's world
     size_t mq = jl_set_membership_query_world(min_world);
     jl_membership_dispatch_walk(member, set_instance, min_world);
+    jl_deep_ending_pop(oldkind, oldcause);
     jl_membership_ambiguity_report(member, set_instance, min_world);
     jl_set_membership_query_world(mq);
     JL_UNLOCK(&world_counter_lock);
     JL_GC_POP();
     return entry;
+}
+
+// Take a membership back (compiler §4.3; traits §5.13), as a method is deleted. Under the world counter's
+// lock the entry gets `max_world = counter` and its method is deleted in the same world; the walk replays
+// the set's methods at the member as deleted there (§5.5); the entry leaves its set's candidates and the
+// member's kept check answers go with it (§10.4); the counter advances. The library checks ownership and
+// strict mode first. A member by its definition is refused: its supertype is its definition's.
+JL_DLLEXPORT void jl_delete_membership(jl_value_t *member, jl_value_t *set_instance, jl_value_t *deleter)
+{
+    if (!jl_is_type(member) || !jl_is_type(set_instance))
+        jl_error("a membership's member and set are types");
+    jl_value_t *pattern = jl_unwrap_unionall(member);
+    jl_value_t *setuw = jl_unwrap_unionall(set_instance);
+    if (!jl_is_datatype(pattern) || !jl_is_datatype(setuw))
+        jl_error("a membership's member and set are DataTypes, or UnionAlls over one");
+    jl_typename_t *setname = ((jl_datatype_t*)setuw)->name;
+    if (!setname->open_set)
+        jl_errorf("%s is not an open set", jl_symbol_name(setname->name));
+    if (jl_options.incremental && jl_generating_output())
+        jl_error("a membership cannot be taken back while a package image is built");
+    jl_typename_t *home = membership_home((jl_datatype_t*)pattern);
+    // a member by its definition (`struct S <: X`): its declared supertype chain reaches the set
+    for (jl_datatype_t *d = (jl_datatype_t*)pattern; d != NULL && d != jl_any_type; d = d->super) {
+        if (d != (jl_datatype_t*)pattern && d->name == setname)
+            jl_errorf("%s is a member of %s by its definition: only a new definition changes its supertype",
+                      jl_symbol_name(home->name), jl_symbol_name(setname->name));
+    }
+    (void)deleter;
+    jl_value_t *mmeth = NULL, *oldcause = NULL, *oldkind = NULL;
+    JL_GC_PUSH2(&mmeth, &oldcause);
+    JL_LOCK(&world_counter_lock);
+    if (!jl_atomic_load_relaxed(&allow_new_worlds)) {
+        JL_UNLOCK(&world_counter_lock);
+        jl_error("Membership changes have been disabled via a call to disable_new_worlds.");
+    }
+    size_t world = jl_atomic_load_relaxed(&jl_world_counter);
+    jl_membership_t *found = NULL;
+    jl_svec_t *list = jl_typename_memberships(home);
+    for (size_t i = 0; i < jl_svec_len(list) && found == NULL; i++) {
+        jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
+        if (en->set == setname && jl_atomic_load_relaxed(&en->max_world) == ~(uint64_t)0 &&
+            en->min_world <= world && jl_types_equal(en->member, member) &&
+            same_inputs(setname, en->instance, set_instance))
+            found = en;
+    }
+    if (found == NULL) {
+        JL_UNLOCK(&world_counter_lock);
+        JL_GC_POP();
+        jl_errorf("no membership of %s in %s is in force to take back", jl_symbol_name(home->name),
+                  jl_symbol_name(setname->name));
+    }
+    // what ending the membership ends of the deep class is the membership's, named by its method (§10.2)
+    mmeth = found->method;
+    oldkind = jl_deep_ending_push("membership", jl_is_method(mmeth) ? mmeth : (jl_value_t*)found, &oldcause);
+    size_t mq = jl_set_membership_query_world(world);
+    jl_atomic_store_release(&found->max_world, world);
+    // the entry's visibility changes at world + 1: a dispatch's range asked from then on is exact at its
+    // end, and one asked at an older world is cut at `world` (subtype.c, the range's fast path)
+    jl_membership_changed(world + 1);
+    if (jl_is_method(mmeth))
+        jl_membership_method_end((jl_method_t*)mmeth, world);
+    jl_membership_removal_walk(found->member, found->instance, world);
+    jl_set_membership_query_world(mq);
+    jl_deep_ending_pop(oldkind, oldcause);
+    unregister_candidates(setname, found->member);
+    jl_member_states_forget(found->member, setname);
+    jl_atomic_store_release(&jl_world_counter, world + 1);
+    JL_UNLOCK(&world_counter_lock);
+    JL_GC_POP();
 }
 
 // Open a set (the library's @trait), before its binding is published: then no

@@ -116,6 +116,10 @@ typedef struct jl_stenv_t {
     // Used to represent the length difference between 2 vararg.
     // intersect(X, Y) ==> X = Y + Loffset
     int Loffset;
+    // inside the equality of an invariant parameter (compiler §4.5): a membership adds subtype answers,
+    // never type equalities, so no entry is consulted there; a variable's bound is a subtype question
+    // and is asked with entries (subtype_ccheck, intersect_var)
+    int noentry;
     // Callable's questions in progress on this path (compiler §7.4): a question that reaches itself
     // answers no within the query, which gives the least fixed point
     jl_value_t *callable_asked[8];
@@ -753,6 +757,14 @@ static int local_forall_exists_subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t 
 
 static int is_leaf_typevar(jl_tvar_t *v) JL_NOTSAFEPOINT;
 
+static int subtype_noentry(jl_value_t *x, jl_value_t *y);
+// a question asked afresh from inside the walk keeps the walk's rule for membership entries: none
+// inside an invariant parameter's equality (compiler §4.5)
+static int subtype_fresh(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
+{
+    return e->noentry ? subtype_noentry(x, y) : jl_subtype(x, y);
+}
+
 // Check whether env (variable bounds & diagonality) changed compared to saved env.
 static int env_unchanged(jl_stenv_t *e, jl_savedenv_t *se) JL_NOTSAFEPOINT
 {
@@ -800,7 +812,11 @@ static int subtype_ccheck(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     if (obviously_in_union(y, x))
         return 1;
     jl_saved_unionstate_t oldLunions; push_unionstate(&oldLunions, &e->Lunions);
+    // a variable's bound is a subtype question: memberships count (compiler §4.5)
+    int noentry = e->noentry;
+    e->noentry = 0;
     int sub = local_forall_exists_subtype(x, y, e, 0, 1);
+    e->noentry = noentry;
     pop_unionstate(&e->Lunions, &oldLunions);
     return sub;
 }
@@ -1441,6 +1457,9 @@ static int subtype_callable_method(jl_value_t *f, jl_value_t *yu, jl_method_t *m
 // members on the right of `<:` is, so the rest of the walk can revisit it.
 static int subtype_membership(jl_datatype_t *x, jl_value_t *y, jl_stenv_t *e, int param)
 {
+    // inside an invariant parameter's equality a membership is no answer (compiler §4.5)
+    if (e->noentry)
+        return 0;
     size_t world = jl_membership_world();
     jl_value_t *yu = jl_unwrap_unionall(y);
     jl_typename_t *yname = jl_is_datatype(yu) ? ((jl_datatype_t*)yu)->name : NULL;
@@ -2228,7 +2247,7 @@ static int subtype_tuple_varargs(
         }
         else if ((e->Runions.depth == 0 ? !jl_has_free_typevars(xp0) : jl_is_concrete_type(xp0)) && !jl_has_free_typevars(yp0)) {
             // fast path for separable sub-formulas
-            if (!jl_subtype(xp0, yp0))
+            if (!subtype_fresh(xp0, yp0, e))
                 return 0;
         }
         else {
@@ -2393,7 +2412,7 @@ static int subtype_tuple_tail(jl_datatype_t *xd, jl_datatype_t *yd, int8_t R, jl
         }
         else if ((e->Runions.depth == 0 ? !jl_has_free_typevars(xi) : jl_is_concrete_type(xi)) && !jl_has_free_typevars(yi)) {
             // fast path for separable sub-formulas
-            if (!jl_subtype(xi, yi))
+            if (!subtype_fresh(xi, yi, e))
                 return 0;
         }
         else if (!subtype(xi, yi, e, param)) {
@@ -2773,7 +2792,7 @@ static int local_forall_exists_subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t 
     int kindx = !jl_has_free_typevars(x);
     int kindy = !jl_has_free_typevars(y);
     if (kindx && kindy)
-        return jl_subtype(x, y);
+        return subtype_fresh(x, y, e);
     int has_exists = (!kindx && has_existential_typevar(x, e)) ||
                      (!kindy && has_existential_typevar(y, e));
     if (!has_exists) {
@@ -2880,9 +2899,22 @@ static int equal_var(jl_tvar_t *v, jl_value_t *x, jl_stenv_t *e)
     return 1;
 }
 
+static int forall_exists_equal_(jl_value_t *x, jl_value_t *y, jl_stenv_t *e);
+
+// The equality of an invariant parameter (compiler §4.5): two types are equal where they are equal
+// by their declared structure, so no membership entry is consulted inside it. A variable's bound
+// asked on the way is a subtype question (subtype_ccheck).
 static int forall_exists_equal(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
 {
     if (obviously_egal(x, y)) return 1;
+    e->noentry++;
+    int ans = forall_exists_equal_(x, y, e);
+    e->noentry--;
+    return ans;
+}
+
+static int forall_exists_equal_(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
+{
 
     if ((is_indefinite_length_tuple_type(x) && is_definite_length_tuple_type(y)) ||
         (is_definite_length_tuple_type(x) && is_indefinite_length_tuple_type(y)))
@@ -2991,6 +3023,7 @@ static void init_stenv(jl_stenv_t *e, jl_value_t **env, int envsz)
     e->emptiness_only = 0;
     e->triangular = 0;
     e->Loffset = 0;
+    e->noentry = 0;
     e->ncallable_asked = 0;
     e->Lunions.depth = 0;      e->Runions.depth = 0;
     e->Lunions.more = 0;       e->Runions.more = 0;
@@ -3468,7 +3501,22 @@ static int subtype_in_env(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     e2.envout = e->envout;
     e2.envidx = e->envidx;
     e2.Loffset = e->Loffset;
+    e2.noentry = e->noentry;
     return forall_exists_subtype(x, y, &e2, 0);
+}
+
+// x <: y with no membership consulted (compiler §4.5): the half of an equality inside an invariant
+// parameter, asked at the top level
+static int subtype_noentry(jl_value_t *x, jl_value_t *y)
+{
+    if (x == y || y == (jl_value_t*)jl_any_type || x == jl_bottom_type)
+        return 1;
+    jl_stenv_t e;
+    init_stenv(&e, NULL, 0);
+    e.noentry = 1;
+    int sub = forall_exists_subtype(x, y, &e, 0);
+    free_stenv(&e);
+    return sub;
 }
 
 JL_DLLEXPORT int jl_subtype(jl_value_t *x, jl_value_t *y)
@@ -3730,7 +3778,11 @@ static jl_value_t *intersect_aside(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, 
     jl_saved_unionstate_t oldRunions; push_unionstate(&oldRunions, &e->Runions);
     int savedepth = e->invdepth;
     e->invdepth = depth;
+    // a bound's meet is a subtype question: memberships count (compiler §4.5)
+    int noentry = e->noentry;
+    e->noentry = 0;
     jl_value_t *res = intersect_all(x, y, e);
+    e->noentry = noentry;
     e->invdepth = savedepth;
     pop_unionstate(&e->Runions, &oldRunions);
     if (bbprev) e->vars->prev = bbprev;
@@ -3941,7 +3993,20 @@ static int check_unsat_bound(jl_value_t *t, jl_tvar_t *v, jl_stenv_t *e) JL_NOTS
 
 static int intersect_var_ccheck_in_env(jl_value_t *xlb, jl_value_t *xub, jl_value_t *ylb, jl_value_t *yub, jl_stenv_t *e, int flip);
 
+static jl_value_t *intersect_var_(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int8_t R, int param);
+
+// a variable meets a type: its bounds are subtype questions, so memberships count there, also
+// inside an invariant parameter (compiler §4.5)
 static jl_value_t *intersect_var(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int8_t R, int param)
+{
+    int noentry = e->noentry;
+    e->noentry = 0;
+    jl_value_t *res = intersect_var_(b, a, e, R, param);
+    e->noentry = noentry;
+    return res;
+}
+
+static jl_value_t *intersect_var_(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int8_t R, int param)
 {
     jl_varbinding_t *bb = lookup(e, b);
     if (bb == NULL)
@@ -5007,6 +5072,10 @@ JL_DLLEXPORT jl_value_t *jl_supertrait_instances(jl_value_t *x)
 // answer when an entry of x's could lead to y (intersection may over-approximate).
 static jl_value_t *intersect_membership(jl_datatype_t *x, jl_value_t *y, jl_stenv_t *e, int R, int param)
 {
+    // inside an invariant parameter two types meet only where they are equal by their declared
+    // structure (compiler §4.5, §4.9)
+    if (e->noentry)
+        return jl_bottom_type;
     size_t world = jl_membership_world();
     jl_typename_t *yname = ((jl_datatype_t*)jl_unwrap_unionall(y))->name;
     // a kind of type object meets Callable, which takes a type by its methods (compiler §7.4), and a
@@ -5063,11 +5132,15 @@ static jl_value_t *intersect_sub_datatype(jl_datatype_t *xd, jl_datatype_t *yd, 
 
 static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
 {
+    // two types meet inside an invariant parameter where they are equal by their declared structure:
+    // no membership entry is consulted (compiler §4.5, §4.9)
     if (e->Loffset == 0 && !jl_has_free_typevars(x) && !jl_has_free_typevars(y)) {
-        return (jl_subtype(x,y) && jl_subtype(y,x)) ? y : NULL;
+        return (subtype_noentry(x,y) && subtype_noentry(y,x)) ? y : NULL;
     }
     e->invdepth++;
+    e->noentry++;
     jl_value_t *ii = intersect(x, y, e, 2);
+    e->noentry--;
     e->invdepth--;
     if (jl_is_typevar(x) && jl_is_typevar(y) && jl_is_typevar(ii))
         return ii; // skip the following check due to possible circular constraints.
@@ -5085,6 +5158,7 @@ static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t 
     jl_savedenv_t se;
     JL_GC_PUSH1(&ii);
     save_env(e, &se, 1);
+    e->noentry++;
     if (!subtype_in_env_existential(x, y, e))
         ii = NULL;
     else {
@@ -5094,6 +5168,7 @@ static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t 
             ii = NULL;
         flip_offset(e);
     }
+    e->noentry--;
     restore_env(e, &se, 1);
     free_env(&se);
     JL_GC_POP();
@@ -5477,8 +5552,8 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
         return intersect_var((jl_tvar_t*)y, x, e, 1, param);
     }
     if (e->Loffset == 0 && !jl_has_free_typevars(x) && !jl_has_free_typevars(y)) {
-        if (jl_subtype(x, y)) return x;
-        if (jl_subtype(y, x)) return y;
+        if (subtype_fresh(x, y, e)) return x;
+        if (subtype_fresh(y, x, e)) return y;
     }
     if (jl_is_uniontype(x)) {
         if (obviously_in_union(x, y))
@@ -5516,9 +5591,9 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
             }
             free_env(&se);
             if (!jl_has_free_typevars(a) && !jl_has_free_typevars(b)) {
-                if (jl_subtype(a, b))
+                if (subtype_fresh(a, b, e))
                     res = b;
-                else if (jl_subtype(b, a))
+                else if (subtype_fresh(b, a, e))
                     res = a;
             }
             if (!res) res = simple_join(a, b);

@@ -2928,6 +2928,83 @@ JL_DLLEXPORT jl_value_t *jl_debug_method_invalidation(int state)
     return jl_nothing;
 }
 
+// What a definition ended, by class (compiler §10.2): for each method definition, deletion, membership
+// and image validation that ends code compiled by facts in the deep class (§3.2), the cause and the
+// instances it ended, as [kind, cause, code, ...], kind :definition, :deletion, :membership or
+// :validation. The library takes the list after a definition or a load (jl_take_deep_endings) and
+// reports a pirate. It is filled only where such code ends, and only while the library asks for it.
+jl_array_t *jl_deep_endings JL_GLOBALLY_ROOTED = NULL;
+static int deep_endings_on = 0;
+static jl_value_t *deep_ending_kind = NULL;   // a Symbol (permanent), set under the world counter's lock
+static jl_value_t *deep_ending_cause = NULL;  // a Method in the table, or a membership's method
+static jl_mutex_t deep_endings_lock;
+
+JL_DLLEXPORT int jl_set_deep_endings(int on)
+{
+    int old = deep_endings_on;
+    deep_endings_on = on != 0;
+    return old;
+}
+
+JL_DLLEXPORT jl_value_t *jl_take_deep_endings(void)
+{
+    JL_LOCK(&deep_endings_lock);
+    jl_value_t *r = jl_deep_endings ? (jl_value_t*)jl_deep_endings : jl_nothing;
+    jl_deep_endings = NULL;
+    JL_UNLOCK(&deep_endings_lock);
+    return r;
+}
+
+static void note_deep_ending(jl_value_t *kind, jl_value_t *cause, jl_code_instance_t *ci)
+{
+    JL_LOCK(&deep_endings_lock);
+    if (jl_deep_endings == NULL)
+        jl_deep_endings = jl_alloc_vec_any(0);
+    jl_array_ptr_1d_push(jl_deep_endings, kind ? kind : jl_nothing);
+    jl_array_ptr_1d_push(jl_deep_endings, cause ? cause : jl_nothing);
+    jl_array_ptr_1d_push(jl_deep_endings, (jl_value_t*)ci);
+    JL_UNLOCK(&deep_endings_lock);
+}
+
+static int is_deep_facts_code(jl_code_instance_t *ci) JL_NOTSAFEPOINT
+{
+    uint8_t f = jl_atomic_load_relaxed(&ci->flags);
+    return (f & JL_CI_FLAGS_G2) && (f & JL_CI_FLAGS_FACTS);
+}
+
+// image validation (Compiler's reinfer.jl): an edge of a loaded CodeInstance that fails in this session
+JL_DLLEXPORT void jl_note_deep_ending(jl_value_t *edge, jl_code_instance_t *ci)
+{
+    if (deep_endings_on && jl_is_code_instance(ci) && is_deep_facts_code(ci))
+        note_deep_ending((jl_value_t*)jl_symbol("validation"), edge, ci);
+}
+
+// the cause of what the invalidations below end, set by the definition, deletion or membership that
+// runs them; an outer cause (a membership's method activated within its declaration) is kept
+static jl_value_t *deep_ending_push(const char *kind, jl_value_t *cause, jl_value_t **oldcause)
+{
+    jl_value_t *oldkind = deep_ending_kind;
+    *oldcause = deep_ending_cause;
+    if (oldkind == NULL && deep_endings_on) {
+        deep_ending_kind = (jl_value_t*)jl_symbol(kind);
+        deep_ending_cause = cause;
+    }
+    return oldkind;
+}
+static void deep_ending_pop(jl_value_t *oldkind, jl_value_t *oldcause) JL_NOTSAFEPOINT
+{
+    deep_ending_kind = oldkind;
+    deep_ending_cause = oldcause;
+}
+JL_DLLEXPORT jl_value_t *jl_deep_ending_push(const char *kind, jl_value_t *cause, jl_value_t **oldcause)
+{
+    return deep_ending_push(kind, cause, oldcause);
+}
+JL_DLLEXPORT void jl_deep_ending_pop(jl_value_t *oldkind, jl_value_t *oldcause)
+{
+    deep_ending_pop(oldkind, oldcause);
+}
+
 static void _invalidate_backedges(jl_method_instance_t *replaced_mi, jl_code_instance_t *replaced_ci, size_t max_world, int depth);
 
 // recursively invalidate cached methods that had an edge to a replaced method
@@ -2951,6 +3028,9 @@ static void invalidate_code_instance(jl_code_instance_t *replaced, size_t max_wo
     if (replacedmaxworld == ~(size_t)0) {
         assert(jl_atomic_load_relaxed(&replaced->min_world) - 1 <= max_world && "attempting to set illogical world constraints (probable race condition)");
         jl_atomic_store_release(&replaced->max_world, max_world);
+        // deep-G2 code compiled by facts ended: kept for the library's report (compiler §10.2)
+        if (deep_endings_on && is_deep_facts_code(replaced))
+            note_deep_ending(deep_ending_kind, deep_ending_cause, replaced);
         // recurse to all backedges to update their valid range also
         _invalidate_backedges(replaced_mi, replaced, max_world, depth + 1);
         // TODO: should we visit all forward edges now and delete ourself from all of those lists too?
@@ -3308,6 +3388,7 @@ struct _typename_invalidate_backedge {
     size_t max_world;
     int invalidated;
     jl_method_t *skip; // a membership's replay: the replayed method, whose own entry is live in the table; else NULL
+    int removal;       // a membership taken back (compiler §5.5): a call exactly at the member's signature ends
 };
 
 static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *env0)
@@ -3327,7 +3408,11 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
         jl_value_t *backedgetyp = d[i - 1];
         JL_GC_PROMISE_ROOTED(backedgetyp);
         int missing = 0;
-        if (jl_type_intersection2(backedgetyp, (jl_value_t*)env->type, env->isect, env->isect2)) {
+        if (env->removal) {
+            // a call at the member that found no method, or ambiguous ones, among them the one taken back there
+            missing = jl_subtype(backedgetyp, (jl_value_t*)env->type);
+        }
+        else if (jl_type_intersection2(backedgetyp, (jl_value_t*)env->type, env->isect, env->isect2)) {
             // See if the intersection was actually already fully
             // covered, but that the new method is ambiguous.
             //  -> no previous method: now there is one, need to update the missing edge
@@ -3683,7 +3768,7 @@ void jl_membership_method_retire(jl_method_t *method, size_t world)
 JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
 {
     if (jl_is_implements_sig(method->sig))
-        jl_error("a membership's method cannot be deleted: taking a membership back is not built (W-141)");
+        jl_error("a membership's method is deleted only with its membership: take the membership back (compiler §4.3)");
     jl_call_deletion_hook(method); // strict mode may refuse it (compiler §10.2)
     jl_methtable_t *mt = jl_method_get_table(method);
     jl_typemap_entry_t *methodentry = do_typemap_search(mt, method);
@@ -3698,7 +3783,10 @@ JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
         jl_atomic_store_relaxed(&method->dispatch_status, 0);
         assert(jl_atomic_load_relaxed(&methodentry->max_world) == ~(size_t)0);
         jl_atomic_store_relaxed(&methodentry->max_world, world);
+        jl_value_t *oldcause = NULL;
+        jl_value_t *oldkind = deep_ending_push("deletion", (jl_value_t*)method, &oldcause);
         jl_method_table_invalidate(method, world, 1);
+        deep_ending_pop(oldkind, oldcause);
         lower_callable_dispatch(method, world);
         jl_atomic_store_release(&jl_world_counter, world + 1);
     }
@@ -4081,6 +4169,9 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
         JL_UNLOCK(&open_set_methods_lock);
     }
     jl_timing_show_method(method, JL_TIMING_DEFAULT_BLOCK);
+    // what this definition ends of the deep class is the method's (compiler §10.2)
+    jl_value_t *oldcause = NULL;
+    jl_value_t *oldkind = deep_ending_push("definition", (jl_value_t*)method, &oldcause);
     jl_value_t *type = (jl_value_t*)newentry->sig;
     jl_value_t *oldvalue = NULL;
     jl_array_t *oldmi = NULL;
@@ -4241,6 +4332,7 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     jl_atomic_store_relaxed(&method->dispatch_status, dispatch_bits); // TODO: this should be sequenced fully after the world counter store
     jl_atomic_store_release(&method->interferences, interferences);
     jl_gc_wb(method, interferences);
+    deep_ending_pop(oldkind, oldcause);
     JL_GC_POP();
 }
 
@@ -4898,7 +4990,9 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
         if (!jl_is_mtable(mt))
             continue;
         int clean = 1;
-        jl_value_t *substsing = membership_subst_sig(m, sets, member, &clean);
+        // rooted at once: the member's signature can be a fresh UnionAll, and the search type below
+        // allocates (open issue 189: unrooted, a collection there left the typemap entry a freed object)
+        jl_value_t *substsing = gc[5] = membership_subst_sig(m, sets, member, &clean);
         if (clean == 2)
             continue; // m names the set only at other instances: the membership does not reach it
         membership_stats.replays++;
@@ -5034,6 +5128,217 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
     }
     jl_membership_log(member, set_instance, max_world);
     JL_GC_POP();
+}
+
+// A membership taken back (compiler §4.3, §5.5): its method ends as a deleted method does, in `world`,
+// the last world the membership holds in: the code that folded the positive holds an edge to the method's
+// instance and ends with it (§5.6). Called under the world counter's lock.
+JL_DLLEXPORT void jl_membership_method_end(jl_method_t *m, size_t world)
+{
+    jl_methtable_t *mt = jl_method_get_table(m);
+    jl_typemap_entry_t *me = do_typemap_search(mt, m);
+    if (me == NULL || jl_atomic_load_relaxed(&me->max_world) != ~(size_t)0)
+        return;
+    jl_atomic_store_relaxed(&m->dispatch_status, 0);
+    jl_atomic_store_relaxed(&me->max_world, world);
+    jl_method_invalidate_core(m, world, 1);
+}
+
+// the callers of an instance of a replayed method `m` that is wider than the member's signature
+// (compiled once at the set): a caller whose call's signature was under `m`'s while the membership
+// held and is not after it selected `m` at the member, and ends; a call at the set itself keeps `m`
+static int membership_removal_backedges(jl_method_instance_t *mi, jl_value_t *substsig, jl_method_t *m, size_t world)
+{
+    uint8_t flags = 0;
+    jl_array_t *backedges = jl_mi_get_backedges_mutate(mi, &flags);
+    if (!backedges)
+        return 0;
+    JL_GC_PUSH1(&backedges);
+    size_t ib = 0, insb = 0, nb = jl_array_nrows(backedges);
+    jl_value_t *invokeTypes;
+    jl_code_instance_t *caller;
+    int any = 0;
+    while (mi->backedges && ib < nb) {
+        ib = get_next_edge(backedges, ib, &invokeTypes, &caller);
+        if (!caller) {
+            insb = ib;
+            continue;
+        }
+        JL_GC_PROMISE_ROOTED(caller); // propagated by get_next_edge from backedges
+        int ends = 0;
+        if (invokeTypes && jl_is_svec(invokeTypes)) {
+            jl_value_t *callsig = jl_svecref(invokeTypes, 0);
+            ends = !jl_has_empty_intersection(callsig, substsig) &&
+                   jl_membership_holds_at(callsig, (jl_value_t*)m->sig, world) &&
+                   !jl_membership_holds_at(callsig, (jl_value_t*)m->sig, world + 1);
+        }
+        else if (invokeTypes) {
+            ends = jl_subtype(invokeTypes, substsig); // an invoke at the member's signature
+        }
+        if (ends) {
+            invalidate_code_instance(caller, world, 1);
+            insb = clear_next_edge(backedges, insb, invokeTypes, caller);
+            jl_atomic_fetch_or(&mi->flags, MI_FLAG_BACKEDGES_DIRTY);
+            any = 1;
+        }
+        else {
+            insb = set_next_edge(backedges, insb, invokeTypes, caller);
+        }
+    }
+    jl_mi_done_backedges(mi, flags);
+    JL_GC_POP();
+    return any;
+}
+
+// The walk for a membership taken back (compiler §5.5): each method at the set, or at a set it joins, is
+// replayed at the member as if deleted there. Its instances compiled at the member end, with their
+// callers; a caller of a wider instance whose call selected it at the member ends; the cache entries
+// that selected such an instance at the member are lowered; a call at the member that found no method
+// or ambiguous ones ends. A call at the member that selected another method (the member's own) keeps its
+// code. Called under the world counter's lock, with the entry live in `world` and not after it, and
+// the membership's query world at `world`.
+JL_DLLEXPORT void jl_membership_removal_walk(jl_value_t *member, jl_value_t *set_instance, size_t world)
+{
+    if (!jl_atomic_load_relaxed(&allow_new_worlds))
+        return;
+    // gc slots: 0 sets, 1 targets, 2 ms / search, 3 shadowed, 4 the member's signature, 5 dummy, 6 isect, 7 isect2
+    jl_value_t **gc;
+    JL_GC_PUSHARGS(gc, 8);
+    jl_array_t *sets = (jl_array_t*)(gc[0] = (jl_value_t*)jl_alloc_vec_any(0));
+    membership_superset_sets(set_instance, world, sets);
+    jl_array_t *targets = (jl_array_t*)(gc[1] = (jl_value_t*)jl_alloc_vec_any(0));
+    for (size_t s = 0; s < jl_array_nrows(sets); s++) {
+        jl_value_t *Yuw = jl_unwrap_unionall(jl_array_ptr_ref(sets, s));
+        jl_array_t *ms = (jl_array_t*)(gc[2] = (jl_value_t*)jl_methods_at_set(((jl_datatype_t*)Yuw)->name));
+        for (size_t i = 0; i < jl_array_nrows(ms); i++) {
+            jl_value_t *m = jl_array_ptr_ref(ms, i);
+            size_t k;
+            for (k = 0; k < jl_array_nrows(targets); k++)
+                if (jl_array_ptr_ref(targets, k) == m)
+                    break;
+            if (k == jl_array_nrows(targets))
+                jl_array_ptr_1d_push(targets, m);
+        }
+    }
+    gc[2] = NULL;
+    for (size_t i = 0; i < jl_array_nrows(targets); i++) {
+        jl_method_t *m = (jl_method_t*)jl_array_ptr_ref(targets, i);
+        jl_methtable_t *mt = jl_method_get_table(m);
+        if (!jl_is_mtable(mt))
+            continue;
+        int clean = 1;
+        jl_value_t *substsig = gc[4] = membership_subst_sig(m, sets, member, &clean);
+        if (clean == 2)
+            continue; // m names the set only at other instances
+        jl_value_t *search = gc[2] = method_function_search_type(m);
+        jl_array_t *shadowed = (jl_array_t*)(gc[3] = (jl_value_t*)jl_alloc_vec_any(0));
+        jl_typemap_entry_t *dummy = NULL;
+        if (!clean || substsig == NULL) {
+            // no one signature says what the membership added: every instance of m ends, with its callers
+            jl_method_invalidate_core(m, world, 0);
+            membership_all_specializations(m, shadowed);
+        }
+        else {
+            dummy = (jl_typemap_entry_t*)(gc[5] = (jl_value_t*)jl_typemap_alloc((jl_tupletype_t*)substsig, NULL, jl_emptysvec, (jl_value_t*)m, ~(size_t)0, 1));
+            jl_value_t *specs = gc[2] = (jl_value_t*)jl_atomic_load_relaxed(&m->specializations);
+            _Atomic(jl_method_instance_t*) *data;
+            size_t l;
+            if (jl_is_svec(specs)) {
+                data = (_Atomic(jl_method_instance_t*)*)jl_svec_data(specs);
+                l = jl_svec_len(specs);
+            }
+            else {
+                data = (_Atomic(jl_method_instance_t*)*)&m->specializations;
+                l = 1;
+            }
+            for (size_t j = 0; j < l; j++) {
+                jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[j]);
+                if ((jl_value_t*)mi == jl_nothing || mi == NULL)
+                    continue;
+                if (jl_has_empty_intersection((jl_value_t*)mi->specTypes, substsig))
+                    continue;
+                jl_array_ptr_1d_push(shadowed, (jl_value_t*)mi);
+                if (jl_subtype((jl_value_t*)mi->specTypes, substsig)) {
+                    // an instance compiled at the member (a default's method compiled for it): it ends, with its callers
+                    jl_code_instance_t *ci = jl_atomic_load_relaxed(&mi->cache);
+                    while (ci) {
+                        invalidate_code_instance(ci, world, 1);
+                        ci = jl_atomic_load_relaxed(&ci->next);
+                    }
+                    jl_atomic_store_relaxed(&mi->dispatch_status, 0);
+                }
+                else {
+                    membership_removal_backedges(mi, substsig, m, world);
+                }
+            }
+            gc[2] = search;
+        }
+        jl_methcache_t *mc = jl_method_table->cache;
+        JL_LOCK(&mc->writelock);
+        if (jl_array_nrows(shadowed) || !dummy) {
+            struct invalidate_mt_env mt_cache_env;
+            mt_cache_env.max_world = world;
+            mt_cache_env.shadowed = shadowed;
+            mt_cache_env.newentry = dummy;
+            mt_cache_env.stats = NULL;
+            membership_visit_function(jl_atomic_load_relaxed(&mc->cache), search, world,
+                                      dummy ? invalidate_mt_cache : invalidate_all_mt_cache, (void*)&mt_cache_env);
+            jl_genericmemory_t *leafcache = jl_atomic_load_relaxed(&mc->leafcache);
+            size_t li, ll = leafcache->length;
+            for (li = 1; li < ll; li += 2) {
+                jl_value_t *entry = jl_genericmemory_ptr_ref(leafcache, li);
+                if (entry) {
+                    while (entry != jl_nothing) {
+                        jl_atomic_store_relaxed(&((jl_typemap_entry_t*)entry)->max_world, world);
+                        entry = (jl_value_t*)jl_atomic_load_relaxed(&((jl_typemap_entry_t*)entry)->next);
+                    }
+                }
+            }
+            jl_atomic_store_relaxed(&mc->leafcache, (jl_genericmemory_t*)jl_an_empty_memory_any);
+        }
+        if (substsig != NULL && clean) {
+            struct _typename_invalidate_backedge typename_env = {substsig, (jl_value_t*)m->sig, &gc[6], &gc[7], NULL, 0, world, 0, NULL, 1};
+            invalidate_missing_backedges(&typename_env);
+        }
+        JL_UNLOCK(&mc->writelock);
+        gc[2] = gc[3] = gc[4] = gc[5] = NULL;
+    }
+    JL_GC_POP();
+}
+
+// The member's kept check answers for a set (compiler §10.4), forgotten when its membership is taken back:
+// for each member type under `member` (a pattern's every member), the pairs whose set is `setname`. The
+// list of the checks images brought (under `nothing`) is read by the library from a cursor and stays: the
+// library forgets its records itself.
+JL_DLLEXPORT void jl_member_states_forget(jl_value_t *member, jl_typename_t *setname)
+{
+    JL_LOCK(&jl_member_state_lock);
+    if (jl_member_states != NULL) {
+        size_t n = jl_member_states->length;
+        for (size_t i = 0; i + 1 < n; i += 2) {
+            jl_value_t *T = jl_genericmemory_ptr_ref(jl_member_states, i);
+            jl_value_t *v = jl_genericmemory_ptr_ref(jl_member_states, i + 1);
+            if (T == NULL || T == jl_nothing || v == NULL || !jl_is_array(v))
+                continue;
+            jl_array_t *a = (jl_array_t*)v;
+            size_t w = 0;
+            for (size_t k = 0; k + 1 < jl_array_nrows(a); k += 2) {
+                jl_value_t *mt = T;
+                jl_value_t *X = jl_array_ptr_ref(a, k);
+                jl_value_t *Xu = jl_unwrap_unionall(X);
+                int drop = jl_is_type(mt) && jl_is_datatype(Xu) && ((jl_datatype_t*)Xu)->name == setname &&
+                           jl_subtype(mt, member);
+                if (!drop) {
+                    jl_array_ptr_set(a, w, jl_array_ptr_ref(a, k));
+                    jl_array_ptr_set(a, w + 1, jl_array_ptr_ref(a, k + 1));
+                    w += 2;
+                }
+            }
+            if (w < jl_array_nrows(a))
+                jl_array_del_end(a, jl_array_nrows(a) - w);
+        }
+    }
+    JL_UNLOCK(&jl_member_state_lock);
 }
 
 JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method, jl_tupletype_t *simpletype)
