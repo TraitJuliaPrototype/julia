@@ -1603,7 +1603,7 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
             end
             # a branch called through a `:caller_world` pointer dispatches in the caller's world: no edge
             pointer && item isa InvokeCase && continue
-            split_case_edge!(state.edges, item)
+            split_case_edge!(state.edges, item, estate.edges)
         end
     end
     # in a closed build (compiler §7.6) the split is over every member: past its branches the call
@@ -1634,10 +1634,20 @@ function split_inline_leaf(item::InliningTodo)
     return true
 end
 
-# the edge of a split's branch that is inlined or stays a direct call (compiler §7.2)
-function split_case_edge!(edges::Vector{Any}, @nospecialize(item))
+# the edge of a split's branch that is inlined or stays a direct call (compiler §7.2). An inlined
+# branch names the CodeInstance whose code it inlined, where the case's own edges have it, as an
+# ordinary inlined call does: the caller rests on that code, not on every code its instance may get
+# (compiler §3.2)
+function split_case_edge!(edges::Vector{Any}, @nospecialize(item), caseedges::Vector{Any})
     if item isa InliningTodo
-        add_inlining_edge!(edges, item.mi)
+        ci = nothing
+        for e in caseedges
+            if e isa CodeInstance && get_ci_mi(e) === item.mi
+                ci = e
+                break
+            end
+        end
+        add_inlining_edge!(edges, ci === nothing ? item.mi : ci)
     elseif item isa InvokeCase
         add_inlining_edge!(edges, item.invoke)
     elseif item isa ConstantCase
