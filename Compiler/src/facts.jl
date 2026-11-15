@@ -268,6 +268,32 @@ function edges_satisfy_g2(edges::SimpleVector, own::Union{CodeInstance,IdSet{Any
     return true
 end
 
+"""
+An edge that names a callee by its MethodInstance alone names the callee's CodeInstance where one exists
+when the caller finishes (compiler §3.2): inference had no CodeInstance for the callee where it reached the
+call (a recursion through it, a limited inference), and the callee was finished before the caller. The
+CodeInstance is the one of the policy the caller's call reaches, valid in the caller's worlds. The backedge
+is the same, on the instance: a definition that changes dispatch at the callee ends the caller as before;
+of the callee's code, only the CodeInstance named ends it. The caller's own instance, the members of its
+inference cycle (not yet cached), a membership's instance and an interpreter of no policy are left as they
+are.
+"""
+function name_callee_code(interp::AbstractInterpreter, caller::MethodInstance, edges::SimpleVector, worlds::WorldRange)
+    interp isa NativeInterpreter && !interp.plainrt || return edges
+    out = nothing
+    for i in 1:length(edges)
+        e = edges[i]
+        e isa MethodInstance || continue
+        (e === caller || !(e.def isa Method) || is_membership_mi(e)) && continue
+        cache = WorldView(InternalCodeCache(cache_owner(interp), Cint(mi_policy_facts_at(e, interp.facts))), worlds)
+        ci = get(cache, e, nothing)
+        ci isa CodeInstance || continue
+        out === nothing && (out = Any[edges...])
+        out[i] = ci
+    end
+    return out === nothing ? edges : Core.svec(out...)
+end
+
 "Whether `mi` is an instance of a membership's method, which a folded positive's edge names (compiler §5.6)."
 is_membership_mi(mi::MethodInstance) = (m = mi.def; m isa Method && is_absence_sig(m.sig))
 
