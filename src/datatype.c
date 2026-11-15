@@ -771,7 +771,10 @@ void jl_memberships_activated(jl_array_t *list, size_t world)
         jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i + 1);
         if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
             continue;
+        jl_value_t *oldcause = NULL;
+        jl_value_t *oldkind = jl_deep_ending_push("membership", en->method != jl_nothing ? en->method : (jl_value_t*)en, &oldcause);
         jl_membership_dispatch_walk(en->member, en->instance, world);
+        jl_deep_ending_pop(oldkind, oldcause);
         if (!collect) {
             jl_membership_ambiguity_report(en->member, en->instance, world);
             continue;
@@ -1351,6 +1354,9 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         jl_declared_memberships = jl_alloc_vec_any(0);
     jl_array_ptr_1d_push(jl_declared_memberships, (jl_value_t*)home);
     jl_array_ptr_1d_push(jl_declared_memberships, entry);
+    // what the membership ends of the deep class is the membership's, named by its method (compiler §10.2)
+    jl_value_t *oldcause = NULL;
+    jl_value_t *oldkind = jl_deep_ending_push("membership", mmeth != NULL ? (jl_value_t*)mmeth : entry, &oldcause);
     if (mmeth != NULL) {
         // the method begins in the entry's world; its insertion ends the code that relied on the
         // pair's absence, through the table's backedges (W-141). No refusal is past this point
@@ -1365,6 +1371,7 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     // reach, then report the ambiguities, both at the entry's world
     size_t mq = jl_set_membership_query_world(min_world);
     jl_membership_dispatch_walk(member, set_instance, min_world);
+    jl_deep_ending_pop(oldkind, oldcause);
     jl_membership_ambiguity_report(member, set_instance, min_world);
     jl_set_membership_query_world(mq);
     JL_UNLOCK(&world_counter_lock);
