@@ -2916,6 +2916,7 @@ static void gc_mark_roots(jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT
     gc_try_claim_and_push(mq, jl_fully_typed_hook, NULL); // fully typed mode's hook (gf.c)
     gc_heap_snapshot_record_gc_roots(jl_member_hook, "member_hook");
     gc_try_claim_and_push(mq, jl_method_definition_hook, NULL); // the library's hooks (gf.c)
+    gc_try_claim_and_push(mq, jl_method_expansion_hook, NULL);
     gc_heap_snapshot_record_gc_roots(jl_method_definition_hook, "method_definition_hook");
     gc_try_claim_and_push(mq, jl_image_methods_hook, NULL);
     gc_heap_snapshot_record_gc_roots(jl_image_methods_hook, "image_methods_hook");

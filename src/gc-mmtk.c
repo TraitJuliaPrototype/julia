@@ -546,6 +546,7 @@ JL_DLLEXPORT void jl_gc_scan_vm_specific_roots(RootsWorkClosure* closure)
     add_node_to_roots_buffer(closure, &buf, &len, jl_member_failed_users);
     add_node_to_roots_buffer(closure, &buf, &len, jl_fully_typed_hook); // fully typed mode's hook (gf.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_method_definition_hook); // the library's hooks (gf.c)
+    add_node_to_roots_buffer(closure, &buf, &len, jl_method_expansion_hook);
     add_node_to_roots_buffer(closure, &buf, &len, jl_image_methods_hook);
     add_node_to_roots_buffer(closure, &buf, &len, jl_module_end_hook);
     add_node_to_roots_buffer(closure, &buf, &len, jl_method_deletion_hook); // strict mode's deletion hook (gf.c)

@@ -6522,11 +6522,19 @@ JL_DLLEXPORT void jl_not_fully_typed(jl_value_t *site)
 // world, outside the world counter's lock, not for a definition a hook makes, and not while the
 // system image is built. They are rooted for the collectors.
 jl_value_t *jl_method_definition_hook JL_GLOBALLY_ROOTED = NULL;
+jl_value_t *jl_method_expansion_hook JL_GLOBALLY_ROOTED = NULL;
 jl_value_t *jl_image_methods_hook JL_GLOBALLY_ROOTED = NULL;
 jl_value_t *jl_module_end_hook JL_GLOBALLY_ROOTED = NULL;
 JL_DLLEXPORT void jl_set_method_definition_hook(jl_value_t *hook)
 {
     jl_method_definition_hook = hook == jl_nothing ? NULL : hook;
+}
+// The expansion hook: hook(argdata, code, module) -> nothing, or an svec of svec(argdata, code)
+// pairs that the one definition makes in its place, in order (a method at a trait that erases by
+// default, at its kept forms, then its forwarder: lowering §5)
+JL_DLLEXPORT void jl_set_method_expansion_hook(jl_value_t *hook)
+{
+    jl_method_expansion_hook = hook == jl_nothing ? NULL : hook;
 }
 JL_DLLEXPORT void jl_set_image_methods_hook(jl_value_t *hook)
 {
@@ -6591,6 +6599,31 @@ void jl_call_definition_hook(jl_method_t *m, int after)
         }
     }
     JL_GC_POP();
+}
+
+// before a method is made, where its signature names a set: the methods the definition makes
+// instead, or NULL where it makes the one it is
+jl_svec_t *jl_call_expansion_hook(jl_svec_t *argdata, jl_code_info_t *code, jl_module_t *module)
+{
+    if (jl_method_expansion_hook == NULL)
+        return NULL;
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 4);
+    args[0] = jl_method_expansion_hook;
+    args[1] = (jl_value_t*)argdata;
+    args[2] = (jl_value_t*)code;
+    args[3] = (jl_value_t*)module;
+    jl_value_t *r = call_library_hook(args, 4);
+    JL_GC_POP();
+    if (r == NULL || !jl_is_svec(r) || jl_svec_len(r) == 0)
+        return NULL;
+    for (size_t i = 0; i < jl_svec_len(r); i++) {
+        jl_value_t *p = jl_svecref(r, i);
+        if (!jl_is_svec(p) || jl_svec_len(p) != 2 || !jl_is_svec(jl_svecref(p, 0)) ||
+                !jl_is_code_info(jl_svecref(p, 1)))
+            jl_error("the expansion hook returned no list of (argdata, code) pairs");
+    }
+    return (jl_svec_t*)r;
 }
 
 // before a method is deleted (it may throw to refuse it)

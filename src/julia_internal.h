@@ -460,6 +460,8 @@ extern jl_value_t *jl_fully_typed_hook JL_GLOBALLY_ROOTED;
 extern jl_value_t *jl_method_deletion_hook JL_GLOBALLY_ROOTED;
 void jl_call_deletion_hook(jl_method_t *m);
 extern jl_value_t *jl_method_definition_hook JL_GLOBALLY_ROOTED; // the library's hooks (gf.c, compiler §10.1)
+extern jl_value_t *jl_method_expansion_hook JL_GLOBALLY_ROOTED;
+jl_svec_t *jl_call_expansion_hook(jl_svec_t *argdata, jl_code_info_t *code, jl_module_t *module);
 extern jl_value_t *jl_image_methods_hook JL_GLOBALLY_ROOTED;
 extern jl_value_t *jl_module_end_hook JL_GLOBALLY_ROOTED;
 void jl_call_definition_hook(jl_method_t *m, int after);

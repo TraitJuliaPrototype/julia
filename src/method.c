@@ -1413,10 +1413,19 @@ JL_DLLEXPORT jl_methcache_t *jl_method_get_cache(jl_method_t *method JL_PROPAGAT
     return jl_method_get_table(method)->cache;
 }
 
+static jl_method_t *method_def(jl_svec_t *argdata, jl_methtable_t *mt, jl_code_info_t *f,
+                               jl_module_t *module, int expand);
+
 JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
                                         jl_methtable_t *mt,
                                         jl_code_info_t *f,
                                         jl_module_t *module)
+{
+    return method_def(argdata, mt, f, module, 1);
+}
+
+static jl_method_t *method_def(jl_svec_t *argdata, jl_methtable_t *mt, jl_code_info_t *f,
+                               jl_module_t *module, int expand)
 {
     // argdata is svec(svec(types...), svec(typevars...), functionloc)
     jl_svec_t *atypes = (jl_svec_t*)jl_svecref(argdata, 0);
@@ -1528,6 +1537,28 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
     ft = jl_rewrap_unionall(ft, argtype);
     if (!external_mt && !jl_has_empty_intersection(ft, (jl_value_t*)jl_builtin_type)) // disallow adding methods to Any, Function, Builtin, and subtypes, or Unions of those
         jl_errorf("cannot add methods to builtin function `%s`", jl_symbol_name(name));
+
+    // a definition whose signature names a set may make several methods, as a positional default
+    // makes a second one: the library's expansion hook decides by the evaluated signature (an
+    // argument at a trait that erases by default: the method at the kept forms, then its
+    // forwarder; lowering §5, compiler §10.1). Each is defined as written, without expansion.
+    if (expand && !external_mt && jl_method_expansion_hook != NULL && jl_has_open_set_in(argtype)) {
+        jl_svec_t *defs = jl_call_expansion_hook(argdata, f, module);
+        if (defs != NULL) {
+            JL_GC_PUSH1(&defs);
+            jl_method_t *first = NULL;
+            for (i = 0; i < jl_svec_len(defs); i++) {
+                jl_svec_t *d = (jl_svec_t*)jl_svecref(defs, i);
+                jl_method_t *mi = method_def((jl_svec_t*)jl_svecref(d, 0), mt,
+                                             (jl_code_info_t*)jl_svecref(d, 1), module, 0);
+                if (first == NULL)
+                    first = mi;
+            }
+            JL_GC_POP();
+            JL_GC_POP();
+            return first;
+        }
+    }
 
     m = jl_new_method_uninit(module);
     m->external_mt = (jl_value_t*)external_mt;
