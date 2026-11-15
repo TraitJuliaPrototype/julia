@@ -4373,12 +4373,13 @@ static int declared_parameter(jl_unionall_t *ua) JL_NOTSAFEPOINT
 //   membership, so no code and no cache entry is at one. A bound that the signature sets
 //   (`Box{<:X}`) fails: `Box{Union{S, T}}` was made before and is under it only now.
 // - `in_bound`: `v` is the bound of a variable that is no type's declared parameter (one of the
-//   signature's, or `S` in `Type{<:Cell}`). A set replaced there outside a declared parameter fails
-//   for the same reason.
+//   signature's, or `S` in `Type{<:Cell}`). A set there outside a declared parameter is a place no
+//   one signature with the member says (`Box{Union{S, T}}` was made before): `*fail = 2`, and the
+//   caller replays the method at its own signature.
 // - An intersection `All{…}` that names the set gives the member (it may not be in the other sets:
 //   more is replayed, nothing missed).
 // - A parameter of any other type does not vary: only that type is under it, whoever joins the set.
-// `*did` counts the places where a set was replaced. `*fail` is set where the shape cannot be followed (a set
+// `*did` counts the places where a set was replaced. `*fail = 1` where the shape cannot be followed (a set
 // in a variable's lower bound, or deeper than 8): the caller takes the conservative path.
 static jl_value_t *membership_subst_nested(jl_value_t *v, jl_array_t *sets, jl_value_t *memb,
                                            jl_value_t *msig, int *did, int *fail, int depth, int in_bound)
@@ -4454,7 +4455,7 @@ static jl_value_t *membership_subst_nested(jl_value_t *v, jl_array_t *sets, jl_v
                     if (((jl_datatype_t*)jl_unwrap_unionall(Y))->name == ((jl_datatype_t*)c)->name &&
                             membership_param_meets(Y, c, msig)) {
                         if (in_bound)
-                            *fail = 1; // the bound of a signature's variable: see the caller
+                            *fail = 2; // the bound of a signature's variable: see the caller
                         *did += 1;
                         r = memb;
                         break;
@@ -4520,6 +4521,7 @@ static jl_value_t *membership_subst_sig(jl_method_t *m, jl_array_t *sets,
     newvars = jl_alloc_svec(mvars_n);
     size_t nreplaced = 0;
     size_t nnested = 0;      // of them, below a position's top
+    int whole = 0;           // a place no one signature with the member says (a bound the signature sets)
     int var_done[16] = {0};  // the signature's variables replaced at a position of their own
     volatile int thrown = 0;
     for (size_t i = 0; i < n; i++) {
@@ -4573,12 +4575,13 @@ static jl_value_t *membership_subst_sig(jl_method_t *m, jl_array_t *sets,
             JL_CATCH {
                 thrown = 1;
             }
-            if (fail || thrown) {
+            if (fail == 1 || thrown) {
                 *clean = 0;
                 JL_GC_POP();
                 return NULL;
             }
-            jl_svecset(newparams, i, tmp);
+            whole |= fail == 2;
+            jl_svecset(newparams, i, fail ? p : tmp);
             nreplaced += did;
             nnested += did;
         }
@@ -4602,20 +4605,24 @@ static jl_value_t *membership_subst_sig(jl_method_t *m, jl_array_t *sets,
         JL_CATCH {
             thrown = 1;
         }
-        if (fail || thrown) {
+        if (fail == 1 || thrown) {
             *clean = 0;
             JL_GC_POP();
             return NULL;
         }
+        whole |= fail == 2;
         nreplaced += did;
         nnested += did;
     }
     // The member in one place: the types the membership adds under the signature. With the set in
-    // several places, a new call has the member in any one of them, which one signature does not say.
-    if (nnested > 0 && nreplaced > 1) {
-        *clean = 0;
+    // several places, a new call has the member in any one of them, which one signature does not say;
+    // nor does it at a bound the signature sets. There the replay is at the method's own signature:
+    // what the membership adds is under it, and the method's own instances stay (a membership adds
+    // no method and takes no type from under a signature; the walk passes over the replayed method).
+    if (whole || (nnested > 0 && nreplaced > 1)) {
+        *clean = 3;
         JL_GC_POP();
-        return NULL;
+        return msig;
     }
     if (nreplaced == 0) {
         // m names the set at top level only at instances the member is not of (else the
@@ -4846,7 +4853,7 @@ JL_DLLEXPORT jl_value_t *jl_membership_replay_sigs(jl_value_t *member, jl_value_
             if (clean == 2)
                 continue; // the method names the set only at other instances
             jl_array_ptr_1d_push(out, m);
-            jl_array_ptr_1d_push(out, clean && sub != NULL ? sub : jl_nothing);
+            jl_array_ptr_1d_push(out, clean == 1 && sub != NULL ? sub : jl_nothing); // 3: the method's own
         }
     }
     JL_UNLOCK(&world_counter_lock);
@@ -4904,9 +4911,9 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
         jl_typemap_entry_t *dummy = NULL;
         jl_array_t *oldmi = NULL;
         if (!clean || substsing == NULL) {
-            // rare shape (set inside a parameter, or under Vararg — the latter
-            // since review W2-5c made membership_subst_sig refuse vararg
-            // substitutions): conservative full pass over m. No substituted sig
+            // rare shape (the set under a Vararg, in a variable's lower bound, or
+            // deeper than 8; a bound the signature sets replays at m's own sig,
+            // clean == 3): conservative full pass over m. No substituted sig
             // exists, so missing edges are pruned against m's own sig — with no
             // d[] to cover them, every intersecting edge is treated as missing
             // (never pruned). The invalidate CORE, not jl_method_table_invalidate:
