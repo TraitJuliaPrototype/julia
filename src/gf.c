@@ -7490,7 +7490,7 @@ static NOINLINE jl_value_t *apply_generic_reach(jl_value_t *F, jl_value_t **args
     if (__unlikely(dp_on > 0))
         dp_ip = ip;
     jl_method_instance_t *mfunc = jl_lookup_generic_(F, args, nargs,
-                                                     jl_int32hash_fast(ip),
+                                                     jl_int32hash_fast((uint32_t)(uintptr_t)ip),
                                                      world);
     JL_GC_PROMISE_ROOTED(mfunc);
     return _jl_invoke(F, args, nargs, mfunc, world, reach);

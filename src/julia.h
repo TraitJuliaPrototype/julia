@@ -2114,6 +2114,8 @@ JL_DLLEXPORT void jl_set_module_infer(jl_module_t *self, int value);
 JL_DLLEXPORT int jl_get_module_infer(jl_module_t *m);
 JL_DLLEXPORT void jl_set_module_max_methods(jl_module_t *self, int value);
 JL_DLLEXPORT int jl_get_module_max_methods(jl_module_t *m);
+JL_DLLEXPORT void jl_set_module_facts(jl_module_t *self, int value);
+JL_DLLEXPORT void jl_set_module_trait_option(jl_module_t *self, int bit, int value);
 JL_DLLEXPORT jl_value_t *jl_get_module_usings_backedges(jl_module_t *m);
 JL_DLLEXPORT jl_value_t *jl_get_module_scanned_methods(jl_module_t *m);
 JL_DLLEXPORT jl_value_t *jl_get_module_binding_or_nothing(jl_module_t *m, jl_sym_t *s);
