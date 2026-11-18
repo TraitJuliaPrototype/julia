@@ -6447,7 +6447,10 @@ static _Thread_local int library_hook_depth = 0;
 // args[0] is the hook; returns its result, or NULL where it does not run
 static jl_value_t *call_library_hook(jl_value_t **args, int nargs)
 {
-    if (args[0] == NULL || library_hook_depth > 0 || (jl_generating_output() && !jl_options.incremental))
+    // not while the system image is built; a trimmed build (also a non-incremental output) loads its program
+    // as a session does (compiler §7.6, §10.1)
+    if (args[0] == NULL || library_hook_depth > 0 ||
+        (jl_generating_output() && !jl_options.incremental && jl_options.trim == JL_TRIM_NO))
         return NULL;
     jl_task_t *ct = jl_current_task;
     size_t last_age = ct->world_age;
