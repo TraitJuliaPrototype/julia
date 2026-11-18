@@ -804,11 +804,13 @@ JL_DLLEXPORT int jl_method_fully_typed(jl_method_t *m) JL_NOTSAFEPOINT
     uint8_t o = m->module->trait_options;
     return (o & 32) ? 2 : (o & 16) ? 1 : 0;
 }
-// The trait language's scope options (compiler §2.1), as bits: 1 bounded, 2 no_pirates, 4 dynamic,
-// 8 first_seen; fully typed mode 16 warn, 32 enforce; 64 owner_only (compiler §1.2: the functions the
-// module neither exports nor declares public take methods from their owner only).
+// The trait language's scope options (compiler §2.1), as bits: 1 bounded, 2 no_pirates; fully typed
+// mode 16 warn, 32 enforce; 64 owner_only (compiler §1.2: the functions the module neither exports nor
+// declares public take methods from their owner only).
 JL_DLLEXPORT void jl_set_module_trait_option(jl_module_t *self, int bit, int value)
 {
+    if (bit != 1 && bit != 2 && bit != 16 && bit != 32 && bit != 64)
+        jl_errorf("unknown module option bit %d", bit);
     if (value)
         self->trait_options |= (uint8_t)bit;
     else

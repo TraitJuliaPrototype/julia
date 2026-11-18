@@ -163,7 +163,7 @@ macro max_methods(n::Int, fdef::Expr)
 end
 
 """
-    Experimental.@compiler_options optimize={0,1,2,3} compile={yes,no,all,min} infer={true,false} max_methods={default,1,2,3,4} facts={true,false} bounded={true,false} no_pirates={true,false} dynamic={true,false} first_seen={true,false} owner_only={true,false} fully_typed={off,warn,enforce}
+    Experimental.@compiler_options optimize={0,1,2,3} compile={yes,no,all,min} infer={true,false} max_methods={default,1,2,3,4} facts={true,false} bounded={true,false} no_pirates={true,false} owner_only={true,false} fully_typed={off,warn,enforce}
 
 Set compiler options for code in the enclosing module. Options correspond directly to
 command-line options with the same name, where applicable. The following options
@@ -176,8 +176,7 @@ are currently supported:
   * `max_methods`: Maximum number of matching methods considered when running type inference.
   * `facts`: Compile the module's methods by facts: their calls are inferred, with their edges,
     only at fact signatures; every other call is dispatched when it runs.
-  * `bounded`, `no_pirates`, `dynamic`, `first_seen`: the trait language's scope options, which a
-    trait library reads.
+  * `bounded`, `no_pirates`: the trait language's scope options, which a trait library reads.
   * `owner_only`: the module's functions that it neither exports nor declares `public` take methods
     from their owner only, so a call of one is a fact at any signature (a trait module's default).
   * `fully_typed`: fully typed mode for the module's methods: compiled by facts, and where the code
@@ -213,9 +212,8 @@ macro compiler_options(args...)
                 a = a === false || a === :no  ? 0 :
                     a === true  || a === :yes ? 1 : error("invalid argument to \"facts\" option")
                 push!(opts.args, Expr(:meta, :facts, a))
-            elseif ex.args[1] in (:bounded, :no_pirates, :dynamic, :first_seen, :owner_only)
-                bit = ex.args[1] === :bounded ? 1 : ex.args[1] === :no_pirates ? 2 : ex.args[1] === :dynamic ? 4 :
-                      ex.args[1] === :first_seen ? 8 : 64
+            elseif ex.args[1] in (:bounded, :no_pirates, :owner_only)
+                bit = ex.args[1] === :bounded ? 1 : ex.args[1] === :no_pirates ? 2 : 64
                 a = ex.args[2]
                 a = a === false || a === :no  ? 0 :
                     a === true  || a === :yes ? 1 : error("invalid argument to \"$(ex.args[1])\" option")
