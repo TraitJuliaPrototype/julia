@@ -857,15 +857,16 @@ static int entry_live_at(jl_membership_t *en, size_t world)
     return en->min_world <= world && world <= jl_atomic_load_relaxed(&en->max_world);
 }
 
-// Whether the member pattern `m`, found at the component `skip` of an intersection's components
-// `comps`, could be in each other component: a concrete type by subtyping, a pattern by intersection
-// (which can answer yes where no type is: the answer errs toward "met").
+// Whether the member pattern `m`, found by an entry at the set of the component `skip` of an
+// intersection's components `comps`, could be in each component: a concrete type by subtyping, a pattern
+// by intersection (which can answer yes where no type is: the answer errs toward "met"). The component
+// `skip` is asked too: the entry may be at another instance of its set (compiler §4.9: `All{X{A}, X{B}}`
+// is met where the entries put a type in both).
 static int member_meets_others(jl_value_t *m, jl_value_t *comps, size_t skip)
 {
+    (void)skip;
     size_t n = jl_nparams(comps);
     for (size_t k = 0; k < n; k++) {
-        if (k == skip)
-            continue;
         jl_value_t *c = jl_tparam(comps, k);
         jl_array_t *fv = NULL;
         JL_GC_PUSH2(&c, &fv);

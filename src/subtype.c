@@ -120,6 +120,10 @@ typedef struct jl_stenv_t {
     // never type equalities, so no entry is consulted there; a variable's bound is a subtype question
     // and is asked with entries (subtype_ccheck, intersect_var)
     int noentry;
+    // meeting an entry's instance with the set asked about (intersect_membership): the member is in the
+    // set only where the entry's instance meets it parameter by parameter, so two instances of one set
+    // that differ in an input do not meet there as two sets do (compiler §4.9)
+    int entryinst;
 } jl_stenv_t;
 
 // state manipulation utilities
@@ -645,6 +649,9 @@ int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
             }
         }
         int istuple = (ad->name == jl_tuple_typename);
+        // two instances of a set with inputs may share a member at different input values (compiler §4.9)
+        if (ad->name->open_set && ad->name->input_params != 0)
+            return 0;
         size_t np;
         if (istuple) {
             size_t na = jl_nparams(ad), nb = jl_nparams(bd);
@@ -2818,6 +2825,7 @@ static void init_stenv(jl_stenv_t *e, jl_value_t **env, int envsz)
     e->triangular = 0;
     e->Loffset = 0;
     e->noentry = 0;
+    e->entryinst = 0;
     e->Lunions.depth = 0;      e->Runions.depth = 0;
     e->Lunions.more = 0;       e->Runions.more = 0;
     e->Lunions.used = 0;       e->Runions.used = 0;
@@ -3295,6 +3303,7 @@ static int subtype_in_env(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     e2.envidx = e->envidx;
     e2.Loffset = e->Loffset;
     e2.noentry = e->noentry;
+    e2.entryinst = e->entryinst;
     return forall_exists_subtype(x, y, &e2, 0);
 }
 
@@ -4897,7 +4906,9 @@ static jl_value_t *intersect_membership(jl_datatype_t *x, jl_value_t *y, jl_sten
             inst = membership_instance((jl_value_t*)xd, en);
             if (inst == NULL)
                 continue;
+            e->entryinst++;
             jl_value_t *ii = R ? intersect(y, inst, e, param) : intersect(inst, y, e, param);
+            e->entryinst--;
             if (ii != jl_bottom_type) {
                 res = (jl_value_t*)x;
                 break;
@@ -5181,6 +5192,33 @@ static jl_value_t *meet_open(jl_value_t *x, jl_value_t *y)
     return r;
 }
 
+// Whether two instances of one set with inputs may be at different values of an input (compiler §4.6,
+// §4.9): a member has one instance per value of the inputs, so two instances at the same input values
+// that differ in another parameter have no common member; at different input values a type may be a
+// member of both. An input with a free variable may take a value the other's does not.
+static int inputs_may_differ(jl_datatype_t *xd, jl_datatype_t *yd)
+{
+    uint8_t mask = xd->name->input_params;
+    size_t np = jl_nparams(xd);
+    for (size_t i = 0; i < np && i < 8; i++) {
+        if (!((mask >> i) & 1))
+            continue;
+        jl_value_t *a = jl_tparam(xd, i), *b = jl_tparam(yd, i);
+        if (a == b)
+            continue;
+        if (jl_has_free_typevars(a) || jl_has_free_typevars(b))
+            return 1;
+        if (jl_is_type(a) && jl_is_type(b)) {
+            if (!(subtype_noentry(a, b) && subtype_noentry(b, a)))
+                return 1;
+        }
+        else if (!jl_egal(a, b)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
 {
     if (x == y) return y;
@@ -5419,6 +5457,13 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
             size_t i, np = jl_nparams(xd);
             jl_value_t **newparams;
             JL_GC_PUSHARGS(newparams, np);
+            // two instances of a set with inputs (compiler §4.9): where their parameters do not meet,
+            // the environment is restored and they may still meet as two sets do
+            int inputs = param < 2 && !e->noentry && !e->entryinst && e->Loffset == 0 &&
+                         xd->name->open_set && xd->name->input_params != 0;
+            jl_savedenv_t se;
+            if (inputs)
+                save_env(e, &se, 1);
             int isx = 1, isy = 1; // try to reuse the object x or y as res whenever we can (e.g. when it is the supertype) instead of allocating a copy
             for (i = 0; i < np; i++) {
                 jl_value_t *xi = jl_tparam(xd, i), *yi = jl_tparam(yd, i);
@@ -5428,6 +5473,19 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
                 isx = isx && ii == xi;
                 isy = isy && ii == yi;
                 newparams[i] = ii;
+            }
+            if (inputs) {
+                jl_value_t *res = NULL;
+                if (i < np) {
+                    restore_env(e, &se, 1);
+                    if (inputs_may_differ(xd, yd))
+                        res = meet_open(x, y);
+                }
+                free_env(&se);
+                if (i < np) {
+                    JL_GC_POP();
+                    return res ? res : jl_bottom_type;
+                }
             }
             jl_value_t *res = jl_bottom_type;
             if (i == np) {
