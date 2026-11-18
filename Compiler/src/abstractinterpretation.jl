@@ -437,10 +437,75 @@ function closed_barrier_split(argtypes::Vector{Any}, bits::UInt32)
             U = Union{U, C}
             n += 1
         end
+        if n > 0 && u === T
+            # and the box `Dynamic{X}`, a member as any other (as an operation's split, §7.2)
+            D = Core.Dynamic{T}
+            D <: T && (U = Union{U, D}; n += 1)
+        end
         (0 < n <= MAX_CLOSED_SPLITS) || continue
         return (i, U)
     end
     return nothing
+end
+
+# The arguments known only by their trait (typed by a set instance) that bind a static parameter of a
+# matched method, which the call leaves unbound: bit `i - 2` for the argument `i` (compiler §7.6).
+function closed_sparam_bits(argtypes::Vector{Any}, applicable::Vector{MethodMatchTarget})
+    bits = UInt32(0)
+    for t in applicable
+        m = t.match
+        sps = m.sparams
+        any(@nospecialize(v) -> isa(v, TypeVar), sps) || continue
+        # the method's variables, in the order of its static parameters
+        sig = m.method.sig
+        vars = TypeVar[]
+        while sig isa UnionAll
+            push!(vars, sig.var)
+            sig = sig.body
+        end
+        (sig isa DataType && length(vars) == length(sps)) || continue
+        decl = sig.parameters
+        for i = 2:min(length(argtypes), 33, length(decl))
+            a = argtypes[i]
+            isvarargtype(a) && break
+            T = widenconst(a)
+            (isconcretetype(T) || has_free_typevars(T)) && continue
+            u = unwrap_unionall(T)
+            (u isa DataType && ccall(:jl_is_open_set, Cint, (Any,), u) != 0) || continue
+            d = decl[i]
+            isvarargtype(d) && (d = unwrapva(d))
+            for j = 1:length(sps)
+                isa(sps[j], TypeVar) || continue
+                if ccall(:jl_has_typevar, Cint, (Any, Any), d, vars[j]) != 0
+                    bits |= UInt32(1) << (i - 2)
+                    break
+                end
+            end
+        end
+    end
+    return bits
+end
+
+# The call with its first argument named by `bits` that a closed build can split (`closed_barrier_split`)
+# at the union of the set's members, each branch the call at a member's type, past them the
+# `MethodError` (compiler §7.6); `nothing` where no argument can be split.
+function closed_member_split(interp::AbstractInterpreter, @nospecialize(func), argtypes::Vector{Any},
+                             si::StmtInfo, sv::AbsIntState, max_methods::Int, bits::UInt32,
+                             attr::Tuple{UInt32,UInt32}, operation::Bool)
+    bsplit = closed_barrier_split(argtypes, bits)
+    bsplit === nothing && return nothing
+    bi, bU = bsplit::Tuple{Int,Type}
+    newargs = copy(argtypes)
+    newargs[bi] = bU
+    call = abstract_call_gf_by_type(interp, func, ArgInfo(nothing, newargs), si,
+                                    argtypes_to_type(newargs), sv, max_methods; attr,
+                                    max_union_splitting = MAX_CLOSED_SPLITS,
+                                    operation, barrier = false)::Future
+    return Future{CallMeta}(call, interp, sv) do call, _, _
+        rt = widenconst(call.rt)
+        rt === Union{} && return call
+        CallMeta(call.rt, call.exct, call.effects, SplitCallInfo(call.info, rt, true), call.refinements)
+    end
 end
 
 # Code inferred while a closed build loads its program saw the members declared until then: a method
@@ -588,21 +653,8 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     # instead, each branch the call at the member's type
     if barrier && closed_build(interp) && (amask & ~adyn) != 0
         note_closed_operation!(sv)
-        bsplit = closed_barrier_split(argtypes, amask & ~adyn)
-        if bsplit !== nothing
-            bi, bU = bsplit::Tuple{Int,Type}
-            newargs = copy(argtypes)
-            newargs[bi] = bU
-            call = abstract_call_gf_by_type(interp, func, ArgInfo(nothing, newargs), si,
-                                            argtypes_to_type(newargs), sv, max_methods; attr = (amask, adyn),
-                                            max_union_splitting = MAX_CLOSED_SPLITS,
-                                            operation, barrier = false)::Future
-            return Future{CallMeta}(call, interp, sv) do call, _, _
-                rt = widenconst(call.rt)
-                rt === Union{} && return call
-                CallMeta(call.rt, call.exct, call.effects, SplitCallInfo(call.info, rt, true), call.refinements)
-            end
-        end
+        bsplit = closed_member_split(interp, func, argtypes, si, sv, max_methods, amask & ~adyn, (amask, adyn), operation)
+        bsplit === nothing || return bsplit
     end
     matches, adispatch = attributed_matches(find_method_matches(interp, argtypes, atype; max_methods, max_union_splitting), amask, adyn, closed_build(interp))
     # (a call left to dispatch on a trait argument when it runs is one a later member may resolve)
@@ -610,6 +662,18 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     if isa(matches, FailedMethodMatch)
         add_remark!(interp, sv, matches.reason)
         return Future(CallMeta(Any, Any, unedged_effects(interp), attributed_info(NoCallInfo(), amask, adyn, acast, false)))
+    end
+
+    # a closed build (compiler §7.6): a call whose method's static parameter a value known only by its
+    # trait binds (the wrapper's constructor, `Compiled(x)` at `x::X`) branches over the set's members,
+    # each branch the call at the member's type. A session leaves such a call to dispatch when it runs.
+    if barrier && closed_build(interp)
+        sbits = closed_sparam_bits(argtypes, matches.applicable)
+        if sbits != 0
+            note_closed_operation!(sv)
+            ssplit = closed_member_split(interp, func, argtypes, si, sv, max_methods, sbits, attr, operation)
+            ssplit === nothing || return ssplit
+        end
     end
 
     (; valid_worlds, applicable) = matches
