@@ -2864,8 +2864,10 @@ JL_DLLEXPORT jl_value_t *jl_debug_method_invalidation(int state)
 // reports a pirate. It is filled only where such code ends, and only while the library asks for it.
 jl_array_t *jl_deep_endings JL_GLOBALLY_ROOTED = NULL;
 static int deep_endings_on = 0;
-static jl_value_t *deep_ending_kind = NULL;   // a Symbol (permanent), set under the world counter's lock
-static jl_value_t *deep_ending_cause = NULL;  // a Method in the table, or a membership's method
+// rooted by the collectors (gc-stock.c, gc-mmtk.c): a cause is read back after allocations (the
+// invalidations it names, an outer cause restored by deep_ending_pop)
+jl_value_t *jl_deep_ending_kind JL_GLOBALLY_ROOTED = NULL;   // a Symbol, set under the world counter's lock
+jl_value_t *jl_deep_ending_cause JL_GLOBALLY_ROOTED = NULL;  // a Method in the table, or a membership's method
 static jl_mutex_t deep_endings_lock;
 
 JL_DLLEXPORT int jl_set_deep_endings(int on)
@@ -2909,29 +2911,31 @@ JL_DLLEXPORT void jl_note_deep_ending(jl_value_t *edge, jl_code_instance_t *ci)
 }
 
 // the cause of what the invalidations below end, set by the definition, deletion or membership that
-// runs them; an outer cause (a membership's method activated within its declaration) is kept
-static jl_value_t *deep_ending_push(const char *kind, jl_value_t *cause, jl_value_t **oldcause)
+// runs them; an outer cause (a membership's method activated within its declaration) is kept: only the
+// outermost push sets the cause, and its pop clears it. Returns whether it set the cause. The globals
+// hold the cause while it is in force, so no caller holds it in a local across the invalidations.
+static int deep_ending_push(const char *kind, jl_value_t *cause)
 {
-    jl_value_t *oldkind = deep_ending_kind;
-    *oldcause = deep_ending_cause;
-    if (oldkind == NULL && deep_endings_on) {
-        deep_ending_kind = (jl_value_t*)jl_symbol(kind);
-        deep_ending_cause = cause;
+    if (jl_deep_ending_kind != NULL || !deep_endings_on)
+        return 0;
+    jl_deep_ending_cause = cause;
+    jl_deep_ending_kind = (jl_value_t*)jl_symbol(kind);
+    return 1;
+}
+static void deep_ending_pop(int pushed) JL_NOTSAFEPOINT
+{
+    if (pushed) {
+        jl_deep_ending_kind = NULL;
+        jl_deep_ending_cause = NULL;
     }
-    return oldkind;
 }
-static void deep_ending_pop(jl_value_t *oldkind, jl_value_t *oldcause) JL_NOTSAFEPOINT
+JL_DLLEXPORT int jl_deep_ending_push(const char *kind, jl_value_t *cause)
 {
-    deep_ending_kind = oldkind;
-    deep_ending_cause = oldcause;
+    return deep_ending_push(kind, cause);
 }
-JL_DLLEXPORT jl_value_t *jl_deep_ending_push(const char *kind, jl_value_t *cause, jl_value_t **oldcause)
+JL_DLLEXPORT void jl_deep_ending_pop(int pushed)
 {
-    return deep_ending_push(kind, cause, oldcause);
-}
-JL_DLLEXPORT void jl_deep_ending_pop(jl_value_t *oldkind, jl_value_t *oldcause)
-{
-    deep_ending_pop(oldkind, oldcause);
+    deep_ending_pop(pushed);
 }
 
 static void _invalidate_backedges(jl_method_instance_t *replaced_mi, jl_code_instance_t *replaced_ci, size_t max_world, int depth);
@@ -2959,7 +2963,7 @@ static void invalidate_code_instance(jl_code_instance_t *replaced, size_t max_wo
         jl_atomic_store_release(&replaced->max_world, max_world);
         // deep-G2 code compiled by facts ended: kept for the library's report (compiler §10.2)
         if (deep_endings_on && is_deep_facts_code(replaced))
-            note_deep_ending(deep_ending_kind, deep_ending_cause, replaced);
+            note_deep_ending(jl_deep_ending_kind, jl_deep_ending_cause, replaced);
         // recurse to all backedges to update their valid range also
         _invalidate_backedges(replaced_mi, replaced, max_world, depth + 1);
         // TODO: should we visit all forward edges now and delete ourself from all of those lists too?
@@ -3150,6 +3154,7 @@ static int _invalidate_dispatch_backedges(jl_method_instance_t *mi, jl_value_t *
             continue;
         }
         JL_GC_PROMISE_ROOTED(caller); // propagated by get_next_edge from backedges
+        JL_GC_PROMISE_ROOTED(invokeTypes); // as caller: propagated by get_next_edge from backedges
         int replaced_edge;
         if (invokeTypes && jl_is_svec(invokeTypes)) {
             // an ordinary call that reached this instance from a narrower signature (compiler §3.1): its
@@ -3354,7 +3359,12 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
             //      -> some may have been called: they may be partly replaced (will be detected in the loop later)
             // c.f. `is_replacing`, which is a similar query, but with an existing method match to compare against
             // a replay: the edge's matches are unchanged where the replayed method matched it before
-            missing = !(env->skip != NULL && replay_matched_before(backedgetyp, env->skip, env->max_world));
+            missing = 1;
+            jl_method_t *skip = env->skip;
+            if (skip != NULL) {
+                JL_GC_PROMISE_ROOTED(skip); // a replayed method, whose entry is live in the method table
+                missing = !replay_matched_before(backedgetyp, skip, env->max_world);
+            }
             for (size_t j = 0; missing && j < env->n; j++) {
                 jl_method_t *m = env->d[j];
                 JL_GC_PROMISE_ROOTED(m);
@@ -3647,10 +3657,9 @@ JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
         jl_atomic_store_relaxed(&method->dispatch_status, 0);
         assert(jl_atomic_load_relaxed(&methodentry->max_world) == ~(size_t)0);
         jl_atomic_store_relaxed(&methodentry->max_world, world);
-        jl_value_t *oldcause = NULL;
-        jl_value_t *oldkind = deep_ending_push("deletion", (jl_value_t*)method, &oldcause);
+        int pushed = deep_ending_push("deletion", (jl_value_t*)method);
         jl_method_table_invalidate(method, world, 1);
-        deep_ending_pop(oldkind, oldcause);
+        deep_ending_pop(pushed);
         jl_atomic_store_release(&jl_world_counter, world + 1);
     }
     JL_UNLOCK(&world_counter_lock);
@@ -4021,6 +4030,14 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
 {
     JL_TIMING(ADD_METHOD, ADD_METHOD);
     jl_method_t *method = newentry->func.method;
+    jl_value_t *oldvalue = NULL;
+    jl_array_t *oldmi = NULL;
+    jl_value_t *loctag = NULL;  // debug info for invalidation
+    jl_value_t *isect = NULL;
+    jl_value_t *isect2 = NULL;
+    jl_genericmemory_t *interferences = NULL;
+    // method: held by newentry too, which the caller holds; the analyzer cannot see it
+    JL_GC_PUSH7(&method, &oldvalue, &oldmi, &loctag, &isect, &isect2, &interferences);
     jl_methtable_t *mt = jl_method_get_table(method);
     assert(jl_is_mtable(mt));
     assert(jl_is_method(method));
@@ -4033,11 +4050,8 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     }
     jl_timing_show_method(method, JL_TIMING_DEFAULT_BLOCK);
     // what this definition ends of the deep class is the method's (compiler §10.2)
-    jl_value_t *oldcause = NULL;
-    jl_value_t *oldkind = deep_ending_push("definition", (jl_value_t*)method, &oldcause);
+    int pushed = deep_ending_push("definition", (jl_value_t*)method);
     jl_value_t *type = (jl_value_t*)newentry->sig;
-    jl_value_t *oldvalue = NULL;
-    jl_array_t *oldmi = NULL;
     size_t world = jl_atomic_load_relaxed(&method->primary_world);
     assert(world == jl_atomic_load_relaxed(&jl_world_counter) + 1); // min-world
     assert((jl_atomic_load_relaxed(&method->dispatch_status) & METHOD_SIG_LATEST_WHICH) == 0);
@@ -4047,11 +4061,6 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     jl_atomic_store_relaxed(&newentry->min_world, world);
     jl_atomic_store_relaxed(&method->primary_world, world);
     size_t max_world = world - 1;
-    jl_value_t *loctag = NULL;  // debug info for invalidation
-    jl_value_t *isect = NULL;
-    jl_value_t *isect2 = NULL;
-    jl_genericmemory_t *interferences = NULL;
-    JL_GC_PUSH6(&oldvalue, &oldmi, &loctag, &isect, &isect2, &interferences);
     jl_typemap_entry_t *replaced = NULL;
     // Check what entries this intersects with in the prior world.
     oldvalue = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), newentry, &replaced, max_world, 0);
@@ -4192,7 +4201,7 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     jl_atomic_store_relaxed(&method->dispatch_status, dispatch_bits); // TODO: this should be sequenced fully after the world counter store
     jl_atomic_store_release(&method->interferences, interferences);
     jl_gc_wb(method, interferences);
-    deep_ending_pop(oldkind, oldcause);
+    deep_ending_pop(pushed);
     JL_GC_POP();
 }
 
@@ -5025,6 +5034,7 @@ static int membership_removal_backedges(jl_method_instance_t *mi, jl_value_t *su
             continue;
         }
         JL_GC_PROMISE_ROOTED(caller); // propagated by get_next_edge from backedges
+        JL_GC_PROMISE_ROOTED(invokeTypes); // as caller: propagated by get_next_edge from backedges
         int ends = 0;
         if (invokeTypes && jl_is_svec(invokeTypes)) {
             jl_value_t *callsig = jl_svecref(invokeTypes, 0);
@@ -5680,7 +5690,8 @@ JL_DLLEXPORT jl_method_instance_t *jl_attributed_mi(jl_tupletype_t *tt, uint32_t
     jl_svec_t *newparams = NULL;
     jl_value_t *sig = NULL;
     jl_method_instance_t *mi = NULL;
-    JL_GC_PUSH5(&matches, &env, &newparams, &sig, &mi);
+    JL_GC_PUSH6(&matches, &env, &newparams, &sig, &mi, &ti);
+    JL_GC_PROMISE_ROOTED(m); // the match's, which `matches` holds
     jl_compilation_sig(ti, env, m, get_max_varargs(m, NULL),
                        effective_nospecialize(m, ti, 0, mask, dyn), &newparams);
     if (newparams) {
@@ -6870,7 +6881,7 @@ static int chain_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT
 {
     if (!jl_is_datatype(t))
         return 0;
-    for (jl_datatype_t *dt = (jl_datatype_t*)t; dt != jl_any_type; dt = dt->super)
+    for (jl_datatype_t *dt = (jl_datatype_t*)t; dt != NULL && dt != jl_any_type; dt = dt->super)
         if (jl_svec_len(jl_typename_memberships(dt->name)) != 0 || (dt->super != NULL && dt->super->name->open_set))
             return 1;
     return 0;
@@ -7057,10 +7068,10 @@ JL_DLLEXPORT jl_value_t *jl_activated_member_checks(void)
 // the pairs whose check passed in this session, not brought by an image: what an image built here keeps
 jl_array_t *jl_member_checks_passed_here(void)
 {
-    jl_array_t *out = jl_alloc_vec_any(0);
-    JL_GC_PUSH1(&out);
+    jl_array_t *out = jl_alloc_vec_any(0), *act = NULL;
+    JL_GC_PUSH2(&out, &act); // act: held by jl_member_states under the lock, rooted here too
     JL_LOCK(&jl_member_state_lock);
-    jl_array_t *act = member_checks_activated_list(0);
+    act = member_checks_activated_list(0);
     if (jl_member_states != NULL) {
         jl_genericmemory_t *t = jl_member_states;
         for (size_t k = 0; k + 1 < t->length; k += 2) {
@@ -7264,9 +7275,9 @@ int jl_member_queue_drain(void)
 // held, and may throw: then nothing is cached, and the next call asks it again (the library
 // keeps its answer, a failure too).
 // `tt` is the caller's, from arg_type_tuple: a tuple type with a `Type{…}` parameter is not concrete,
-// so Julia's type cache does not hold it and nothing else may. It is rooted here, across the method
-// lookup and the hook, which allocate; the caller's lookup that follows roots it again.
-static void member_hook_at_dispatch(jl_tupletype_t *tt JL_MAYBE_UNROOTED, size_t world)
+// so Julia's type cache does not hold it and nothing else may. The caller roots it across this call,
+// whose method lookup and hook allocate.
+static void member_hook_at_dispatch(jl_tupletype_t *tt, size_t world)
 {
     size_t n = jl_nparams(tt);
     int any = 0;
@@ -7274,15 +7285,12 @@ static void member_hook_at_dispatch(jl_tupletype_t *tt JL_MAYBE_UNROOTED, size_t
         any = chain_has_memberships(jl_tparam(tt, i));
     if (!any)
         return;
-    jl_value_t **roots;
-    JL_GC_PUSHARGS(roots, 5);
-    roots[4] = (jl_value_t*)tt;
     size_t min_valid = 0, max_valid = ~(size_t)0;
     jl_method_match_t *matc = _gf_invoke_lookup((jl_value_t*)tt, jl_method_table, world, 0, &min_valid, &max_valid);
-    if (matc == NULL) {
-        JL_GC_POP();
+    if (matc == NULL)
         return;
-    }
+    jl_value_t **roots;
+    JL_GC_PUSHARGS(roots, 4);
     roots[0] = (jl_value_t*)matc;
     jl_value_t *sig = jl_unwrap_unionall((jl_value_t*)matc->method->sig);
     size_t ns = jl_nparams(sig);
@@ -7463,8 +7471,12 @@ have_entry:
         // cache miss case
         dp_path = DP_FULL;
         jl_methcache_t *mc = jl_method_table->cache;
-        if (jl_member_hook != NULL)
+        if (jl_member_hook != NULL) {
+            // tt, from arg_type_tuple, may be held by nothing else (member_hook_at_dispatch, above)
+            JL_GC_PUSH1(&tt);
             member_hook_at_dispatch(tt, world);
+            JL_GC_POP();
+        }
         mfunc = jl_mt_assoc_by_type(jl_method_table, mc, tt, world);
         if (jl_options.malloc_log)
             jl_gc_sync_total_bytes(last_alloc); // discard allocation count from compilation

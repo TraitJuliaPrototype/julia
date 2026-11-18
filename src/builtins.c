@@ -1131,7 +1131,8 @@ static jl_value_t *attributed_call_reach(jl_value_t **args, uint32_t nargs, int 
             JL_GC_POP();
             return jl_apply_reach(cargs, cnargs, reach); // no single method: dispatch says why
         }
-        nl = (jl_value_t*)jl_svec(3, args[0], (jl_value_t*)mi, jl_box_ulong(world));
+        nl = jl_box_ulong(world); // rooted (in nl) while the svec that holds it is allocated
+        nl = (jl_value_t*)jl_svec(3, args[0], (jl_value_t*)mi, nl);
         JL_LOCK(&attributed_cache_lock);
         if (jl_attributed_cache == NULL)
             jl_attributed_cache = jl_alloc_memory_any(16);

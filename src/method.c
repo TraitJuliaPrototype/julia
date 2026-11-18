@@ -1545,8 +1545,8 @@ static jl_method_t *method_def(jl_svec_t *argdata, jl_methtable_t *mt, jl_code_i
     if (expand && !external_mt && jl_method_expansion_hook != NULL && jl_has_open_set_in(argtype)) {
         jl_svec_t *defs = jl_call_expansion_hook(argdata, f, module);
         if (defs != NULL) {
-            JL_GC_PUSH1(&defs);
             jl_method_t *first = NULL;
+            JL_GC_PUSH2(&defs, &first); // first: across the definitions after it
             for (i = 0; i < jl_svec_len(defs); i++) {
                 jl_svec_t *d = (jl_svec_t*)jl_svecref(defs, i);
                 jl_method_t *mi = method_def((jl_svec_t*)jl_svecref(d, 0), mt,

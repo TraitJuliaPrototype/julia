@@ -1262,7 +1262,7 @@ JL_DLLEXPORT int jl_set_membership_prune(int on) JL_NOTSAFEPOINT
     return last;
 }
 
-static int entry_counts(jl_membership_t *en, int value, jl_typename_t *yname, size_t world)
+static int entry_counts(jl_membership_t *en, int value, jl_typename_t *yname, size_t world) JL_NOTSAFEPOINT
 {
     if (!entry_live(en, world) || entry_for_value(en) != value)
         return 0;
@@ -1583,7 +1583,7 @@ static int typename_reaches_r(jl_typename_t *from, jl_typename_t *to, size_t wor
     return ans;
 }
 
-int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world)
+int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world) JL_NOTSAFEPOINT
 {
     size_t lo = 0, hi = ~(size_t)0;
     return typename_reaches_r(from, to, world, &lo, &hi);

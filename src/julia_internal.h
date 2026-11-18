@@ -482,9 +482,11 @@ void jl_activate_memberships(jl_array_t *list, size_t world);
 void jl_memberships_activated(jl_array_t *list, size_t world);
 // what a definition ended, by class (compiler §10.2; gf.c)
 extern jl_array_t *jl_deep_endings JL_GLOBALLY_ROOTED;
+extern jl_value_t *jl_deep_ending_kind JL_GLOBALLY_ROOTED;  // the cause of what invalidations end (gf.c)
+extern jl_value_t *jl_deep_ending_cause JL_GLOBALLY_ROOTED;
 extern jl_array_t *jl_activation_ambiguities JL_GLOBALLY_ROOTED; // strict mode's findings at an image's activation (datatype.c)
-JL_DLLEXPORT jl_value_t *jl_deep_ending_push(const char *kind, jl_value_t *cause, jl_value_t **oldcause);
-JL_DLLEXPORT void jl_deep_ending_pop(jl_value_t *oldkind, jl_value_t *oldcause);
+JL_DLLEXPORT int jl_deep_ending_push(const char *kind, jl_value_t *cause);
+JL_DLLEXPORT void jl_deep_ending_pop(int pushed);
 // a membership taken back (compiler §4.3, §5.5; gf.c)
 JL_DLLEXPORT void jl_membership_method_end(jl_method_t *m, size_t world);
 JL_DLLEXPORT void jl_membership_removal_walk(jl_value_t *member, jl_value_t *set_instance, size_t world);
@@ -1015,7 +1017,7 @@ JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X);
 int jl_membership_holds_at(jl_value_t *x, jl_value_t *y, size_t world);
 // whether the TypeName `from` reaches `to` along declared supertypes and the entries
 // live in `world` (0: every entry)
-int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world);
+int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world) JL_NOTSAFEPOINT;
 jl_value_t *jl_membership_instance(jl_value_t *x, jl_membership_t *en);
 int jl_set_meets_kinds(jl_typename_t *cname, size_t world) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_membership_flip_possible(jl_value_t *a, jl_value_t *b);
