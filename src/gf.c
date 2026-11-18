@@ -1305,172 +1305,18 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
     return r;
 }
 
-// get the compilation signature specialization for this method
-// ---- the attribute of a trait argument (compiler §6.3) ----
-// Which of a method's arguments are compiled once at their declared type (`Dynamic`) rather than for
-// the value's type (`Compiled`). A trait argument is one typed by a set or an intersection of sets,
-// its type naming the method's variables or not (`X{T}` is compiled once at `X{T₀}`), not by a `where`
-// variable (whose binding is the value's type).
-
-// the package a module belongs to: its root module; a module under `Main`, as a script makes one,
-// is its own
-static jl_module_t *module_package(jl_module_t *m) JL_NOTSAFEPOINT
-{
-    jl_module_t *p = m;
-    while (p->parent != p)
-        p = p->parent;
-    return p == jl_main_module ? m : p;
-}
-
-// a `where` variable bounded by a set stands for its bound as an argument's declared type (compiler §6.2)
-static jl_value_t *trait_arg_decl(jl_value_t *decl_i) JL_NOTSAFEPOINT
-{
-    int depth = 0;
-    while (jl_is_typevar(decl_i) && depth++ < 8)
-        decl_i = ((jl_tvar_t*)decl_i)->ub;
-    return decl_i;
-}
+// ---- an argument typed by a set (compiler §6.2) ----
+// A trait argument is one typed by a set or an intersection of sets, its type naming the method's
+// variables or not (`X{T}`), not by a `where` variable (whose binding is the value's type).
 
 static int is_trait_arg_type(jl_value_t *decl_i) JL_NOTSAFEPOINT
 {
-    // a set or an intersection, also where its type names the method's variables (`X{T}`): compiled
-    // once at its instance with those variables' values (compiler §6.2). A `where` variable bounded
-    // by a set (`x::C` with `C <: X`) takes the attribute as the set does: compiled once, the
-    // variable is read from the value when the code runs (W-148).
-    decl_i = trait_arg_decl(decl_i);
+    // a set or an intersection, also where its type names the method's variables (`X{T}`): declared
+    // `@nospecialize`, compiled once at its instance with those variables' values (compiler §6.2)
     if (jl_is_typevar(decl_i))
         return 0;
     jl_value_t *u = jl_unwrap_unionall(decl_i);
     return jl_is_datatype(u) && (((jl_datatype_t*)u)->name->open_set || jl_is_all_type(u));
-}
-
-// the default attribute of the sets that type a trait argument (step 4): 0 none, 1 `Compiled`,
-// 2 `Dynamic`, 3 `Dynamic` with Julia's own types included; for an intersection, the components'
-// where they agree, else none
-static int set_default_attribute(jl_value_t *decl_i, jl_module_t **setmod) JL_NOTSAFEPOINT
-{
-    jl_datatype_t *u = (jl_datatype_t*)jl_unwrap_unionall(decl_i);
-    if (!jl_is_all_type((jl_value_t*)u)) {
-        *setmod = u->name->module;
-        return u->name->default_attribute;
-    }
-    jl_value_t *tup = jl_tparam0(u);
-    int d = -1;
-    for (size_t k = 0; jl_is_tuple_type(tup) && k < jl_nparams(tup); k++) {
-        jl_value_t *c = jl_unwrap_unionall(jl_tparam(tup, k));
-        if (!jl_is_datatype(c))
-            return 0;
-        int dk = ((jl_datatype_t*)c)->name->default_attribute;
-        if (d == -1) {
-            d = dk;
-            *setmod = ((jl_datatype_t*)c)->name->module;
-        }
-        else if (d != dk)
-            return 0;
-    }
-    return d < 0 ? 0 : d;
-}
-
-// whether a type is Julia's own or the set's package's, with every type among its parameters,
-// recursively (a value parameter, a number or a symbol, is the type's own): the set's default does
-// not apply to a value of such a type, since such types are few and fixed. A parametric type that
-// carries another package's type (`FunctionDynamics{typeof(f)}`, `Base.Fix1{typeof(f)}`) is not.
-static int type_is_own_(jl_value_t *t, jl_module_t *setpkg, int depth) JL_NOTSAFEPOINT
-{
-    if (depth > 8)
-        return 0;
-    if (jl_is_typevar(t))
-        return type_is_own_(((jl_tvar_t*)t)->ub, setpkg, depth + 1);
-    if (jl_is_unionall(t))
-        return type_is_own_(jl_unwrap_unionall(t), setpkg, depth);
-    if (jl_is_uniontype(t))
-        return type_is_own_(((jl_uniontype_t*)t)->a, setpkg, depth + 1) &&
-               type_is_own_(((jl_uniontype_t*)t)->b, setpkg, depth + 1);
-    if (jl_is_vararg(t)) {
-        jl_value_t *vt = jl_unwrap_vararg(t);
-        return vt == NULL || type_is_own_(vt, setpkg, depth + 1);
-    }
-    if (!jl_is_datatype(t))
-        return 1; // a value parameter
-    jl_datatype_t *dt = (jl_datatype_t*)t;
-    jl_module_t *p = module_package(dt->name->module);
-    if (!(p == jl_core_module || p == jl_base_module || (setpkg != NULL && p == setpkg)))
-        return 0;
-    for (size_t k = 0; k < jl_nparams(dt); k++) {
-        if (!type_is_own_(jl_tparam(dt, k), setpkg, depth + 1))
-            return 0;
-    }
-    return 1;
-}
-static int type_is_own(jl_value_t *elt, jl_module_t *setmod) JL_NOTSAFEPOINT
-{
-    return type_is_own_(elt, setmod != NULL ? module_package(setmod) : NULL, 0);
-}
-
-// whether two lists of static parameters differ only where the first holds a variable bounded by a set:
-// the widened signature of an instance compiled once does not fix such a variable (W-148)
-static int sparams_differ_at_trait_vars(jl_svec_t *widened, jl_svec_t *exact) JL_NOTSAFEPOINT
-{
-    if (jl_svec_len(widened) != jl_svec_len(exact))
-        return 0;
-    for (size_t i = 0; i < jl_svec_len(widened); i++) {
-        jl_value_t *w = jl_svecref(widened, i);
-        if (jl_egal(w, jl_svecref(exact, i)))
-            continue;
-        if (!jl_is_typevar(w) || !is_trait_arg_type(w))
-            return 0;
-    }
-    return 1;
-}
-
-// The arguments of `m` that a call with argument types `tt` compiles once (compiler §6.3, steps 3 to
-// 5, resolved at the method): the method's `@nospecialize` and `@specialize` at the argument; the
-// module's `dynamic` option; the set's default, except for a value of Julia's own types or the set's
-// package's; the module's `first_seen` option, `Dynamic` at a dynamic call. Returned as the
-// method's `nospecialize` bits with these decisions applied. Casts and the attribute a value carries
-// (steps 1, 2) override it: `force_mask` names the arguments they decide, `force_dynamic` which are
-// `Dynamic`.
-static uint32_t effective_nospecialize(jl_method_t *m, jl_tupletype_t *tt, int static_call,
-                                       uint32_t force_mask, uint32_t force_dynamic) JL_NOTSAFEPOINT
-{
-    uint32_t nospec = m->nospecialize;
-    if (m->generator || !jl_has_open_set_in(m->sig))
-        return nospec;
-    jl_value_t *decl = m->sig;
-    size_t nargs = m->nargs, np = jl_nparams(tt);
-    int opts = m->module->trait_options;
-    for (size_t i = 1; i < nargs && i < np && i <= 32; i++) {
-        if (m->isva && i == nargs - 1)
-            break; // a varargs tail is compiled as Julia compiles it
-        jl_value_t *decl_i = jl_nth_slot_type(decl, i);
-        if (!is_trait_arg_type(decl_i))
-            continue;
-        uint32_t bit = 1u << (i - 1);
-        int dyn;
-        if (force_mask & bit)
-            dyn = (force_dynamic & bit) != 0;                     // 1, 2: a cast, or carried
-        else if (nospec & bit)
-            continue;                                             // 3: `@nospecialize`
-        else if (m->specialize & bit)
-            dyn = 0;                                              // 3: `@specialize`
-        else if (opts & 4)
-            dyn = 1;                                              // 3: the module's `dynamic`
-        else {
-            jl_module_t *setmod = NULL;
-            int d = set_default_attribute(trait_arg_decl(decl_i), &setmod);
-            jl_value_t *elt = jl_tparam(tt, i);
-            // 4: the set's default; 3 is `Dynamic` for Julia's own types too (`IO`, §7.5)
-            if (d != 0 && !jl_is_vararg(elt) && (d == 3 || !type_is_own(elt, setmod)))
-                dyn = d >= 2;
-            else // 5: `first_seen`: `Compiled` where the caller knows the value's type; else `Compiled`
-                dyn = (opts & 8) && !(static_call && !jl_is_vararg(elt) && jl_is_concrete_type(elt));
-        }
-        if (dyn)
-            nospec |= bit;
-        else
-            nospec &= ~bit;
-    }
-    return nospec;
 }
 
 JL_DLLEXPORT int jl_is_trait_arg_type(jl_value_t *t) JL_NOTSAFEPOINT
@@ -1478,28 +1324,12 @@ JL_DLLEXPORT int jl_is_trait_arg_type(jl_value_t *t) JL_NOTSAFEPOINT
     return is_trait_arg_type(t);
 }
 
-// the trait arguments of `m` (as nospecialize bits): a compileable signature may have the declared
-// type there whichever attribute decided it
-static uint32_t trait_arg_bits(jl_method_t *m) JL_NOTSAFEPOINT
-{
-    if (m->generator || !jl_has_open_set_in(m->sig))
-        return 0;
-    uint32_t bits = 0;
-    for (size_t i = 1; i < m->nargs && i <= 32; i++) {
-        if (m->isva && i == m->nargs - 1)
-            break;
-        if (is_trait_arg_type(jl_nth_slot_type(m->sig, i)))
-            bits |= 1u << (i - 1);
-    }
-    return bits;
-}
-
+// get the compilation signature specialization for this method
 static void jl_compilation_sig(
     jl_tupletype_t *const tt, // the original tupletype of the call (or DataType from precompile)
     jl_svec_t *sparams,
     jl_method_t *definition,
     intptr_t max_varargs,
-    uint32_t nospec, // the method's nospecialize bits with the trait arguments' attributes applied
     // output:
     jl_svec_t **const newparams JL_REQUIRE_ROOTED_SLOT)
 {
@@ -1597,7 +1427,7 @@ static void jl_compilation_sig(
         }
 
         if (i_arg > 0 && i_arg <= sizeof(definition->nospecialize) * 8 &&
-                (nospec & (1 << (i_arg - 1)))) {
+                (definition->nospecialize & (1 << (i_arg - 1)))) {
             if (!jl_has_free_typevars(decl_i) && !jl_is_kind(decl_i)) {
                 if (decl_i != elt) {
                     if (!*newparams) *newparams = jl_svec_copy(tt->parameters);
@@ -1608,9 +1438,9 @@ static void jl_compilation_sig(
                 continue;
             }
             // a trait argument whose type names the method's variables (`X{T}`): compiled once at that
-            // instance with the variables' values from the match, the erased key (compiler §6.2; C-54)
+            // instance with the variables' values from the match (compiler §6.2; C-54)
             if (is_trait_arg_type(decl_i) && sparams != NULL && jl_svec_len(sparams) > 0 && jl_is_unionall(decl)) {
-                type_i = jl_instantiate_type_in_env(trait_arg_decl(decl_i), (jl_unionall_t*)decl, jl_svec_data(sparams));
+                type_i = jl_instantiate_type_in_env(decl_i, (jl_unionall_t*)decl, jl_svec_data(sparams));
                 if (!jl_has_free_typevars(type_i)) {
                     if (type_i != elt) {
                         if (!*newparams) *newparams = jl_svec_copy(tt->parameters);
@@ -1768,7 +1598,6 @@ JL_DLLEXPORT int jl_isa_compileable_sig(
     size_t nargs = definition->nargs; // == jl_nparams(jl_unwrap_unionall(decl));
     if (np == 0)
         return nargs == 0;
-    uint32_t trait_bits = trait_arg_bits(definition);
 
     if (definition->generator) {
         // staged functions aren't optimized
@@ -1828,24 +1657,20 @@ JL_DLLEXPORT int jl_isa_compileable_sig(
         type_i = jl_rewrap_unionall(decl_i, decl);
 
         if (i_arg > 0 && i_arg <= sizeof(definition->nospecialize) * 8 &&
-                (definition->nospecialize & (1 << (i_arg - 1))) &&
-                !(trait_bits & (1u << (i_arg - 1)))) { // at a trait argument the attribute decides
+                (definition->nospecialize & (1 << (i_arg - 1)))) {
             if (!jl_has_free_typevars(decl_i) && !jl_is_kind(decl_i)) {
                 if (jl_egal(elt, decl_i))
                     continue;
                 JL_GC_POP();
                 return 0;
             }
+            // a trait argument whose type names the method's variables: its instance with their
+            // values, as `jl_compilation_sig` gives it (compiler §6.2; C-54)
+            if (is_trait_arg_type(decl_i) && is_trait_arg_type(elt) && !jl_has_free_typevars(elt) &&
+                    ((jl_datatype_t*)jl_unwrap_unionall(elt))->name == ((jl_datatype_t*)jl_unwrap_unionall(decl_i))->name &&
+                    jl_subtype(elt, type_i))
+                continue;
         }
-        // a trait argument compiled once has its declared type, whichever attribute decided it
-        if (i_arg > 0 && i_arg <= 32 && (trait_bits & (1u << (i_arg - 1))) && jl_egal(elt, decl_i))
-            continue;
-        // or, where that type names the method's variables, its instance with their values (C-54)
-        if (i_arg > 0 && i_arg <= 32 && (trait_bits & (1u << (i_arg - 1))) && jl_has_free_typevars(decl_i) &&
-                is_trait_arg_type(elt) && !jl_has_free_typevars(elt) &&
-                ((jl_datatype_t*)jl_unwrap_unionall(elt))->name == ((jl_datatype_t*)jl_unwrap_unionall(trait_arg_decl(decl_i)))->name &&
-                jl_subtype(elt, type_i))
-            continue;
 
         if (jl_is_kind(elt)) {
             // kind slots always get guard entries (checking for subtypes of Type)
@@ -2044,12 +1869,7 @@ jl_method_instance_t *cache_method(
     int cache_with_orig = 1;
     jl_tupletype_t *compilationsig = tt;
     intptr_t max_varargs = get_max_varargs(definition, NULL);
-    // a dynamic call: the trait arguments' attributes resolved at the method (compiler §6.3). An
-    // instance compiled once by an attribute is cached with the call's own types: the attribute may
-    // differ for another member (a set's default skips Julia's own types and its package's).
-    uint32_t nospec = effective_nospecialize(definition, tt, 0, 0, 0);
-    int attr_widened = (nospec & ~definition->nospecialize & trait_arg_bits(definition)) != 0;
-    jl_compilation_sig(tt, sparams, definition, max_varargs, nospec, &newparams);
+    jl_compilation_sig(tt, sparams, definition, max_varargs, &newparams);
     if (newparams) {
         temp2 = jl_apply_tuple_type(newparams, 1);
         // Now there may be a problem: the widened signature is more general
@@ -2071,18 +1891,11 @@ jl_method_instance_t *cache_method(
             cache_with_orig = !issubty;
             compilationsig = (jl_datatype_t*)temp2;
         }
-        else if (attr_widened && sparams_differ_at_trait_vars(newparams, sparams)) {
-            // an argument typed by a `where` variable bounded by a set, compiled once (compiler §6.2;
-            // W-148): the instance does not know the variable, and its code reads it from the value
-            temp3 = (jl_value_t*)newparams;
-            sparams = newparams;
-            compilationsig = (jl_datatype_t*)temp2;
-        }
         newparams = NULL;
     }
     // TODO: maybe assert(jl_isa_compileable_sig(compilationsig, sparams, definition));
     newmeth = jl_specializations_get_linfo(definition, (jl_value_t*)compilationsig, sparams);
-    if (newmeth->cache_with_orig || attr_widened)
+    if (newmeth->cache_with_orig)
         cache_with_orig = 1;
 
     // Capture world counter at start to detect races
@@ -5610,104 +5423,6 @@ void jl_read_codeinst_invoke(jl_code_instance_t *ci, uint8_t *specsigflags, jl_c
     }
 }
 
-// The specialization a static call with argument types `tt` runs at `m` (compiler §6.3): the declared
-// type at each trait argument whose attribute is `Dynamic`, the cast or carried attributes `mask` and
-// `dyn` first, the rest resolved at the method. Inference infers the call there, so that what it
-// infers is the instance that runs. `tt` itself where nothing is compiled once.
-JL_DLLEXPORT jl_value_t *jl_attribute_sig(jl_value_t *tt, jl_method_t *m, uint32_t mask, uint32_t dyn)
-{
-    if (!jl_is_datatype(tt) || !jl_is_tuple_type(tt))
-        return tt;
-    uint32_t traits = trait_arg_bits(m);
-    if (traits == 0)
-        return tt;
-    uint32_t nospec = effective_nospecialize(m, (jl_tupletype_t*)tt, 1, mask, dyn) & traits;
-    if (nospec == 0)
-        return tt;
-    jl_svec_t *params = NULL, *env = NULL;
-    jl_value_t *decl_i = NULL;
-    JL_GC_PUSH4(&params, &tt, &env, &decl_i);
-    size_t np = jl_nparams(tt);
-    for (size_t i = 1; i < np && i <= 32; i++) {
-        if (!(nospec & (1u << (i - 1))))
-            continue;
-        decl_i = trait_arg_decl(jl_nth_slot_type(m->sig, i));   // a `where` variable stands for its bound (W-148)
-        if (jl_has_free_typevars(decl_i)) {
-            // a declared type that names the method's variables (`X{T}`, C-54): its instance with their
-            // values from the call, or the type over them where the call does not fix them
-            if (env == NULL) {
-                env = jl_emptysvec;
-                if (jl_is_unionall(m->sig) && jl_type_intersection_env(tt, m->sig, &env) == jl_bottom_type)
-                    env = jl_emptysvec;
-            }
-            jl_value_t *inst = NULL;
-            if (jl_is_unionall(m->sig) && jl_svec_len(env) > 0)
-                inst = jl_instantiate_type_in_env(decl_i, (jl_unionall_t*)m->sig, jl_svec_data(env));
-            decl_i = (inst == NULL || jl_has_free_typevars(inst)) ? jl_rewrap_unionall(decl_i, m->sig) : inst;
-        }
-        if (jl_egal(jl_tparam(tt, i), decl_i))
-            continue;
-        if (params == NULL)
-            params = jl_svec_copy(((jl_datatype_t*)tt)->parameters);
-        jl_svecset(params, i, decl_i);
-    }
-    if (params != NULL)
-        tt = (jl_value_t*)jl_apply_tuple_type(params, 1);
-    JL_GC_POP();
-    return tt;
-}
-
-// The trait arguments of `m` that a static call with argument types `tt` compiles once (compiler
-// §6.3), with the cast or carried attributes `mask` and `dyn` first.
-JL_DLLEXPORT uint32_t jl_attribute_dynamic_bits(jl_value_t *tt, jl_method_t *m, uint32_t mask, uint32_t dyn)
-{
-    if (!jl_is_datatype(tt) || !jl_is_tuple_type(tt))
-        return 0;
-    uint32_t traits = trait_arg_bits(m);
-    return traits ? effective_nospecialize(m, (jl_tupletype_t*)tt, 1, mask, dyn) & traits : 0;
-}
-JL_DLLEXPORT uint32_t jl_trait_arg_bits(jl_method_t *m)
-{
-    return trait_arg_bits(m);
-}
-
-// The method instance a call with argument types `tt` runs with the attribute bits `mask` (the
-// trait arguments decided) and `dyn` (those of them that are `Dynamic`): the method dispatch selects,
-// compiled with those attributes and the rest resolved at the method for a dynamic call (compiler
-// §6.3, §6.9). NULL where dispatch selects no single method: the caller dispatches as usual then.
-JL_DLLEXPORT jl_method_instance_t *jl_attributed_mi(jl_tupletype_t *tt, uint32_t mask, uint32_t dyn, size_t world)
-{
-    size_t min_valid = 1, max_valid = ~(size_t)0;
-    jl_value_t *matches = jl_matching_methods(tt, jl_nothing, 1, 0, world, &min_valid, &max_valid, NULL);
-    if (!jl_is_array(matches) || jl_array_nrows((jl_array_t*)matches) != 1)
-        return NULL;
-    jl_method_match_t *match = (jl_method_match_t*)jl_array_ptr_ref((jl_array_t*)matches, 0);
-    if (!match->fully_covers)
-        return NULL;
-    jl_method_t *m = match->method;
-    jl_svec_t *env = match->sparams;
-    jl_tupletype_t *ti = match->spec_types;
-    jl_svec_t *newparams = NULL;
-    jl_value_t *sig = NULL;
-    jl_method_instance_t *mi = NULL;
-    JL_GC_PUSH6(&matches, &env, &newparams, &sig, &mi, &ti);
-    JL_GC_PROMISE_ROOTED(m); // the match's, which `matches` holds
-    jl_compilation_sig(ti, env, m, get_max_varargs(m, NULL),
-                       effective_nospecialize(m, ti, 0, mask, dyn), &newparams);
-    if (newparams) {
-        sig = (jl_value_t*)jl_apply_tuple_type(newparams, 1);
-        newparams = NULL;
-        jl_value_t *ti2 = jl_type_intersection_env(sig, m->sig, &newparams);
-        if (ti2 != jl_bottom_type) {
-            env = newparams;
-            ti = (jl_tupletype_t*)sig;
-        }
-    }
-    mi = jl_specializations_get_linfo(m, (jl_value_t*)ti, env);
-    JL_GC_POP();
-    return mi;
-}
-
 jl_method_instance_t *jl_normalize_to_compilable_mi(jl_method_instance_t *mi JL_PROPAGATES_ROOT);
 
 JL_DLLEXPORT void jl_add_codeinst_to_jit(jl_code_instance_t *codeinst, jl_code_info_t *src)
@@ -6020,22 +5735,14 @@ JL_DLLEXPORT int32_t jl_invoke_api(jl_code_instance_t *codeinst)
     return -1;
 }
 
-// The compilation signature of a call whose caller's inference chose the specialization `ti`. At a
-// trait argument, the attribute is inference's choice, which `ti` records (compiler §6.3): the
-// declared type where the code is compiled once, the value's type otherwise.
 JL_DLLEXPORT jl_value_t *jl_normalize_to_compilable_sig(jl_tupletype_t *ti, jl_svec_t *env, jl_method_t *m,
                                                         int return_if_compileable)
 {
-    uint32_t force_mask = jl_is_datatype(ti) ? trait_arg_bits(m) : 0, force_dynamic = 0;
-    for (size_t i = 1; force_mask && i <= 32 && i < jl_nparams(ti); i++)
-        if ((force_mask & (1u << (i - 1))) && jl_egal(jl_tparam(ti, i), jl_nth_slot_type(m->sig, i)))
-            force_dynamic |= 1u << (i - 1);
     jl_tupletype_t *tt = NULL;
     jl_svec_t *newparams = NULL;
     JL_GC_PUSH2(&tt, &newparams);
     intptr_t max_varargs = get_max_varargs(m, NULL);
-    jl_compilation_sig(ti, env, m, max_varargs,
-                       effective_nospecialize(m, ti, 1, force_mask, force_dynamic), &newparams);
+    jl_compilation_sig(ti, env, m, max_varargs, &newparams);
     int is_compileable = ((jl_datatype_t*)ti)->isdispatchtuple;
     if (newparams) {
         tt = (jl_datatype_t*)jl_apply_tuple_type(newparams, 1);

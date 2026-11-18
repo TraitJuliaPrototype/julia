@@ -3780,7 +3780,7 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_method_type =
         jl_new_datatype(jl_symbol("Method"), core,
                         jl_any_type, jl_emptysvec,
-                        jl_perm_symsvec(37,
+                        jl_perm_symsvec(36,
                             "name",
                             "module",
                             "file",
@@ -3816,9 +3816,8 @@ void jl_init_types(void) JL_GC_DISABLED
                             "purity",
                             "declared_result", // !const
                             "declared_covers",
-                            "facts",
-                            "specialize"),
-                        jl_svec(37,
+                            "facts"),
+                        jl_svec(36,
                             jl_symbol_type,
                             jl_module_type,
                             jl_symbol_type,
@@ -3854,8 +3853,7 @@ void jl_init_types(void) JL_GC_DISABLED
                             jl_uint16_type,
                             jl_any_type,   // declared_result
                             jl_uint8_type, // declared_covers: bit 0 covers every member
-                            jl_uint8_type,
-                            jl_uint32_type),
+                            jl_uint8_type),
                         jl_emptysvec,
                         0, 1, 10);
     //const static uint32_t method_constfields[] = { 0b0, 0b0 }; // (1<<0)|(1<<1)|(1<<2)|(1<<3)|(1<<6)|(1<<9)|(1<<10)|(1<<17)|(1<<21)|(1<<22)|(1<<23)|(1<<24)|(1<<25)|(1<<26)|(1<<27)|(1<<28)|(1<<29)|(1<<30);
@@ -4186,12 +4184,12 @@ static jl_value_t *core(const char *name)
 void post_boot_hooks(void)
 {
     jl_all_type = (jl_unionall_t*)core("All");
-    // Callable{A, S} (compiler §7.4): an open set from Core's build, compiled once by default (§6.3)
+    // Callable{A, S} (compiler §7.4): an open set from Core's build that erases by default (§6.3)
     jl_callable_type = (jl_unionall_t*)core("Callable");
     {
         jl_datatype_t *cb = (jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type);
         cb->name->open_set = 1;
-        cb->name->default_attribute = 2;
+        cb->name->erases = 1;
         cb->has_open_set = 1;
         // both parameters are inputs (§4.6): a function is a member of every instance, by one entry
         // whose instance leaves them free (Base declares `Function`'s, base/Base.jl)

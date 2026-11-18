@@ -27,8 +27,6 @@ extern "C" {
     XX(_using, "_using") \
     XX(applicable,"applicable") \
     XX(apply_type,"apply_type") \
-    XX(attributed_call,"attributed_call") \
-    XX(compiled_for,"compiled_for") \
     XX(compilerbarrier,"compilerbarrier") \
     XX(current_scope,"current_scope") \
     XX(donotdelete,"donotdelete") \
@@ -78,7 +76,6 @@ extern "C" {
     XX(tuple,"tuple") \
     XX(typeassert,"typeassert") \
     XX(typeof,"typeof") \
-    XX(with_dynamic,"with_dynamic") \
 
 #define DECLARE_BUILTIN(cname,jlname) \
     JL_CALLABLE(jl_f_##cname);
@@ -92,8 +89,7 @@ JL_BUILTIN_FUNCTIONS(DECLARE_BUILTIN)
     XX(invokelatest) \
     XX(invoke_in_world) \
     XX(_call_in_world_total) \
-    XX(invoke) \
-    XX(attributed_call)
+    XX(invoke)
 #define DECLARE_REACH_BUILTIN(cname) \
     JL_CALLABLE(jl_f_##cname##_plain); \
     JL_CALLABLE(jl_f_##cname##_facts);

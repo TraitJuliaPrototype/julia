@@ -84,7 +84,8 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     tn->hash = bitmix(bitmix(module ? module->build_id.lo : 0, name->hash), 0xa1ada1da);
     tn->closed_after_load = 0;
     tn->open_set = 0;
-    tn->default_attribute = 0;
+    tn->erases = 0;
+    tn->_unused = 0;
     tn->never_member = 0;
     tn->abstract = abstract;
     tn->mutabl = mutabl;
@@ -400,7 +401,7 @@ JL_DLLEXPORT int jl_set_enumerable(jl_value_t *set)
             continue;
         if (jl_is_concrete_type(en->member))
             continue;
-        // the box of a value kept `Dynamic` (the set's own entry `Dynamic{Z} where Z<:X`) is no member
+        // the box `Dynamic{X}` (the set's own entry `Dynamic{Z} where Z<:X`) is no member
         // to list: the split takes it as its last branch
         jl_value_t *mu = jl_unwrap_unionall(en->member);
         if (jl_is_datatype(mu) && ((jl_datatype_t*)mu)->name->module == jl_core_module &&
@@ -1599,41 +1600,12 @@ JL_DLLEXPORT void jl_set_contract(jl_value_t *T, jl_value_t *contract)
     jl_gc_wb(tn, contract);
 }
 
-// A set's default attribute (compiler §6.3, step 4; traits §4.6), written by the library at the
-// declaration: 0 none, 1 `Compiled`, 2 `Dynamic`.
-JL_DLLEXPORT void jl_set_default_attribute(jl_value_t *T, int attr)
+// Whether a set erases by default (compiler §4.1, §6.3): a bit Core's build sets on `Callable`; a
+// library's set carries it in its contract. The method definition's expansion hook reads it.
+JL_DLLEXPORT int jl_set_erases(jl_value_t *T)
 {
     jl_value_t *uw = jl_unwrap_unionall(T);
-    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->open_set)
-        jl_error("only a set has a default attribute");
-    if (attr < 0 || attr > 2)
-        jl_error("a default attribute is 0 (none), 1 (Compiled) or 2 (Dynamic)");
-    ((jl_datatype_t*)uw)->name->default_attribute = attr;
-}
-JL_DLLEXPORT int jl_get_default_attribute(jl_value_t *T)
-{
-    jl_value_t *uw = jl_unwrap_unionall(T);
-    return jl_is_datatype(uw) ? ((jl_datatype_t*)uw)->name->default_attribute : 0;
-}
-
-// A set from Core's build (compiler §7.5: `IO`), opened right after its declaration, before any type
-// names it: open, with its default attribute (3: `Dynamic`, for Julia's own types too) and closed
-// after load. Only while Core is built.
-JL_DLLEXPORT void jl_set_core_set(jl_value_t *T, intptr_t attr, intptr_t closed)
-{
-    jl_value_t *uw = jl_unwrap_unionall(T);
-    if (jl_base_module != NULL || !jl_is_datatype(uw) || ((jl_datatype_t*)uw)->name->module != jl_core_module ||
-        !((jl_datatype_t*)uw)->name->abstract)
-        jl_error("only an abstract type of Core, while Core is built, is a set from Core's build");
-    if (attr < 0 || attr > 3)
-        jl_error("a default attribute is 0 (none), 1 (Compiled), 2 (Dynamic) or 3 (Dynamic, Julia's own types too)");
-    jl_datatype_t *dt = (jl_datatype_t*)uw;
-    dt->name->open_set = 1;
-    dt->has_open_set = 1;
-    dt->name->default_attribute = attr;
-    dt->name->closed_after_load = closed != 0;
-    if (closed)
-        jl_atomic_store_relaxed(&any_closed_after_load, 1);
+    return jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->erases;
 }
 
 // A set closed after load (compiler §4.8; traits §3.4), written by the library at the declaration.

@@ -352,12 +352,9 @@
     XX(jl_new_typevar) \
     XX(jl_next_from_addrinfo) \
     XX(jl_normalize_to_compilable_sig) \
-    XX(jl_attribute_sig) \
     XX(jl_set_membership_walk_invalidates) \
     XX(jl_func_methods_at_sets) \
     XX(jl_is_trait_arg_type) \
-    XX(jl_attribute_dynamic_bits) \
-    XX(jl_trait_arg_bits) \
     XX(jl_no_exc_handler) \
     XX(jl_object_id) \
     XX(jl_object_id_) \

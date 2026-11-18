@@ -471,8 +471,6 @@ extern jl_array_t *jl_declared_memberships JL_GLOBALLY_ROOTED; // this session's
 extern jl_genericmemory_t *jl_set_candidates JL_GLOBALLY_ROOTED; // the sets' candidates (datatype.c)
 extern jl_genericmemory_t *jl_set_entries JL_GLOBALLY_ROOTED; // the entries at each set (datatype.c)
 extern _Atomic(jl_svec_t*) jl_activated_entries JL_GLOBALLY_ROOTED; // the entries images activated (datatype.c)
-extern jl_genericmemory_t *jl_attributed_cache JL_GLOBALLY_ROOTED; // Core.attributed_call's cache (builtins.c)
-extern _Atomic(jl_genericmemory_t*) jl_attributed_fast JL_GLOBALLY_ROOTED; // its table of the latest answers (builtins.c)
 extern jl_genericmemory_t *jl_absence_sigs JL_GLOBALLY_ROOTED; // each set's absence signatures (datatype.c)
 extern jl_genericmemory_t *jl_func_set_methods JL_GLOBALLY_ROOTED; // each function's methods at sets (gf.c)
 extern jl_value_t *jl_split_table_miss_func JL_GLOBALLY_ROOTED; // the split tables' miss (gf.c, compiler §7.3)
@@ -811,8 +809,6 @@ int jl_engine_hasreserved_policy(jl_method_instance_t *m, jl_value_t *owner, int
 // dispatch with the policy of the code that dispatches (compiler §2.4)
 JL_DLLEXPORT jl_value_t *jl_apply_generic_reach(jl_value_t *F, jl_value_t **args, uint32_t nargs, int reach);
 JL_DLLEXPORT jl_value_t *jl_invoke_reach(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc, int reach);
-// the method instance of a call with attribute bits (compiler §6.3, §6.9), or NULL
-JL_DLLEXPORT jl_method_instance_t *jl_attributed_mi(jl_tupletype_t *tt, uint32_t mask, uint32_t dyn, size_t world);
 jl_value_t *jl_gf_invoke_by_method_reach(jl_method_t *method, jl_value_t *gf, jl_value_t **args, size_t nargs, int reach);
 jl_value_t *jl_gf_invoke_reach(jl_value_t *types, jl_value_t *f, jl_value_t **args, size_t nargs, int reach);
 // a call the interpreter makes: a builtin that calls a function gets the interpreted code's policy

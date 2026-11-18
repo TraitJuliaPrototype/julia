@@ -448,8 +448,9 @@ end
 function implements end
 _implements_body(@nospecialize(X), @nospecialize(S)) = nothing
 
-# A member of the set `X` kept with the attribute `Dynamic` (compiler §6.9; traits §7.7): an ordinary
-# struct with no rule of subtyping. The library declares its memberships and defines its methods.
+# The box (compiler §6.9; traits §7.7): a member of the set `X`, held so that code for it is compiled once
+# per set instance. An ordinary struct with no rule of subtyping; the library declares its memberships
+# and defines its methods.
 struct Dynamic{X}
     object::X
     function Dynamic{X}(@nospecialize(x)) where {X}
@@ -459,13 +460,6 @@ struct Dynamic{X}
         return new{X}(x)
     end
 end
-# The casts `compiled_for` and `with_dynamic` (compiler §6.9) are builtins that raise: written as an
-# argument of the call they decide, lowering turns them into `attributed_call`.
-# a cast to `Compiled` passes a `Dynamic{X}`'s object
-_cast_compiled(@nospecialize(x)) = isa(x, Dynamic) ? getfield(x, :object) : x
-# `keep(x)` (compiler §6.9) for an argument at a set: `Dynamic{X}(x)` where the code is compiled once
-# for it, `x` otherwise; inference resolves it, and where the code is not compiled it is `x`
-keep(@nospecialize(x)) = x
 # a call of a value known as `Callable{A, S}` (compiler §7.4): its arguments are of `A`, or the call
 # raises `MethodError`; the compiler inserts the check where it cannot prove them
 _callable_argcheck(@nospecialize(f), @nospecialize(A), @nospecialize(args...)) =
@@ -557,10 +551,6 @@ end
 VecElement(arg::T) where {T} = VecElement{T}(arg)
 
 eval(Core, quote
-    # `keep(x)` in an instance compiled once (compiler §6.9): `Dynamic{X}(x)`, a `Dynamic`'s object held anew,
-    # as the constructor does; no membership check, since the argument is a member already
-    _keep_dynamic(::Type{T}, @nospecialize(x)) where {T} =
-        (y = isa(x, Dynamic) ? getfield(x, :object) : x; $(Expr(:new, :T, :y)))
     GotoNode(label::Int) = $(Expr(:new, :GotoNode, :label))
     NewvarNode(slot::SlotNumber) = $(Expr(:new, :NewvarNode, :slot))
     QuoteNode(@nospecialize value) = $(Expr(:new, :QuoteNode, :value))
