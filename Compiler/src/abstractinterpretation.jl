@@ -287,11 +287,22 @@ const MAX_OPERATION_SPLITS = 4
 # the members a closed build splits an operation's call over; past it the call stays dynamic, and the
 # build's verifier refuses it
 const MAX_CLOSED_SPLITS = 64
-"A closed build (compiler §7.6): `--trim`. The members of every set are those the build has."
-closed_build() = JLOptions().trim != 0
+"""
+A closed build (compiler §7.6): `--trim`, once the build compiles its output. The members of every set are
+those the build has. The rules apply to what the build compiles for its output, from the start of
+`compile_and_emit_native`: code the build runs while it loads its program (a package's precompile workload, an
+`__init__`, a constant's initializer) is compiled as in a session.
+"""
+closed_build() = CLOSED_OUTPUT[] && JLOptions().trim != 0
+const CLOSED_OUTPUT = RefValue(false)
 # inference by a closed build's rules: in a build, and in the build's check run in a session (§2.7)
 closed_build(::AbstractInterpreter) = closed_build()
 closed_build(interp::NativeInterpreter) = interp.closed !== nothing || closed_build()
+# A build's process notes, from its start, the instances its output compile infers again by the closed rules
+# (`note_closed_operation!`): code inferred while the build loads its program is inferred as in a session.
+closed_process() = JLOptions().trim != 0
+closed_process(::AbstractInterpreter) = closed_process()
+closed_process(interp::NativeInterpreter) = interp.closed !== nothing || closed_process()
 
 # The types a closed build forgets, and where (compiler §7.6): the concrete type of each value its
 # compiled code passes to a place whose type does not keep it (a field, an array's element, a variable,
@@ -631,7 +642,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     # with a set in it, and is the split already)
     drt = operation ? declared_operation_result(interp, argtypes, atype) : nothing
     if drt !== nothing
-        closed_build(interp) && note_closed_operation!(sv)
+        closed_process(interp) && note_closed_operation!(sv)
         split = operation_split_type(atype, closed_build(interp))
         split === nothing && return Future(CallMeta(drt, Any, Effects(), DeclaredResultInfo(drt)))
         # asserted, as the compiler's own results are: inferred while the compiler bootstraps itself,
@@ -657,7 +668,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     end
     matches = find_method_matches(interp, argtypes, atype; max_methods, max_union_splitting)
     # (in a closed build, a call at a value known only by its trait is one a later member may resolve)
-    closed_build(interp) && closed_has_set_argument(argtypes) && note_closed_operation!(sv)
+    closed_process(interp) && closed_has_set_argument(argtypes) && note_closed_operation!(sv)
     if isa(matches, FailedMethodMatch)
         add_remark!(interp, sv, matches.reason)
         return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
