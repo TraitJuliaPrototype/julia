@@ -593,11 +593,13 @@ jl_code_instance_t *jl_type_infer_policy(jl_method_instance_t *mi, size_t world,
         jl_push_inference_entrance_backtraces((jl_value_t*)ci);
     }
 
-    JL_GC_POP();
-    JL_GC_POP();
     // the member hook in the compile queue (compiler §10.4): outside inference and its lock, before
-    // the code runs. A use that failed its check is inferred again, left to dispatch.
-    if ((ct->reentrant_timing & 0b1110) == 0 && jl_member_queue_drain() > 0)
+    // the code runs. A use that failed its check is inferred again, left to dispatch. The hook runs
+    // Julia code: `ci` stays rooted across it (a CodeInstance not put in the cache has no other root).
+    int again = (ct->reentrant_timing & 0b1110) == 0 && jl_member_queue_drain() > 0;
+    JL_GC_POP();
+    JL_GC_POP();
+    if (again)
         return jl_type_infer_policy(mi, world, source_mode, trim_mode, facts);
 #endif
 
@@ -7261,7 +7263,10 @@ int jl_member_queue_drain(void)
 // library checks the member at its first use. The hook runs in the latest world with no lock
 // held, and may throw: then nothing is cached, and the next call asks it again (the library
 // keeps its answer, a failure too).
-static void member_hook_at_dispatch(jl_tupletype_t *tt, size_t world)
+// `tt` is the caller's, from arg_type_tuple: a tuple type with a `Type{…}` parameter is not concrete,
+// so Julia's type cache does not hold it and nothing else may. It is rooted here, across the method
+// lookup and the hook, which allocate; the caller's lookup that follows roots it again.
+static void member_hook_at_dispatch(jl_tupletype_t *tt JL_MAYBE_UNROOTED, size_t world)
 {
     size_t n = jl_nparams(tt);
     int any = 0;
@@ -7269,12 +7274,15 @@ static void member_hook_at_dispatch(jl_tupletype_t *tt, size_t world)
         any = chain_has_memberships(jl_tparam(tt, i));
     if (!any)
         return;
+    jl_value_t **roots;
+    JL_GC_PUSHARGS(roots, 5);
+    roots[4] = (jl_value_t*)tt;
     size_t min_valid = 0, max_valid = ~(size_t)0;
     jl_method_match_t *matc = _gf_invoke_lookup((jl_value_t*)tt, jl_method_table, world, 0, &min_valid, &max_valid);
-    if (matc == NULL)
+    if (matc == NULL) {
+        JL_GC_POP();
         return;
-    jl_value_t **roots;
-    JL_GC_PUSHARGS(roots, 4);
+    }
     roots[0] = (jl_value_t*)matc;
     jl_value_t *sig = jl_unwrap_unionall((jl_value_t*)matc->method->sig);
     size_t ns = jl_nparams(sig);
