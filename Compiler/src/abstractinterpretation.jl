@@ -426,15 +426,66 @@ function closed_candidates_grew()
     return grew
 end
 
+# The set `X` where `T` is the wrapper of a value known only by its trait, `Compiled{Z} where Z<:X`
+# (compiler §7.6): the type a closed build gives the wrapper's constructor at a value known only by `X`
+# where its members are more than a union keeps. `nothing` for any other type.
+function closed_wrapper_set(@nospecialize(T))
+    T isa UnionAll || return nothing
+    b = T.body
+    (b isa DataType && b.name === (Core.Compiled::UnionAll).body.name && b.parameters[1] === T.var &&
+     T.var.lb === Union{}) || return nothing
+    X = T.var.ub
+    has_free_typevars(X) && return nothing
+    u = unwrap_unionall(X)
+    (u isa DataType && ccall(:jl_is_open_set, Cint, (Any,), u) != 0) || return nothing
+    return X
+end
+# the wrappers of the values known only by the set `X`, `Compiled{Z} where Z<:X`
+function closed_wrapper_of(@nospecialize(X))
+    Z = TypeVar(:Z, Union{}, X)
+    return UnionAll(Z, Core.Compiled{Z})
+end
+# The arguments typed by the wrapper of a value known only by its trait (`closed_wrapper_set`): bit
+# `i - 2` for the argument `i`. A call that takes such a wrapper branches over the members (§7.6).
+function closed_wrapper_bits(argtypes::Vector{Any})
+    bits = UInt32(0)
+    for i = 2:min(length(argtypes), 33)
+        a = argtypes[i]
+        isvarargtype(a) && break
+        closed_wrapper_set(widenconst(a)) === nothing || (bits |= UInt32(1) << (i - 2))
+    end
+    return bits
+end
+
 # The first argument named by `bits` (bit `i - 2` for the argument `i`) that is typed by a set whose members
-# a closed build can list, with the union of those members and the box (compiler §7.6); `nothing` where
-# there is none.
+# a closed build can list, with the union of those members and the box (compiler §7.6), and the type that
+# bounds the split's result where each branch returns the wrapper of its member; or typed by the wrapper
+# of a value known only by such a set, with the union of the members' wrappers. `nothing` where there is
+# none.
 function closed_member_types(argtypes::Vector{Any}, bits::UInt32)
     for i = 2:min(length(argtypes), 33)
         (bits & (UInt32(1) << (i - 2))) != 0 || continue
         a = argtypes[i]
         isvarargtype(a) && break
         T = widenconst(a)
+        W = closed_wrapper_set(T)
+        if W !== nothing
+            # the wrapper of a value known only by `W`: one branch per member's wrapper. A box or a wrapper
+            # is no wrapper's object (the constructor unwraps both), so neither gives a branch
+            uw = unwrap_unionall(W)::DataType
+            wcands = closed_candidates(uw.name.wrapper)
+            wcands === nothing && continue
+            CLOSED_CANDIDATE_COUNTS[uw.name.wrapper] = length(wcands)
+            WU = Union{}
+            nw = 0
+            for C in wcands
+                (C <: W && !(C <: Core.Dynamic) && !(C <: Core.Compiled)) || continue
+                WU = Union{WU, Core.Compiled{C}}
+                nw += 1
+            end
+            (0 < nw <= MAX_CLOSED_SPLITS) || continue
+            return (i, WU, nothing)
+        end
         (isconcretetype(T) || has_free_typevars(T)) && continue
         u = unwrap_unionall(T)
         (u isa DataType && ccall(:jl_is_open_set, Cint, (Any,), u) != 0) || continue
@@ -455,7 +506,7 @@ function closed_member_types(argtypes::Vector{Any}, bits::UInt32)
             D <: T && (U = Union{U, D}; n += 1)
         end
         (0 < n <= MAX_CLOSED_SPLITS) || continue
-        return (i, U)
+        return (i, U, closed_wrapper_of(T))
     end
     return nothing
 end
@@ -505,6 +556,7 @@ function closed_has_set_argument(argtypes::Vector{Any})
         isvarargtype(a) && return false
         T = widenconst(a)
         isconcretetype(T) && continue
+        closed_wrapper_set(T) === nothing || return true
         u = unwrap_unionall(T)
         u isa DataType && ccall(:jl_is_open_set, Cint, (Any,), u) != 0 && return true
     end
@@ -518,13 +570,13 @@ function closed_member_split(interp::AbstractInterpreter, @nospecialize(func), a
                              si::StmtInfo, sv::AbsIntState, max_methods::Int, bits::UInt32, operation::Bool)
     bsplit = closed_member_types(argtypes, bits)
     bsplit === nothing && return nothing
-    bi, bU = bsplit::Tuple{Int,Type}
+    bi, bU, bound = bsplit::Tuple{Int,Type,Any}
     newargs = copy(argtypes)
     newargs[bi] = bU
     call = abstract_call_gf_by_type(interp, func, ArgInfo(nothing, newargs), si,
                                     argtypes_to_type(newargs), sv, max_methods;
                                     max_union_splitting = MAX_CLOSED_SPLITS,
-                                    operation, member_split = false)::Future
+                                    operation, member_split = false, closed_bound = bound)::Future
     return Future{CallMeta}(call, interp, sv) do call, _, _
         rt = widenconst(call.rt)
         rt === Union{} && return call
@@ -629,7 +681,8 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
                                   arginfo::ArgInfo, si::StmtInfo, @nospecialize(atype),
                                   sv::AbsIntState, max_methods::Int;
                                   max_union_splitting::Int = InferenceParams(interp).max_union_splitting,
-                                  operation::Bool = true, member_split::Bool = true)
+                                  operation::Bool = true, member_split::Bool = true,
+                                  @nospecialize(closed_bound = nothing))
     𝕃ₚ, 𝕃ᵢ = ipo_lattice(interp), typeinf_lattice(interp)
     ⊑ₚ, ⊔ₚ, ⊔ᵢ  = partialorder(𝕃ₚ), join(𝕃ₚ), join(𝕃ᵢ)
     argtypes = arginfo.argtypes
@@ -676,9 +729,11 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
 
     # a closed build (compiler §7.6): a call whose method's static parameter a value known only by its
     # trait binds (the wrapper's constructor, `Compiled(x)` at `x::X`) branches over the set's members,
-    # each branch the call at the member's type. A session leaves such a call to dispatch when it runs.
+    # each branch the call at the member's type; so does a call that takes the wrapper of such a value,
+    # `Compiled{<:X}`, each branch the call at a member's wrapper. A session leaves such a call to
+    # dispatch when it runs.
     if member_split && closed_build(interp)
-        sbits = closed_sparam_bits(argtypes, matches.applicable)
+        sbits = closed_sparam_bits(argtypes, matches.applicable) | closed_wrapper_bits(argtypes)
         if sbits != 0
             ssplit = closed_member_split(interp, func, argtypes, si, sv, max_methods, sbits, operation)
             ssplit === nothing || return ssplit
@@ -722,6 +777,9 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     # final result
     gfresult = Future{CallMeta}()
     state = CallInferenceState(func, matches)
+    # a closed split over a set's members (compiler §7.6): whether every branch returns the wrapper of a
+    # member, `closed_bound`
+    inbound = RefValue(true)
 
     # split the for loop off into a function, so that we can pause and restart it at will
     function infercalls(interp, sv)
@@ -820,6 +878,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
                     this_rt = this_conditional
                 end
 
+                closed_bound === nothing || widenconst(ignorelimited(this_rt)) <: closed_bound || (inbound[] = false)
                 state.rettype = state.rettype ⊔ₚ this_rt
                 state.exctype = state.exctype ⊔ₚ this_exct
                 if has_conditional(𝕃ₚ, sv) && this_conditional !== Bottom && is_lattice_bool(𝕃ₚ, state.rettype) && arginfo.fargs !== nothing
@@ -864,6 +923,12 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
             local fargs = arginfo.fargs
             if sv isa InferenceState && fargs !== nothing
                 state.slotrefinements = collect_slot_refinements(𝕃ᵢ, applicable, argtypes, fargs, sv)
+            end
+            # a closed split whose branches each return the wrapper of a member of `X`: the join of more
+            # wrappers than a union keeps is the wrapper of a value known only by `X`, never `Compiled`
+            # (compiler §7.6), and a call that takes it branches over the members again
+            if closed_bound !== nothing && inbound[] && state.rettype isa Type && !(state.rettype <: closed_bound)
+                state.rettype = typeintersect(state.rettype, closed_bound)
             end
             state.rettype = from_interprocedural!(interp, state.rettype, sv, arginfo, state.conditionals)
             if call_result_unused(si) && !(state.rettype === Bottom)
