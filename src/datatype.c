@@ -1139,7 +1139,7 @@ static int pattern_second_instance(jl_value_t *pattern, jl_value_t *set_instance
                 pair[1] = jl_array_ptr_ref(insts, j);
                 t = jl_apply_tuple_type_v(pair, 2);
                 t = jl_rewrap_unionall(t, en->member);
-                d = jl_type_intersection(a, t);
+                d = jl_entry_intersection(a, t);
                 conflict = d != jl_bottom_type && !jl_subtype(d, b);
             }
         }

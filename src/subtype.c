@@ -5682,7 +5682,7 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
 
 // type intersection entry points
 
-static jl_value_t *intersect_types(jl_value_t *x, jl_value_t *y, int emptiness_only)
+static jl_value_t *intersect_types_(jl_value_t *x, jl_value_t *y, int emptiness_only, int entryinst)
 {
     jl_stenv_t e;
     if (obviously_disjoint(x, y, 0))
@@ -5698,9 +5698,24 @@ static jl_value_t *intersect_types(jl_value_t *x, jl_value_t *y, int emptiness_o
     init_stenv(&e, NULL, 0);
     e.intersection = e.ignore_free = 1;
     e.emptiness_only = emptiness_only;
+    e.entryinst = entryinst;
     jl_value_t *ans = intersect_all(x, y, &e);
     free_stenv(&e);
     return ans;
+}
+
+static jl_value_t *intersect_types(jl_value_t *x, jl_value_t *y, int emptiness_only)
+{
+    return intersect_types_(x, y, emptiness_only, 0);
+}
+
+// The intersection of entries, each a member with its instance (one instance per member, compiler §4.6):
+// an instance of a set is paired with another parameter by parameter, as intersect_membership pairs an
+// entry's instance with the set asked about, so two instances that differ in an input do not meet here as
+// two sets do (§4.9): a member is in the instance its entry names.
+JL_DLLEXPORT jl_value_t *jl_entry_intersection(jl_value_t *x, jl_value_t *y)
+{
+    return intersect_types_(x, y, 0, 1);
 }
 
 JL_DLLEXPORT jl_value_t *jl_intersect_types(jl_value_t *x, jl_value_t *y)
