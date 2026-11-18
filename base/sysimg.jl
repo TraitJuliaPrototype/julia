@@ -10,7 +10,7 @@ ccall(:jl_module_set_loaded, Cvoid, (Any,), Base)
 # Code compiled during Base's build kept a match at an intersection no type is in, whose negative was not
 # final yet: once a set of Base's build is closed after load, those instances are invalidated, with
 # their callers, and what the image compiles from here drops the match (compiler §4.8, open issue 169).
-# Base declares no such set, so the walk runs only where one is.
+# Core's `Callable` is such a set (compiler §7.4).
 ccall(:jl_any_closed_after_load, Cint, ()) != 0 && let cis = Any[]
     Base.visit(Core.methodtable) do m
         m isa Method || return

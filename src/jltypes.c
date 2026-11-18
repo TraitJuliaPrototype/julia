@@ -4196,6 +4196,9 @@ void post_boot_hooks(void)
         // both parameters are inputs (§4.6): a function is a member of every instance, by one entry
         // whose instance leaves them free (Base declares `Function`'s, base/Base.jl)
         cb->name->input_params = 0x03;
+        // closed after load, as every set (§4.8, §7.4): a negative at Callable is final once its
+        // declarers have loaded, and a membership declared later invalidates what relied on it
+        jl_set_closed_after_load((jl_value_t*)jl_callable_type);
     }
     // an intersection carries the open-set bit, so the bit gates the test for one (julia_internal.h)
     ((jl_datatype_t*)jl_all_type->body)->has_open_set = 1;

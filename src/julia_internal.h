@@ -1007,6 +1007,7 @@ JL_DLLEXPORT void jl_set_open_set(jl_value_t *T);
 JL_DLLEXPORT void jl_set_contract(jl_value_t *T, jl_value_t *contract);
 JL_DLLEXPORT void jl_set_contract_operations(jl_value_t *T, jl_value_t *ops);
 JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X);
+JL_DLLEXPORT void jl_set_closed_after_load(jl_value_t *T);
 // sets closed after load (compiler §4.8): final negatives and their cells
 JL_DLLEXPORT int jl_membership_final(jl_value_t *S, jl_value_t *X);
 JL_DLLEXPORT jl_value_t *jl_membership_final_cell(jl_value_t *member, jl_value_t *set);

@@ -975,6 +975,10 @@ static jl_value_t *final_pair_component(jl_value_t *c JL_PROPAGATES_ROOT)
     jl_value_t *u = jl_unwrap_unionall(c);
     if (jl_is_datatype(u) && abstract_member(u))
         return ((jl_datatype_t*)u)->name->wrapper;
+    // a set with free variables (`Callable{A, S}`, a parametric set written bare) by its name: a pair's
+    // cell is per set (membership_absence), and the negative is asked of every instance
+    if (jl_is_datatype(u) && ((jl_datatype_t*)u)->name->open_set && !jl_is_all_type(u))
+        return ((jl_datatype_t*)u)->name->wrapper;
     return NULL;
 }
 
