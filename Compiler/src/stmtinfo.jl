@@ -49,39 +49,6 @@ end
 add_edges_impl(::Vector{Any}, ::CallableCallInfo) = nothing
 
 """
-    info::AttributedCallInfo <: CallInfo
-
-A call with attributes for its trait arguments (compiler §6.3): from casts written at the call (`cast`,
-a call of `Core.attributed_call`), or the attributes the trait arguments of the caller's instance
-carry. `mask` names the arguments decided, `dyn` those of them that are `Dynamic` (bit `k - 1` for
-argument `k`). Its matches are inferred at the instances the attributes select; a call left dynamic
-passes them on through `Core.attributed_call`. `dispatch`: an argument is `Compiled` where the caller
-does not know its type, so the call dispatches on it when it runs, a function barrier.
-"""
-struct AttributedCallInfo <: CallInfo
-    info::CallInfo
-    mask::UInt32
-    dyn::UInt32
-    cast::Bool
-    dispatch::Bool
-end
-add_edges_impl(edges::Vector{Any}, info::AttributedCallInfo) = add_edges!(edges, info.info)
-nsplit_impl(info::AttributedCallInfo) = nsplit(info.info)
-getsplit_impl(info::AttributedCallInfo, idx::Int) = getsplit(info.info, idx)
-getresult_impl(info::AttributedCallInfo, idx::Int) = getresult(info.info, idx)
-
-"""
-    info::KeepInfo <: CallInfo
-
-`Core.keep(x)` resolved where the instance is compiled (compiler §6.9): `T` is `Dynamic{X}` where the
-instance is compiled once for the argument `x` at the set `X`, `nothing` where it is `x`.
-"""
-struct KeepInfo <: CallInfo
-    T::Any
-end
-add_edges_impl(::Vector{Any}, ::KeepInfo) = nothing
-
-"""
     info::SplitCallInfo <: CallInfo
 
 A call of an operation of a set at a receiver typed by the set, split over the set's first
@@ -161,10 +128,7 @@ function _add_edges_impl(edges::Vector{Any}, info::MethodMatchInfo, mi_edge::Boo
         else
             mi = edge.def::MethodInstance
         end
-        # the one-edge form only where the instance is no wider than the call: a match the
-        # attribute widened to the instance compiled once at a set (compiler §6.3) keeps the call's
-        # signature, so its backedge does (§3.1)
-        if mi.specTypes === m.spec_types && (m.spec_types === info.atype || m.spec_types <: info.atype)
+        if mi.specTypes === m.spec_types
             add_one_edge!(edges, edge)
             return nothing
         end

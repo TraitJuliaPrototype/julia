@@ -333,67 +333,6 @@ function fully_typed_fault(interp::AbstractInterpreter, mi::MethodInstance, effe
     return 0
 end
 
-# An instance compiled once at an argument typed by a `where` variable bounded by a set (compiler §6.2;
-# W-148) does not know that variable. Its body reads the static parameters from its arguments when it
-# runs, as an inlined callee does (`ir_prepare_inlining!`): the variable is the value's type under
-# either attribute.
-function resolve_runtime_sparams!(ir::IRCode, mi::MethodInstance)
-    def = mi.def
-    def isa Method || return ir
-    sp = mi.sparam_vals
-    unknown = false
-    for i = 1:length(sp)
-        sp[i] isa TypeVar && (unknown = true)
-    end
-    unknown || return ir
-    ccall(:jl_has_open_set, Cint, (Any,), def.sig) == 0 && return ir
-    def.isva && return ir
-    spssa = nothing
-    refs = Vector{Any}(undef, length(sp))
-    fill!(refs, nothing)
-    nstmts = length(ir.stmts)
-    for idx = 1:nstmts
-        inst = ir[SSAValue(idx)]
-        stmt = inst[:stmt]
-        if stmt isa Expr && stmt.head === :static_parameter
-            i = stmt.args[1]::Int
-            sp[i] isa TypeVar || continue
-            if spssa === nothing
-                argexprs = Any[Argument(k) for k = 1:Int(def.nargs)]
-                spssa = insert_node!(ir, SSAValue(1), NewInstruction(Expr(:call, Core._compute_sparams, def, argexprs...), SimpleVector))
-            end
-            inst[:stmt] = Expr(:call, Core._svec_ref, spssa, i)
-            inst[:flag] = IR_FLAG_NULL
-            continue
-        end
-        urs = userefs(stmt)
-        changed = false
-        for ur in urs
-            v = ur[]
-            (v isa Expr && v.head === :static_parameter) || continue
-            i = v.args[1]::Int
-            sp[i] isa TypeVar || continue
-            if spssa === nothing
-                argexprs = Any[Argument(k) for k = 1:Int(def.nargs)]
-                spssa = insert_node!(ir, SSAValue(1), NewInstruction(Expr(:call, Core._compute_sparams, def, argexprs...), SimpleVector))
-            end
-            r = refs[i]
-            if r === nothing
-                r = insert_node!(ir, SSAValue(1), NewInstruction(Expr(:call, Core._svec_ref, spssa, i), Any))
-                refs[i] = r
-            end
-            ur[] = r
-            changed = true
-        end
-        if changed
-            inst[:stmt] = urs[]
-            inst[:flag] = IR_FLAG_NULL
-        end
-    end
-    spssa === nothing && return ir
-    return compact!(ir)
-end
-
 "The check at the start of code that fails fully typed mode: `jl_not_fully_typed(svec(mi, level, warned, kind, rt))`."
 function insert_fully_typed_check!(ir::IRCode, interp::AbstractInterpreter, mi::MethodInstance, result::InferenceResult)
     kind = fully_typed_fault(interp, mi, result.ipo_effects, result.result)
@@ -442,7 +381,6 @@ function rtsite_target(interp::AbstractInterpreter, args::Vector{Any}, src::Code
     length(matches.matches) == 1 || return nothing
     m = (only(matches.matches)::MethodMatch).method
     nospec = reinterpret(UInt32, m.nospecialize)
-    traits = ccall(:jl_trait_arg_bits, UInt32, (Any,), m)
     decl = unwrap_unionall(m.sig)
     decl isa DataType || return nothing
     nd = length(decl.parameters)
@@ -451,12 +389,12 @@ function rtsite_target(interp::AbstractInterpreter, args::Vector{Any}, src::Code
         p = ps[i]
         isvarargtype(p) && return nothing
         isdispatchelem(p) && continue
-        # an abstract argument: not specialized on (`@nospecialize`, not a trait argument), at a
-        # declared type the runtime compiles at whatever the value (gf.c, `jl_compilation_sig`)
+        # an abstract argument: not specialized on (`@nospecialize`), at a declared type the runtime
+        # compiles at whatever the value (gf.c, `jl_compilation_sig`)
         iarg = m.isva ? min(i - 1, m.nargs - 1) : i - 1
         (1 <= iarg <= 32 && nd >= 1) || return nothing
         bit = UInt32(1) << (iarg - 1)
-        (nospec & bit != 0 && traits & bit == 0) || return nothing
+        nospec & bit != 0 || return nothing
         d = unwrapva(decl.parameters[min(i, nd)])
         (has_free_typevars(d) || iskindtype(d)) && return nothing
     end

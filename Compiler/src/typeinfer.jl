@@ -782,7 +782,7 @@ function Base.iterate(it::ForwardToBackedgeIterator, i::Int = 1)
         item = edges[i]
         if item isa Int
             # a call with one match, fully covering, that reached an instance wider than its own
-            # signature (a method compiled once at a set, or `@nospecialize`): the backedge keeps
+            # signature (`@nospecialize`, a forwarder compiled once at a set): the backedge keeps
             # the call's signature, so a method defined later invalidates the caller only where it
             # meets that signature (compiler §3.1)
             if item == 1 && i + 2 <= length(edges)

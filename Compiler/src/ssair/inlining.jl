@@ -1469,7 +1469,6 @@ function process_simple!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::Int, flag
     if is_builtin(optimizer_lattice(state.interp), sig)
         let f = sig.f
             if (f !== Core.invoke &&
-                f !== Core.attributed_call && # a cast's call (compiler §6.9): `handle_attributed_call!`
                 f !== Core.finalizer &&
                 f !== modifyfield! &&
                 f !== Core.modifyglobal! &&
@@ -1883,69 +1882,6 @@ function inline_const_if_inlineable!(inst::Instruction)
     return false
 end
 
-# A call with attributes for its trait arguments (compiler §6.3, §6.9). A cast's call
-# (`Core.attributed_call(bits, f, args...)`) runs the instance its attributes select, never inlined, or
-# stays the builtin's dynamic call. A call whose arguments carry their attributes is handled as any
-# call, its matches inferred at the instances that run; left dynamic, it passes them on.
-function handle_attributed_call!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::Int, stmt::Expr,
-                                 info::AttributedCallInfo, flag::UInt32, sig::Signature,
-                                 state::InliningState)
-    inner = info.info
-    if info.dispatch
-        # an argument `Compiled` where the call does not know its type: the call dispatches on it when it
-        # runs; a cast's call stays the builtin's
-        cur = ir[SSAValue(idx)][:stmt]
-        if !info.cast && info.mask != 0 && isexpr(cur, :call)
-            bits = Int(info.mask) | (Int(info.dyn) << 32)
-            ir[SSAValue(idx)][:stmt] = Expr(:call, GlobalRef(Core, :attributed_call), bits, cur.args...)
-        end
-        return nothing
-    end
-    if info.cast && inner isa SplitCallInfo
-        # a closed build's branches over the members of the cast argument's set (compiler §7.6): the
-        # call itself, split as an operation's is
-        newstmt = Expr(:call, stmt.args[3:end]...)
-        nsig = call_sig(ir, newstmt)
-        nsig === nothing && return nothing
-        # the branches test the value's type themselves: an argument typed by a set with parameters
-        # (`Column{T} where T`) is taken as `Any`, so that the call's signature is a tuple type
-        for i = 2:length(nsig.argtypes)
-            widenconst(nsig.argtypes[i]) isa UnionAll && (nsig.argtypes[i] = Any)
-        end
-        ir[SSAValue(idx)][:stmt] = newstmt
-        n = length(todo)
-        handle_call!(todo, ir, idx, newstmt, inner, flag, nsig, state)
-        # not split: the builtin's call again
-        length(todo) == n && ir[SSAValue(idx)][:stmt] === newstmt && (ir[SSAValue(idx)][:stmt] = stmt)
-        return nothing
-    end
-    if info.cast
-        inner isa ConstCallInfo && (inner = inner.call)
-        inner isa MethodMatchInfo || return nothing
-        length(inner.results) == 1 || return nothing
-        match = inner.results[1]::MethodMatch
-        match.fully_covers || return nothing
-        mi = specialize_method(match; preexisting=true)
-        mi === nothing && (mi = specialize_method(match))
-        code = get(code_cache(state), mi, nothing)
-        code isa CodeInstance || (code = mi)
-        ir[SSAValue(idx)][:stmt] = Expr(:invoke, code, stmt.args[3:end]...)
-        return nothing
-    end
-    if inner !== NoCallInfo()
-        n = length(todo)
-        handle_call!(todo, ir, idx, stmt, inner, flag, sig, state)
-        (length(todo) != n || !isexpr(ir[SSAValue(idx)][:stmt], :call)) && return nothing
-    end
-    # left a dynamic call: it passes its arguments' attributes on
-    cur = ir[SSAValue(idx)][:stmt]
-    if isexpr(cur, :call)
-        bits = Int(info.mask) | (Int(info.dyn) << 32)
-        ir[SSAValue(idx)][:stmt] = Expr(:call, GlobalRef(Core, :attributed_call), bits, cur.args...)
-    end
-    return nothing
-end
-
 function assemble_inline_todo!(ir::IRCode, state::InliningState)
     todo = Pair{Int, Any}[]
 
@@ -1980,17 +1916,6 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
         end
         if isa(info, CallableCallInfo)
             handle_callable_call!(ir, idx, stmt, info)
-            continue
-        end
-        if isa(info, KeepInfo)
-            # `Core.keep(x)` (compiler §6.9): `x`, or `Dynamic{X}(x)` in an instance compiled once for it,
-            # a `Dynamic`'s object held anew (never a `Dynamic` of a `Dynamic`)
-            x = stmt.args[2]
-            ir[SSAValue(idx)][:stmt] = info.T === nothing ? x : Expr(:call, GlobalRef(Core, :_keep_dynamic), info.T, x)
-            continue
-        end
-        if isa(info, AttributedCallInfo)
-            handle_attributed_call!(todo, ir, idx, stmt, info, flag, sig, state)
             continue
         end
 
