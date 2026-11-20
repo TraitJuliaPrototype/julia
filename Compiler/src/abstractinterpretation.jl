@@ -549,6 +549,40 @@ function closed_sparam_bits(argtypes::Vector{Any}, applicable::Vector{MethodMatc
     return bits
 end
 
+# The arguments known only by their trait (typed by a set instance) at which the member's type chooses
+# the method: a matched method at a type that is no set takes only some of the set's members there
+# (`f(x::ODEFunction)` and `f(x)` at `x::Callable{…}`). Bit `i - 2` for the argument `i` (compiler §7.6).
+# A method at a subtrait or an intersection, or at a kept form, is taken at the set instance, once.
+function closed_choice_bits(argtypes::Vector{Any}, applicable::Vector{MethodMatchTarget})
+    bits = UInt32(0)
+    for i = 2:min(length(argtypes), 33)
+        a = argtypes[i]
+        isvarargtype(a) && break
+        T = widenconst(a)
+        (isconcretetype(T) || has_free_typevars(T)) && continue
+        u = unwrap_unionall(T)
+        (u isa DataType && ccall(:jl_is_open_set, Cint, (Any,), u) != 0) || continue
+        for t in applicable
+            sig = unwrap_unionall(t.match.spec_types)
+            sig isa DataType || continue
+            ps = sig.parameters
+            i <= length(ps) || continue
+            p = ps[i]
+            isvarargtype(p) && (p = unwrapva(p))
+            q = unwrap_unionall(p)
+            # a method at a set (a subtrait, an intersection) or at a kept form is taken at the set
+            # instance, once; a method at a type that is no set takes the members of that type
+            (q isa DataType && !isabstracttype(q) && q.name !== (Core.Dynamic::UnionAll).body.name &&
+             q.name !== (Core.Compiled::UnionAll).body.name) || continue
+            if !(T <: rewrap_unionall(p, t.match.spec_types))
+                bits |= UInt32(1) << (i - 2)
+                break
+            end
+        end
+    end
+    return bits
+end
+
 # whether a call has an argument known only by its trait (typed by a set instance)
 function closed_has_set_argument(argtypes::Vector{Any})
     for i = 2:length(argtypes)
@@ -730,10 +764,12 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     # a closed build (compiler §7.6): a call whose method's static parameter a value known only by its
     # trait binds (the wrapper's constructor, `Compiled(x)` at `x::X`) branches over the set's members,
     # each branch the call at the member's type; so does a call that takes the wrapper of such a value,
-    # `Compiled{<:X}`, each branch the call at a member's wrapper. A session leaves such a call to
-    # dispatch when it runs.
+    # `Compiled{<:X}`, each branch the call at a member's wrapper; and so does a call at such a value
+    # where the member's type chooses the method (`closed_choice_bits`). A session leaves such a call
+    # to dispatch when it runs.
     if member_split && closed_build(interp)
-        sbits = closed_sparam_bits(argtypes, matches.applicable) | closed_wrapper_bits(argtypes)
+        sbits = closed_sparam_bits(argtypes, matches.applicable) | closed_wrapper_bits(argtypes) |
+                closed_choice_bits(argtypes, matches.applicable)
         if sbits != 0
             ssplit = closed_member_split(interp, func, argtypes, si, sv, max_methods, sbits, operation)
             ssplit === nothing || return ssplit
