@@ -779,18 +779,99 @@ function closed_has_set_argument(argtypes::Vector{Any})
     return false
 end
 
+# Whether `m` is a forwarder (compiler §6.3): its code carries the mark `Expr(:meta, :erasing_forwarder)`.
+const CLOSED_FORWARDERS = IdDict{Method,Bool}()
+function closed_is_forwarder(m::Method)
+    r = get(CLOSED_FORWARDERS, m, nothing)
+    r === nothing || return r::Bool
+    src = isdefined(m, :source) ? m.source : nothing
+    src isa String && (src = ccall(:jl_uncompress_ir, Ref{CodeInfo}, (Any, Ptr{Cvoid}, Any), m, C_NULL, src))
+    r = false
+    if src isa CodeInfo
+        for st in src.code
+            if isexpr(st, :meta) && length(st.args) == 1 && st.args[1] === :erasing_forwarder
+                r = true
+                break
+            end
+        end
+    end
+    CLOSED_FORWARDERS[m] = r
+    return r
+end
+# The forwarder among the methods a call takes, where it answers for each of them: every other method is at
+# the forwarder's types or narrower, and at kept forms (`closed_kept_form`) wherever the forwarder's type names
+# a set. The forwarder passes a kept form as it is and calls the function again, so a value that another
+# method takes reaches that method through it; a plain member it boxes. `nothing` otherwise.
+function closed_forwarder(applicable::Vector{MethodMatchTarget})
+    F = nothing
+    for t in applicable
+        m = t.match.method
+        closed_is_forwarder(m) || continue
+        F === nothing || return nothing
+        F = m
+    end
+    F === nothing && return nothing
+    fsig = unwrap_unionall(F.sig)
+    fsig isa DataType || return nothing
+    for t in applicable
+        m = t.match.method
+        m === F && continue
+        m.sig <: F.sig || return nothing
+        msig = unwrap_unionall(m.sig)
+        (msig isa DataType && length(msig.parameters) == length(fsig.parameters)) || return nothing
+        for i = 2:length(fsig.parameters)
+            p, q = msig.parameters[i], fsig.parameters[i]
+            isvarargtype(q) && (q = unwrapva(q))
+            isvarargtype(p) && (p = unwrapva(p))
+            q isa TypeVar && (q = q.ub)
+            ccall(:jl_has_open_set, Cint, (Any,), q) != 0 || continue
+            p isa TypeVar && (p = p.ub)
+            closed_kept_form(unwrap_unionall(p)) || return nothing
+        end
+    end
+    return F
+end
+# A closed build's call past the bound of the product, where the method the members reach is a forwarder
+# (compiler §7.6): the call is the forwarder's instance at the call's types met with its signature, entered
+# where each argument is of the forwarder's type (a test per argument), past it the `MethodError`. In the
+# forwarder each argument is boxed by its own call, which branches over that argument's members: their sum,
+# not their product; the method as written is called once at the boxes.
+function closed_forwarder_call(interp::AbstractInterpreter, F::Method, arginfo::ArgInfo, si::StmtInfo,
+                               sv::AbsIntState)
+    atype = argtypes_to_type(arginfo.argtypes)
+    tienv = ccall(:jl_type_intersection_with_env, Any, (Any, Any), atype, F.sig)::SimpleVector
+    ti = tienv[1]
+    env = tienv[2]::SimpleVector
+    (ti isa DataType && ti !== Bottom) || return nothing
+    any(@nospecialize(v) -> isa(v, TypeVar), env) && return nothing
+    match = MethodMatch(ti, env, F, false)
+    mresult = abstract_call_method(interp, F, ti, env, false, si, sv)::Future
+    return Future{CallMeta}(mresult, interp, sv) do result, interp, sv
+        (; rt, exct, effects, edge) = result
+        rt = from_interprocedural!(interp, rt, sv, arginfo, ti)
+        info = MethodMatchInfo(MethodLookupResult(Any[match], WorldRange(typemin(UInt), typemax(UInt)), false),
+                               Core.methodtable, atype, false)
+        info.edges[1] = edge
+        CallMeta(rt, Union{exct, MethodError}, Effects(effects; nothrow = false),
+                 SplitCallInfo(info, widenconst(rt), true))
+    end
+end
+
 # The call with each argument named by `bits` that a closed build can split (`closed_member_type`) at the
 # union of its set's members: the call branches over each, each branch the call at the members' types,
 # past them the `MethodError` (compiler §7.6). The branches are the product of the arguments' members:
-# taken in order while the product stays within `MAX_CLOSED_SPLITS`, an argument past it left as it is.
+# taken in order while the product stays within `MAX_CLOSED_SPLITS`, an argument past it left as it is,
+# but where the method the members reach is a forwarder (`closed_forwarder_call`).
 # `nothing` where no argument can be split.
 function closed_member_split(interp::AbstractInterpreter, @nospecialize(func), arginfo::ArgInfo,
-                             si::StmtInfo, sv::AbsIntState, max_methods::Int, bits::UInt32, operation::Bool)
+                             si::StmtInfo, sv::AbsIntState, max_methods::Int, bits::UInt32, operation::Bool,
+                             applicable::Vector{MethodMatchTarget} = MethodMatchTarget[])
     argtypes = arginfo.argtypes
     newargs = nothing
     bound = nothing
     nsplit = unionsplitcost(typeinf_lattice(interp), argtypes)
     nargs = 0
+    past = false
     for i = 2:min(length(argtypes), 33)
         (bits & (UInt32(1) << (i - 2))) != 0 || continue
         isvarargtype(argtypes[i]) && break
@@ -804,12 +885,19 @@ function closed_member_split(interp::AbstractInterpreter, @nospecialize(func), a
             bU === Union{} && !CLOSED_NO_MEMBER[] && (CLOSED_NO_MEMBER_MET[] = true; continue)
         end
         bU === Union{} && return Future(closed_no_member(Union{}))
-        nsplit * n <= MAX_CLOSED_SPLITS || continue
+        nsplit * n <= MAX_CLOSED_SPLITS || (past = true; continue)
         nsplit *= n
         newargs === nothing && (newargs = copy(argtypes))
         newargs[i] = bU
         nargs += 1
         bound = b
+    end
+    if past
+        F = closed_forwarder(applicable)
+        if F !== nothing
+            fcall = closed_forwarder_call(interp, F, arginfo, si, sv)
+            fcall === nothing || return fcall
+        end
     end
     newargs === nothing && return nothing
     # (each branch returns the wrapper of its member only where one argument is split)
@@ -1011,7 +1099,8 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         sbits = closed_sparam_bits(argtypes, matches.applicable) | closed_wrapper_bits(argtypes) |
                 closed_choice_bits(argtypes, matches.applicable)
         if sbits != 0
-            ssplit = closed_member_split(interp, func, arginfo, si, sv, max_methods, sbits, operation)
+            ssplit = closed_member_split(interp, func, arginfo, si, sv, max_methods, sbits, operation,
+                                         matches.applicable)
             ssplit === nothing || return ssplit
         end
     end
