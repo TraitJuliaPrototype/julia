@@ -718,11 +718,10 @@ function closed_choice_bits(argtypes::Vector{Any}, applicable::Vector{MethodMatc
             i <= length(ps) || continue
             p = ps[i]
             isvarargtype(p) && (p = unwrapva(p))
-            q = unwrap_unionall(p)
             # a method at a set (a subtrait, an intersection) is taken at the set instance, once; a method
             # at a type that is no set takes the members of that type: a struct, a family, a kept form (the
-            # box, the wrappers `Compiled{<:X}`)
-            (closed_kept_form(q) || (q isa DataType && !isabstracttype(q))) || continue
+            # box, the wrappers `Compiled{<:X}`), a union with such a component
+            closed_choosing_type(p) || continue
             if !(T <: rewrap_unionall(p, t.match.spec_types))
                 bits |= UInt32(1) << (i - 2)
                 break
@@ -732,6 +731,14 @@ function closed_choice_bits(argtypes::Vector{Any}, applicable::Vector{MethodMatc
     return bits
 end
 
+# whether a method's type at an argument is no set, so that the member's type chooses it: a struct, a family,
+# a kept form, or a union with such a component (`f::Union{NonlinearFunction, ODEFunction}`); each component
+# read with its own variables
+function closed_choosing_type(@nospecialize(p))
+    q = unwrap_unionall(p)
+    q isa Union && return closed_choosing_type(q.a) || closed_choosing_type(q.b)
+    return closed_kept_form(q) || (q isa DataType && !isabstracttype(q))
+end
 # whether every component of `q` is a kept form, `Dynamic{…}` or `Compiled{…}`
 function closed_kept_form(@nospecialize(q))
     q isa Union && return closed_kept_form(unwrap_unionall(q.a)) && closed_kept_form(unwrap_unionall(q.b))
