@@ -821,7 +821,13 @@ function closed_member_split(interp::AbstractInterpreter, @nospecialize(func), a
     return Future{CallMeta}(call, interp, sv) do call, _, _
         rt = widenconst(call.rt)
         rt === Union{} && return call
-        CallMeta(call.rt, call.exct, call.effects, SplitCallInfo(call.info, rt, true), call.refinements)
+        # past the branches the call raises `MethodError` (a value the build did not count): the branches' call,
+        # inferred at the union of the members, takes that union as all its argument can be, and would claim the
+        # call never throws, so that a call whose result is a constant is dropped and another member's answer is
+        # returned for such a value
+        effects = Effects(call.effects; nothrow = false)
+        CallMeta(call.rt, Union{widenconst(call.exct), MethodError}, effects, SplitCallInfo(call.info, rt, true),
+                 call.refinements)
     end
 end
 
