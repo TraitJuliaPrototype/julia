@@ -16,7 +16,7 @@ using ..Compiler:
      hasintersect, haskey, in, isdefinedglobal, isdispatchelem, isempty, isexpr, iterate, length, map!, max,
      pop!, popfirst!, push!, pushfirst!, reinterpret, reverse!, reverse, setindex!,
      setproperty!, similar, singleton_type, sptypes_from_meth_instance, sp_type_rewrap,
-     unsafe_pointer_to_objref, widenconst, isconcretetype,
+     unsafe_pointer_to_objref, widenconst, isconcretetype, use_const_api,
      # misc
      @nospecialize, @assert, C_NULL
 using ..IRShow: LineInfoNode, print, show, println, append_scopes!, IOContext, IO, normalize_method_name, is_expected_union
@@ -321,11 +321,14 @@ function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance,
             if edge isa CodeInstance
                 haskey(parents, edge) || (parents[edge] = (codeinst, i))
                 edge in inspected && continue
-                edge_mi = get_ci_mi(edge)
-                if edge_mi === edge.def
-                    ci = get(caches, edge_mi, nothing)
-                    ci isa CodeInstance && continue # assume that only this_world matters for trim
-                end
+                # (a constant's code instance needs no code: codegen returns the constant)
+                use_const_api(edge) && continue
+                # Codegen calls an invoke's code instance as itself: one the build did not compile is a
+                # call to code the binary lacks, though its instance has other code (an instance the
+                # build ended between its rounds and inferred again, compiler §7.6): the program would
+                # stop with `MissingCodeError` where it runs the call
+                get(caches, get_ci_mi(edge), nothing) isa CodeInstance &&
+                    (error = "unresolved invoke: the code it names is not compiled, its instance's other code is")
             end
             # TODO: check for calls to Base.atexit?
         elseif isexpr(stmt, :call)
