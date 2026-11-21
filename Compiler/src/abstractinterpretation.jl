@@ -187,14 +187,16 @@ function declared_operation_result(interp::AbstractInterpreter, argtypes::Vector
     end
     rt = nothing
     if entries !== nothing
+        unchecked = false
         for e in entries
             e = e::SimpleVector
             sig = e[2]
             atype <: sig || continue
             r = declared_result_at(sig, e[3], atype)
             rt = rt === nothing ? r : typeintersect(rt, r)
+            unchecked |= operation_entry_unchecked(sig, atype)
         end
-        return rt
+        return unchecked && rt !== nothing && rt !== Any ? UncheckedDeclaredResult(rt) : rt
     end
     (ms === nothing || isempty(ms)) && return nothing
     world = get_inference_world(interp)
@@ -1010,6 +1012,42 @@ function operation_split_type(@nospecialize(atype), closed_rules::Bool)
     return nothing
 end
 
+# a declared result that a member's check does not reach at the call's types (compiler §7.4)
+struct UncheckedDeclaredResult
+    rt::Any
+end
+
+# whether a member's check leaves the operation's result unchecked at the call's types (traits §5.10):
+# the check infers a serving method at the declared signature with the receiver at the member, and not
+# where another argument is declared at a type that is not concrete (an iteration state, a second value
+# of the set, a variable of the operation's own). Read at the declared signature, its variables
+# instantiated where the call fixes them: the receiver is one argument that is not concrete, so a second
+# one leaves the result unchecked (compiler §7.4)
+function operation_entry_unchecked(@nospecialize(sig), @nospecialize(atype))
+    s = unwrap_unionall(sig)
+    if sig isa UnionAll
+        env = ccall(:jl_type_intersection_with_env, Any, (Any, Any), atype, sig)::SimpleVector
+        vals = env[2]::SimpleVector
+        if all(v -> !isa(v, TypeVar), vals)
+            s = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), s, sig, vals)
+        end
+    end
+    s isa DataType || return true
+    n = 0
+    for i in 2:length(s.parameters)
+        p = s.parameters[i]
+        isvarargtype(p) && return true
+        isconcretetype(p) || (n += 1)
+    end
+    return n > 1
+end
+
+# The effects of a call whose result is a declared result its members' own code is not checked against
+# (compiler §7.4): `TRUSTED_CALLABLE` or `TRUSTED_OPERATION`. A closed build leaves no call to dispatch
+# (§7.6): every call runs the instance inferred, and nothing is trusted there
+trusted_effects(interp::AbstractInterpreter, bits::UInt8, effects::Effects = Effects()) =
+    closed_build(interp) ? effects : Effects(effects; trusted = bits)
+
 # a declared result at the call's types: the declared signature's variables instantiated where the
 # call fixes them, else bounded by their bounds
 function declared_result_at(@nospecialize(sig), @nospecialize(rt), @nospecialize(atype))
@@ -1042,8 +1080,11 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     drt = operation ? declared_operation_result(interp, argtypes, atype) : nothing
     if drt !== nothing
         closed_process(interp) && note_closed_operation!(sv)
+        # (a result its members' check does not reach: trusted, compiler §7.4)
+        opeffects = drt isa UncheckedDeclaredResult ? trusted_effects(interp, TRUSTED_OPERATION) : Effects()
+        drt isa UncheckedDeclaredResult && (drt = drt.rt)
         split = operation_split_type(atype, closed_build(interp))
-        split === nothing && return Future(CallMeta(drt, Any, Effects(), DeclaredResultInfo(drt)))
+        split === nothing && return Future(CallMeta(drt, Any, opeffects, DeclaredResultInfo(drt)))
         # asserted, as the compiler's own results are: inferred while the compiler bootstraps itself,
         # an untyped index made `newargs[i]` a dynamic call whose edges any new integer constructor
         # invalidated, and the compiler with it
@@ -1074,7 +1115,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         return Future{CallMeta}(call, interp, sv) do call, _, _
             # (a closed build: the branches' results are forgotten at the declared result, a place)
             closed && closed_note_result!(call.rt, drtbox[])
-            CallMeta(drtbox[], Any, Effects(), SplitCallInfo(call.info, drtbox[], closed))
+            CallMeta(drtbox[], Any, opeffects, SplitCallInfo(call.info, drtbox[], closed))
         end
     end
     # (a closed build lists the methods a call at a value known only by its trait takes, up to the
@@ -1353,6 +1394,19 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         end
 
         rettype, exctype, effects = state.rettype, state.exctype, state.all_effects
+        # a result that rests on a declared result its members' own code does not check holds for the
+        # instance inferred (compiler §7.4). At concrete argument types that instance is the one that
+        # runs: nothing is trusted past the call. Else dispatch may run another instance: the call keeps
+        # the mark, so its callers' and the optimizer's checks see it, and its result is the type alone
+        # (a constant, a field's type or a condition read from the instance at the signature is not
+        # what another instance gives)
+        if is_trusted(effects)
+            if isdispatchtuple(atype)
+                effects = Effects(effects; trusted = 0x00)
+            else
+                rettype = widenconst(rettype)
+            end
+        end
         gfresult[] = CallMeta(rettype, exctype, effects,
                               retinfo, state.slotrefinements)
         return true
@@ -4022,9 +4076,11 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
             args = argtypes_to_type(arginfo.argtypes[2:end])
             if !hasintersect(args, A)
                 # proved outside `A`: the check still runs, and raises, before the call would
-                return Future(CallMeta(Union{}, MethodError, EFFECTS_THROWS, CallableCallInfo(Union{}, A)))
+                # (the function's own code may take them: trusted)
+                return Future(CallMeta(Union{}, MethodError, trusted_effects(interp, TRUSTED_CALLABLE, EFFECTS_THROWS),
+                                       CallableCallInfo(Union{}, A)))
             elseif !(args <: A)
-                return Future(CallMeta(S, Any, Effects(), CallableCallInfo(S, A)))
+                return Future(CallMeta(S, Any, callable_effects(interp, S), CallableCallInfo(S, A)))
             end
         end
         # a closed build (compiler §7.4, §7.6): the call branches over the signature's members, as an
@@ -4033,7 +4089,8 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
             csplit = closed_callable_split(interp, wft, S, arginfo, si, sv, max_methods)
             csplit === nothing || return csplit
         end
-        return Future(CallMeta(S, Any, Effects(), DeclaredResultInfo(S)))
+        # (the arguments are of `A`: no check of them, the result's check alone)
+        return Future(CallMeta(S, Any, callable_effects(interp, S), CallableCallInfo(S, nothing)))
     end
     # a call of a function known only as `Callable`, with no signature (an element of a `Vector{Callable}`):
     # in a closed build it branches over `Callable`'s members by use, its result the join of the branches'
@@ -4102,6 +4159,11 @@ function closed_callable_split(interp::AbstractInterpreter, @nospecialize(ft), @
         CallMeta(rt, Any, Effects(), SplitCallInfo(call.info, S, true))
     end
 end
+
+# A `Callable{A, S}`'s call: its result `S` is checked in the code that calls the function known only by
+# the signature, not in the function's own code; trusted, but where `S` is `Any` (compiler §7.4)
+callable_effects(interp::AbstractInterpreter, @nospecialize(S)) =
+    S === Any ? Effects() : trusted_effects(interp, TRUSTED_CALLABLE)
 
 # whether `T` types a function known only by its signature: `Callable{A, S}`, or an intersection of such
 function callable_set_type(@nospecialize(T))

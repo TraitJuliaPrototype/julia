@@ -34,3 +34,4 @@ function _split_table_miss!(tbl::Compiler.SplitTable, @nospecialize(T))
         (@atomicreplace :acquire_release :monotonic tbl.state old => new).success && return fp
     end
 end
+

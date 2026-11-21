@@ -482,6 +482,11 @@ Dynamic{X}(w::Compiled) where {X} = Dynamic{X}(getfield(w, :object))
 # raises `MethodError`; the compiler inserts the check where it cannot prove them
 _callable_argcheck(@nospecialize(f), @nospecialize(A), @nospecialize(args...)) =
     (isa(args, A) || throw_methoderror(f, args...); nothing)
+# and its result, or the result of a call that passed such a value on to code compiled for the function's
+# own type, is of the type inferred for it, or the call raises the box's `TypeError` (traits §9): the
+# compiler invokes it after the call
+_callable_result(@nospecialize(r), @nospecialize(T)) =
+    isa(r, T) ? r : throw(TypeError(:Callable, T === Nothing ? "end the function with `nothing`" : "", T, r))
 struct UndefKeywordError <: Exception
     var::Symbol
 end
