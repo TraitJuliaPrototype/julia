@@ -553,56 +553,52 @@ function closed_wrapper_bits(argtypes::Vector{Any})
     return bits
 end
 
-# The first argument named by `bits` (bit `i - 2` for the argument `i`) that is typed by a set whose members
-# a closed build can list, with the union of those members of its type (compiler §7.6), and the type that
-# bounds the split's result where each branch returns the wrapper of its member; or typed by the wrapper
-# of a value known only by such a set, with the union of the members' wrappers. The union is `Union{}`
-# where the set has no member of the argument's type: the call raises `MethodError`. `nothing` where
-# there is no such argument.
-function closed_member_types(argtypes::Vector{Any}, bits::UInt32)
-    for i = 2:min(length(argtypes), 33)
-        (bits & (UInt32(1) << (i - 2))) != 0 || continue
-        a = argtypes[i]
-        isvarargtype(a) && break
-        T = widenconst(a)
-        W = closed_wrapper_set(T)
-        if W !== nothing
-            # the wrapper of a value known only by `W`: one branch per member's wrapper. A box or a wrapper
-            # is no wrapper's object (the constructor unwraps both), so neither gives a branch
-            wcands = closed_candidates(W)
-            wcands === nothing && continue
-            CLOSED_CANDIDATE_COUNTS[W] = length(wcands)
-            WU = Union{}
-            nw = 0
-            for C in wcands
-                (C <: W && !(C <: Core.Dynamic) && !(C <: Core.Compiled)) || continue
-                WU = Union{WU, Core.Compiled{C}}
-                nw += 1
-            end
-            nw <= MAX_CLOSED_SPLITS || continue
-            nw == 0 && !CLOSED_NO_MEMBER[] && (CLOSED_NO_MEMBER_MET[] = true; continue)
-            return (i, WU, nothing)
+# The argument `i`, where it is typed by a set whose members a closed build can list: the union of those
+# members of its type (compiler §7.6), their number, and the type that bounds the split's result where each
+# branch returns the wrapper of its member; or typed by the wrapper of a value known only by such a set:
+# the union of the members' wrappers. The union is `Union{}` where the set has no member of the
+# argument's type: the call raises `MethodError`. `nothing` where the argument is neither, or its members
+# are past the bound, or, in the rounds before "no member" is a fact, it has none yet.
+function closed_member_type(argtypes::Vector{Any}, i::Int)
+    a = argtypes[i]
+    isvarargtype(a) && return nothing
+    T = widenconst(a)
+    W = closed_wrapper_set(T)
+    if W !== nothing
+        # the wrapper of a value known only by `W`: one branch per member's wrapper. A box or a wrapper
+        # is no wrapper's object (the constructor unwraps both), so neither gives a branch
+        wcands = closed_candidates(W)
+        wcands === nothing && return nothing
+        CLOSED_CANDIDATE_COUNTS[W] = length(wcands)
+        WU = Union{}
+        nw = 0
+        for C in wcands
+            (C <: W && !(C <: Core.Dynamic) && !(C <: Core.Compiled)) || continue
+            WU = Union{WU, Core.Compiled{C}}
+            nw += 1
         end
-        (isconcretetype(T) || has_free_typevars(T)) && continue
-        u = unwrap_unionall(T)
-        (u isa DataType && ccall(:jl_is_open_set, Cint, (Any,), u) != 0) || continue
-        # its members by use at `T`, and the box where the build forgets one at a place typed by `T`
-        cands = closed_candidates(T)
-        cands === nothing && continue
-        # (the count before the test: a set with no member yet gains them in a later round)
-        CLOSED_CANDIDATE_COUNTS[T] = length(cands)
-        U = Union{}
-        n = 0
-        for C in cands
-            C <: T || continue
-            U = Union{U, C}
-            n += 1
-        end
-        n <= MAX_CLOSED_SPLITS || continue
-        n == 0 && !CLOSED_NO_MEMBER[] && (CLOSED_NO_MEMBER_MET[] = true; continue)
-        return (i, U, closed_wrapper_of(T))
+        nw <= MAX_CLOSED_SPLITS || return nothing
+        nw == 0 && !CLOSED_NO_MEMBER[] && (CLOSED_NO_MEMBER_MET[] = true; return nothing)
+        return (WU, nw, nothing)
     end
-    return nothing
+    (isconcretetype(T) || has_free_typevars(T)) && return nothing
+    u = unwrap_unionall(T)
+    (u isa DataType && ccall(:jl_is_open_set, Cint, (Any,), u) != 0) || return nothing
+    # its members by use at `T`, and the box where the build forgets one at a place typed by `T`
+    cands = closed_candidates(T)
+    cands === nothing && return nothing
+    # (the count before the test: a set with no member yet gains them in a later round)
+    CLOSED_CANDIDATE_COUNTS[T] = length(cands)
+    U = Union{}
+    n = 0
+    for C in cands
+        C <: T || continue
+        U = Union{U, C}
+        n += 1
+    end
+    n <= MAX_CLOSED_SPLITS || return nothing
+    n == 0 && !CLOSED_NO_MEMBER[] && (CLOSED_NO_MEMBER_MET[] = true; return nothing)
+    return (U, n, closed_wrapper_of(T))
 end
 
 # Whether the argument `i` of a call is the object a box holds, `getfield(d::Dynamic, :object)`: never a
@@ -733,23 +729,41 @@ function closed_has_set_argument(argtypes::Vector{Any})
     return false
 end
 
-# The call with its first argument named by `bits` that a closed build can split (`closed_member_types`)
-# at the union of the set's members, each branch the call at a member's type, past them the
-# `MethodError` (compiler §7.6); `nothing` where no argument can be split.
+# The call with each argument named by `bits` that a closed build can split (`closed_member_type`) at the
+# union of its set's members: the call branches over each, each branch the call at the members' types,
+# past them the `MethodError` (compiler §7.6). The branches are the product of the arguments' members:
+# taken in order while the product stays within `MAX_CLOSED_SPLITS`, an argument past it left as it is.
+# `nothing` where no argument can be split.
 function closed_member_split(interp::AbstractInterpreter, @nospecialize(func), arginfo::ArgInfo,
                              si::StmtInfo, sv::AbsIntState, max_methods::Int, bits::UInt32, operation::Bool)
     argtypes = arginfo.argtypes
-    bsplit = closed_member_types(argtypes, bits)
-    bsplit === nothing && return nothing
-    bi, bU, bound = bsplit::Tuple{Int,Type,Any}
-    if bU !== Union{} && closed_box_object(arginfo, bi, sv)
-        bU = closed_drop_boxes(bU)
-        # (no member but a box, in the rounds before "no member" is a fact: the call as it is)
-        bU === Union{} && !CLOSED_NO_MEMBER[] && (CLOSED_NO_MEMBER_MET[] = true; return nothing)
+    newargs = nothing
+    bound = nothing
+    nsplit = unionsplitcost(typeinf_lattice(interp), argtypes)
+    nargs = 0
+    for i = 2:min(length(argtypes), 33)
+        (bits & (UInt32(1) << (i - 2))) != 0 || continue
+        isvarargtype(argtypes[i]) && break
+        bsplit = closed_member_type(argtypes, i)
+        bsplit === nothing && continue
+        bU, n, b = bsplit::Tuple{Type,Int,Any}
+        if bU !== Union{} && closed_box_object(arginfo, i, sv)
+            bU = closed_drop_boxes(bU)
+            n = length(uniontypes(bU))
+            # (no member but a box, in the rounds before "no member" is a fact: the argument as it is)
+            bU === Union{} && !CLOSED_NO_MEMBER[] && (CLOSED_NO_MEMBER_MET[] = true; continue)
+        end
+        bU === Union{} && return Future(closed_no_member(Union{}))
+        nsplit * n <= MAX_CLOSED_SPLITS || continue
+        nsplit *= n
+        newargs === nothing && (newargs = copy(argtypes))
+        newargs[i] = bU
+        nargs += 1
+        bound = b
     end
-    bU === Union{} && return Future(closed_no_member(Union{}))
-    newargs = copy(argtypes)
-    newargs[bi] = bU
+    newargs === nothing && return nothing
+    # (each branch returns the wrapper of its member only where one argument is split)
+    nargs == 1 || (bound = nothing)
     call = abstract_call_gf_by_type(interp, func, ArgInfo(nothing, newargs), si,
                                     argtypes_to_type(newargs), sv, max_methods;
                                     max_union_splitting = MAX_CLOSED_SPLITS,
@@ -917,6 +931,10 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
             CallMeta(drtbox[], Any, Effects(), SplitCallInfo(call.info, drtbox[], closed))
         end
     end
+    # (a closed build lists the methods a call at a value known only by its trait takes, up to the
+    # bound of a split, not Julia's few: the methods are final, §7.6)
+    closedset = closed_build(interp) && member_split && closed_has_set_argument(argtypes)
+    closedset && (max_methods = max(max_methods, MAX_CLOSED_SPLITS))
     matches = find_method_matches(interp, argtypes, atype; max_methods, max_union_splitting)
     # (in a closed build, a call at a value known only by its trait is one a later member may resolve)
     closed_process(interp) && closed_has_set_argument(argtypes) && note_closed_operation!(sv)
