@@ -1516,8 +1516,10 @@ static void jl_compilation_sig(
             }
         }
 
+        // (not an argument declared at a set, `Callable{A, S}`: how it is compiled is the set's rule,
+        // compiler §6.3, and `Function` is merely one of its members)
         int notcalled_func = (i_arg > 0 && i_arg <= 8 && !(definition->called & (1 << (i_arg - 1))) &&
-                              !jl_has_free_typevars(decl_i) &&
+                              !jl_has_free_typevars(decl_i) && !is_trait_arg_type(decl_i) &&
                               jl_subtype(elt, (jl_value_t*)jl_function_type));
         if (notcalled_func && (jl_subtype((jl_value_t*)jl_function_type, type_i))) {
             // and attempt to despecialize types marked as a supertype of Function (i.e.
@@ -1750,8 +1752,9 @@ JL_DLLEXPORT int jl_isa_compileable_sig(
             continue;
         }
 
+        // (not an argument declared at a set: as in `jl_compilation_sig`)
         int notcalled_func = (i_arg > 0 && i_arg <= 8 && !(definition->called & (1 << (i_arg - 1))) &&
-                              !jl_has_free_typevars(decl_i) &&
+                              !jl_has_free_typevars(decl_i) && !is_trait_arg_type(decl_i) &&
                               jl_subtype(elt, (jl_value_t*)jl_function_type));
         if (notcalled_func && jl_subtype((jl_value_t*)jl_function_type, type_i)) {
             // and attempt to despecialize types marked as a supertype of Function (i.e.
