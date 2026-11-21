@@ -267,7 +267,9 @@ function declared_field_in(@nospecialize(c), name::Symbol, depth::Int)
                     nk = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), nk, tn.wrapper, c.parameters)
                 end
                 nk === name || continue
-                T = df[2][k]
+                # (the types' vector asserted: an untyped read is a call left to run time, which taints the
+                # lookup's effects, so a check under an overlay of methods does not evaluate it, §2.7)
+                T = (df[2]::SimpleVector)[k]
                 has_free_typevars(T) || return T
                 return ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), T, tn.wrapper, c.parameters)
             end
