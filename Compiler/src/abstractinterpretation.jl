@@ -3872,7 +3872,7 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
         # where inference cannot prove them; an intersection's component is chosen by the arguments
         A = callable_args(wft)
         if A !== nothing
-            args = argtypes_to_type(Any[widenconst(a) for a in arginfo.argtypes[2:end]])
+            args = argtypes_to_type(arginfo.argtypes[2:end])
             if !hasintersect(args, A)
                 # proved outside `A`: the check still runs, and raises, before the call would
                 return Future(CallMeta(Union{}, MethodError, EFFECTS_THROWS, CallableCallInfo(Union{}, A)))
@@ -3985,7 +3985,7 @@ function callable_result(@nospecialize(ft), argtypes::Vector{Any})
     elseif u.name === unwrap_unionall(Core.All).name
         tup = u.parameters[1]
         tup isa DataType || return nothing
-        args = argtypes_to_type(Any[widenconst(a) for a in argtypes[2:end]])
+        args = argtypes_to_type(argtypes[2:end])
         for c in tup.parameters
             cu = unwrap_unionall(c)
             cu isa DataType || continue
