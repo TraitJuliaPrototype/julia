@@ -683,7 +683,7 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
             if fallback_rt !== nothing && !⊑(optimizer_lattice(interp), argextype(val, compact), fallback_rt)
                 # a case whose result is not known to be the declared result asserts it
                 val = insert_node_here!(compact, NewInstruction(
-                    Expr(:call, GlobalRef(Core, :typeassert), val, fallback_rt), fallback_rt, line))
+                    trusted_result_check(val, fallback_rt, trusted, get_inference_world(interp)), fallback_rt, line))
             end
             push!(pn.edges, bb)
             push!(pn.values, val)
@@ -711,7 +711,7 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
             ssa = split_table_call!(compact, argexprs, table::SplitTable, fp, line)
             if fallback_rt !== nothing
                 ssa = insert_node_here!(compact, NewInstruction(
-                    Expr(:call, GlobalRef(Core, :typeassert), ssa, fallback_rt), fallback_rt, line))
+                    trusted_result_check(ssa, fallback_rt, trusted, get_inference_world(interp)), fallback_rt, line))
             end
             push!(pn.edges, dyn_bb - 1)
             push!(pn.values, ssa)
@@ -731,7 +731,7 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
         if fallback_rt !== nothing
             # the split's last branch: the dynamic call, its result asserted to the declared result
             ssa = insert_node_here!(compact, NewInstruction(
-                Expr(:call, GlobalRef(Core, :typeassert), ssa, fallback_rt), fallback_rt, line))
+                trusted_result_check(ssa, fallback_rt, trusted, get_inference_world(interp)), fallback_rt, line))
         end
         push!(pn.edges, bb)
         push!(pn.values, ssa)
@@ -1615,11 +1615,17 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
     cases, handled_all_cases, fully_covered, joint_effects = cases
     atype = argtypes_to_type(sig.argtypes)
     atype === Union{} && return nothing # accidentally actually unreachable
-    # an operation's split (compiler §7.2): never fully covered, its branches asserted
+    # an operation's split (compiler §7.2): never fully covered, its branches asserted; a `Callable`'s (a closed
+    # build's, §7.6) checked as the box's call checks (traits §9)
     fallback_rt = split ? info.rt : nothing
+    kind = split && callable_set_type(widenconst(sig.ft)) ? IR_FLAG_TRUSTED_CALLABLE : UInt32(0)
     # (a closed build's split with no branch, a set with no member: the `MethodError` below, §7.6)
     if fallback_rt !== nothing && isempty(cases) && !((info::SplitCallInfo).closed && handled_all_cases)
-        handle_declared_result!(ir, idx, stmt, DeclaredResultInfo(fallback_rt))
+        inst = ir[SSAValue(idx)]
+        call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], nothing))
+        inst[:stmt] = trusted_result_check(call, fallback_rt, kind, state.world)
+        inst[:info] = NoCallInfo()
+        inst[:flag] = IR_FLAG_NULL
         return nothing
     end
     table = fallback_rt === nothing ? nothing : split_fallback_table(sig, fallback_rt, closed_build(state.interp))
@@ -1643,7 +1649,7 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
     # raises the `MethodError`, and no call is left to dispatch when the program runs
     closed = split && (info::SplitCallInfo).closed && handled_all_cases
     handle_cases!(todo, ir, idx, stmt, atype, cases, fallback_rt === nothing ? handled_all_cases : closed,
-                  fallback_rt === nothing ? fully_covered : false, joint_effects, fallback_rt, table)
+                  fallback_rt === nothing ? fully_covered : false, joint_effects, fallback_rt, table, kind)
 end
 
 """
@@ -1770,7 +1776,8 @@ end
 
 function handle_cases!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::Int, stmt::Expr,
     @nospecialize(atype), cases::Vector{InliningCase}, handled_all_cases::Bool, fully_covered::Bool,
-    joint_effects::Effects, @nospecialize(fallback_rt = nothing), @nospecialize(table = nothing))
+    joint_effects::Effects, @nospecialize(fallback_rt = nothing), @nospecialize(table = nothing),
+    kind::UInt32 = UInt32(0))
     # If we only have one case and that case is fully covered, we may either
     # be able to do the inlining now (for constant cases), or push it directly
     # onto the todo list
@@ -1781,7 +1788,7 @@ function handle_cases!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::Int, stmt::
         for case in cases
             isa(case.sig, DataType) || return nothing
         end
-        push!(todo, idx=>UnionSplit(handled_all_cases, fully_covered, atype, cases, fallback_rt, table))
+        push!(todo, idx=>UnionSplit(handled_all_cases, fully_covered, atype, cases, fallback_rt, table, kind))
     else
         add_flag!(ir[SSAValue(idx)], flags_for_effects(joint_effects))
     end
