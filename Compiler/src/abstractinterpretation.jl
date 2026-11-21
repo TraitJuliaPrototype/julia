@@ -482,8 +482,25 @@ function closed_candidates(@nospecialize(p))
     return out
 end
 function closed_reaches(@nospecialize(T), R::IdSet{Any})
-    for P in CLOSED_USED_AT[T]
+    at = get(CLOSED_USED_AT, T, nothing)
+    at === nothing && return false
+    for P in at
         P in R && return true
+    end
+    return false
+end
+# Whether the concrete type `m`'s entry in force in the set `X` leaves an input of the set free (its
+# instance has a variable: `@implement Callable T`, the instance `Callable{A, S} where {A, S}`), so that
+# `m` is a member of more than one instance (compiler §7.6)
+function closed_entry_free(@nospecialize(m), @nospecialize(X))
+    m isa DataType || return false
+    xn = (unwrap_unionall(X)::DataType).name
+    for e in getfield(m.name, :memberships, :acquire)::SimpleVector
+        e = e::Core.MembershipEntry
+        (e.set === xn && e.member === m) || continue
+        getfield(e, :max_world, :monotonic) == typemax(UInt) || continue
+        inst = e.instance
+        (inst isa UnionAll || has_free_typevars(inst)) && return true
     end
     return false
 end
@@ -492,7 +509,14 @@ function closed_candidates_in(@nospecialize(X), R::IdSet{Any}, out::Vector{Any},
     pats = ccall(:jl_set_member_patterns, Any, (Any,), X)::Vector{Any}
     for m in pats
         if isconcretetype(m)
-            any(c -> c === m, out) || push!(out, m)
+            any(c -> c === m, out) && continue
+            # an entry that leaves the set's inputs free makes the type a member of every instance
+            # (`@implement Callable T`): a member by use at each, as a family's member is
+            if closed_entry_free(m, X)
+                closed_reaches(m, R) && push!(out, m)
+            else
+                push!(out, m)
+            end
             continue
         end
         u = unwrap_unionall(m)
@@ -3888,6 +3912,16 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
         end
         return Future(CallMeta(S, Any, Effects(), DeclaredResultInfo(S)))
     end
+    # a call of a function known only as `Callable`, with no signature (an element of a `Vector{Callable}`):
+    # in a closed build it branches over `Callable`'s members by use, its result the join of the branches'
+    # (compiler §7.6). There is no `A` or `S` to check
+    if callable_set_type(wft)
+        closed_process(interp) && note_closed_operation!(sv)
+        if closed_build(interp)
+            csplit = closed_callable_split(interp, wft, nothing, arginfo, si, sv, max_methods)
+            csplit === nothing || return csplit
+        end
+    end
     if hasintersect(wft, Builtin)
         add_remark!(interp, sv, "Could not identify method table for call")
         return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
@@ -3907,8 +3941,9 @@ end
 # A closed build's call of a function known only as `Callable{A, S}` (or an intersection of such), its
 # arguments of `A` (compiler §7.4, §7.6): split over the set type's members, each branch the call at the
 # member's type, its result asserted to `S`; past the branches the `MethodError`. The object a box holds
-# has no box branch. `nothing` where the members cannot be listed, or are past the bound, or none is
-# known yet before "no member" is a fact.
+# has no box branch. `S === nothing`: a function known only as `Callable` with no signature, the result
+# the join of the branches'. `nothing` where the members cannot be listed, or are past the bound, or none
+# is known yet before "no member" is a fact.
 function closed_callable_split(interp::AbstractInterpreter, @nospecialize(ft), @nospecialize(S),
                                arginfo::ArgInfo, si::StmtInfo, sv::AbsIntState, max_methods::Int)
     (isconcretetype(ft) || has_free_typevars(ft)) && return nothing
@@ -3926,7 +3961,7 @@ function closed_callable_split(interp::AbstractInterpreter, @nospecialize(ft), @
     U !== Union{} && closed_box_object(arginfo, 1, sv) && (U = closed_drop_boxes(U))
     if U === Union{}
         CLOSED_NO_MEMBER[] || (CLOSED_NO_MEMBER_MET[] = true; return nothing)
-        return Future(closed_no_member(S))
+        return Future(closed_no_member(S === nothing ? Any : S))
     end
     newargs = copy(arginfo.argtypes)
     newargs[1] = U
@@ -3937,6 +3972,8 @@ function closed_callable_split(interp::AbstractInterpreter, @nospecialize(ft), @
     Sbox = RefValue{Any}(S)
     return Future{CallMeta}(call, interp, sv) do call, _, _
         S = Sbox[]
+        # (no signature: the join of the branches, nothing to assert)
+        S === nothing && return CallMeta(call.rt, Any, Effects(), SplitCallInfo(call.info, Any, true))
         rt = widenconst(call.rt) <: S ? call.rt : S
         CallMeta(rt, Any, Effects(), SplitCallInfo(call.info, S, true))
     end
