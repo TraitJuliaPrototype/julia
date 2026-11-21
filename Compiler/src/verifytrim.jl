@@ -5,9 +5,9 @@ import ..Compiler: verify_typeinf_trim, NativeInterpreter, argtypes_to_type, com
 
 using ..Compiler:
      # operators
-     !, !=, !==, %, -, +, :, <, <=, ==, =>, >, >=, ^, ∈, ∉,
+     !, !=, !==, %, -, +, :, <, <=, ==, =>, >, >=, ^, ∈, ∉, &, |,
      # types
-     Array, Builtin, Callable, Cint, CodeInfo, CodeInstance, Csize_t, Exception,
+     Array, Builtin, Callable, Cint, CodeInfo, CodeInstance, Csize_t, Exception, UInt8,
      GenericMemory, GlobalRef, IdDict, IdSet, IntrinsicFunction, Method, MethodInstance,
      NamedTuple, Pair, PhiCNode, PhiNode, PiNode, QuoteNode, SSAValue, SimpleVector, String,
      Tuple, VarState, Vector,
@@ -16,7 +16,7 @@ using ..Compiler:
      hasintersect, haskey, in, isdefinedglobal, isdispatchelem, isempty, isexpr, iterate, length, map!, max,
      pop!, popfirst!, push!, pushfirst!, reinterpret, reverse!, reverse, setindex!,
      setproperty!, similar, singleton_type, sptypes_from_meth_instance, sp_type_rewrap,
-     unsafe_pointer_to_objref, widenconst, isconcretetype, use_const_api,
+     unsafe_pointer_to_objref, widenconst, isconcretetype, use_const_api, mi_policy_facts_at, ci_policy_facts,
      # misc
      @nospecialize, @assert, C_NULL
 using ..IRShow: LineInfoNode, print, show, println, append_scopes!, IOContext, IO, normalize_method_name, is_expected_union
@@ -288,7 +288,8 @@ function may_dispatch(@nospecialize ftyp)
     end
 end
 
-function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance, codeinfo::CodeInfo, inspected::IdSet{CodeInstance}, caches::IdDict{MethodInstance,CodeInstance}, parents::ParentMap, errors::ErrorList)
+function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance, codeinfo::CodeInfo, inspected::IdSet{CodeInstance}, caches::IdDict{MethodInstance,CodeInstance}, parents::ParentMap, errors::ErrorList,
+                              policies::IdDict{MethodInstance,UInt8} = IdDict{MethodInstance,UInt8}())
     mi = get_ci_mi(codeinst)
     # The dynamic call of a `@threads` loop body is checked where the loop starts instead.
     is_threads_call_def(mi.def) && return
@@ -323,12 +324,17 @@ function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance,
                 edge in inspected && continue
                 # (a constant's code instance needs no code: codegen returns the constant)
                 use_const_api(edge) && continue
-                # Codegen calls an invoke's code instance as itself: one the build did not compile is a
-                # call to code the binary lacks, though its instance has other code (an instance the
-                # build ended between its rounds and inferred again, compiler §7.6): the program would
-                # stop with `MissingCodeError` where it runs the call
-                get(caches, get_ci_mi(edge), nothing) isa CodeInstance &&
-                    (error = "unresolved invoke: the code it names is not compiled, its instance's other code is")
+                # Codegen calls an invoke's code instance as itself; one the build did not compile (an
+                # instance the build ended between its rounds and inferred again, compiler §7.6) is
+                # called through `jl_invoke` at the policy of the code it names, which runs the
+                # instance's code of the policy that call asks (compiler §2.4). Resolved only where the
+                # build compiles such code, valid in its world; else the program stops with
+                # `MissingCodeError` where it runs the call
+                emi = get_ci_mi(edge)
+                want = edge.owner === nothing ? (mi_policy_facts_at(emi, ci_policy_facts(edge)) ? 0x02 : 0x01) : 0x03
+                (get(policies, emi, 0x00) & want) != 0x00 && continue
+                get(caches, emi, nothing) isa CodeInstance &&
+                    (error = "unresolved invoke: neither the code it names nor its instance's code of the policy it asks is compiled")
             end
             # TODO: check for calls to Base.atexit?
         elseif isexpr(stmt, :call)
@@ -455,6 +461,8 @@ function get_verify_typeinf_trim(codeinfos::Vector{Any}, @nospecialize(owner = n
     interp = owner === nothing ? NativeInterpreter(this_world) : NativeInterpreter(this_world; closed = owner)
     inspected = IdSet{CodeInstance}()
     caches = IdDict{MethodInstance,CodeInstance}()
+    # the policies of each instance's compiled code valid in this world: bit 1 plain, bit 2 facts
+    policies = IdDict{MethodInstance,UInt8}()
     errors = ErrorList()
     parents = ParentMap()
     for i = 1:length(codeinfos)
@@ -466,6 +474,7 @@ function get_verify_typeinf_trim(codeinfos::Vector{Any}, @nospecialize(owner = n
                 if mi === item.def
                     caches[mi] = item
                 end
+                policies[mi] = get(policies, mi, 0x00) | (item.owner === nothing && ci_policy_facts(item) ? 0x02 : 0x01)
             end
         end
     end
@@ -473,7 +482,7 @@ function get_verify_typeinf_trim(codeinfos::Vector{Any}, @nospecialize(owner = n
         item = codeinfos[i]
         if item isa CodeInstance
             src = codeinfos[i + 1]::CodeInfo
-            verify_codeinstance!(interp, item, src, inspected, caches, parents, errors)
+            verify_codeinstance!(interp, item, src, inspected, caches, parents, errors, policies)
         elseif item isa SimpleVector
             rt = item[1]::Type
             sig = item[2]::Type
