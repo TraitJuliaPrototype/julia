@@ -2135,8 +2135,12 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
                      " types forgotten, ", nflows, " flows between places")
         for (X, n) in CLOSED_CANDIDATE_COUNTS
             c = closed_candidates(X)
-            Core.println(Core.stderr, "  ", X, ": split with ", n, " members; it has ", c === nothing ? "?" : length(c))
-            c === nothing || for T in c
+            # (its members of its type, as the check lists them: a box that reaches a place by a flow from a wider
+            # place is a candidate, and of the set's type only where it is a box of it)
+            m = c === nothing ? nothing : Any[T for T in c if T <: X]
+            Core.println(Core.stderr, "  ", X, ": split with ", n, " candidates; it has ", c === nothing ? "?" : length(c),
+                         ", members of its type ", m === nothing ? "?" : length(m))
+            m === nothing || for T in m
                 Core.println(Core.stderr, "    ", T)
             end
         end
