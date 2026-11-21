@@ -489,18 +489,23 @@ function closed_reaches(@nospecialize(T), R::IdSet{Any})
     end
     return false
 end
-# Whether the concrete type `m`'s entry in force in the set `X` leaves an input of the set free (its
-# instance has a variable: `@implement Callable T`, the instance `Callable{A, S} where {A, S}`), so that
-# `m` is a member of more than one instance (compiler §7.6)
+# Whether the concrete type `m`'s entry in force in the set `X` leaves an input of the set free (the
+# instance has a variable at an input parameter: `@implement Callable T`, the instance `Callable{A, S}
+# where {A, S}`), so that `m` is a member of every instance at those inputs (compiler §4.6, §7.6)
 function closed_entry_free(@nospecialize(m), @nospecialize(X))
     m isa DataType || return false
     xn = (unwrap_unionall(X)::DataType).name
+    inputs = getfield(xn, :input_params)::UInt8
+    inputs == 0x00 && return false
     for e in getfield(m.name, :memberships, :acquire)::SimpleVector
         e = e::Core.MembershipEntry
         (e.set === xn && e.member === m) || continue
         getfield(e, :max_world, :monotonic) == typemax(UInt) || continue
-        inst = e.instance
-        (inst isa UnionAll || has_free_typevars(inst)) && return true
+        u = unwrap_unionall(e.instance)
+        u isa DataType || continue
+        for i = 1:min(length(u.parameters), 8)
+            ((inputs >> (i - 1)) & 0x01) == 0x01 && u.parameters[i] isa TypeVar && return true
+        end
     end
     return false
 end
@@ -653,6 +658,20 @@ function closed_drop_boxes(@nospecialize(U))
         (C isa DataType && C.name === (Core.Dynamic::UnionAll).body.name) || (V = Union{V, C})
     end
     return V
+end
+
+# The result of an operation's call is typed by the declared result (§7.1): in a closed build the branches'
+# results are values forgotten at a place of that type (compiler §7.6). Noted while inferring: the optimizer
+# may inline a lone branch, after which no statement of the code forgets its value (`linfactor(ls, W)`, its
+# result typed `Solvable{Float64}`, the one member's `LU` passed straight to `ldiv!`).
+function closed_note_result!(@nospecialize(rt), @nospecialize(P))
+    R = widenconst(rt)
+    (R isa Type && P isa Type && R !== Union{} && !has_free_typevars(P)) || return nothing
+    n = CLOSED_USED_PAIRS[]
+    note_used_type!(R, P)
+    note_closed_flow!(R, P)
+    CLOSED_USED_PAIRS[] > n && empty!(CLOSED_CANDIDATES_MEMO)
+    return nothing
 end
 
 # A closed build's call at a value known only by its trait, with no member of the value's type (compiler
@@ -959,6 +978,8 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         # compiled in each session for each declared result)
         drtbox = RefValue{Any}(drt)
         return Future{CallMeta}(call, interp, sv) do call, _, _
+            # (a closed build: the branches' results are forgotten at the declared result, a place)
+            closed && closed_note_result!(call.rt, drtbox[])
             CallMeta(drtbox[], Any, Effects(), SplitCallInfo(call.info, drtbox[], closed))
         end
     end
@@ -3981,6 +4002,7 @@ function closed_callable_split(interp::AbstractInterpreter, @nospecialize(ft), @
         S = Sbox[]
         # (no signature: the join of the branches, nothing to assert)
         S === nothing && return CallMeta(call.rt, Any, Effects(), SplitCallInfo(call.info, Any, true))
+        closed_note_result!(call.rt, S)
         rt = widenconst(call.rt) <: S ? call.rt : S
         CallMeta(rt, Any, Effects(), SplitCallInfo(call.info, S, true))
     end
