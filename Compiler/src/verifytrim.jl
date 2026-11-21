@@ -445,8 +445,9 @@ end
 
 ## entry-point ##
 
-function get_verify_typeinf_trim(codeinfos::Vector{Any}, @nospecialize(owner = nothing))
-    this_world = get_world_counter()
+function get_verify_typeinf_trim(codeinfos::Vector{Any}, @nospecialize(owner = nothing),
+                                 this_world::UInt = get_world_counter())
+    # (a check run in a session verifies in the world it inferred in: later worlds bound its code's)
     # (a check's verifier looks methods up as the check inferred them: through its overlay)
     interp = owner === nothing ? NativeInterpreter(this_world) : NativeInterpreter(this_world; closed = owner)
     inspected = IdSet{CodeInstance}()

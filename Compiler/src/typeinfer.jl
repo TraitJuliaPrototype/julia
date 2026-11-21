@@ -1861,7 +1861,11 @@ function closed_note_value!(@nospecialize(x), @nospecialize(P), src::CodeInfo, s
         closed_note_constant!(t.val, P, 0)
     else
         t = widenconst(t)
-        t isa Type && P isa Type && note_used_type!(t, P)
+        if t isa Type && P isa Type
+            note_used_type!(t, P)
+            # and a value whose type is lost already, passed on: its place flows to `P`
+            note_closed_flow!(t, P)
+        end
     end
     return nothing
 end
@@ -1885,27 +1889,26 @@ function closed_note_constant!(@nospecialize(v), @nospecialize(P), depth::Int)
     return nothing
 end
 
-# Between the rounds of a closed build: the round's instances that invoke an instance inferred again
-# are inferred again too, and so on up. A caller kept over an equal result (the code slot, §3.3) would
-# go on invoking the instance with the fewer members.
+# Between the rounds of a closed build: the round's instances that invoke an instance inferred again, or
+# hold its code inlined, are inferred again too, and so on up. A caller kept over an equal result (the
+# code slot, §3.3) would go on invoking the instance with the fewer members. A caller is found by its
+# edges, which name the callees it invokes and those it inlined; an edge is matched by its method
+# instance, since a callee inferred with constants is a code instance of its own.
 function closed_invalidate_callers!(codeinfos::Vector{Any}, stale::IdSet{Any}, world::UInt, @nospecialize(owner = nothing))
+    stale_mis = IdSet{Any}()
+    for ci in stale
+        ci isa CodeInstance && push!(stale_mis, get_ci_mi(ci))
+    end
     changed = true
     while changed
         changed = false
-        callee = nothing
-        for item in codeinfos
-            if item isa CodeInstance
-                callee = item
-                continue
-            end
-            (item isa CodeInfo && callee isa CodeInstance && !(callee in stale)) || continue
-            for stmt in item.code
-                isexpr(stmt, :(=)) && (stmt = stmt.args[2])
-                (isexpr(stmt, :invoke) && stmt.args[1] in stale) || continue
+        for callee in codeinfos
+            (callee isa CodeInstance && !(callee in stale) && isdefined(callee, :edges)) || continue
+            for e in callee.edges
+                (e isa CodeInstance ? get_ci_mi(e) : e) in stale_mis || continue
                 push!(stale, callee)
-                if callee.owner === owner && callee.max_world == typemax(UInt)
-                    ccall(:jl_invalidate_code_instance, Cvoid, (Any, UInt), callee, world - 1)
-                end
+                push!(stale_mis, get_ci_mi(callee))
+                callee.owner === owner && closed_end_code!(callee, world)
                 changed = true
                 break
             end
@@ -1958,9 +1961,8 @@ function closed_note_used!(codeinfos::Vector{Any})
                 end
             elseif stmt isa PiNode
                 # a value of a known type taken at a type that does not keep it (`x::Shape` at a `Circle`);
-                # and a test that narrows a wider value to a type under a set: an entry into the set
+                # and a test that narrows a wider value: its place flows to the narrowed type's
                 closed_note_value!(stmt.val, widenconst(stmt.typ), src, sptypes, argts)
-                note_closed_entry!(widenconst(argextype(stmt.val, src, sptypes, argts)), widenconst(stmt.typ))
             elseif isexpr(stmt, :new)
                 T = widenconst(tys[i])
                 if T isa DataType && isconcretetype(T)
@@ -1986,7 +1988,6 @@ function closed_note_used!(codeinfos::Vector{Any})
                 f = singleton_type(ft)
                 if f === typeassert && length(stmt.args) >= 3
                     closed_note_value!(stmt.args[2], widenconst(tys[i]), src, sptypes, argts)
-                    note_closed_entry!(widenconst(argextype(stmt.args[2], src, sptypes, argts)), widenconst(tys[i]))
                 elseif (f === Core.memoryrefset! || f === Core.memoryrefswap!) && length(stmt.args) >= 3
                     R = widenconst(argextype(stmt.args[2], src, sptypes, argts))
                     R isa DataType && R <: GenericMemoryRef && closed_note_value!(stmt.args[3], R.parameters[2], src, sptypes, argts)
@@ -2003,6 +2004,14 @@ function closed_note_used!(codeinfos::Vector{Any})
     grew = CLOSED_USED_PAIRS[] > n
     grew && empty!(CLOSED_CANDIDATES_MEMO)
     return grew
+end
+
+# Whether a closed build infers its splits again with "no member" as a fact (compiler §7.6): where no round
+# adds a member and a split with no member was met
+function closed_no_member_round(rounds::Int)
+    (rounds < 16 && !CLOSED_NO_MEMBER[] && CLOSED_NO_MEMBER_MET[]) || return false
+    CLOSED_NO_MEMBER[] = true
+    return true
 end
 
 # This is a bridge for the C code calling `jl_typeinf_func()` on set of Method matches
@@ -2079,6 +2088,7 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
         try
             closed_note_used!(codeinfos)
             again = rounds < 16 && closed_candidates_grew()
+            again || (again = closed_no_member_round(rounds))
         finally
             ccall(:jl_set_membership_query_world, UInt, (UInt,), mq)
         end
@@ -2091,8 +2101,12 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
     # the build's report of its sets (compiler §7.6), asked for by `JULIA_CLOSED_BUILD_REPORT`
     if trim_mode != TRIM_NO && latest > 0 && ccall(:getenv, Ptr{UInt8}, (Ptr{UInt8},), "JULIA_CLOSED_BUILD_REPORT") != C_NULL
         mq = ccall(:jl_set_membership_query_world, UInt, (UInt,), latest)
+        nflows = 0
+        for (_, from) in CLOSED_FLOWS
+            nflows += length(from)
+        end
         Core.println(Core.stderr, "closed build: ", rounds + 1, " rounds, ", length(CLOSED_USED_TYPES),
-                     " types forgotten, ", length(CLOSED_ENTRIES) ÷ 2, " entries by a test")
+                     " types forgotten, ", nflows, " flows between places")
         for (X, n) in CLOSED_CANDIDATE_COUNTS
             c = closed_candidates(X)
             Core.println(Core.stderr, "  ", X, ": split with ", n, " members; it has ", c === nothing ? "?" : length(c))
@@ -2125,13 +2139,14 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
 end
 
 """
-    closed_check(mis::Vector{Any}, world::UInt, overlay = nothing) -> (errors, parents)
+    closed_check(mis::Vector{Any}, world::UInt, overlay = nothing) -> (errors, parents, members, rounds)
 
 The closed build's check, run in a session (compiler §2.7, §7.6): the method instances `mis` and what
 they reach are inferred by a closed build's rules, every method plainly, in the build's rounds, into
 a cache of their own, and verified by the build's verifier. `errors` lists the calls a build from
 `mis` would refuse (`TrimVerifier.CallMissing`, each with `false` for an error, `true` for a call
-that only raises); `parents` gives each instance's caller. The session's code is not touched: the
+that only raises); `parents` gives each instance's caller; `members` each set type a split was made
+at, with its members of that type; `rounds` the number of rounds. The session's code is not touched: the
 check's code has an owner of its own, a fresh object. `overlay` holds the methods the build replaces
 in Base: the check infers and verifies with them laid over the session's.
 """
@@ -2154,19 +2169,29 @@ function closed_check(mis::Vector{Any}, world::UInt, overlay::Union{Nothing,Meth
             compile!(codeinfos, workqueue; invokelatest_queue = latest_queue, external_linkage = false)
             compile!(codeinfos, latest_queue; invokelatest_queue = latest_queue, external_linkage = false)
             closed_note_used!(codeinfos)
-            (rounds < 16 && closed_candidates_grew()) || break
+            (rounds < 16 && closed_candidates_grew()) || closed_no_member_round(rounds) || break
             rounds += 1
             stale = IdSet{Any}()
             closed_build_reinfer!(world, stale, owner)
             closed_invalidate_callers!(codeinfos, stale, world, owner)
         end
-        return Core._call_in_world(_verify_trim_world_age[], TrimVerifier.get_verify_typeinf_trim, codeinfos, owner)
+        # each set type a split was made at, with its members of that type
+        members = Pair{Any,Vector{Any}}[]
+        for (X, _) in CLOSED_CANDIDATE_COUNTS
+            c = closed_candidates(X)
+            c === nothing && continue
+            mx = Any[]
+            for C in c
+                C <: X && push!(mx, C)
+            end
+            push!(members, Pair{Any,Vector{Any}}(X, mx))
+        end
+        errors, parents = Core._call_in_world(_verify_trim_world_age[], TrimVerifier.get_verify_typeinf_trim, codeinfos, owner, world)
+        return errors, parents, members, rounds + 1
     finally
         # the check's code ends with the check
         for item in codeinfos
-            if item isa CodeInstance && item.owner === owner && item.max_world == typemax(UInt)
-                ccall(:jl_invalidate_code_instance, Cvoid, (Any, UInt), item, world - 1)
-            end
+            item isa CodeInstance && item.owner === owner && closed_end_code!(item, world)
         end
         empty!(CLOSED_OPERATION_INSTANCES)
         closed_used_reset!()

@@ -1610,7 +1610,8 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
     atype === Union{} && return nothing # accidentally actually unreachable
     # an operation's split (compiler §7.2): never fully covered, its branches asserted
     fallback_rt = split ? info.rt : nothing
-    if fallback_rt !== nothing && isempty(cases)
+    # (a closed build's split with no branch, a set with no member: the `MethodError` below, §7.6)
+    if fallback_rt !== nothing && isempty(cases) && !((info::SplitCallInfo).closed && handled_all_cases)
         handle_declared_result!(ir, idx, stmt, DeclaredResultInfo(fallback_rt))
         return nothing
     end
