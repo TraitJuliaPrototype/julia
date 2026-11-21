@@ -2661,7 +2661,9 @@ function abstract_apply(interp::AbstractInterpreter, argtypes::Vector{Any}, si::
     aargtypes = argtype_tail(argtypes, 4)
     aftw = widenconst(aft)
     if !isa(aft, Const) && !isa(aft, PartialOpaque) && (!isType(aftw) || has_free_typevars(aftw))
-        if !isconcretetype(aftw) || (aftw <: Builtin)
+        # (a closed build infers the call of a function known only by its signature, compiler §7.4,
+        # §7.6: it branches over the signature's members)
+        if (!isconcretetype(aftw) || (aftw <: Builtin)) && !(closed_build(interp) && callable_set_type(aftw))
             add_remark!(interp, sv, "Core._apply_iterate called on a function of a non-concrete type")
             # bail now, since it seems unlikely that abstract_call will be able to do any better after splitting
             # this also ensures we don't call abstract_call_gf_by_type below on an IntrinsicFunction or Builtin
@@ -3864,6 +3866,8 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
     # builtin is never a member, though the set meets `Builtin` as an intersection
     S = callable_result(wft, arginfo.argtypes)
     if S !== nothing
+        # (in a closed build, a call a later member may resolve: inferred again when the members grow)
+        closed_process(interp) && note_closed_operation!(sv)
         # its arguments must be of `A`, or the call raises `MethodError` (C-60): checked when it runs
         # where inference cannot prove them; an intersection's component is chosen by the arguments
         A = callable_args(wft)
@@ -3875,6 +3879,12 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
             elseif !(args <: A)
                 return Future(CallMeta(S, Any, Effects(), CallableCallInfo(S, A)))
             end
+        end
+        # a closed build (compiler §7.4, §7.6): the call branches over the signature's members, as an
+        # operation's call does, each branch the call at the member's type, its result asserted to `S`
+        if closed_build(interp)
+            csplit = closed_callable_split(interp, wft, S, arginfo, si, sv, max_methods)
+            csplit === nothing || return csplit
         end
         return Future(CallMeta(S, Any, Effects(), DeclaredResultInfo(S)))
     end
@@ -3892,6 +3902,60 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
     atype = argtypes_to_type(arginfo.argtypes)
     atype === Bottom && return Future(CallMeta(Union{}, Union{}, EFFECTS_THROWS, NoCallInfo())) # accidentally unreachable
     return abstract_call_gf_by_type(interp, nothing, arginfo, si, atype, sv, max_methods)::Future
+end
+
+# A closed build's call of a function known only as `Callable{A, S}` (or an intersection of such), its
+# arguments of `A` (compiler §7.4, §7.6): split over the set type's members, each branch the call at the
+# member's type, its result asserted to `S`; past the branches the `MethodError`. The object a box holds
+# has no box branch. `nothing` where the members cannot be listed, or are past the bound, or none is
+# known yet before "no member" is a fact.
+function closed_callable_split(interp::AbstractInterpreter, @nospecialize(ft), @nospecialize(S),
+                               arginfo::ArgInfo, si::StmtInfo, sv::AbsIntState, max_methods::Int)
+    (isconcretetype(ft) || has_free_typevars(ft)) && return nothing
+    cands = closed_candidates(ft)
+    cands === nothing && return nothing
+    CLOSED_CANDIDATE_COUNTS[ft] = length(cands)
+    U = Union{}
+    n = 0
+    for C in cands
+        C <: ft || continue
+        U = Union{U, C}
+        n += 1
+    end
+    n <= MAX_CLOSED_SPLITS || return nothing
+    U !== Union{} && closed_box_object(arginfo, 1, sv) && (U = closed_drop_boxes(U))
+    if U === Union{}
+        CLOSED_NO_MEMBER[] || (CLOSED_NO_MEMBER_MET[] = true; return nothing)
+        return Future(closed_no_member(S))
+    end
+    newargs = copy(arginfo.argtypes)
+    newargs[1] = U
+    call = abstract_call_gf_by_type(interp, nothing, ArgInfo(nothing, newargs), si,
+                                    argtypes_to_type(newargs), sv, max_methods;
+                                    max_union_splitting = MAX_CLOSED_SPLITS,
+                                    operation = false, member_split = false)::Future
+    Sbox = RefValue{Any}(S)
+    return Future{CallMeta}(call, interp, sv) do call, _, _
+        S = Sbox[]
+        rt = widenconst(call.rt) <: S ? call.rt : S
+        CallMeta(rt, Any, Effects(), SplitCallInfo(call.info, S, true))
+    end
+end
+
+# whether `T` types a function known only by its signature: `Callable{A, S}`, or an intersection of such
+function callable_set_type(@nospecialize(T))
+    u = unwrap_unionall(T)
+    u isa DataType || return false
+    cname = unwrap_unionall(Core.Callable).name
+    u.name === cname && return true
+    u.name === unwrap_unionall(Core.All).name || return false
+    tup = u.parameters[1]
+    tup isa DataType || return false
+    for c in tup.parameters
+        cu = unwrap_unionall(c)
+        (cu isa DataType && cu.name === cname) || return false
+    end
+    return true
 end
 
 # The argument types `A` of a value known as `Callable{A, S}`, where `A` is a type with no free variable
