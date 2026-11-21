@@ -4890,7 +4890,7 @@ function merge_override_effects!(interp::AbstractInterpreter, effects::Effects, 
         override = decode_statement_effects_override(sv)
         effects = override_effects(effects, override)
     end
-    set_curr_ssaflag!(sv, flags_for_effects(effects), IR_FLAGS_EFFECTS)
+    set_curr_ssaflag!(sv, flags_for_effects(effects), IR_FLAGS_EFFECTS | IR_FLAGS_TRUSTED)
     merge_effects!(interp, sv, effects)
     return effects
 end

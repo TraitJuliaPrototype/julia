@@ -60,7 +60,8 @@ struct UnionSplit
     bbs::Vector{Int}
     fallback_rt::Any # an operation's split (compiler §7.2): its declared result, else nothing
     table::Any       # and the table of its last branch (§7.3), or nothing for the dynamic call
-    trusted::UInt32  # the call's `IR_FLAGS_TRUSTED` (§7.4): the fallback's result is checked
+    trusted::UInt32  # the call's `IR_FLAGS_TRUSTED` (§7.4): the fallback's result is checked, and a case's at an
+                     # instance of wider types; a `Callable`'s split: its check's kind
     UnionSplit(handled_all_cases::Bool, fully_covered::Bool, atype::DataType, cases::Vector{InliningCase},
                @nospecialize(fallback_rt = nothing), @nospecialize(table = nothing), trusted::UInt32 = UInt32(0)) =
         new(handled_all_cases, fully_covered, atype, cases, Int[], fallback_rt, table, trusted)
@@ -675,6 +676,15 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
             ityp = fallback_rt === nothing ? typ :
                    case.invoke isa CodeInstance ? (case.invoke::CodeInstance).rettype : Any
             val = insert_node_here!(compact, NewInstruction(invoke_stmt, ityp, case.info, line, flag))
+            # (a call whose type rests on a declared result its members' own code does not check, its case an
+            # instance at wider types than the case's: the result checked, compiler §7.4)
+            if fallback_rt === nothing && trusted != 0 && widenconst(typ) !== Any
+                mi = case.invoke isa CodeInstance ? get_ci_mi(case.invoke) : case.invoke
+                if !(mi.specTypes <: mtype)
+                    check = trusted_result_check(val, widenconst(typ), trusted, get_inference_world(interp))
+                    val = insert_node_here!(compact, NewInstruction(check, typ, line))
+                end
+            end
         else
             case = case::ConstantCase
             val = case.val
@@ -1973,7 +1983,7 @@ function check_trusted_result!(todo::Vector{Pair{Int,Any}}, ntodo::Int, ir::IRCo
                                sig::Union{Nothing,Signature}, trusted::UInt32, state::InliningState)
     if length(todo) > ntodo && todo[end].first == idx
         item = todo[end].second
-        if item isa UnionSplit && !item.handled_all_cases && item.fallback_rt === nothing
+        if item isa UnionSplit && item.fallback_rt === nothing
             todo[end] = idx => UnionSplit(item.handled_all_cases, item.fully_covered, item.atype, item.cases,
                                           item.fallback_rt, item.table, trusted)
         end

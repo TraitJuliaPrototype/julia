@@ -371,7 +371,7 @@ function adjust_cycle_frame!(sv::InferenceState, cycle_valid_worlds::WorldRange,
     for (callee, pc) in sv.cycle_backedges
         old_currpc = callee.currpc
         callee.currpc = pc
-        set_curr_ssaflag!(callee, new_flags, IR_FLAGS_EFFECTS)
+        set_curr_ssaflag!(callee, new_flags, IR_FLAGS_EFFECTS | IR_FLAGS_TRUSTED)
         callee.currpc = old_currpc
     end
     return nothing
