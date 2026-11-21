@@ -1875,17 +1875,37 @@ function closed_note_constant!(@nospecialize(v), @nospecialize(P), depth::Int)
     (depth >= 3 || !(T isa DataType)) && return nothing
     if v isa Array || v isa GenericMemory
         E = eltype(v)
-        closed_keeps_type(E) && return nothing
+        # (a field or element whose type keeps its values' types forgets none itself, but a value in it
+        # may hold one in a field of its own: a box's object; only an isbits type holds none)
+        closed_holds_none(E) && return nothing
         for i = 1:min(length(v), 4096)
             isassigned(v, i) && closed_note_constant!(v[i], E, depth + 1)
         end
     elseif isstructtype(T) && !(v isa Type) && !(v isa Module) && !(v isa Method) && !(v isa MethodInstance) && !(v isa CodeInstance)
         for i = 1:fieldcount(T)
             F = fieldtype(T, i)
-            closed_keeps_type(F) && continue
+            closed_holds_none(F) && continue
             isdefined(v, i) && closed_note_constant!(getfield(v, i), F, depth + 1)
         end
     end
+    return nothing
+end
+# a type whose values hold no value of a type they forget: an isbits type (no reference in it)
+closed_holds_none(@nospecialize(T)) = T isa DataType && isbitstype(T)
+# A constant the code holds, as an operand of any statement (folded by inference, a literal, a global's
+# value): what it holds in fields and elements whose types do not keep their values' types is forgotten
+# there, wherever the code uses it (compiler §7.6). Each constant once a round (`seen`).
+function closed_note_held!(@nospecialize(x), src::CodeInfo, sptypes::Vector{VarState}, argts::Vector{Any}, seen::IdSet{Any})
+    (x isa SSAValue || x isa Argument || x isa SlotNumber || x isa Expr) && return nothing
+    t = argextype(x, src, sptypes, argts)
+    t isa Const || return nothing
+    v = t.val
+    T = typeof(v)
+    (T isa DataType && !isbitstype(T) && !(v isa Type) && !(v isa Module) && !(v isa Symbol) &&
+     !(v isa String) && !(v isa Core.Builtin)) || return nothing
+    v in seen && return nothing
+    push!(seen, v)
+    closed_note_constant!(v, T, 0)
     return nothing
 end
 
@@ -1924,6 +1944,7 @@ function closed_note_used!(codeinfos::Vector{Any})
     rt = Any
     sptypes = VarState[]
     spec = nothing
+    seen = IdSet{Any}()
     for item in codeinfos
         if item isa CodeInstance
             rt = item.rettype
@@ -1952,6 +1973,11 @@ function closed_note_used!(codeinfos::Vector{Any})
         for i = 1:length(code)
             stmt = code[i]
             isexpr(stmt, :(=)) && (stmt = stmt.args[2])
+            if stmt isa Expr && stmt.head !== :meta
+                for k = (stmt.head === :invoke ? 2 : 1):length(stmt.args)
+                    closed_note_held!(stmt.args[k], src, sptypes, argts, seen)
+                end
+            end
             if stmt isa ReturnNode
                 isdefined(stmt, :val) && closed_note_value!(stmt.val, rt, src, sptypes, argts)
             elseif stmt isa PhiNode
