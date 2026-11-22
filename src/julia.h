@@ -386,6 +386,9 @@ typedef struct _jl_method_t {
     // Override the conclusions of inter-procedural effect analysis,
     // forcing the conclusion to always true.
     _jl_purity_overrides_t purity;
+    // the method's policy, bits 0-1: 0 as its module says, 1 a boundary (compiled in the policy
+    // of the code that reaches it), 2 always compiled by facts
+    uint8_t facts;
 
 // hidden fields:
     jl_mutex_t writelock;
@@ -448,6 +451,7 @@ typedef struct _jl_opaque_closure_t {
 #define JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR   0b0010
 #define JL_CI_FLAGS_FROM_IMAGE               0b0100
 #define JL_CI_FLAGS_NATIVE_CACHE_VALID       0b1000
+#define JL_CI_FLAGS_FACTS                   0b100000  // compiled by facts (its calls inferred only at fact signatures)
 
 typedef struct _jl_code_instance_t {
     JL_DATA_TYPE
@@ -858,6 +862,8 @@ typedef struct _jl_module_t {
     int8_t infer;
     uint8_t istopmod;
     int8_t max_methods;
+    // compiled by facts: 0 plain, 1 facts, 2 never (the compiler's own modules)
+    int8_t facts;
     // If cleared no binding partition in this module has PARTITION_FLAG_EXPORTED and min_world > jl_require_world.
     _Atomic(int8_t) export_set_changed_since_require_world;
     jl_mutex_t lock;
