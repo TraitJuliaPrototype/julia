@@ -661,3 +661,24 @@ let ci = method_instance(fshow61667, (Vector{ShowInval61667},)).cache
     Core.eval(Main, :(struct ShowInval61667 end))
     @test ci.max_world == typemax(UInt)
 end
+
+# a call that reaches an instance wider than its own signature (a `@nospecialize` argument inferred
+# so) keeps its signature on the backedge: a method defined later invalidates the caller only
+# where it meets the call's signature
+Base.@nospecializeinfer kcallsig(@nospecialize(x)) = x isa Int ? 1 : 2
+ccallsig(x::Int) = kcallsig(x)
+dcallsig(@nospecialize(x)) = kcallsig(x)
+ecallsig(x::Integer) = kcallsig(x)
+@test ccallsig(1) == 1 && dcallsig(1) == 1 && ecallsig(Int8(1)) == 2
+let cc = method_instance(ccallsig, (Int,)).cache, cd = method_instance(dcallsig, (Any,)).cache,
+    ce = method_instance(ecallsig, (Int8,)).cache
+    @test cc.max_world == cd.max_world == ce.max_world == typemax(UInt)
+    @eval kcallsig(x::String) = 3
+    @test cc.max_world == typemax(UInt)  # a caller at Int: the new method does not meet its call
+    @test cd.max_world != typemax(UInt)  # a caller at Any is invalidated
+    @test ce.max_world == typemax(UInt)
+    @test dcallsig("s") == 3
+    @eval kcallsig(x::Int8) = 4
+    @test ce.max_world != typemax(UInt)  # a method that meets the call's signature invalidates
+    @test ecallsig(Int8(1)) == 4 && ccallsig(1) == 1
+end
