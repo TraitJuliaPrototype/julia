@@ -451,6 +451,36 @@ end
 function implements end
 _implements_body(@nospecialize(X), @nospecialize(S)) = nothing
 
+# The kept forms: ordinary structs with no rule of subtyping. The library
+# declares their memberships (each set's `Dynamic{Z} where Z<:X` and `Compiled{Z} where Z<:X`) and defines
+# their other methods; Core defines them so that a forwarder made where a method is defined names them.
+# The box: a member of the set `X`, held so that code for it is compiled once per set instance. Its
+# membership test is the field test of `new` with no conversion (`_new_dynamic`, below): `TypeError` for
+# a value that is not a member, decided by the compiler where it knows the member.
+struct Dynamic{X}
+    object::X
+    function Dynamic{X}(@nospecialize(x)) where {X}
+        X isa UnionAll && throw(ArgumentError("Dynamic{X} needs the trait's parameters"))
+        return _new_dynamic(Dynamic{X}, x)
+    end
+    # a box of `X` is itself; a box of a subset of `X` gives its object boxed at `X`, a member already
+    Dynamic{X}(d::Dynamic{X}) where {X} = d
+    function Dynamic{X}(d::Dynamic{Y}) where {X, Y<:X}
+        X isa UnionAll && throw(ArgumentError("Dynamic{X} needs the trait's parameters"))
+        return _new_dynamic(Dynamic{X}, getfield(d, :object))
+    end
+end
+# The wrapper: a value held at its own type, so that code for it is compiled for that type. A box gives
+# its object wrapped; a wrapper is itself. (The library's `compiled_for(x)` makes one.)
+struct Compiled{T}
+    object::T
+    Compiled{T}(x) where {T} = new{T}(x)
+end
+Compiled(x::T) where {T} = Compiled{T}(x)
+Compiled(w::Compiled) = w
+Compiled(d::Dynamic) = Compiled(getfield(d, :object))
+# a box of a wrapper holds the wrapper's object
+Dynamic{X}(w::Compiled) where {X} = Dynamic{X}(getfield(w, :object))
 # a call of a value known as `Callable{A, S}`: its arguments are of `A`, or the call
 # raises `MethodError`; the compiler inserts the check where it cannot prove them
 _callable_argcheck(@nospecialize(f), @nospecialize(A), @nospecialize(args...)) =
@@ -547,6 +577,8 @@ end
 VecElement(arg::T) where {T} = VecElement{T}(arg)
 
 eval(Core, quote
+    # the box made by `new` with no conversion: its field test is the membership test
+    _new_dynamic(::Type{D}, @nospecialize(x)) where {D} = $(Expr(:new, :D, :x))
     GotoNode(label::Int) = $(Expr(:new, :GotoNode, :label))
     NewvarNode(slot::SlotNumber) = $(Expr(:new, :NewvarNode, :slot))
     QuoteNode(@nospecialize value) = $(Expr(:new, :QuoteNode, :value))
