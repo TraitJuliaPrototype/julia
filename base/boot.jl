@@ -328,14 +328,16 @@ end
 
 macro inline()   Expr(:meta, :inline)   end
 macro noinline() Expr(:meta, :noinline) end
+macro _nospecializeinfer_meta() Expr(:meta, :nospecializeinfer) end
 
 macro _boundscheck() Expr(:boundscheck) end
 
-# n.b. the effects and model of these is refined in inference abstractinterpretation.jl
-TypeVar(@nospecialize(n)) = _typevar(n::Symbol, Union{}, Any)
-TypeVar(@nospecialize(n), @nospecialize(ub)) = _typevar(n::Symbol, Union{}, ub)
-TypeVar(@nospecialize(n), @nospecialize(lb), @nospecialize(ub)) = _typevar(n::Symbol, lb, ub)
-UnionAll(@nospecialize(v), @nospecialize(t)) = ccall(:jl_type_unionall, Any, (Any, Any), v::TypeVar, t)
+# n.b. the effects and model of these is refined in inference abstractinterpretation.jl; they are
+# inferred once, at `Any` (`Base.@nospecializeinfer`), and a call is matched at its own signature
+TypeVar(@nospecialize(n)) = (@_nospecializeinfer_meta; _typevar(n::Symbol, Union{}, Any))
+TypeVar(@nospecialize(n), @nospecialize(ub)) = (@_nospecializeinfer_meta; _typevar(n::Symbol, Union{}, ub))
+TypeVar(@nospecialize(n), @nospecialize(lb), @nospecialize(ub)) = (@_nospecializeinfer_meta; _typevar(n::Symbol, lb, ub))
+UnionAll(@nospecialize(v), @nospecialize(t)) = (@_nospecializeinfer_meta; ccall(:jl_type_unionall, Any, (Any, Any), v::TypeVar, t))
 
 const Memory{T} = GenericMemory{:not_atomic, T, CPU}
 const MemoryRef{T} = GenericMemoryRef{:not_atomic, T, CPU}

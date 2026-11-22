@@ -2807,10 +2807,11 @@ function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
         # make sure to be able to get `PartialTypeVar`s out.
         2 ≤ la ≤ 4 || return Future(CallMeta(Bottom, Any, EFFECTS_THROWS, NoCallInfo()))
         # make sure generic code is prepared for inlining if needed later
-        let T = Any[Type{TypeVar}, Any, Any, Any]
+        # its methods are inferred once, at `Any` (`Base.@nospecializeinfer`), and the call is matched
+        # at its own signature, which its edge keeps
+        let T = Any[Const(TypeVar), Any, Any, Any]
             resize!(T, la)
-            atype = Tuple{T...}
-            T[1] = Const(TypeVar)
+            atype = argtypes_to_type(argtypes)
             let call = abstract_call_gf_by_type(interp, f, ArgInfo(nothing, T), si, atype, sv, max_methods)::Future
                 return Future{CallMeta}(call, interp, sv) do call, interp, sv
                     n = argtypes[2]
@@ -2835,7 +2836,8 @@ function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
             end
         end
     elseif f === UnionAll
-        let call = abstract_call_gf_by_type(interp, f, ArgInfo(nothing, Any[Const(UnionAll), Any, Any]), si, Tuple{Type{UnionAll}, Any, Any}, sv, max_methods)::Future
+        # inferred once, at `(Any, Any)`, and matched at the call's own signature, as `TypeVar` above
+        let call = abstract_call_gf_by_type(interp, f, ArgInfo(nothing, Any[Const(UnionAll), Any, Any]), si, argtypes_to_type(argtypes), sv, max_methods)::Future
             return Future{CallMeta}(call, interp, sv) do call, interp, sv
                 return abstract_call_unionall(interp, argtypes, call)
             end

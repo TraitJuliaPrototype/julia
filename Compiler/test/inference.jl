@@ -6727,4 +6727,14 @@ irinterp_scan_d2(t) = irinterp_scan_derivative(irinterp_scan_d1, t)
 @test Base.infer_return_type(irinterp_scan_d2, (Int,)) === Int
 @test irinterp_scan_d2(2) == 2
 
+
+# `TypeVar` and `UnionAll` are inferred once, at `Any`, and a call of them is matched at the call's own types
+make_typevar(n) = TypeVar(n)
+make_unionall(v, t) = UnionAll(v, t)
+@test Base.infer_return_type(make_typevar, (Symbol,)) === TypeVar
+let tv = make_typevar(:T); @test make_unionall(tv, Ref{tv}) isa UnionAll; end
+for f in (TypeVar, UnionAll), m in methods(f), mi in Base.specializations(m)
+    @test all(p -> p === Any, mi.specTypes.parameters[2:end])
+end
+
 end # module inference
