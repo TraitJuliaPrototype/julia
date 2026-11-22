@@ -162,14 +162,14 @@ function notify(c::GenericCondition, @nospecialize(arg), all, error)
     cnt = 0
     while !isempty(c.waitq)
         t = popfirst!(c.waitq)
-        schedule(t, arg, error=error)
+        invoke(_schedule, Tuple{Task, Any, Any}, t, arg, error)
         cnt += 1
         all || break
     end
     return cnt
 end
 
-notify_error(c::GenericCondition, err) = notify(c, err, true, true)
+notify_error(c::GenericCondition, @nospecialize(err)) = invoke(notify, Tuple{GenericCondition, Any, Any, Any}, c, err, true, true)
 
 """
     isempty(condition)
