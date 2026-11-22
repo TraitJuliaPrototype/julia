@@ -74,8 +74,20 @@ function negative_fold_blocked(@nospecialize(a), @nospecialize(b), sv::Union{Not
     cells isa SimpleVector || return true
     for c in cells
         add_absence_edge!(sv.edges, c)
+        # the code holds only in the worlds where the pair's absence does: inferred for a world before a
+        # membership, or after one is taken back, it is not run where the membership holds
+        update_valid_age!(sv, absence_worlds(c, frame_world(sv)))
     end
     return false
+end
+# The worlds around `world` in which no method meets the absence signature `sig`: no membership of the
+# pair is in force (compiler §4.8).
+function absence_worlds(@nospecialize(sig), world::UInt)
+    min_valid = RefValue{UInt}(typemin(UInt))
+    max_valid = RefValue{UInt}(typemax(UInt))
+    ambig = RefValue{Int32}(0)
+    _methods_by_ftype(sig, nothing, -1, world, false, min_valid, max_valid, ambig)
+    return WorldRange(min_valid[], max_valid[])
 end
 # The edge of a negative the code relied on (W-141; compiler §4.8): the signature of `Core.implements` at
 # the pair, with no method. As a call that found no method, it holds a backedge at the method table
