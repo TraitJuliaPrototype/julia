@@ -44,7 +44,7 @@ for (T, c) in (
         (Core.MethodCache, [:leafcache, :cache, :var""]),
         (Core.TypeMapEntry, [:next, :min_world, :max_world]),
         (Core.TypeMapLevel, [:arg1, :targ, :name1, :tname, :list, :any]),
-        (Core.TypeName, [:cache, :linearcache, :Typeofwrapper, :max_args, :cache_entry_count]),
+        (Core.TypeName, [:cache, :linearcache, :Typeofwrapper, :max_args, :cache_entry_count, :memberships]),
         (DataType, [:types, :layout]),
         (Core.Memory, []),
         (Core.GenericMemoryRef, []),
@@ -53,6 +53,19 @@ for (T, c) in (
     )
     @test Set((fieldname(T, i) for i in 1:fieldcount(T) if Base.isfieldatomic(T, i))) == Set(c)
 end
+
+# a type's memberships in sets, and the bits of a TypeName and a DataType that sets use
+@test Int.name.memberships === Core.svec()
+@test Int.name.input_params === 0x00
+@test fieldtype(Core.TypeName, :memberships) === Core.SimpleVector
+@test fieldtype(DataType, :flags) === UInt32
+@test DataType.name.flags & 0x10 == 0x10  # never a member of a set
+@test typeof(+).name.flags & 0x10 == 0x00
+@test typeof(Core.isa).name.flags & 0x10 == 0x10
+@test fieldnames(Core.MembershipEntry) ==
+    (:set, :member, :instance, :receiver, :min_world, :max_world, :declarer, :by)
+@test Base.isfieldatomic(Core.MembershipEntry, :max_world)
+@test ismutabletype(Core.MembershipEntry)
 
 @test_throws(ErrorException("setfield!: const field .name of type DataType cannot be changed"),
     setfield!(Int, :name, Int.name))

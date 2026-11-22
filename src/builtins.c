@@ -2683,6 +2683,7 @@ void jl_init_primitives(void) JL_GC_DISABLED
             continue;
         jl_sym_t *sname = jl_symbol(jl_builtin_names[i]);
         jl_value_t *builtin = jl_new_generic_function_with_supertype(sname, jl_core_module, jl_builtin_type, 0);
+        ((jl_datatype_t*)jl_typeof(builtin))->name->never_member = 1;
         jl_set_initial_const(jl_core_module, sname, builtin, 0);
         jl_mk_builtin_func((jl_datatype_t*)jl_typeof(builtin), sname, jl_builtin_f_addrs[i]);
         jl_builtin_instances[i] = builtin;
@@ -2696,6 +2697,7 @@ void jl_init_primitives(void) JL_GC_DISABLED
     add_builtin("Nothing", (jl_value_t*)jl_nothing_type);
     add_builtin("nothing", (jl_value_t*)jl_nothing);
     add_builtin("TypeName", (jl_value_t*)jl_typename_type);
+    add_builtin("MembershipEntry", (jl_value_t*)jl_membership_type);
     add_builtin("DataType", (jl_value_t*)jl_datatype_type);
     add_builtin("TypeVar", (jl_value_t*)jl_tvar_type);
     add_builtin("UnionAll", (jl_value_t*)jl_unionall_type);
