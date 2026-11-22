@@ -552,7 +552,7 @@ The definition-time check: Julia's inference of a method at its own signature, w
 ephemeral cache, so that every function the method reaches is inferred again, and at each known call
 `hook(interp, f, argtypes, sv)`, the library's, which records a use outside a set's contract in `state`.
 The interpreter is the compiler's own: a library that runs the check defines no method of the
-compiler's functions, so loading it invalidates none of the compiler's code (compiler ).
+compiler's functions, so loading it invalidates none of the compiler's code.
 """
 struct DefinitionCheckCache
     dict::IdDict{MethodInstance,CodeInstance}

@@ -193,7 +193,7 @@ function policy_interp(interp::NativeInterpreter, facts::Bool; nested::Bool = tr
                              facts, interp.crossings + Int(nested), false, nothing, nothing)
 end
 
-"Whether `interp` infers `mi`'s top frame under the other policy than its method's (facts )."
+"Whether `interp` infers `mi`'s top frame under the other policy than its method's (reflection)."
 infers_other_policy(::AbstractInterpreter, ::MethodInstance) = false
 infers_other_policy(interp::NativeInterpreter, mi::MethodInstance) =
     !interp.plainrt && mi.def isa Method && mi_policy_facts_at(mi, interp.facts) !== interp.facts

@@ -6743,6 +6743,6 @@ let sigs = Compiler.callsig_splits(Tuple{typeof(!==), Union{Nothing,Int}, Nothin
     @test sigs !== nothing && Set(sigs) == Set(Any[Tuple{typeof(!==), Nothing, Nothing}, Tuple{typeof(!==), Int, Nothing}])
 end
 @test Compiler.callsig_splits(Tuple{typeof(!==), Int, Nothing}) === nothing
-@test Compiler.callsig_splits(Tuple{typeof(!==), Union{Int8,Int16,Int32,Int64,Int128}, Nothing}) === nothing
+@test Compiler.callsig_splits(Tuple{typeof(!==), Union{Int8,Int16,Int32}, Union{Nothing,Missing,Float64}}) === nothing
 
 end # module inference
