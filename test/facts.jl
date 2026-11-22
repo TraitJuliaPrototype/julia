@@ -77,3 +77,70 @@ end
     # an unknown option bit is refused
     @test_throws ErrorException ccall(:jl_set_module_option, Cvoid, (Any, Cint, Cint), NotOwnerOnly, 3, 1)
 end
+
+# the CodeInstances of the native owner in `f`'s instance at `T`
+function native_cis(f, T)
+    mi = Base.method_instance(f, T)
+    out = Core.CodeInstance[]
+    ci = mi.cache
+    while true
+        ci.owner === nothing && push!(out, ci)
+        isdefined(ci, :next) || break
+        ci = ci.next
+    end
+    return out
+end
+const CI_FLAG_G2 = 0x10      # deep G2: its dispatch edges, and every callee's at any depth, at fact signatures
+const CI_FLAG_FACTS = 0x20   # compiled by facts
+
+module DeepEndings
+Base.Experimental.@compiler_options facts=true
+g(x::Int) = 1
+f(x::Int) = g(x) + 1
+h(x::Int) = g(x) + 2
+end
+deep_plain_g(x::Int) = 1
+deep_plain_f(x::Int) = deep_plain_g(x) + 1
+
+@testset "what a definition ends of the deep class" begin
+    take() = (r = ccall(:jl_take_deep_endings, Any, ()); r === nothing ? Any[] : r)
+    @test DeepEndings.f(1) == 2 && DeepEndings.h(1) == 3 && deep_plain_f(1) == 2
+    ci_f = only(native_cis(DeepEndings.f, (Int,)))
+    @test ci_f.flags & (CI_FLAG_G2 | CI_FLAG_FACTS) == CI_FLAG_G2 | CI_FLAG_FACTS
+    @test ccall(:jl_set_deep_endings, Cint, (Cint,), 1) == 0
+    try
+        # a definition that replaces g(::Int) ends f's and h's code: kind :definition, the cause the
+        # new method
+        @eval DeepEndings g(x::Int) = 10
+        list = take()
+        @test length(list) >= 6 && length(list) % 3 == 0
+        newg = which(DeepEndings.g, (Int,))
+        @test all(==(:definition), list[1:3:end])
+        @test all(c -> c === newg, list[2:3:end])
+        @test ci_f in list[3:3:end]
+        @test all(ci -> ci.flags & (CI_FLAG_G2 | CI_FLAG_FACTS) == CI_FLAG_G2 | CI_FLAG_FACTS, list[3:3:end])
+        @test DeepEndings.f(1) == 11 && DeepEndings.h(1) == 12
+
+        # plain code that a definition ends is not kept
+        @eval deep_plain_g(x::Int) = 5
+        @test isempty(take())
+        @test deep_plain_f(1) == 6
+
+        # a deletion: kind :deletion, the cause the method deleted
+        @eval DeepEndings g(x::Integer) = 20
+        take()
+        @test DeepEndings.f(1) == 11
+        Base.delete_method(which(DeepEndings.g, (Int,)))
+        list = take()
+        @test !isempty(list)
+        @test all(==(:deletion), list[1:3:end])
+        @test all(c -> c === newg, list[2:3:end])
+        @test DeepEndings.f(1) == DeepEndings.g(1) + 1   # the method the deleted one replaced, or g(::Integer)
+    finally
+        @test ccall(:jl_set_deep_endings, Cint, (Cint,), 0) == 1
+    end
+    # switched off: nothing is kept
+    @eval DeepEndings g(x::Int) = 30
+    @test isempty(take())
+    @test DeepEndings.f(1) == 31
+end
