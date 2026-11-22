@@ -37,19 +37,6 @@ end
 add_edges_impl(::Vector{Any}, ::DeclaredResultInfo) = nothing
 
 """
-    info::CallableCallInfo <: CallInfo
-
-A call of a value known as `Callable{A, S}` whose arguments inference cannot prove to
-be of `A`: the dynamic call, its arguments checked against `A` (`MethodError`) and its result asserted
-to `rt`.
-"""
-struct CallableCallInfo <: CallInfo
-    rt::Any
-    A::Any
-end
-add_edges_impl(::Vector{Any}, ::CallableCallInfo) = nothing
-
-"""
     info::SplitCallInfo <: CallInfo
 
 A call of an operation of a set at a receiver typed by the set, split over the set's first

@@ -4519,7 +4519,3 @@ precompile(include_package_for_output, (PkgId, String, Vector{String}, Vector{St
 precompile(include_package_for_output, (PkgId, String, Vector{String}, Vector{String}, Vector{String}, typeof(_concrete_dependencies), String)) || @assert false
 precompile(create_expr_cache, (PkgId, String, String, String, typeof(_concrete_dependencies), Cmd, CacheFlags, IO, IO)) || @assert false
 precompile(create_expr_cache, (PkgId, String, String, Nothing, typeof(_concrete_dependencies), Cmd, CacheFlags, IO, IO)) || @assert false
-# the result's check the compiler invokes after a call of a function known only as `Callable{A, S}`, and after a
-# call that passed one on to code compiled for the function's own type: in the system image, so that
-# no session compiles it
-precompile(Core._callable_result, (Any, Any)) || @assert false
