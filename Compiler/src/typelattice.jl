@@ -650,6 +650,9 @@ end
 @nospecializeinfer function tmeet(lattice::ConstsLattice, @nospecialize(v), @nospecialize(t::Type))
     if isa(v, Const)
         if !has_free_typevars(t) && !isa(v.val, t)
+            # the `isa` above is this world's answer: where a membership could change it, widen and let
+            # the arms below, which ask the gates, decide
+            negative_fold_blocked(typeof(v.val), t) && return tmeet(widenlattice(lattice), widenconst(v), t)
             return Bottom
         end
         return v
@@ -660,6 +663,8 @@ end
 @nospecializeinfer function tmeet(lattice::ConditionalsLattice, @nospecialize(v), @nospecialize(t::Type))
     if isa(v, Conditional)
         if !(Bool <: t)
+            # this world's answer too: widen where a membership could change it
+            negative_fold_blocked(Bool, t) && return tmeet(widenlattice(lattice), Bool, t)
             return Bottom
         end
         return v
