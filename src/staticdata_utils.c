@@ -554,6 +554,11 @@ static jl_array_t *queue_external_cis(jl_array_t *list, jl_query_cache *query_ca
             if (found == 1) {
                 jl_array_ptr_1d_push(new_ext_cis, (jl_value_t*)ci);
             }
+            else if (found == 0 && (jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_G2)) {
+                // code the workload reached only by a dynamic call is kept where it is deep G2, of either
+                // policy: only a definition by an owner of what its facts name, or a pirate, invalidates it
+                jl_array_ptr_1d_push(new_ext_cis, (jl_value_t*)ci);
+            }
         }
     }
     htable_free(&visited);
