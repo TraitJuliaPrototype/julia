@@ -636,8 +636,8 @@ Can be called on any `isconcretetype`.
 """
 function datatype_haspadding(dt::DataType)
     @_foldable_meta
-    dt.layout == C_NULL && throw(UndefRefError())
-    flags = unsafe_load(convert(Ptr{DataTypeLayout}, dt.layout)).flags
+    getfield(dt, :layout) == C_NULL && throw(UndefRefError())
+    flags = unsafe_load(convert(Ptr{DataTypeLayout}, getfield(dt, :layout))).flags
     return flags & 1 == 1
 end
 
@@ -651,8 +651,8 @@ independent of their identity (e.g. immutable structs, some types, etc.).
 """
 function datatype_isbitsegal(dt::DataType)
     @_foldable_meta
-    dt.layout == C_NULL && throw(UndefRefError())
-    flags = unsafe_load(convert(Ptr{DataTypeLayout}, dt.layout)).flags
+    getfield(dt, :layout) == C_NULL && throw(UndefRefError())
+    flags = unsafe_load(convert(Ptr{DataTypeLayout}, getfield(dt, :layout))).flags
     return (flags & (1<<7)) != 0
 end
 
@@ -665,8 +665,8 @@ Can be called on any `isconcretetype`.
 """
 function datatype_nfields(dt::DataType)
     @_foldable_meta
-    dt.layout == C_NULL && throw(UndefRefError())
-    return unsafe_load(convert(Ptr{DataTypeLayout}, dt.layout)).nfields
+    getfield(dt, :layout) == C_NULL && throw(UndefRefError())
+    return unsafe_load(convert(Ptr{DataTypeLayout}, getfield(dt, :layout))).nfields
 end
 
 """
@@ -689,7 +689,7 @@ Can be called on any `isconcretetype`.
 """
 function datatype_pointerfree(dt::DataType)
     @_foldable_meta
-    return datatype_npointers(dt) == 0
+    return invoke(datatype_npointers, Tuple{DataType}, dt) == 0
 end
 
 """
@@ -703,8 +703,8 @@ See also [`fieldoffset`](@ref).
 """
 function datatype_fielddesc_type(dt::DataType)
     @_foldable_meta
-    dt.layout == C_NULL && throw(UndefRefError())
-    flags = unsafe_load(convert(Ptr{DataTypeLayout}, dt.layout)).flags
+    getfield(dt, :layout) == C_NULL && throw(UndefRefError())
+    flags = unsafe_load(convert(Ptr{DataTypeLayout}, getfield(dt, :layout))).flags
     return (flags >> 1) & 3
 end
 
@@ -720,15 +720,15 @@ Can be called on any `isconcretetype`, but only meaningful on `Memory`.
 """
 function datatype_arrayelem(dt::DataType)
     @_foldable_meta
-    dt.layout == C_NULL && throw(UndefRefError())
-    flags = unsafe_load(convert(Ptr{DataTypeLayout}, dt.layout)).flags
+    getfield(dt, :layout) == C_NULL && throw(UndefRefError())
+    flags = unsafe_load(convert(Ptr{DataTypeLayout}, getfield(dt, :layout))).flags
     return (flags >> 3) & 3
 end
 
 function datatype_layoutsize(dt::DataType)
     @_foldable_meta
-    dt.layout == C_NULL && throw(UndefRefError())
-    size = unsafe_load(convert(Ptr{DataTypeLayout}, dt.layout)).size
+    getfield(dt, :layout) == C_NULL && throw(UndefRefError())
+    size = unsafe_load(convert(Ptr{DataTypeLayout}, getfield(dt, :layout))).size
     return size % Int
 end
 
@@ -752,13 +752,13 @@ FieldDesc(fd::FieldDescStorage{T}) where {T} =
 struct DataTypeFieldDesc
     dt::DataType
     function DataTypeFieldDesc(dt::DataType)
-        dt.layout == C_NULL && throw(UndefRefError())
+        getfield(dt, :layout) == C_NULL && throw(UndefRefError())
         new(dt)
     end
 end
 
 function getindex(dtfd::DataTypeFieldDesc, i::Int)
-    layout_ptr = convert(Ptr{DataTypeLayout}, dtfd.dt.layout)
+    layout_ptr = convert(Ptr{DataTypeLayout}, getfield(dtfd.dt, :layout))
     fd_ptr = layout_ptr + Core.sizeof(DataTypeLayout)
     layout = unsafe_load(layout_ptr)
     fielddesc_type = (layout.flags >> 1) & 3
@@ -800,7 +800,7 @@ true
 !!! compat "Julia 1.5"
     This function requires at least Julia 1.5.
 """
-ismutable(@nospecialize(x)) = (@_total_meta; (typeof(x).name::Core.TypeName).flags & 0x2 == 0x2)
+ismutable(@nospecialize(x)) = (@_total_meta; (getfield(typeof(x), :name)::Core.TypeName).flags & 0x2 == 0x2)
 # The type assertion above is required to fix some invalidations.
 # See also https://github.com/JuliaLang/julia/issues/52134
 
@@ -818,7 +818,7 @@ function ismutabletype(@nospecialize t)
     @_total_meta
     t = unwrap_unionall(t)
     # TODO: what to do for `Union`?
-    return isa(t, DataType) && ismutabletypename(t.name)
+    return isa(t, DataType) && ismutabletypename(getfield(t, :name))
 end
 
 ismutabletypename(tn::Core.TypeName) = tn.flags & 0x2 == 0x2
@@ -851,7 +851,7 @@ function isprimitivetype(@nospecialize t)
     # TODO: what to do for `Union`?
     isa(t, DataType) || return false
     # n.b. DataType's memoized `flags` word is a UInt32; the masks keep that width
-    return (t.flags & 0x00000080) == 0x00000080
+    return (getfield(t, :flags) & 0x00000080) == 0x00000080
 end
 
 """
@@ -878,7 +878,7 @@ julia> isbitstype(Complex)
 false
 ```
 """
-isbitstype(@nospecialize t) = (@_total_meta; isa(t, DataType) && (t.flags & 0x00000008) == 0x00000008)
+isbitstype(@nospecialize t) = (@_total_meta; isa(t, DataType) && (getfield(t, :flags) & 0x00000008) == 0x00000008)
 
 """
     isbits(x)
@@ -945,9 +945,9 @@ julia> isdispatchtuple(Tuple{Type})
 false
 ```
 """
-isdispatchtuple(@nospecialize(t)) = (@_total_meta; isa(t, DataType) && (t.flags & 0x00000004) == 0x00000004)
+isdispatchtuple(@nospecialize(t)) = (@_total_meta; isa(t, DataType) && (getfield(t, :flags) & 0x00000004) == 0x00000004)
 
-datatype_ismutationfree(dt::DataType) = (@_total_meta; (dt.flags & 0x00000100) == 0x00000100)
+datatype_ismutationfree(dt::DataType) = (@_total_meta; (getfield(dt, :flags) & 0x00000100) == 0x00000100)
 
 """
     Base.ismutationfree(T)
@@ -969,7 +969,7 @@ function ismutationfree(@nospecialize(t))
     return false
 end
 
-datatype_isidentityfree(dt::DataType) = (@_total_meta; (dt.flags & 0x00000200) == 0x00000200)
+datatype_isidentityfree(dt::DataType) = (@_total_meta; (getfield(dt, :flags) & 0x00000200) == 0x00000200)
 
 """
     Base.isidentityfree(T)
@@ -1084,7 +1084,7 @@ julia> isconcretetype(Tuple{T} where T<:Int)
 false
 ```
 """
-isconcretetype(@nospecialize(t)) = (@_total_meta; isa(t, DataType) && (t.flags & 0x00000002) == 0x00000002)
+isconcretetype(@nospecialize(t)) = (@_total_meta; isa(t, DataType) && (getfield(t, :flags) & 0x00000002) == 0x00000002)
 
 """
     isabstracttype(T)
