@@ -28,12 +28,16 @@ function bootstrap!()
         typeinf_ext_tt = Tuple{typeof(typeinf_ext), NativeInterpreter, MethodInstance, UInt8}
         typeinf_tt = Tuple{typeof(typeinf), NativeInterpreter, InferenceState}
         typeinf_edge_tt = Tuple{typeof(typeinf_edge), NativeInterpreter, Method, Any, SimpleVector, InferenceState, Bool, Bool}
+        # the entry of `return_type` at run time (`collect` of a generator, `map` over an empty
+        # collection): otherwise it has no code in the system image and its first call in a
+        # session compiles it
+        return_type_tt = Tuple{typeof(_return_type), NativeInterpreter, DataType}
         fs = Any[
             # we first create caches for the optimizer, because they contain many loop constructions
             # and they're better to not run in interpreter even during bootstrapping
             compact!, ssa_inlining_pass!_tt, optimize_tt,
             # then we create caches for inference entries
-            typeinf_ext_tt, typeinf_tt, typeinf_edge_tt,
+            typeinf_ext_tt, typeinf_tt, typeinf_edge_tt, return_type_tt,
         ]
         # tfuncs can't be inferred from the inference entries above, so here we infer them manually
         for x in T_FFUNC_VAL
