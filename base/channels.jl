@@ -200,11 +200,11 @@ close(c::Channel) = close(c, closed_exception()) # nospecialize on default arg s
 function close(c::Channel, @nospecialize(excp::Exception))
     lock(c)
     try
-        c.excp = excp
+        setfield!(c, :excp, excp)
         @atomic :release c.state = :closed
-        notify_error(c.cond_take, excp)
-        notify_error(c.cond_wait, excp)
-        notify_error(c.cond_put, excp)
+        invoke(notify_error, Tuple{GenericCondition, Any}, c.cond_take, excp)
+        invoke(notify_error, Tuple{GenericCondition, Any}, c.cond_wait, excp)
+        invoke(notify_error, Tuple{GenericCondition, Any}, c.cond_put, excp)
     finally
         unlock(c)
     end
