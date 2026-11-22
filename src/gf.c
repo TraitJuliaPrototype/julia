@@ -5657,6 +5657,46 @@ JL_DLLEXPORT void jl_drop_all_caches(void)
 }
 
 
+// Fully typed mode: the compiler puts a call of `jl_not_fully_typed` at the start of code that fails
+// it, with the site `svec(mi, level, warned, kind, rt)`. The hook a tool sets (`jl_set_fully_typed_hook`)
+// is called with the site and warns or raises; under warn it runs once per site. Without a hook,
+// enforce raises an error and warn does nothing. Run in the latest world.
+jl_value_t *jl_fully_typed_hook JL_GLOBALLY_ROOTED = NULL;
+JL_DLLEXPORT void jl_set_fully_typed_hook(jl_value_t *hook)
+{
+    jl_fully_typed_hook = hook == jl_nothing ? NULL : hook;
+}
+JL_DLLEXPORT void jl_not_fully_typed(jl_value_t *site)
+{
+    if (!jl_is_svec(site) || jl_svec_len(site) < 3 || jl_svecref(site, 2) != jl_false)
+        return;
+    int enforce = jl_unbox_long(jl_svecref(site, 1)) == 2;
+    if (!enforce)
+        jl_svecset(site, 2, jl_true);
+    jl_value_t *hook = jl_fully_typed_hook;
+    if (hook == NULL) {
+        if (enforce)
+            jl_error("the code is not fully typed (fully typed mode)");
+        return;
+    }
+    jl_task_t *ct = jl_current_task;
+    size_t last_age = ct->world_age;
+    ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 2);
+    args[0] = hook;
+    args[1] = site;
+    JL_TRY {
+        jl_apply(args, 2);
+    }
+    JL_CATCH {
+        ct->world_age = last_age;
+        jl_rethrow();
+    }
+    ct->world_age = last_age;
+    JL_GC_POP();
+}
+
 #ifdef __cplusplus
 }
 #endif
