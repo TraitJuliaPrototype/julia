@@ -6727,4 +6727,13 @@ irinterp_scan_d2(t) = irinterp_scan_derivative(irinterp_scan_d1, t)
 @test Base.infer_return_type(irinterp_scan_d2, (Int,)) === Int
 @test irinterp_scan_d2(2) == 2
 
+
+# `!==` is inferred once, at `(Any, Any)`, and a call of it is matched at the call's own types
+struct NotIdenticalT; x::Int; end
+not_identical(a, b) = a !== b
+@test Base.infer_return_type(not_identical, (NotIdenticalT, NotIdenticalT)) === Bool
+@test not_identical(NotIdenticalT(1), NotIdenticalT(2))
+@test all(mi -> mi.specTypes === Tuple{typeof(!==), Any, Any}, Base.specializations(only(methods(!==))))
+@test only(code_typed(not_identical, (Union{Nothing,Int}, Nothing)))[2] === Bool
+
 end # module inference
