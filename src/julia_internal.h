@@ -444,6 +444,9 @@ extern tracer_cb jl_newmeth_tracer;
 void jl_call_tracer(tracer_cb callback, jl_value_t *tracee);
 void print_func_loc(JL_STREAM *s, jl_method_t *m);
 extern jl_array_t *_jl_debug_method_invalidation JL_GLOBALLY_ROOTED;
+extern jl_array_t *jl_deep_endings JL_GLOBALLY_ROOTED;      // what definitions ended of the deep class (gf.c)
+extern jl_value_t *jl_deep_ending_kind JL_GLOBALLY_ROOTED;  // the cause of what invalidations end (gf.c)
+extern jl_value_t *jl_deep_ending_cause JL_GLOBALLY_ROOTED;
 JL_DLLEXPORT extern arraylist_t jl_linkage_blobs; // external linkage: sysimg/pkgimages
 JL_DLLEXPORT extern arraylist_t jl_image_relocs;  // external linkage: sysimg/pkgimages
 JL_DLLEXPORT extern arraylist_t jl_top_mods;  // external linkage: sysimg/pkgimages
