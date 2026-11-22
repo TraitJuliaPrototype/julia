@@ -851,6 +851,11 @@ enum jl_binding_flags {
 
 // the bits of a module's options word
 enum jl_module_option {
+    // the scope options of a trait library, which the library reads (`jl_get_module_options`): the
+    // module's methods at a set are checked where they are defined (bounded), and the module defines
+    // no method or membership of another module's function and types (no_pirates)
+    JL_MODULE_OPTION_BOUNDED = 1,
+    JL_MODULE_OPTION_NO_PIRATES = 2,
     // the functions the module neither exports nor declares public take methods from their owner only
     JL_MODULE_OPTION_OWNER_ONLY = 64,
     // fully typed mode for the module's methods: warn, or enforce
