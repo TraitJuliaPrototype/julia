@@ -120,6 +120,10 @@ typedef struct jl_stenv_t {
     // equalities, so no entry is consulted there; a variable's bound is a subtype question and is
     // asked with entries (subtype_ccheck, intersect_var)
     int noentry;
+    // meeting an entry's instance with the set asked about (intersect_membership): the member is in the
+    // set only where the entry's instance meets it parameter by parameter, so two instances of one set
+    // that differ in an input do not meet there as two sets do
+    int entryinst;
 } jl_stenv_t;
 
 // state manipulation utilities
@@ -587,6 +591,8 @@ int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
         return 1;
     if (jl_is_unionall(a)) a = jl_unwrap_unionall(a);
     if (jl_is_unionall(b)) b = jl_unwrap_unionall(b);
+    if (jl_is_all_type(a) || jl_is_all_type(b))
+        return 0; // an intersection meets what each component meets
     if (jl_is_uniontype(a))
         return obviously_disjoint(((jl_uniontype_t *)a)->a, b, specificity) &&
                obviously_disjoint(((jl_uniontype_t *)a)->b, b, specificity);
@@ -629,6 +635,9 @@ int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
             }
         }
         int istuple = (ad->name == jl_tuple_typename);
+        // two instances of a set with inputs may share a member at different input values
+        if (ad->name->open_set && ad->name->input_params != 0)
+            return 0;
         size_t np;
         if (istuple) {
             size_t na = jl_nparams(ad), nb = jl_nparams(bd);
@@ -1594,6 +1603,28 @@ JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X)
 {
     jl_value_t *su = jl_unwrap_unionall(S);
     jl_value_t *xu = jl_unwrap_unionall(X);
+    // an intersection: S could join All{Z, W} when it is in, or could join, each component; All{X, Y}
+    // could join X' when some component could
+    if (jl_is_all_type(xu)) {
+        jl_value_t *tup = jl_tparam0(xu);
+        if (!jl_is_tuple_type(tup))
+            return 1;
+        for (size_t i = 0; i < jl_nparams(tup); i++) {
+            jl_value_t *c = jl_tparam(tup, i);
+            if (!(jl_subtype(S, c) || jl_could_join(S, c)))
+                return 0;
+        }
+        return 1;
+    }
+    if (jl_is_all_type(su)) {
+        jl_value_t *tup = jl_tparam0(su);
+        if (!jl_is_tuple_type(tup))
+            return 1;
+        for (size_t i = 0; i < jl_nparams(tup); i++)
+            if (jl_could_join(jl_tparam(tup, i), X))
+                return 1;
+        return 0;
+    }
     if (jl_is_uniontype(xu))
         return jl_could_join(S, ((jl_uniontype_t*)xu)->a) || jl_could_join(S, ((jl_uniontype_t*)xu)->b);
     if (jl_is_uniontype(su))
@@ -1643,6 +1674,8 @@ JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X)
         return 0;
     jl_value_t *su = jl_unwrap_unionall(S);
     jl_value_t *xu = jl_unwrap_unionall(X);
+    if (jl_is_all_type(su) || jl_is_all_type(xu))
+        return 1; // an intersection's answer may come through an entry
     if (!jl_is_datatype(su) || !jl_is_datatype(xu) || jl_is_uniontype(xu))
         return 1;
     if (jl_is_type_type(su) && ((jl_datatype_t*)xu)->name->open_set)
@@ -2001,6 +2034,32 @@ static int has_existential_typevar(jl_value_t *x, jl_stenv_t *e) JL_NOTSAFEPOINT
 // (as opposed to being outside any type constructor, or comparing variable bounds).
 // this is used to record the positions where type variables occur for the
 // diagonal rule (record_var_occurrence).
+// x <: All{Z, W}: x is a subtype of each component, in the same environment
+static int subtype_all_right(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
+{
+    jl_value_t *tup = jl_tparam0(y);
+    if (!jl_is_datatype(tup))
+        return 0; // All{T} with T a variable: no components to ask
+    for (size_t i = 0; i < jl_nparams(tup); i++)
+        if (!subtype(x, jl_tparam(tup, i), e, param))
+            return 0;
+    return 1;
+}
+
+// All{X, Y} <: y: some component is a subtype of y. The component is chosen
+// as an element of a Union on the right is, by the walk's decisions, so that the outer loop
+// backtracks over the choice with the rest of the walk.
+static int subtype_all_left(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
+{
+    jl_value_t *tup = jl_tparam0(x);
+    if (!jl_is_tuple_type(tup))
+        return 0;
+    size_t n = jl_nparams(tup), i = 0;
+    while (i + 1 < n && pick_union_decision(e, 1))
+        i++;
+    return subtype(jl_tparam(tup, i), y, e, param);
+}
+
 static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
 {
     if (jl_is_uniontype(x)) {
@@ -2109,7 +2168,7 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
     jl_value_t *ux = jl_unwrap_unionall(x);
     jl_value_t *uy = jl_unwrap_unionall(y);
     if ((x != ux || y != uy) && y != (jl_value_t*)jl_any_type && jl_is_datatype(ux) && jl_is_datatype(uy) &&
-        !jl_is_type_type(ux)) {
+        !jl_is_type_type(ux) && !jl_is_all_type(ux) && !jl_is_all_type(uy)) {
         assert(ux);
         if (uy == (jl_value_t*)jl_any_type)
             return 1;
@@ -2132,6 +2191,13 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
     if (jl_is_datatype(x) && jl_is_datatype(y)) {
         if (x == y) return 1;
         if (y == (jl_value_t*)jl_any_type) return 1;
+        // intersections: x <: All{Z, W} when x is a subtype of each component, checked in the same
+        // environment as a tuple's parameters are; All{X, Y} <: y when some component is a subtype of y.
+        // The wrapper Core.All (a variable for the components) takes the ordinary rule below
+        if (jl_is_all_type(y) && jl_is_tuple_type(jl_tparam0(y)))
+            return subtype_all_right(x, y, e, param);
+        if (jl_is_all_type(x) && !(jl_is_all_type(y) && !jl_is_tuple_type(jl_tparam0(y))))
+            return subtype_all_left(x, y, e, param);
         jl_datatype_t *xd = (jl_datatype_t*)x, *yd = (jl_datatype_t*)y;
         if (jl_is_type_type(x) && !jl_is_type_type(y)) {
             jl_value_t *tp0 = jl_tparam0(xd);
@@ -2486,6 +2552,7 @@ static void init_stenv(jl_stenv_t *e, jl_value_t **env, int envsz)
     e->triangular = 0;
     e->Loffset = 0;
     e->noentry = 0;
+    e->entryinst = 0;
     e->Lunions.depth = 0;      e->Runions.depth = 0;
     e->Lunions.more = 0;       e->Runions.more = 0;
     e->Lunions.used = 0;       e->Runions.used = 0;
@@ -2632,6 +2699,9 @@ static int obvious_subtype(jl_value_t *x, jl_value_t *y, jl_value_t *y0, int *su
         *subtype = jl_egal(x, y);
         return 1;
     }
+    // x and y are unwrapped here: an intersection takes the full walk
+    if (jl_is_all_type(x) || jl_is_all_type(y))
+        return 0;
     if (jl_is_uniontype(x)) {
         // TODO: consider handling more LHS unions, being wary of covariance
         if (obvious_subtype(((jl_uniontype_t*)x)->a, y, y0, subtype) && *subtype) {
@@ -2960,6 +3030,7 @@ static int subtype_in_env(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     e2.envidx = e->envidx;
     e2.Loffset = e->Loffset;
     e2.noentry = e->noentry;
+    e2.entryinst = e->entryinst;
     return forall_exists_subtype(x, y, &e2, 0);
 }
 
@@ -3588,6 +3659,9 @@ static int var_occurs_inside(jl_value_t *v, jl_tvar_t *var, int inside, int want
     }
     else if (jl_is_datatype(v)) {
         size_t i;
+        if (jl_is_all_type(v) && jl_is_tuple_type(jl_tparam0(v)))
+            // an intersection's components are covariant positions, as a tuple's
+            return var_occurs_inside(jl_tparam0(v), var, inside, want_inv);
         int istuple = jl_is_tuple_type(v);
         for (i=0; i < jl_nparams(v); i++) {
             int ins_i = inside || !want_inv || !istuple;
@@ -4136,6 +4210,8 @@ static int always_occurs_cov(jl_value_t *v, jl_tvar_t *var, int param) JL_NOTSAF
         return vm->T && always_occurs_cov(vm->T, var, param);
     }
     else if (jl_is_datatype(v)) {
+        if (jl_is_all_type(v) && jl_is_tuple_type(jl_tparam0(v)))
+            return always_occurs_cov(jl_tparam0(v), var, param); // covariant components
         int nparam = jl_is_tuple_type(v) ? 1 : param;
         for (size_t i = 0; i < jl_nparams(v); i++) {
             if (always_occurs_cov(jl_tparam(v, i), var, nparam))
@@ -4496,7 +4572,9 @@ static jl_value_t *intersect_membership(jl_datatype_t *x, jl_value_t *y, jl_sten
             inst = membership_instance((jl_value_t*)xd, en);
             if (inst == NULL)
                 continue;
+            e->entryinst++;
             jl_value_t *ii = R ? intersect(y, inst, e, param) : intersect(inst, y, e, param);
+            e->entryinst--;
             if (ii != jl_bottom_type) {
                 res = (jl_value_t*)x;
                 break;
@@ -4724,6 +4802,89 @@ static int has_typevar_via_env(jl_value_t *x, jl_tvar_t *t, jl_stenv_t *e)
 // (as opposed to being outside any type constructor, or comparing variable bounds).
 // this is used to record the positions where type variables occur for the
 // diagonal rule (record_var_occurrence).
+// x ∩ All{Z, W}: x met with each component in the same environment, and the results'
+// intersection in its normal form. x is met with the components, never with
+// a partial result, so no intersection is built and met again.
+static jl_value_t *intersect_with_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
+{
+    int R = !jl_is_all_type(y);                 // the intersection is on the left
+    jl_value_t *all = R ? x : y;
+    jl_value_t *other = R ? y : x;
+    jl_value_t *tup = jl_tparam0(all);
+    if (!jl_is_datatype(tup))
+        return jl_bottom_type;
+    size_t i, n = jl_nparams(tup);
+    jl_value_t **rs;
+    JL_GC_PUSHARGS(rs, n + 1);
+    for (i = 0; i < n; i++) {
+        jl_value_t *c = jl_tparam(tup, i);
+        rs[i] = R ? intersect(c, other, e, param) : intersect(other, c, e, param);
+        if (rs[i] == jl_bottom_type) {
+            JL_GC_POP();
+            return jl_bottom_type;
+        }
+    }
+    jl_value_t *res = rs[0];
+    JL_TRY {
+        res = jl_type_all(rs, n);
+    }
+    JL_CATCH {
+        res = rs[0];                            // x ∩ Z covers x ∩ All{Z, W}
+    }
+    rs[n] = res;
+    JL_GC_POP();
+    return res;
+}
+
+// A closed type with subtypes that may be members of an open set: an abstract type other
+// than a tuple type or a type value's
+static int meets_open(jl_value_t *t)
+{
+    jl_datatype_t *d = (jl_datatype_t*)t;
+    return d->name->abstract && !jl_is_tuple_type(t) && !jl_is_type_type(t) && !jl_is_all_type(t);
+}
+
+// An open set meets a set or an abstract type that no entry relates to it as their
+// intersection All{X, T}: the members of X below T, now or later.
+static jl_value_t *meet_open(jl_value_t *x, jl_value_t *y)
+{
+    jl_value_t *ts[2] = {x, y};
+    jl_value_t *r = jl_bottom_type;
+    JL_TRY {
+        r = jl_type_all(ts, 2);
+    }
+    JL_CATCH {
+        r = jl_bottom_type;
+    }
+    return r;
+}
+
+// Whether two instances of one set with inputs may be at different values of an input: a member has one instance per value of the inputs, so two instances at the same input values
+// that differ in another parameter have no common member; at different input values a type may be a
+// member of both. An input with a free variable may take a value the other's does not.
+static int inputs_may_differ(jl_datatype_t *xd, jl_datatype_t *yd)
+{
+    uint8_t mask = xd->name->input_params;
+    size_t np = jl_nparams(xd);
+    for (size_t i = 0; i < np && i < 8; i++) {
+        if (!((mask >> i) & 1))
+            continue;
+        jl_value_t *a = jl_tparam(xd, i), *b = jl_tparam(yd, i);
+        if (a == b)
+            continue;
+        if (jl_has_free_typevars(a) || jl_has_free_typevars(b))
+            return 1;
+        if (jl_is_type(a) && jl_is_type(b)) {
+            if (!(subtype_noentry(a, b) && subtype_noentry(b, a)))
+                return 1;
+        }
+        else if (!jl_egal(a, b)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
 {
     if (x == y) return y;
@@ -4942,6 +5103,8 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
         return intersect_unionall(x, (jl_unionall_t*)y, e, 1, param);
     if (jl_is_datatype(x) && jl_is_datatype(y)) {
         jl_datatype_t *xd = (jl_datatype_t*)x, *yd = (jl_datatype_t*)y;
+        if (param < 2 && (jl_is_all_type(x) || jl_is_all_type(y)))
+            return intersect_with_all(x, y, e, param);
         if (param < 2) {
             // a type value meets a set by an entry for Type{S}
             if (jl_is_type_type(x)) {
@@ -4960,6 +5123,13 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
             size_t i, np = jl_nparams(xd);
             jl_value_t **newparams;
             JL_GC_PUSHARGS(newparams, np);
+            // two instances of a set with inputs: where their parameters do not meet, the environment is
+            // restored and they may still meet as two sets do
+            int inputs = param < 2 && !e->noentry && !e->entryinst && e->Loffset == 0 &&
+                         xd->name->open_set && xd->name->input_params != 0;
+            jl_savedenv_t se;
+            if (inputs)
+                save_env(e, &se, 1);
             int isx = 1, isy = 1; // try to reuse the object x or y as res whenever we can (e.g. when it is the supertype) instead of allocating a copy
             for (i = 0; i < np; i++) {
                 jl_value_t *xi = jl_tparam(xd, i), *yi = jl_tparam(yd, i);
@@ -4969,6 +5139,19 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
                 isx = isx && ii == xi;
                 isy = isy && ii == yi;
                 newparams[i] = ii;
+            }
+            if (inputs) {
+                jl_value_t *res = NULL;
+                if (i < np) {
+                    restore_env(e, &se, 1);
+                    if (inputs_may_differ(xd, yd))
+                        res = meet_open(x, y);
+                }
+                free_env(&se);
+                if (i < np) {
+                    JL_GC_POP();
+                    return res ? res : jl_bottom_type;
+                }
             }
             jl_value_t *res = jl_bottom_type;
             if (i == np) {
@@ -5011,8 +5194,14 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
                 jl_value_t *r = jl_bottom_type;
                 if (((jl_datatype_t*)y)->name->open_set)
                     r = intersect_membership((jl_datatype_t*)x, y, e, 0, param);
-                if (r == jl_bottom_type && ((jl_datatype_t*)x)->name->open_set)
+                int xo = ((jl_datatype_t*)x)->name->open_set, yo = ((jl_datatype_t*)y)->name->open_set;
+                if (r == jl_bottom_type && xo)
                     r = intersect_membership((jl_datatype_t*)y, x, e, 1, param);
+                // a set meets a set or an abstract type that no entry relates as their intersection;
+                // a concrete non-member does not meet it
+                if (r == jl_bottom_type && param < 2 &&
+                    ((xo && (yo || meets_open(y))) || (yo && meets_open(x))))
+                    r = meet_open(x, y);
                 return r;
             }
             return intersect_sub_datatype((jl_datatype_t*)y, xd, e, 1, param);
@@ -5159,7 +5348,7 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
 
 // type intersection entry points
 
-static jl_value_t *intersect_types(jl_value_t *x, jl_value_t *y, int emptiness_only)
+static jl_value_t *intersect_types_(jl_value_t *x, jl_value_t *y, int emptiness_only, int entryinst)
 {
     jl_stenv_t e;
     if (obviously_disjoint(x, y, 0))
@@ -5175,9 +5364,15 @@ static jl_value_t *intersect_types(jl_value_t *x, jl_value_t *y, int emptiness_o
     init_stenv(&e, NULL, 0);
     e.intersection = e.ignore_free = 1;
     e.emptiness_only = emptiness_only;
+    e.entryinst = entryinst;
     jl_value_t *ans = intersect_all(x, y, &e);
     free_stenv(&e);
     return ans;
+}
+
+static jl_value_t *intersect_types(jl_value_t *x, jl_value_t *y, int emptiness_only)
+{
+    return intersect_types_(x, y, emptiness_only, 0);
 }
 
 JL_DLLEXPORT jl_value_t *jl_intersect_types(jl_value_t *x, jl_value_t *y)
@@ -5185,10 +5380,13 @@ JL_DLLEXPORT jl_value_t *jl_intersect_types(jl_value_t *x, jl_value_t *y)
     return intersect_types(x, y, 0);
 }
 
-// The intersection of two entries, each a member pattern with its instance (one instance per member)
+// The intersection of entries, each a member with its instance (one instance per member): an instance of
+// a set is paired with another parameter by parameter, as intersect_membership pairs an entry's instance
+// with the set asked about, so two instances that differ in an input do not meet here as two sets do: a
+// member is in the instance its entry names.
 JL_DLLEXPORT jl_value_t *jl_entry_intersection(jl_value_t *x, jl_value_t *y)
 {
-    return intersect_types(x, y, 0);
+    return intersect_types_(x, y, 0, 1);
 }
 
 // TODO: this can probably be done more efficiently
@@ -6065,6 +6263,40 @@ int tuple_cmp_typeofbottom(jl_datatype_t *a, jl_datatype_t *b)
     newenv.val = (jl_value_t*)(intptr_t)count_occurs(ub->body, ub->var); \
     return type_morespecific_(a, ub->body, a0, b0, invariant, &newenv)
 
+// a component at least as specific as t: the same type, or more specific
+static int all_component_covers(jl_value_t *c, jl_value_t *t, jl_value_t *a0, jl_value_t *b0, jl_typeenv_t *env)
+{
+    return c == t || eq_msp(c, t, a0, b0, env) || type_morespecific_(c, t, a0, b0, 0, env);
+}
+
+// a at least as specific as b where either is an intersection: an
+// intersection is as specific as b when one of its components is; a type is as specific as
+// an intersection when it is as specific as each component. So an intersection is more
+// specific than each component, and one with a closed component ranks as closed against an
+// open set, by the rule for closed and open types at each component.
+static int all_covers(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_value_t *b0, jl_typeenv_t *env)
+{
+    if (jl_is_all_type(b)) {
+        jl_value_t *tb = jl_tparam0(b);
+        if (!jl_is_datatype(tb))
+            return 0;
+        for (size_t j = 0; j < jl_nparams(tb); j++)
+            if (!all_covers(a, jl_tparam(tb, j), a0, b0, env))
+                return 0;
+        return 1;
+    }
+    if (jl_is_all_type(a)) {
+        jl_value_t *ta = jl_tparam0(a);
+        if (!jl_is_datatype(ta))
+            return 0;
+        for (size_t i = 0; i < jl_nparams(ta); i++)
+            if (all_component_covers(jl_tparam(ta, i), b, a0, b0, env))
+                return 1;
+        return 0;
+    }
+    return all_component_covers(a, b, a0, b0, env);
+}
+
 static int type_morespecific_(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_value_t *b0, int invariant, jl_typeenv_t *env)
 {
     if (a == b)
@@ -6147,6 +6379,10 @@ static int type_morespecific_(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_v
             return !type_morespecific_(b, a, b0, a0, invariant, env);
         return 0;
     }
+
+    if (!invariant && (jl_is_all_type(a) || jl_is_all_type(b)) &&
+        (jl_is_datatype(a) || jl_is_typevar(a)) && (jl_is_datatype(b) || jl_is_typevar(b)))
+        return all_covers(a, b, a0, b0, env) && !all_covers(b, a, b0, a0, env);
 
     if (jl_is_datatype(a) && jl_is_datatype(b)) {
         jl_datatype_t *tta = (jl_datatype_t*)a, *ttb = (jl_datatype_t*)b;
