@@ -539,10 +539,14 @@ ERROR: ArgumentError: Cannot call tail on an empty tuple.
 tail(x::Tuple) = argtail(x...)
 tail(::Tuple{}) = throw(ArgumentError("Cannot call tail on an empty tuple."))
 
+# The type-introspection helpers read a type's fields with `getfield` and call each other through
+# `invoke` at the callee's own signature: a call or a property read at a value of unknown type is a call
+# at an abstract signature, which a package's method for its own type intercepts (and invalidates),
+# under helpers whose effects are asserted.
 function unwrap_unionall(@nospecialize(a))
     @_foldable_meta
     while isa(a,UnionAll)
-        a = a.body
+        a = getfield(a, :body)
     end
     return a
 end
@@ -590,17 +594,18 @@ end
 
 function isvatuple(@nospecialize(t))
     @_foldable_meta
-    t = unwrap_unionall(t)
+    t = invoke(unwrap_unionall, Tuple{Any}, t)
     if isa(t, DataType)
-        n = length(t.parameters)
-        return n > 0 && isvarargtype(t.parameters[n])
+        ps = getfield(t, :parameters)
+        n = length(ps)
+        return n > 0 && isa(ps[n], Core.TypeofVararg)   # `isvarargtype`'s test, on an element of unknown type
     end
     return false
 end
 
 function unwrapva(@nospecialize(t))
     isa(t, Core.TypeofVararg) || return t
-    return isdefined(t, :T) ? t.T : Any
+    return isdefined(t, :T) ? getfield(t, :T) : Any
 end
 
 function unconstrain_vararg_length(va::Core.TypeofVararg)
