@@ -295,6 +295,10 @@ typedef struct _jl_task_t {
     jl_handler_t *eh;
     // saved thread state
     jl_ucontext_t ctx; // pointer into stkbuf, if suspended
+    // the world in which membership questions are answered, for the length of a query (inference,
+    // method matching, a declaration); 0 for the task's world age. Saved and restored by exception
+    // handlers as world_age is
+    size_t membership_world;
 } jl_task_t;
 
 JL_DLLEXPORT void *jl_get_ptls_states(void);

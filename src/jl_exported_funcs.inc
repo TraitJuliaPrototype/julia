@@ -29,6 +29,7 @@
     XX(jl_array_ptr) \
     XX(jl_array_ptr_1d_append) \
     XX(jl_array_ptr_1d_push) \
+    XX(jl_declare_membership) \
     XX(jl_genericmemory_owner) \
     XX(jl_genericmemoryref) \
     XX(jl_array_rank) \
@@ -227,6 +228,8 @@
     XX(jl_get_world_counter) \
     XX(jl_get_zero_subnormals) \
     XX(jl_gf_invoke_lookup) \
+    XX(jl_has_open_set) \
+    XX(jl_is_open_set) \
     XX(jl_method_lookup_by_tt) \
     XX(jl_method_lookup) \
     XX(jl_gf_invoke_lookup_worlds) \
@@ -403,6 +406,7 @@
     XX(jl_safepoint_suspend_thread) \
     XX(jl_safepoint_resume_thread) \
     XX(jl_SC_CLK_TCK) \
+    XX(jl_set_open_set) \
     XX(jl_setaffinity) \
     XX(jl_set_ARGS) \
     XX(jl_set_const) \

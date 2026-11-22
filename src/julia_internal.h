@@ -945,6 +945,28 @@ STATIC_INLINE int jl_has_open_set_in(jl_value_t *v) JL_NOTSAFEPOINT
         return ((jl_datatype_t*)v)->has_open_set;
     return jl_open_set_witness(v);
 }
+JL_DLLEXPORT int jl_has_open_set(jl_value_t *v);
+JL_DLLEXPORT int jl_is_open_set(jl_value_t *T);
+JL_DLLEXPORT void jl_set_open_set(jl_value_t *T);
+JL_DLLEXPORT void jl_set_input_params(jl_value_t *T, uint8_t mask);
+// declares `member` (a DataType, a UnionAll member pattern, Type{S}, or a set instance) a member of the
+// set named by set_instance (X, or an instance X{...} sharing the pattern's variables), in a new world.
+// declarer is a Module; by the forwarding field's name or nothing; receiver :self, :field or :none.
+// The caller continues in the latest world (Expr(:latestworld)).
+JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *set_instance,
+                                               jl_value_t *declarer, jl_value_t *by,
+                                               jl_value_t *receiver);
+extern jl_genericmemory_t *jl_set_entries JL_GLOBALLY_ROOTED; // the entries at each set (datatype.c)
+// whether the TypeName `from` reaches `to` along declared supertypes and the entries live in `world`
+// (0: every entry)
+int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world) JL_NOTSAFEPOINT;
+jl_value_t *jl_membership_instance(jl_value_t *x, jl_membership_t *en);
+// the world in which membership questions are answered, for contexts whose task world is frozen below
+// the latest entries (inference, method matching, a declaration): set it for the length of the query
+// (the call returns the previous value, to restore); 0 clears it
+JL_DLLEXPORT size_t jl_set_membership_query_world(size_t world) JL_NOTSAFEPOINT;
+JL_DLLEXPORT size_t jl_membership_query_world(void) JL_NOTSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_entry_intersection(jl_value_t *x, jl_value_t *y);
 jl_datatype_t *jl_new_uninitialized_datatype(void);
 void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable);
 JL_DLLEXPORT jl_datatype_t *jl_wrap_Type(jl_value_t *t);  // x -> Type{x}

@@ -2226,6 +2226,11 @@ static void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super)
         error = "cannot add subtypes to Core.Builtin";
     else if (!jl_is_abstracttype(super))
         error = "can only subtype abstract types";
+    else if (tt->name->open_set && super != (jl_value_t*)jl_any_type &&
+             !((jl_datatype_t*)super)->name->open_set)
+        // a member of the set would then be a subtype of super: a closed type's answers would
+        // change with memberships
+        error = "a set's supertype must be Any or a set";
     if (error)
          jl_errorf("invalid subtyping in definition of %s: %s.", jl_symbol_name(tt->name->name), error);
     tt->super = (jl_datatype_t*)super;
