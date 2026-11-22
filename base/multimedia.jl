@@ -251,16 +251,14 @@ objects are printed in the Julia REPL.)
 struct TextDisplay <: AbstractDisplay
     io::IO
 end
-# The display erases the stream: `show` runs at `IOContext{IO}`, one type whatever the
-# display's stream, which a package image's workload at `IOContext{IO}(IOBuffer())` covers.
-display(d::TextDisplay, M::MIME"text/plain", @nospecialize x) = (show(IOContext{IO}(d.io), M, x); println(d.io))
+display(d::TextDisplay, M::MIME"text/plain", @nospecialize x) = (show(d.io, M, x); println(d.io))
 display(d::TextDisplay, @nospecialize x) = display(d, MIME"text/plain"(), x)
 
 # if you explicitly call display("text/foo", x), it should work on a TextDisplay:
 displayable(d::TextDisplay, M::MIME) = istextmime(M)
 function display(d::TextDisplay, M::MIME, @nospecialize x)
     displayable(d, M) || throw(MethodError(display, (d, M, x)))
-    show(IOContext{IO}(d.io), M, x); println(d.io)
+    show(d.io, M, x); println(d.io)
 end
 
 import Base: close, flush

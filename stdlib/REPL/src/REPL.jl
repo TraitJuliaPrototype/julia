@@ -544,9 +544,7 @@ function show_limited(io::IO, mime::MIME, x)
         # We wrap in a LimitIO to limit the amount of printing.
         # We unpack `IOContext`s, since we will pass the properties on the outside.
         inner = io isa IOContext ? io.io : io
-        # The display erases the stream: every value's `show` runs at `IOContext{IO}`, one type
-        # whatever the terminal, which a package image's workload at `IOContext{IO}(IOBuffer())` covers.
-        wrapped_limiter = IOContext{IO}(IOContext(LimitIO(inner, SHOW_MAXIMUM_BYTES), io))
+        wrapped_limiter = IOContext(LimitIO(inner, SHOW_MAXIMUM_BYTES), io)
         # `show_repl` to allow the hook with special syntax highlighting
         show_repl(wrapped_limiter, mime, x)
     catch e
