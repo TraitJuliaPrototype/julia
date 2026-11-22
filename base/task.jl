@@ -1148,7 +1148,7 @@ function yieldto(t::Task, @nospecialize(x=nothing))
     record_running_time!(ct)
     # [task] created -scheduled-unfairly-> wait_time
     maybe_record_enqueued!(t)
-    t.result = x
+    setfield!(t, :result, x)
     set_next_task(t)
     return try_yieldto(identity)
 end
