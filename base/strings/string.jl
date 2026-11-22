@@ -9,7 +9,8 @@ struct StringIndexError <: Exception
     string::AbstractString
     index::Int
 end
-@noinline string_index_err((@nospecialize s::AbstractString), i::Integer) =
+# by the string's type: its call of `StringIndexError` is then at a concrete signature
+@noinline string_index_err(s::AbstractString, i::Integer) =
     throw(StringIndexError(s, Int(i)))
 function showerror(io::IO, exc::StringIndexError)
     s = exc.string
