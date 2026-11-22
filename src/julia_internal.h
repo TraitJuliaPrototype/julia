@@ -973,6 +973,14 @@ JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b);
 JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X);
 JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X);
 JL_DLLEXPORT int jl_membership_flip_possible(jl_value_t *a, jl_value_t *b);
+// intersections: All{X, Y} is Core.All{Tuple{X, Y}}, built in its normal form. Every intersection has
+// the open-set bit, so a type without it is answered by two loads and the hot paths pay nothing more.
+STATIC_INLINE int jl_is_all_type(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    return jl_is_datatype(v) && ((jl_datatype_t*)v)->has_open_set && jl_all_type != NULL &&
+           ((jl_datatype_t*)v)->name == ((jl_datatype_t*)((jl_unionall_t*)jl_all_type)->body)->name;
+}
+JL_DLLEXPORT jl_value_t *jl_type_all(jl_value_t **ts, size_t n);
 jl_datatype_t *jl_new_uninitialized_datatype(void);
 void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable);
 JL_DLLEXPORT jl_datatype_t *jl_wrap_Type(jl_value_t *t);  // x -> Type{x}
