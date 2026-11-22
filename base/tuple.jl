@@ -285,24 +285,27 @@ function eltype(t::Type{<:Tuple})
 end
 function _compute_eltype(@nospecialize t)
     @_total_meta
-    has_free_typevars(t) && return Any
-    t´ = unwrap_unionall(t)
+    invoke(has_free_typevars, Tuple{Any}, t) && return Any
+    t´ = invoke(unwrap_unionall, Tuple{Any}, t)
     # Given t = Tuple{Vararg{S}} where S<:Real, the various
     # unwrapping/wrapping/va-handling here will return Real
+    # (the type's fields are read with `getfield`, and the type functions called through `invoke`
+    # at their own signatures, as in the type joins)
     if t´ isa Union
-        return promote_typejoin(_compute_eltype(rewrap_unionall(t´.a, t)),
-                                _compute_eltype(rewrap_unionall(t´.b, t)))
+        return invoke(promote_typejoin, Tuple{Any, Any},
+                      invoke(_compute_eltype, Tuple{Any}, invoke(rewrap_unionall, Tuple{Any, Any}, getfield(t´, :a), t)),
+                      invoke(_compute_eltype, Tuple{Any}, invoke(rewrap_unionall, Tuple{Any, Any}, getfield(t´, :b), t)))
     end
-    p = (t´::DataType).parameters
+    p = getfield(t´::DataType, :parameters)
     length(p) == 0 && return Union{}
-    elt = rewrap_unionall(unwrapva(p[1]), t)
+    elt = invoke(rewrap_unionall, Tuple{Any, Any}, invoke(unwrapva, Tuple{Any}, p[1]), t)
     elt isa Type || return Union{} # Tuple{2} is legal as a Type, but the eltype is Union{} since it is uninhabited
     r = elt
     for i in 2:length(p)
         r === Any && return r # if we've already reached Any, it can't widen any more
-        elt = rewrap_unionall(unwrapva(p[i]), t)
+        elt = invoke(rewrap_unionall, Tuple{Any, Any}, invoke(unwrapva, Tuple{Any}, p[i]), t)
         elt isa Type || return Union{} # Tuple{2} is legal as a Type, but the eltype is Union{} since it is uninhabited
-        r = promote_typejoin(elt, r)
+        r = invoke(promote_typejoin, Tuple{Any, Any}, elt, r)
     end
     return r
 end
