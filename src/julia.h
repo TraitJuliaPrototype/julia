@@ -816,7 +816,15 @@ enum jl_binding_flags {
     BINDING_FLAG_PUBLICP                              = 0x4,
     // Set if any methods defined in this module implicitly reference
     // this binding. If not, invalidation is optimized.
-    BINDING_FLAG_ANY_IMPLICIT_EDGES                   = 0x8
+    BINDING_FLAG_ANY_IMPLICIT_EDGES                   = 0x8,
+    // an owner-only function by its owner's declaration: only its owner defines its methods
+    BINDING_FLAG_OWNER_ONLY                           = 0x10
+};
+
+// the bits of a module's options word
+enum jl_module_option {
+    // the functions the module neither exports nor declares public take methods from their owner only
+    JL_MODULE_OPTION_OWNER_ONLY = 64,
 };
 
 typedef struct _jl_binding_t {
@@ -865,6 +873,8 @@ typedef struct _jl_module_t {
     int8_t max_methods;
     // compiled by facts: 0 plain, 1 facts, 2 never (the compiler's own modules)
     int8_t facts;
+    // options for the module's own functions (`@compiler_options`), as bits: JL_MODULE_OPTION_*
+    uint8_t options;
     // If cleared no binding partition in this module has PARTITION_FLAG_EXPORTED and min_world > jl_require_world.
     _Atomic(int8_t) export_set_changed_since_require_world;
     jl_mutex_t lock;
@@ -2061,6 +2071,7 @@ JL_DLLEXPORT int jl_get_module_infer(jl_module_t *m);
 JL_DLLEXPORT void jl_set_module_max_methods(jl_module_t *self, int value);
 JL_DLLEXPORT int jl_get_module_max_methods(jl_module_t *m);
 JL_DLLEXPORT void jl_set_module_facts(jl_module_t *self, int value);
+JL_DLLEXPORT void jl_set_module_option(jl_module_t *self, int bit, int value);
 JL_DLLEXPORT jl_value_t *jl_get_module_usings_backedges(jl_module_t *m);
 JL_DLLEXPORT jl_value_t *jl_get_module_scanned_methods(jl_module_t *m);
 JL_DLLEXPORT jl_value_t *jl_get_module_binding_or_nothing(jl_module_t *m, jl_sym_t *s);
