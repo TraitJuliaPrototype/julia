@@ -328,6 +328,7 @@ end
 
 macro inline()   Expr(:meta, :inline)   end
 macro noinline() Expr(:meta, :noinline) end
+macro _nospecializeinfer_meta() Expr(:meta, :nospecializeinfer) end
 
 macro _boundscheck() Expr(:boundscheck) end
 
@@ -1139,7 +1140,9 @@ typename(union::UnionAll) = typename(union.body)
 # Special inference support to avoid execess specialization of these methods.
 # TODO: Replace this by a generic heuristic.
 (>:)(@nospecialize(a), @nospecialize(b)) = (b <: a)
-(!==)(@nospecialize(a), @nospecialize(b)) = Intrinsics.not_int(a === b)
+# inferred once, at `(Any, Any)`, whatever the call's argument types (`Base.@nospecializeinfer`): a call
+# reaches that one instance, and its dispatch backedge keeps the call's own signature
+(!==)(@nospecialize(a), @nospecialize(b)) = (@_nospecializeinfer_meta; Intrinsics.not_int(a === b))
 
 include(Core, "optimized_generics.jl")
 

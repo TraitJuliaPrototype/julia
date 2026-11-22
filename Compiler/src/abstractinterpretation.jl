@@ -2851,8 +2851,10 @@ function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
     elseif is_return_type(f)
         return return_type_tfunc(interp, argtypes, si, sv)
     elseif la == 3 && f === Core.:(!==)
-        # mark !== as exactly a negated call to ===
-        let callfuture = abstract_call_gf_by_type(interp, f, ArgInfo(fargs, Any[Const(f), Any, Any]), si, Tuple{typeof(f), Any, Any}, sv, max_methods)::Future,
+        # mark !== as exactly a negated call to ===. Its one method is inferred at `(Any, Any)`, and the
+        # call is matched at its own signature, which its edge keeps: a later method of `!==` ends the
+        # caller only where it meets the call's types
+        let callfuture = abstract_call_gf_by_type(interp, f, ArgInfo(fargs, Any[Const(f), Any, Any]), si, argtypes_to_type(argtypes), sv, max_methods)::Future,
             rtfuture = abstract_call_known(interp, (===), arginfo, si, sv, max_methods)::Future
             return Future{CallMeta}(isready(callfuture) && isready(rtfuture), interp, sv) do interp, sv
                 local rty = rtfuture[].rt
