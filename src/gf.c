@@ -4300,11 +4300,11 @@ STATIC_INLINE jl_value_t *verify_type(jl_value_t *v) JL_NOTSAFEPOINT
     return v;
 }
 
-STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc, size_t world)
+// Runs the code of `mfunc` of the policy it has where `reach` reaches it.
+STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc, size_t world, int reach)
 {
     jl_code_instance_t *codeinst = NULL;
-    // the code of the policy the method instance has where the runtime reaches it
-    int facts = mi_policy_facts_at(mfunc, JL_REACH_RUNTIME);
+    int facts = mi_policy_facts_at(mfunc, reach);
     jl_callptr_t invoke = jl_method_compiled_callptr(mfunc, world, facts, &codeinst);
     if (invoke) {
         jl_value_t *res = invoke(F, args, nargs, codeinst);
@@ -4330,7 +4330,23 @@ STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t 
 JL_DLLEXPORT jl_value_t *jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc)
 {
     size_t world = jl_current_task->world_age;
-    return _jl_invoke(F, args, nargs, mfunc, world);
+    return _jl_invoke(F, args, nargs, mfunc, world, JL_REACH_RUNTIME);
+}
+// the entries of compiled code of each policy, and of a call made for code of a policy
+JL_DLLEXPORT jl_value_t *jl_invoke_plain(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc)
+{
+    size_t world = jl_current_task->world_age;
+    return _jl_invoke(F, args, nargs, mfunc, world, JL_REACH_PLAIN);
+}
+JL_DLLEXPORT jl_value_t *jl_invoke_facts(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc)
+{
+    size_t world = jl_current_task->world_age;
+    return _jl_invoke(F, args, nargs, mfunc, world, JL_REACH_FACTS);
+}
+JL_DLLEXPORT jl_value_t *jl_invoke_reach(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc, int reach)
+{
+    size_t world = jl_current_task->world_age;
+    return _jl_invoke(F, args, nargs, mfunc, world, reach);
 }
 
 JL_DLLEXPORT jl_value_t *jl_invoke_oc(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc)
@@ -4340,7 +4356,7 @@ JL_DLLEXPORT jl_value_t *jl_invoke_oc(jl_value_t *F, jl_value_t **args, uint32_t
     size_t last_age = ct->world_age;
     size_t world = oc->world;
     ct->world_age = world;
-    jl_value_t *ret = _jl_invoke(F, args, nargs, mfunc, world);
+    jl_value_t *ret = _jl_invoke(F, args, nargs, mfunc, world, JL_REACH_RUNTIME);
     ct->world_age = last_age;
     return ret;
 }
@@ -4721,16 +4737,39 @@ have_entry:
     return mfunc;
 }
 
-JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t *F, jl_value_t **args, uint32_t nargs)
+// A dynamic call: the method lookup, with the per-call-site cache keyed by the caller's return
+// address, then the code of the policy `reach` asks for. One copy, so that the lookup is inlined
+// into it as into jl_apply_generic before; the entries below jump to it.
+static NOINLINE jl_value_t *apply_generic_reach(jl_value_t *F, jl_value_t **args, uint32_t nargs, void *ip, int reach)
 {
     size_t world = jl_current_task->world_age;
     if (__unlikely(dp_on > 0))
         dp_ip = (void*)jl_return_address();
     jl_method_instance_t *mfunc = jl_lookup_generic_(F, args, nargs,
-                                                     jl_int32hash_fast(jl_return_address()),
+                                                     jl_int32hash_fast((uint32_t)(uintptr_t)ip),
                                                      world);
     JL_GC_PROMISE_ROOTED(mfunc);
-    return _jl_invoke(F, args, nargs, mfunc, world);
+    return _jl_invoke(F, args, nargs, mfunc, world, reach);
+}
+
+// the runtime's own entry: plain code is reached
+JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t *F, jl_value_t **args, uint32_t nargs)
+{
+    return apply_generic_reach(F, args, nargs, (void*)jl_return_address(), JL_REACH_RUNTIME);
+}
+// the entries of compiled code of each policy
+JL_DLLEXPORT jl_value_t *jl_apply_generic_plain(jl_value_t *F, jl_value_t **args, uint32_t nargs)
+{
+    return apply_generic_reach(F, args, nargs, (void*)jl_return_address(), JL_REACH_PLAIN);
+}
+JL_DLLEXPORT jl_value_t *jl_apply_generic_facts(jl_value_t *F, jl_value_t **args, uint32_t nargs)
+{
+    return apply_generic_reach(F, args, nargs, (void*)jl_return_address(), JL_REACH_FACTS);
+}
+// a call made for code of a policy (a builtin that calls a function, the interpreter)
+JL_DLLEXPORT jl_value_t *jl_apply_generic_reach(jl_value_t *F, jl_value_t **args, uint32_t nargs, int reach)
+{
+    return apply_generic_reach(F, args, nargs, (void*)jl_return_address(), reach);
 }
 
 static jl_method_match_t *_gf_invoke_lookup(jl_value_t *types JL_PROPAGATES_ROOT, jl_methtable_t *mt, size_t world, int cache_result, size_t *min_valid, size_t *max_valid)
@@ -4783,6 +4822,11 @@ JL_DLLEXPORT jl_value_t *jl_gf_invoke_lookup_worlds(jl_value_t *types, jl_value_
 // NOTE: assumes argument type is a subtype of the lookup type.
 jl_value_t *jl_gf_invoke(jl_value_t *types0, jl_value_t *gf, jl_value_t **args, size_t nargs)
 {
+    return jl_gf_invoke_reach(types0, gf, args, nargs, JL_REACH_RUNTIME);
+}
+
+jl_value_t *jl_gf_invoke_reach(jl_value_t *types0, jl_value_t *gf, jl_value_t **args, size_t nargs, int reach)
+{
     size_t world = jl_current_task->world_age;
     jl_value_t *types = NULL;
     JL_GC_PUSH1(&types);
@@ -4798,10 +4842,15 @@ jl_value_t *jl_gf_invoke(jl_value_t *types0, jl_value_t *gf, jl_value_t **args, 
     // now we have found the matching definition.
     // next look for or create a specialization of this definition.
     JL_GC_POP();
-    return jl_gf_invoke_by_method(method, gf, args, nargs);
+    return jl_gf_invoke_by_method_reach(method, gf, args, nargs, reach);
 }
 
 jl_value_t *jl_gf_invoke_by_method(jl_method_t *method, jl_value_t *gf, jl_value_t **args, size_t nargs)
+{
+    return jl_gf_invoke_by_method_reach(method, gf, args, nargs, JL_REACH_RUNTIME);
+}
+
+jl_value_t *jl_gf_invoke_by_method_reach(jl_method_t *method, jl_value_t *gf, jl_value_t **args, size_t nargs, int reach)
 {
     jl_method_instance_t *mfunc = NULL;
     jl_typemap_entry_t *tm = NULL;
@@ -4847,7 +4896,7 @@ jl_value_t *jl_gf_invoke_by_method(jl_method_t *method, jl_value_t *gf, jl_value
         }
     }
     size_t world = jl_current_task->world_age;
-    return _jl_invoke(gf, args, nargs - 1, mfunc, world);
+    return _jl_invoke(gf, args, nargs - 1, mfunc, world, reach);
 }
 
 jl_sym_t *jl_gf_supertype_name(jl_sym_t *name)
