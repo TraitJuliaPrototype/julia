@@ -399,15 +399,21 @@ static int emit_codeinst_and_edges(jl_code_instance_t *codeinst)
 }
 
 // The policy of a method instance's code: its method's; a top-level thunk's is its module's, plain
-// for a module that is not compiled by facts.
+// for a module that is not compiled by facts (under the test bed, facts for a module that declares no
+// option).
 static int mi_policy_uncached(jl_method_instance_t *mi) JL_NOTSAFEPOINT
 {
     jl_value_t *def = mi->def.value;
     if (jl_is_method(def))
         return jl_method_policy((jl_method_t*)def);
-    if (jl_is_module(def) && jl_options.trim == JL_TRIM_NO && ((jl_module_t*)def)->facts == 1)
-        return JL_POLICY_FACTS;
-    return JL_POLICY_PLAIN;
+    if (jl_is_module(def) && jl_options.trim == JL_TRIM_NO) {
+        int8_t mf = ((jl_module_t*)def)->facts;
+        if (mf == 1)
+            return JL_POLICY_FACTS;
+        if (mf == 2)
+            return JL_POLICY_PLAIN;
+    }
+    return jl_compile_by_facts_all() ? JL_POLICY_FACTS : JL_POLICY_PLAIN;
 }
 // The same, cached in the method instance's flags at its first use: dispatch asks it at every call.
 // A module's option set after one of its methods was first called does not change that method's
@@ -423,12 +429,14 @@ STATIC_INLINE int mi_policy(jl_method_instance_t *mi) JL_NOTSAFEPOINT
 }
 // Whether the code of `mi` reached with `reach` is compiled by facts: its own policy, or for a
 // method that takes the policy of the code reaching it, that code's; the runtime's own entries
-// reach with plain code.
+// reach with plain code, under the test bed with facts.
 STATIC_INLINE int mi_policy_facts_at(jl_method_instance_t *mi, int reach) JL_NOTSAFEPOINT
 {
     int p = mi_policy(mi);
     if (p != JL_POLICY_CALLER)
         return p;
+    if (reach == JL_REACH_RUNTIME)
+        return jl_compile_by_facts_all();
     return reach == JL_REACH_FACTS;
 }
 JL_DLLEXPORT int jl_mi_policy_at(jl_method_instance_t *mi, int reach) JL_NOTSAFEPOINT

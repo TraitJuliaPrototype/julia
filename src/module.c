@@ -741,10 +741,36 @@ JL_DLLEXPORT int jl_get_module_facts(jl_module_t *m)
 {
     return m->facts;
 }
+// The test bed: with JULIA_COMPILE_BY_FACTS=1 (read once; never while generating output) a method of
+// a module that declares no option takes the policy of the code that reaches it, and the runtime's
+// own entries reach with facts, so that a whole session's own code compiles by facts.
+static int compile_by_facts_all = -1;
+static int facts_all(void) JL_NOTSAFEPOINT
+{
+    if (compile_by_facts_all < 0) {
+        const char *e = getenv("JULIA_COMPILE_BY_FACTS");
+        compile_by_facts_all = e != NULL && e[0] == '1' && e[1] == '\0' && !jl_generating_output();
+    }
+    return compile_by_facts_all;
+}
+JL_DLLEXPORT int jl_compile_by_facts_all(void) JL_NOTSAFEPOINT
+{
+    return facts_all();
+}
+// A builtin's (or intrinsic's) method: its one CodeInstance is the runtime's, and every caller runs it.
+static int method_is_builtin(jl_method_t *m) JL_NOTSAFEPOINT
+{
+    jl_value_t *sig = jl_unwrap_unionall(m->sig);
+    if (!jl_is_tuple_type(sig) || jl_nparams(sig) == 0)
+        return 0;
+    jl_value_t *ft = jl_tparam0(sig);
+    return jl_is_datatype(ft) && ((jl_datatype_t*)ft)->super == jl_builtin_type;
+}
 // The policy of a method's code: the compiler's own code (a module of flag 2) is plain, whatever its
 // methods' flags say; then the method's flag: always facts, or a boundary, which takes the policy of
-// the code that reaches it; then its module's: flag 1 facts; any other method plain. A trimmed build
-// compiles every method plainly.
+// the code that reaches it; then its module's: flag 1 facts; any other method plain, and under the
+// test bed the policy of the code that reaches it. A builtin is plain. A trimmed build compiles every
+// method plainly.
 JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT
 {
     if (jl_options.trim != JL_TRIM_NO)
@@ -759,7 +785,9 @@ JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT
         return JL_POLICY_CALLER;
     if (mf == 1)
         return JL_POLICY_FACTS;
-    return JL_POLICY_PLAIN;
+    if (!facts_all() || method_is_builtin(m))
+        return JL_POLICY_PLAIN;
+    return JL_POLICY_CALLER;
 }
 // whether a method's code is compiled by facts whoever reaches it
 JL_DLLEXPORT int jl_method_is_facts(jl_method_t *m) JL_NOTSAFEPOINT

@@ -749,6 +749,7 @@ JL_DLLEXPORT jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t
 #define JL_REACH_FACTS 1
 #define JL_REACH_RUNTIME 2
 JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_compile_by_facts_all(void) JL_NOTSAFEPOINT;
 // whether the code of `mi` reached with `reach` is compiled by facts
 JL_DLLEXPORT int jl_mi_policy_at(jl_method_instance_t *mi, int reach) JL_NOTSAFEPOINT;
 JL_DLLEXPORT void jl_ci_set_policy(jl_code_instance_t *ci, int facts) JL_NOTSAFEPOINT;
