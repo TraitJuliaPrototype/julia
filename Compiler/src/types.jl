@@ -394,12 +394,14 @@ struct NativeInterpreter <: AbstractInterpreter
 
     # whether calls are inferred only at facts (facts.jl)
     facts::Bool
+    # how many inferences of the other policy this one is nested in
+    crossings::Int
 end
 
 function NativeInterpreter(world::UInt = get_world_counter();
                            inf_params::InferenceParams = InferenceParams(),
                            opt_params::OptimizationParams = OptimizationParams(),
-                           facts::Bool = false)
+                           facts::Bool = false, crossings::Int = 0)
     curr_max_world = get_world_counter()
     # Sometimes the caller is lazy and passes typemax(UInt).
     # we cap it to the current world age for correctness
@@ -412,7 +414,7 @@ function NativeInterpreter(world::UInt = get_world_counter();
     method_table = CachedMethodTable(InternalMethodTable(world))
     inf_cache = Vector{InferenceResult}() # Initially empty cache
     codegen = IdDict{CodeInstance,CodeInfo}()
-    return NativeInterpreter(world, method_table, inf_cache, codegen, inf_params, opt_params, facts)
+    return NativeInterpreter(world, method_table, inf_cache, codegen, inf_params, opt_params, facts, crossings)
 end
 
 # Quickly and easily satisfy the AbstractInterpreter API contract

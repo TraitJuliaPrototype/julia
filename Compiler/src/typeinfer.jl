@@ -1048,6 +1048,11 @@ end
 # compute (and cache) an inferred AST and return the current best estimate of the result type
 function typeinf_edge(interp::AbstractInterpreter, method::Method, @nospecialize(atype), sparams::SimpleVector, caller::AbsIntState, edgecycle::Bool, edgelimited::Bool)
     mi = specialize_method(method, atype, sparams)
+    # a callee of the other policy: an inference of its own; a callee that takes the policy of the
+    # code reaching it is inferred under the caller's
+    if interp isa NativeInterpreter && other_policy(method_policy(method), interp.facts)
+        return typeinf_other_policy(interp, method, mi, caller, edgecycle, edgelimited)
+    end
     cache_mode = CACHE_MODE_GLOBAL # cache edge targets globally by default
     force_inline = is_stmt_inline(get_curr_ssaflag(caller))
     edge_ci = nothing
@@ -1429,6 +1434,13 @@ end
 typeinf_type(interp::AbstractInterpreter, match::MethodMatch) =
     typeinf_type(interp, specialize_method(match))
 function typeinf_type(interp::AbstractInterpreter, mi::MethodInstance)
+    if infers_other_policy(interp, mi)
+        # reflection's top frame of a method of the other policy is inferred but never cached as the
+        # method's code, which is of the method's policy only
+        frame = typeinf_frame(interp, mi, false)
+        frame === nothing && return nothing
+        return widenconst(ignorelimited(frame.result.result))
+    end
     ci = typeinf_ext(interp, mi, SOURCE_MODE_NOT_REQUIRED)
     ci isa CodeInstance || return nothing
     return ci.rettype
@@ -1602,7 +1614,9 @@ function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UIn
                 src = _uncompressed_ir(callee, src)
             end
             if !isa(src, CodeInfo)
-                newcallee = typeinf_ext(workqueue.interp, callee.def, source_mode) # always SOURCE_MODE_ABI
+                # inferred again under the policy it was compiled in
+                newcallee = typeinf_ext(callee.owner === nothing ? interp_for_policy(workqueue.interp, ci_policy_facts(callee)) : workqueue.interp,
+                                        callee.def, source_mode) # always SOURCE_MODE_ABI
                 if newcallee isa CodeInstance
                     callee === ci && (ci = newcallee) # ci stopped meeting the requirements after typeinf_ext last checked, try again with newcallee
                     push!(workqueue, newcallee)
@@ -1667,7 +1681,9 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             # and this is either the primary world, or not applicable in the primary world
             # then we want to compile and emit this
             if item.def.primary_world <= world
-                ci = typeinf_ext(interp, item, SOURCE_MODE_GET_SOURCE)
+                # under the policy of the method as the queue reaches it
+                ci = typeinf_ext(item.def isa Method ? interp_for_policy(interp, mi_policy_facts_at(item, code_policy(interp) == 1)) : interp,
+                                 item, SOURCE_MODE_GET_SOURCE)
                 ci isa CodeInstance && push!(workqueue, ci)
             end
             markinspected!(workqueue, item)
@@ -1696,7 +1712,9 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             else
                 src = get(interp.codegen, callee, nothing)
                 if src === nothing
-                    newcallee = typeinf_ext(interp, mi, SOURCE_MODE_GET_SOURCE)
+                    # inferred again under the policy it was compiled in
+                    newcallee = typeinf_ext(callee.owner === nothing ? interp_for_policy(interp, ci_policy_facts(callee)) : interp,
+                                            mi, SOURCE_MODE_GET_SOURCE)
                     if newcallee isa CodeInstance
                         @assert use_const_api(newcallee) || haskey(interp.codegen, newcallee)
                         push!(workqueue, newcallee)
