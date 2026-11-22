@@ -447,6 +447,7 @@ extern jl_array_t *_jl_debug_method_invalidation JL_GLOBALLY_ROOTED;
 extern jl_array_t *jl_deep_endings JL_GLOBALLY_ROOTED;      // what definitions ended of the deep class (gf.c)
 extern jl_value_t *jl_deep_ending_kind JL_GLOBALLY_ROOTED;  // the cause of what invalidations end (gf.c)
 extern jl_value_t *jl_deep_ending_cause JL_GLOBALLY_ROOTED;
+extern jl_value_t *jl_fully_typed_hook JL_GLOBALLY_ROOTED;     // fully typed mode's hook (gf.c)
 JL_DLLEXPORT extern arraylist_t jl_linkage_blobs; // external linkage: sysimg/pkgimages
 JL_DLLEXPORT extern arraylist_t jl_image_relocs;  // external linkage: sysimg/pkgimages
 JL_DLLEXPORT extern arraylist_t jl_top_mods;  // external linkage: sysimg/pkgimages
@@ -753,6 +754,7 @@ JL_DLLEXPORT jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t
 #define JL_REACH_RUNTIME 2
 JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_compile_by_facts_all(void) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_method_fully_typed(jl_method_t *m) JL_NOTSAFEPOINT;
 // whether the code of `mi` reached with `reach` is compiled by facts
 JL_DLLEXPORT int jl_mi_policy_at(jl_method_instance_t *mi, int reach) JL_NOTSAFEPOINT;
 JL_DLLEXPORT void jl_ci_set_policy(jl_code_instance_t *ci, int facts) JL_NOTSAFEPOINT;
@@ -2035,6 +2037,8 @@ JL_DLLEXPORT int jl_isabspath(const char *in) JL_NOTSAFEPOINT;
     XX(module_option_sym) \
     XX(facts_boundary_sym) \
     XX(facts_always_sym) \
+    XX(fully_typed_warn_sym) \
+    XX(fully_typed_enforce_sym) \
     XX(meta_sym) \
     XX(method_sym) \
     XX(module_sym) \

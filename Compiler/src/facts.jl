@@ -298,6 +298,39 @@ is_own(own::IdSet{Any}, @nospecialize(e)) = e in own
 set_g2!(ci::CodeInstance, edges::SimpleVector) =
     (edges_satisfy_g2(edges, ci) && ccall(:jl_ci_set_g2, Cvoid, (Any,), ci); nothing)
 
+# Fully typed mode: a method that asks for it is compiled by facts; where its code at a signature holds
+# a run-time site, itself or in a callee, the optimizer puts a call of `jl_not_fully_typed` at the code's
+# start, which reaches the hook a tool sets: it warns at the first run there, or raises at every run.
+# Fully typed code gets no check.
+
+"The method's fully typed mode: 0 off, 1 warn, 2 enforce (its own, else its module's)."
+method_fully_typed(m::Method) = ccall(:jl_method_fully_typed, Cint, (Any,), m)
+
+"""
+The fault of `mi`'s code under fully typed mode: 0 none, 1 a run-time site (in it or a callee). The
+result's type is no fault: a type is a fault where it is used. Only for code compiled by facts of a
+method that asks for the mode.
+"""
+function fully_typed_fault(interp::AbstractInterpreter, mi::MethodInstance, effects::Effects, @nospecialize(rt))
+    facts_mode(interp) || return 0
+    def = mi.def
+    def isa Method || return 0
+    method_fully_typed(def) == 0 && return 0
+    is_nortsite(effects) || return 1
+    return 0
+end
+
+"The check at the start of code that fails fully typed mode: `jl_not_fully_typed(svec(mi, level, warned, kind, rt))`."
+function insert_fully_typed_check!(ir::IRCode, interp::AbstractInterpreter, mi::MethodInstance, result::InferenceResult)
+    kind = fully_typed_fault(interp, mi, result.ipo_effects, result.result)
+    kind == 0 && return ir
+    site = svec(mi, Int(method_fully_typed(mi.def::Method)), false, Int(kind), widenconst(ignorelimited(result.result)))
+    stmt = Expr(:foreigncall, Expr(:tuple, QuoteNode(:jl_not_fully_typed)), Nothing, svec(Any), 0,
+                QuoteNode(:ccall), QuoteNode(site))
+    insert_node!(ir, 1, NewInstruction(stmt, Nothing, NoCallInfo(), nothing, IR_FLAG_NULL))
+    return compact!(ir)
+end
+
 # The code a run-time site reaches whatever the values: while an image is built, a
 # run-time site in facts code whose types match one method that specializes on none of the site's
 # abstract arguments reaches that method's one instance; the image holds it, as plain inference

@@ -963,12 +963,22 @@ JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src)
                         m->facts = (m->facts & ~3) | 1;
                     else if (ak == (jl_value_t*)jl_facts_always_sym)
                         m->facts = (m->facts & ~3) | 2;
+                    else if (ak == (jl_value_t*)jl_fully_typed_warn_sym)
+                        m->facts = (m->facts & 3) | 4;
+                    else if (ak == (jl_value_t*)jl_fully_typed_enforce_sym)
+                        m->facts = (m->facts & 3) | 8;
                 }
             }
             if (nargs == 1 && (jl_exprarg(st, 0) == (jl_value_t*)jl_facts_boundary_sym ||
                                jl_exprarg(st, 0) == (jl_value_t*)jl_facts_always_sym)) {
                 // the method's policy: a boundary, or always facts
                 m->facts = (m->facts & ~3) | (jl_exprarg(st, 0) == (jl_value_t*)jl_facts_always_sym ? 2 : 1);
+                st = jl_nothing;
+            }
+            else if (nargs == 1 && (jl_exprarg(st, 0) == (jl_value_t*)jl_fully_typed_warn_sym ||
+                                    jl_exprarg(st, 0) == (jl_value_t*)jl_fully_typed_enforce_sym)) {
+                // fully typed mode: warn, or enforce
+                m->facts = (m->facts & 3) | (jl_exprarg(st, 0) == (jl_value_t*)jl_fully_typed_enforce_sym ? 8 : 4);
                 st = jl_nothing;
             }
             else if (nargs >= 1 && jl_exprarg(st, 0) == (jl_value_t*)jl_nospecialize_sym) {
