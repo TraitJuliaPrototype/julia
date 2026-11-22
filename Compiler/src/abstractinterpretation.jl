@@ -251,6 +251,12 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
                     end
                 end
 
+                # a call given a type in which an open set occurs as a constant may answer by the world's
+                # memberships (`typeintersect`, `==` of types, whatever asserts its consistency): it is not
+                # consistent, and is not evaluated at compile time (`concrete_eval_eligible`)
+                if effects.consistent !== ALWAYS_FALSE && names_open_set_const(this_argtypes)
+                    effects = Effects(effects; consistent = ALWAYS_FALSE)
+                end
                 state.all_effects = merge_effects(state.all_effects, effects)
                 if const_result !== nothing
                     local const_results = state.const_results
@@ -308,6 +314,12 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
                 # Account for the fact that we may encounter a MethodError with a non-covered or ambiguous signature.
                 state.all_effects = Effects(state.all_effects; nothrow=false)
                 state.exctype = state.exctype ⊔ₚ MethodError
+            end
+            # a method chosen when the call runs, among matches at a set, answers by the world's memberships:
+            # not consistent, so no compile-time evaluation folds the choice
+            if state.all_effects.consistent !== ALWAYS_FALSE &&
+               choice_rests_on_memberships(applicable, fully_covering(state.matches))
+                state.all_effects = Effects(state.all_effects; consistent = ALWAYS_FALSE)
             end
             local fargs = arginfo.fargs
             if sv isa InferenceState && fargs !== nothing
@@ -983,6 +995,11 @@ function concrete_eval_eligible(interp::AbstractInterpreter,
             return :none
         end
     end
+    if names_open_set_const(arginfo.argtypes)
+        # its answer may differ in another world, and compile-time evaluation records nothing for it
+        add_remark!(interp, sv, "[constprop] Concrete eval disabled for a set given as a constant")
+        return :none
+    end
     if result.edge !== nothing && is_foldable(effects, #=check_rtcall=#true)
         if f !== nothing && is_all_const_arg(arginfo, #=start=#2)
             if (is_nonoverlayed(interp) || is_nonoverlayed(effects) ||
@@ -1010,6 +1027,18 @@ function concrete_eval_eligible(interp::AbstractInterpreter,
         end
     end
     return :none
+end
+
+# Whether an argument after the function is a constant type in which an open set occurs.
+function names_open_set_const(argtypes::Vector{Any})
+    for i = 2:length(argtypes)
+        a = argtypes[i]
+        isvarargtype(a) && continue
+        a = widenslotwrapper(a)
+        isa(a, Const) && isa(a.val, Type) && ccall(:jl_has_open_set, Cint, (Any,), a.val) != 0 && return true
+        isType(a) && (p = a.parameters[1]; isa(p, Type) && ccall(:jl_has_open_set, Cint, (Any,), p) != 0) && return true
+    end
+    return false
 end
 
 is_all_const_arg(arginfo::ArgInfo, start::Int) = is_all_const_arg(arginfo.argtypes, start::Int)
@@ -3254,10 +3283,13 @@ function abstract_eval_new(interp::AbstractInterpreter, e::Expr, sstate::Stateme
             for i = 1:nargs
                 at = widenslotwrapper(abstract_eval_value(interp, e.args[i+1], sstate, sv))
                 ft = fieldtype(rt, i)
-                nothrow && (nothrow = ⊑(𝕃ᵢ, at, ft))
+                proved = ⊑(𝕃ᵢ, at, ft)
                 # a field's test that holds through a membership entry is relied on with an edge on
                 # the entry, as `isa`'s positive is
-                nothrow && (nothrow = !positive_fold_blocked(widenconst(at), ft, sv))
+                proved && (proved = !positive_fold_blocked(widenconst(at), ft, sv))
+                nothrow &= proved
+                # a field's test about a set that is not proved passes or throws by the world: not consistent
+                !proved && (names_open_set(at) || names_open_set(ft)) && (consistent = ALWAYS_FALSE)
                 at = tmeet(𝕃ᵢ, at, ft)
                 at === Bottom && return RTEffects(Bottom, TypeError, EFFECTS_THROWS)
                 if ismutable && !isconst(rt, i)

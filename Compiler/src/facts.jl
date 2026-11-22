@@ -256,7 +256,9 @@ function edges_satisfy_g2(edges::SimpleVector, own::Union{CodeInstance,IdSet{Any
         if item isa Core.Binding
             continue
         elseif item isa MethodTable
-            is_fact_sig(invokesig) || return false
+            # a call's dispatch at a fact signature, or a negative's absence edge: only a membership
+            # of the pair, by an owner of the set or the type or by a pirate, breaks it
+            (is_fact_sig(invokesig) || is_implements_sig(invokesig)) || return false
         elseif item isa MethodInstance && is_membership_mi(item)
             continue
         elseif item isa MethodInstance

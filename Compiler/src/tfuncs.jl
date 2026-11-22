@@ -910,6 +910,10 @@ end
                     negative_fold_blocked(v, t, sv) && return Bool
                     return Const(false)
                 end
+            elseif is_all_type(typeintersect(v, t))
+                # an intersection folds as a negative where it is final: no type of the world is in it
+                negative_fold_blocked(v, t, sv) && return Bool
+                return Const(false)
             end
         end
     end
@@ -2716,6 +2720,12 @@ function builtin_effects(𝕃::AbstractLattice, @nospecialize(f::Builtin), argty
             effect_free = ALWAYS_FALSE
         end
         nothrow = builtin_nothrow(𝕃, f, argtypes, rt)
+        # an answer about a set that inference did not fold changes with the world, and nothing records it: it is
+        # not consistent, so no concrete evaluation runs it at compile time
+        if consistent !== ALWAYS_FALSE && (f === isa || f === (<:) || f === typeassert) &&
+           (f === typeassert ? !nothrow : !isa(rt, Const)) && names_open_set(argtypes, 1)
+            consistent = ALWAYS_FALSE
+        end
         if contains_is(_INACCESSIBLEMEM_BUILTINS, f)
             inaccessiblememonly = ALWAYS_TRUE
         elseif contains_is(_ARGMEM_BUILTINS, f)
@@ -3255,6 +3265,9 @@ function abstract_applicable(interp::AbstractInterpreter, argtypes::Vector{Any},
             end
             if rt !== Bool
                 info = VirtualMethodMatchInfo(matches.info)
+            elseif choice_rests_on_memberships(applicable, fully_covering(matches))
+                # answered when it runs by the world's memberships: not consistent
+                return Future(CallMeta(rt, Union{}, Effects(EFFECTS_TOTAL; consistent = ALWAYS_FALSE), info))
             end
         end
     end
@@ -3287,8 +3300,19 @@ function _hasmethod_tfunc(interp::AbstractInterpreter, argtypes::Vector{Any}, sv
     match, valid_worlds = findsup(types, method_table(interp))
     update_valid_age!(sv, valid_worlds)
     if match === nothing
+        # "no method covers `types`" is a negative about a set where a method that meets `types` rests on
+        # memberships, or `types` names a set: a membership can make the method cover it, while the call's
+        # matches stay the same. It folds only with the absence edges of the pairs it rests on,
+        # those of the matches the lookup dropped at a final pair. Elsewhere it is not folded.
+        lookup = findall(types, method_table(interp))
+        if lookup === nothing || names_open_set(types) ||
+           any(i -> sig_rests_on_memberships(lookup[i].method.sig), 1:length(lookup))
+            return CallMeta(Bool, Any, Effects(EFFECTS_TOTAL; consistent = ALWAYS_FALSE), NoCallInfo())
+        end
+        valid_worlds = intersect(valid_worlds, lookup.valid_worlds)
+        update_valid_age!(sv, valid_worlds)
         rt = Const(false)
-        vresults = MethodLookupResult(Any[], valid_worlds, true)
+        vresults = MethodLookupResult(Any[], valid_worlds, true, lookup.cells)
         mt = Core.methodtable
         vinfo = MethodMatchInfo(vresults, mt, types, false) # XXX: this should actually be an info with invoke-type edge
     else

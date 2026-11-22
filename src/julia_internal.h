@@ -991,6 +991,7 @@ int jl_membership_range_is_fast(size_t world) JL_NOTSAFEPOINT;
 // signature of the method matched.
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_t world, size_t *lo, size_t *hi);
 JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_type_has_kind(jl_value_t *t) JL_NOTSAFEPOINT;
 void jl_sig_lower_bounds(jl_value_t *t, arraylist_t *out, int depth) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_sig_lower_bounds_have_memberships(jl_value_t *sig) JL_NOTSAFEPOINT;
 // x <: y at an explicit world (subtype.c)
@@ -1005,6 +1006,14 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
 JL_DLLEXPORT void jl_membership_removal_walk(jl_value_t *member, jl_value_t *set_instance, size_t world);
 // a membership's method ends with its membership (gf.c)
 JL_DLLEXPORT void jl_membership_method_end(jl_method_t *m, size_t world);
+// final negatives (datatype.c): a pair's absence signature, the signatures a negative or a dropped
+// match rests on, and whether call types hold an argument met only at an intersection no type is in
+extern jl_genericmemory_t *jl_absence_sigs JL_GLOBALLY_ROOTED;
+JL_DLLEXPORT int jl_membership_final(jl_value_t *S, jl_value_t *X);
+JL_DLLEXPORT jl_value_t *jl_membership_final_cell(jl_value_t *member, jl_value_t *set);
+JL_DLLEXPORT jl_value_t *jl_membership_final_cells(jl_value_t *a, jl_value_t *b);
+JL_DLLEXPORT int jl_has_unmet_argument(jl_value_t *ti, size_t world);
+JL_DLLEXPORT jl_value_t *jl_unmet_final_cells(jl_value_t *spec);
 JL_DLLEXPORT size_t jl_membership_stat(int which);
 // what a membership ends of the deep class, kept as a definition's is (gf.c)
 JL_DLLEXPORT int jl_deep_ending_push(const char *kind, jl_value_t *cause);

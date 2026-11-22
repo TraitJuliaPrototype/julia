@@ -46,6 +46,13 @@ struct MethodMatchInfo <: CallInfo
 end
 add_edges_impl(edges::Vector{Any}, info::MethodMatchInfo) = _add_edges_impl(edges, info)
 function _add_edges_impl(edges::Vector{Any}, info::MethodMatchInfo, mi_edge::Bool=false)
+    # the absence signatures the lookup relied on
+    cells = info.results.cells
+    if cells !== nothing
+        for c in cells::SimpleVector
+            add_absence_edge!(edges, c)
+        end
+    end
     if !fully_covering(info)
         exists = false
         for i in 2:length(edges)
