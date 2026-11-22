@@ -144,6 +144,162 @@ mutable struct CallInferenceState
     end
 end
 
+# A call of an operation of a set whose receiver's type is the set, or a set or intersection below it,
+# and not a concrete member: its result is the operation's declared result, read from the entries of
+# the set's contract, of the sets it joins and of an intersection's components.
+# Each entry whose declared signature the call's types fall under bounds the result, so the result is
+# their intersection. No method at the set is read. The same at a closed abstract type with a contract,
+# whose operations are its methods at the type, each with its declared result. `nothing` where no
+# argument is typed by a set or such a type, or no entry applies.
+function declared_operation_result(interp::AbstractInterpreter, argtypes::Vector{Any}, @nospecialize(atype))
+    tt = unwrap_unionall(atype)
+    tt isa DataType || return nothing
+    length(tt.parameters) >= 2 || return nothing
+    # a declared field read at a value typed by its set: its declared type
+    if length(argtypes) == 3 && argtypes[1] === Const(Base.getproperty)
+        name = argtypes[3]
+        if name isa Const && name.val isa Symbol
+            dft = declared_field_type(widenconst(argtypes[2]), name.val::Symbol)
+            dft === nothing || return dft
+        end
+    end
+    ft = tt.parameters[1]
+    # the entries of the sets the arguments are typed by; at a closed abstract type with a contract, its
+    # contract's operations of the function
+    entries = nothing
+    ms = nothing
+    for i = 2:length(tt.parameters)
+        p = tt.parameters[i]
+        isvarargtype(p) && break
+        isconcretetype(p) && continue
+        if ccall(:jl_has_open_set, Cint, (Any,), p) != 0
+            entries === nothing && (entries = Any[])
+            operation_entries!(entries, ft, p, 0)
+            continue
+        end
+        entries === nothing || continue
+        ops = ccall(:jl_contract_operations, Any, (Any,), p)
+        if ops isa SimpleVector
+            ms = Any[]
+            for m in ops
+                (unwrap_unionall((m::Method).sig)::DataType).parameters[1] === ft && push!(ms, m)
+            end
+            break
+        end
+    end
+    rt = nothing
+    if entries !== nothing
+        for e in entries
+            e = e::SimpleVector
+            sig = e[2]
+            atype <: sig || continue
+            r = declared_result_at(sig, e[3], atype)
+            rt = rt === nothing ? r : typeintersect(rt, r)
+        end
+        return rt
+    end
+    (ms === nothing || isempty(ms)) && return nothing
+    world = get_inference_world(interp)
+    for m in ms
+        m = m::Method
+        m.primary_world <= world || continue
+        atype <: m.sig || continue
+        r = declared_result_at(m.sig, m.declared_result, atype)
+        rt = rt === nothing ? r : typeintersect(rt, r)
+    end
+    return rt
+end
+
+# The entries for the function type `ft` of the sets a type `p` is typed by: a set's own (its TypeName's
+# `operations`), its supertraits' (from the set's own memberships, `jl_supertrait_instances`), each
+# component's of an intersection. The contract is fixed at the declaration and read without an edge.
+function operation_entries!(out::Vector{Any}, @nospecialize(ft), @nospecialize(p), depth::Int)
+    depth > 8 && return out
+    u = unwrap_unionall(p)
+    u isa DataType || return out
+    if u.name === (unwrap_unionall(Core.All)::DataType).name
+        for c in (u.parameters[1]::DataType).parameters
+            operation_entries!(out, ft, c, depth + 1)
+        end
+        return out
+    end
+    ccall(:jl_is_open_set, Cint, (Any,), u) != 0 || return out
+    tn = u.name
+    if isdefined(tn, :operations)
+        for e in tn.operations::SimpleVector
+            e = e::SimpleVector
+            e[1] isa ft || continue
+            any(x -> x === e, out) || push!(out, e)
+        end
+    end
+    for s in ccall(:jl_supertrait_instances, Any, (Any,), u)::Vector{Any}
+        operation_entries!(out, ft, s, depth + 1)
+    end
+    return out
+end
+
+# The declared type of field `name` of a value of type `X`, typed by a set or an intersection and
+# not by a concrete member: from the set's declared fields, or a supertrait's,
+# instantiated at `X`'s parameters; `nothing` where none declares it.
+function declared_field_type(@nospecialize(X), name::Symbol)
+    (isconcretetype(X) || ccall(:jl_has_open_set, Cint, (Any,), X) == 0) && return nothing
+    u = unwrap_unionall(X)
+    u isa DataType || return nothing
+    comps = u.name === (unwrap_unionall(Core.All)::DataType).name ? (u.parameters[1]::DataType).parameters : Any[u]
+    for c in comps
+        T = declared_field_in(unwrap_unionall(c), name, 0)
+        T === nothing && continue
+        return has_free_typevars(T) ? rewrap_unionall(T, X) : T
+    end
+    return nothing
+end
+
+# The declared type of the field `name` at the set instance `c`: on its TypeName, its declared
+# supertypes' or its supertraits' (their instances at `c`'s parameters). A field named by an input
+# parameter (`HasProperty{N, R}`'s `N`) is named by that parameter's value at `c`.
+function declared_field_in(@nospecialize(c), name::Symbol, depth::Int)
+    while c isa DataType && c !== Any
+        tn = c.name
+        if isdefined(tn, :declared_fields)
+            df = tn.declared_fields::SimpleVector
+            names = df[1]::SimpleVector
+            for k in 1:length(names)
+                nk = names[k]
+                if nk isa TypeVar
+                    nk = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), nk, tn.wrapper, c.parameters)
+                end
+                nk === name || continue
+                # (the types' vector asserted: an untyped read is a call left to run time, which taints the
+                # lookup's effects, so a check under an overlay of methods does not evaluate it)
+                T = (df[2]::SimpleVector)[k]
+                has_free_typevars(T) || return T
+                return ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), T, tn.wrapper, c.parameters)
+            end
+        end
+        if depth < 8 && ccall(:jl_is_open_set, Cint, (Any,), c) != 0
+            for s in ccall(:jl_supertrait_instances, Any, (Any,), c)::Vector{Any}
+                T = declared_field_in(unwrap_unionall(s), name, depth + 1)
+                T === nothing || return T
+            end
+        end
+        c = c.super
+    end
+    return nothing
+end
+
+# a declared result at the call's types: the declared signature's variables instantiated where the
+# call fixes them, else bounded by their bounds
+function declared_result_at(@nospecialize(sig), @nospecialize(rt), @nospecialize(atype))
+    has_free_typevars(rt) || return rt
+    env = ccall(:jl_type_intersection_with_env, Any, (Any, Any), atype, sig)::SimpleVector
+    vals = env[2]::SimpleVector
+    if all(v -> !isa(v, TypeVar), vals)
+        rt = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), rt, sig, vals)
+        has_free_typevars(rt) || return rt
+    end
+    return rewrap_unionall(rt, sig)
+end
+
 function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(func),
                                   arginfo::ArgInfo, si::StmtInfo, @nospecialize(atype),
                                   sv::AbsIntState, max_methods::Int)
@@ -154,6 +310,10 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         add_remark!(interp, sv, "Cannot infer call, because we previously saw :latestworld")
         return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
     end
+    # an operation of a set at a receiver typed by the set: the operation's declared result, the call
+    # left to dispatch and its result asserted
+    drt = declared_operation_result(interp, argtypes, atype)
+    drt === nothing || return Future(CallMeta(drt, Any, Effects(), DeclaredResultInfo(drt)))
     matches = find_method_matches(interp, argtypes, atype; max_methods)
     if isa(matches, FailedMethodMatch)
         add_remark!(interp, sv, matches.reason)

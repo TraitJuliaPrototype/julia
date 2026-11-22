@@ -33,7 +33,8 @@ Whether `F` (a function's type) is owner-only: only its owner may define its met
 is a fact at any signature (a method another module defines for it is a pirate's). A function its
 owner declared so (`jl_set_owner_only`), or a function of a module whose `owner_only` option is on
 (its submodules included) that the module neither exports nor declares `public`, a closure of such a
-module among them. Read where the call is inferred.
+module among them, but for a trait's operation, open to the set's members (`jl_set_open_operation`).
+Read where the call is inferred.
 """
 function is_owner_only(@nospecialize(F))
     F isa DataType || return false
@@ -42,6 +43,8 @@ function is_owner_only(@nospecialize(F))
     m = tn.module
     name = tn.singletonname
     ccall(:jl_binding_owner_only_p, Cint, (Any, Any), m, name) != 0 && return true
+    # a trait's operation is open to the set's members, exported or not
+    ccall(:jl_binding_open_operation_p, Cint, (Any, Any), m, name) != 0 && return false
     (ccall(:jl_get_module_options, Cint, (Any,), m) & Cint(64)) != 0 || return false
     return ccall(:jl_module_public_p, Cint, (Any, Any), m, name) == 0
 end

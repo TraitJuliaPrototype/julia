@@ -464,6 +464,16 @@ JL_DLLEXPORT void jl_ci_set_policy(jl_code_instance_t *ci, int facts) JL_NOTSAFE
         jl_atomic_fetch_and_relaxed(&ci->flags, (uint8_t)~JL_CI_FLAGS_FACTS);
 }
 
+// A method's declared result, as lowering records `f(…)::RT`, set by a module for an operation of a
+// closed type's contract whose method has none.
+JL_DLLEXPORT void jl_method_set_declared_result(jl_method_t *m, jl_value_t *rt)
+{
+    if (!jl_is_type(rt) && !jl_is_typevar(rt))
+        jl_type_error("declared result", (jl_value_t*)jl_type_type, rt);
+    m->declared_result = rt;
+    jl_gc_wb(m, rt);
+}
+
 // G2 as a predicate: set once a CodeInstance is finished and is deep G2 (Compiler's `set_g2!`).
 JL_DLLEXPORT void jl_ci_set_g2(jl_code_instance_t *ci) JL_NOTSAFEPOINT
 {
