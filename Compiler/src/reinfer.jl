@@ -276,6 +276,11 @@ function verify_method(codeinst::CodeInstance, validation_world::UInt, workspace
                     if maxworld > max_valid2
                         maxworld = max_valid2
                     end
+                    if max_valid2 < validation_world
+                        # an image's deep code that a definition loaded earlier ends: kept for a tool's
+                        # report; the runtime keeps it only for such code, and only while asked to
+                        @ccall jl_note_deep_ending(edge::Any, initial.codeinst::Any)::Cvoid
+                    end
                     invalidations = _jl_debug_method_invalidation[]
                     if max_valid2 ≠ typemax(UInt) && invalidations !== nothing
                         push!(invalidations, edge, "insert_backedges_callee", initial.codeinst, copy(matches))
