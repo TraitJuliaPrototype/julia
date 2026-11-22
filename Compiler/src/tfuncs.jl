@@ -2721,6 +2721,12 @@ function builtin_effects(𝕃::AbstractLattice, @nospecialize(f::Builtin), argty
             effect_free = ALWAYS_FALSE
         end
         nothrow = builtin_nothrow(𝕃, f, argtypes, rt)
+        # an answer about a set that inference did not fold changes with the world, and nothing records it: it is
+        # not consistent, so no concrete evaluation runs it at compile time (compiler §4.8)
+        if consistent !== ALWAYS_FALSE && (f === isa || f === (<:) || f === typeassert) &&
+           (f === typeassert ? !nothrow : !isa(rt, Const)) && names_open_set(argtypes, 1)
+            consistent = ALWAYS_FALSE
+        end
         if contains_is(_INACCESSIBLEMEM_BUILTINS, f)
             inaccessiblememonly = ALWAYS_TRUE
         elseif contains_is(_ARGMEM_BUILTINS, f)

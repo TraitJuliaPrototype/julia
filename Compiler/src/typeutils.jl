@@ -100,6 +100,23 @@ function add_absence_edge!(edges::Vector{Any}, @nospecialize(sig))
     push!(edges, 0, sig)
     return nothing
 end
+# Whether an open set occurs in the type a lattice element stands for, in the type it holds as a constant, or in
+# the type of the constant: an answer about it may change with the world (compiler §4.8).
+function names_open_set(@nospecialize(a))::Bool
+    isvarargtype(a) && return names_open_set(unwrapva(a))
+    if isa(a, Const)
+        v = a.val
+        isa(v, Type) && ccall(:jl_has_open_set, Cint, (Any,), v) != 0 && return true
+        return ccall(:jl_has_open_set, Cint, (Any,), typeof(v)) != 0
+    end
+    T = widenconst(a)
+    if isType(T)
+        p = T.parameters[1]
+        isa(p, Type) && ccall(:jl_has_open_set, Cint, (Any,), p) != 0 && return true
+    end
+    return ccall(:jl_has_open_set, Cint, (Any,), T) != 0
+end
+names_open_set(argtypes::Vector{Any}, start::Int) = any(i -> names_open_set(argtypes[i]), start:length(argtypes))
 function positive_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
     (ccall(:jl_has_open_set, Cint, (Any,), a) != 0 || ccall(:jl_has_open_set, Cint, (Any,), b) != 0) || return false
     return ccall(:jl_subtype_via_membership, Cint, (Any, Any), a, b) != 0
