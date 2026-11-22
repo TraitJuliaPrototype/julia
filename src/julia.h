@@ -563,12 +563,36 @@ typedef struct {
     uint8_t abstract:1;
     uint8_t mutabl:1;
     uint8_t mayinlinealloc:1;
-    uint8_t _unused:5;
+    uint8_t open_set:1;       // this type is a set: it may gain members after its definition
+    uint8_t never_member:1;   // Core's kinds and builtins: can never be a member of a set
+    uint8_t _unused:3;
     _Atomic(uint8_t) cache_entry_count; // (approximate counter of TypeMapEntry for heuristics)
     uint8_t max_methods; // override for inference's max_methods setting (0 = no additional limit or relaxation)
     uint8_t constprop_heustic; // override for inference's constprop heuristic
     uint8_t concrete_only; // Bool: inference refuses to commit (records no backedge) at non-concrete call sites
+    // a set's inputs: bit i set when parameter i (of the first eight) is an input; a member has one
+    // instance of the set per value of the inputs. Written once, when the set is declared.
+    uint8_t input_params;
+    // this type's memberships in sets: a SimpleVector of MembershipEntry objects, replaced copy-on-write;
+    // jl_emptysvec when none was declared. The entry of a type value (member pattern Type{S}) is kept on
+    // S's TypeName.
+    _Atomic(jl_svec_t*) memberships;
 } jl_typename_t;
+
+// One declared membership of a member type in a set, kept on the member's TypeName. The member pattern
+// and the instance share the pattern's variables: for the member pattern `S{T} where T` the instance is
+// the set applied to them, `X{T}`.
+typedef struct {
+    JL_DATA_TYPE
+    jl_typename_t *JL_NONNULL set;   // the set's TypeName (X)
+    jl_value_t *JL_NONNULL member;   // the member pattern: S, S{T} where T, Type{S}, a set instance
+    jl_value_t *JL_NONNULL instance; // the set instance for the pattern
+    jl_value_t *JL_NONNULL receiver; // :self, :field (the forwarding field `by`) or :none
+    uint64_t min_world;                // in this world range the entry is in force
+    _Atomic(uint64_t) max_world;       // lowered once, when the membership is redeclared
+    jl_value_t *JL_NONNULL declarer; // the Module that declared it
+    jl_value_t *JL_NONNULL by;       // the forwarding field name, or nothing
+} jl_membership_t;
 
 typedef struct {
     JL_DATA_TYPE
@@ -643,17 +667,19 @@ typedef struct _jl_datatype_t {
     const jl_datatype_layout_t *layout;
     // memoized properties (set on construction)
     uint32_t hash;
-    uint16_t hasfreetypevars:1; // majority part of isconcrete computation
-    uint16_t isconcretetype:1; // whether this type can have instances
-    uint16_t isdispatchtuple:1; // aka isleaftupletype
-    uint16_t isbitstype:1; // relevant query for C-api and type-parameters
-    uint16_t zeroinit:1; // if one or more fields requires zero-initialization
-    uint16_t has_concrete_subtype:1; // If clear, no value will have this datatype
-    uint16_t maybe_subtype_of_cache:1; // Computational bit for has_concrete_supertype. See description in jltypes.c.
-    uint16_t isprimitivetype:1; // whether this is declared with 'primitive type' keyword (sized, no fields, and immutable)
-    uint16_t ismutationfree:1; // whether any mutable memory is reachable through this type (in the type or via fields)
-    uint16_t isidentityfree:1; // whether this type or any object reachable through its fields has non-content-based identity
-    uint16_t smalltag:6; // whether this type has a small-tag optimization
+    uint32_t hasfreetypevars:1; // majority part of isconcrete computation
+    uint32_t isconcretetype:1; // whether this type can have instances
+    uint32_t isdispatchtuple:1; // aka isleaftupletype
+    uint32_t isbitstype:1; // relevant query for C-api and type-parameters
+    uint32_t zeroinit:1; // if one or more fields requires zero-initialization
+    uint32_t has_concrete_subtype:1; // If clear, no value will have this datatype
+    uint32_t maybe_subtype_of_cache:1; // Computational bit for has_concrete_supertype. See description in jltypes.c.
+    uint32_t isprimitivetype:1; // whether this is declared with 'primitive type' keyword (sized, no fields, and immutable)
+    uint32_t ismutationfree:1; // whether any mutable memory is reachable through this type (in the type or via fields)
+    uint32_t isidentityfree:1; // whether this type or any object reachable through its fields has non-content-based identity
+    uint32_t has_open_set:1; // whether a set occurs in this type, as the type, a parameter, a union component or a type variable's bound (lower or upper): when clear, no membership can affect a question about this type. A set is a set from its declaration, so the bit is final when the type is built
+    uint32_t _unused_flags:15; // with the bits above and smalltag this fills the word (11 + 15 + 6)
+    uint32_t smalltag:6; // whether this type has a small-tag optimization
 } jl_datatype_t;
 
 typedef struct _jl_vararg_t {

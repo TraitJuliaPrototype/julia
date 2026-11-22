@@ -932,6 +932,19 @@ JL_DLLEXPORT jl_value_t *jl_nth_union_component(jl_value_t *v JL_PROPAGATES_ROOT
 int jl_find_union_component(jl_value_t *haystack, jl_value_t *needle, unsigned *nth) JL_NOTSAFEPOINT;
 jl_datatype_t *jl_new_abstracttype(jl_value_t *name, jl_module_t *module,
                                    jl_datatype_t *super, jl_svec_t *parameters);
+// sets and memberships: a type's entries live on its TypeName, published copy-on-write; the entry of a
+// type value (member pattern Type{S}) lives on S's TypeName
+#define jl_typename_memberships(tn) jl_atomic_load_acquire(&(tn)->memberships)
+int jl_open_set_witness(jl_value_t *v) JL_NOTSAFEPOINT; // unions, variables, varargs (datatype.c)
+// whether a set occurs in v: a type's bit, read inline on the hot paths
+STATIC_INLINE int jl_has_open_set_in(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    while (jl_is_unionall(v))
+        v = ((jl_unionall_t*)v)->body;
+    if (jl_is_datatype(v))
+        return ((jl_datatype_t*)v)->has_open_set;
+    return jl_open_set_witness(v);
+}
 jl_datatype_t *jl_new_uninitialized_datatype(void);
 void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable);
 JL_DLLEXPORT jl_datatype_t *jl_wrap_Type(jl_value_t *t);  // x -> Type{x}
