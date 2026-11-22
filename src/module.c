@@ -523,7 +523,7 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
     m->max_methods = -1;
     // a submodule takes its parent's policy
     m->facts = parent != NULL && parent != m ? parent->facts : 0;
-    m->trait_options = parent != NULL && parent != m ? parent->trait_options : 0;
+    m->options = parent != NULL && parent != m ? parent->options : 0;
     m->file = jl_empty_sym;
     m->line = 0;
     m->hash = parent == NULL ? bitmix(name->hash, jl_module_type->hash) :
@@ -744,20 +744,20 @@ JL_DLLEXPORT int jl_get_module_facts(jl_module_t *m)
 }
 // A module's options word, set by `@compiler_options` (a bit and its value), inherited by a submodule
 // at its creation.
-JL_DLLEXPORT void jl_set_module_trait_option(jl_module_t *self, int bit, int value)
+JL_DLLEXPORT void jl_set_module_option(jl_module_t *self, int bit, int value)
 {
     if (bit != JL_MODULE_OPTION_OWNER_ONLY && bit != JL_MODULE_OPTION_FULLY_TYPED_WARN &&
         bit != JL_MODULE_OPTION_FULLY_TYPED_ENFORCE && bit != JL_MODULE_OPTION_BOUNDED &&
         bit != JL_MODULE_OPTION_NO_PIRATES)
         jl_errorf("unknown module option bit %d", bit);
     if (value)
-        self->trait_options |= (uint8_t)bit;
+        self->options |= (uint8_t)bit;
     else
-        self->trait_options &= (uint8_t)~bit;
+        self->options &= (uint8_t)~bit;
 }
-JL_DLLEXPORT int jl_get_module_trait_options(jl_module_t *m)
+JL_DLLEXPORT int jl_get_module_options(jl_module_t *m)
 {
-    return m->trait_options;
+    return m->options;
 }
 // The test bed: with JULIA_COMPILE_BY_FACTS=1 (read once; never while generating output) a method of
 // a module that declares no option takes the policy of the code that reaches it, and the runtime's
@@ -815,7 +815,7 @@ JL_DLLEXPORT int jl_method_fully_typed(jl_method_t *m) JL_NOTSAFEPOINT
         return 2;
     if (m->facts & 4)
         return 1;
-    uint8_t o = m->module->trait_options;
+    uint8_t o = m->module->options;
     return (o & JL_MODULE_OPTION_FULLY_TYPED_ENFORCE) ? 2 : (o & JL_MODULE_OPTION_FULLY_TYPED_WARN) ? 1 : 0;
 }
 // whether a method's code is compiled by facts whoever reaches it

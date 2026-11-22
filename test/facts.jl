@@ -44,9 +44,9 @@ call_declared(x::Real) = declared(x)
 end
 
 @testset "owner-only functions" begin
-    @test ccall(:jl_get_module_trait_options, Cint, (Any,), OwnerOnly) == 64
-    @test ccall(:jl_get_module_trait_options, Cint, (Any,), OwnerOnly.Sub) == 64   # inherited at creation
-    @test ccall(:jl_get_module_trait_options, Cint, (Any,), NotOwnerOnly) == 0
+    @test ccall(:jl_get_module_options, Cint, (Any,), OwnerOnly) == 64
+    @test ccall(:jl_get_module_options, Cint, (Any,), OwnerOnly.Sub) == 64   # inherited at creation
+    @test ccall(:jl_get_module_options, Cint, (Any,), NotOwnerOnly) == 0
     @test CC.is_owner_only(typeof(OwnerOnly.helper))
     @test CC.is_owner_only(typeof(OwnerOnly.Sub.inner))
     @test !CC.is_owner_only(typeof(OwnerOnly.pub_exported))
@@ -75,7 +75,7 @@ end
     @test facts_rt(NotOwnerOnly.call_other, (Real,)) === Any
 
     # an unknown option bit is refused
-    @test_throws ErrorException ccall(:jl_set_module_trait_option, Cvoid, (Any, Cint, Cint), NotOwnerOnly, 3, 1)
+    @test_throws ErrorException ccall(:jl_set_module_option, Cvoid, (Any, Cint, Cint), NotOwnerOnly, 3, 1)
 end
 
 # the CodeInstances of the native owner in `f`'s instance at `T`
@@ -162,8 +162,8 @@ end
 @testset "fully typed mode" begin
     policy(f, T) = (Base.method_instance(f, T).cache.flags & CI_FLAG_FACTS) != 0 ? :facts : :plain
     E, W, O = FullyTypedEnforce, FullyTypedWarn, FullyTypedOff
-    @test ccall(:jl_get_module_trait_options, Cint, (Any,), E) == 32
-    @test ccall(:jl_get_module_trait_options, Cint, (Any,), W) == 16
+    @test ccall(:jl_get_module_options, Cint, (Any,), E) == 32
+    @test ccall(:jl_get_module_options, Cint, (Any,), W) == 16
     @test ccall(:jl_method_fully_typed, Cint, (Any,), which(E.typed, (Int,))) == 2
     @test ccall(:jl_method_fully_typed, Cint, (Any,), which(W.untyped, (Vector{Any},))) == 1
     @test ccall(:jl_method_fully_typed, Cint, (Any,), which(O.untyped, (Vector{Any},))) == 0
