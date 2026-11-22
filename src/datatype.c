@@ -203,6 +203,60 @@ static jl_value_t *publish_entry(jl_typename_t *tn, jl_typename_t *setname, jl_v
     return entry_v;
 }
 
+jl_genericmemory_t *jl_set_candidates JL_GLOBALLY_ROOTED = NULL;
+
+static jl_mutex_t candidates_lock;
+
+static void register_candidate(jl_typename_t *set, jl_value_t *T)
+{
+    jl_array_t *nw = NULL;
+    JL_GC_PUSH1(&nw);
+    JL_LOCK(&candidates_lock);
+    if (jl_set_candidates == NULL)
+        jl_set_candidates = jl_alloc_memory_any(16);
+    jl_array_t *old = (jl_array_t*)jl_eqtable_get(jl_set_candidates, (jl_value_t*)set, NULL);
+    size_t n = old ? jl_array_nrows(old) : 0;
+    int seen = 0;
+    for (size_t i = 0; i < n && !seen; i++)
+        seen = jl_array_ptr_ref(old, i) == T;
+    if (!seen) {
+        nw = jl_alloc_vec_any(n + 1);
+        for (size_t i = 0; i < n; i++)
+            jl_array_ptr_set(nw, i, jl_array_ptr_ref(old, i));
+        jl_array_ptr_set(nw, n, T);
+        jl_set_candidates = jl_eqtable_put(jl_set_candidates, (jl_value_t*)set, (jl_value_t*)nw, NULL);
+    }
+    JL_UNLOCK(&candidates_lock);
+    JL_GC_POP();
+}
+
+// a member taken back leaves its set's candidates (compiler §4.3, §7.2), a pattern's every member with
+// it: the list replaced without them. Called under the world counter's lock, so no declaration adds one
+// meanwhile.
+static void unregister_candidates(jl_typename_t *set, jl_value_t *member)
+{
+    jl_array_t *old = NULL, *nw = NULL;
+    JL_GC_PUSH2(&old, &nw);
+    JL_LOCK(&candidates_lock);
+    old = jl_set_candidates ? (jl_array_t*)jl_eqtable_get(jl_set_candidates, (jl_value_t*)set, NULL) : NULL;
+    JL_UNLOCK(&candidates_lock);
+    size_t n = old ? jl_array_nrows(old) : 0;
+    int concrete = jl_is_concrete_type(member);
+    nw = jl_alloc_vec_any(0);
+    for (size_t i = 0; i < n; i++) {
+        jl_value_t *T = jl_array_ptr_ref(old, i);
+        int drop = T == member || (!concrete && jl_is_type(T) && jl_subtype(T, member));
+        if (!drop)
+            jl_array_ptr_1d_push(nw, T);
+    }
+    if (n > 0 && jl_array_nrows(nw) < n) {
+        JL_LOCK(&candidates_lock);
+        jl_set_candidates = jl_eqtable_put(jl_set_candidates, (jl_value_t*)set, (jl_value_t*)nw, NULL);
+        JL_UNLOCK(&candidates_lock);
+    }
+    JL_GC_POP();
+}
+
 // The entries at each set: a set's TypeName to a Vector{Any} of the entries whose set it is, in force
 // or ended. The check of a member pattern reads it. Written under the world counter's lock; a list is
 // replaced, never mutated.
@@ -848,6 +902,13 @@ void jl_activate_memberships(jl_array_t *list, size_t world)
         jl_atomic_store_release(&home->memberships, (jl_svec_t*)nd);
         jl_gc_wb(home, nd);
     }
+    // the concrete members of the entries in force are their sets' candidates
+    nd = NULL;
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i + 1);
+        if (jl_atomic_load_relaxed(&en->max_world) == ~(uint64_t)0 && jl_is_concrete_type(en->member))
+            register_candidate(en->set, en->member);
+    }
     JL_GC_POP();
 }
 
@@ -1117,6 +1178,12 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         }
     }
     // the session's list, from which an image built here takes its own modules' memberships
+    // a concrete member is a candidate of its set, for an operation's split
+    if (jl_is_concrete_type(member))
+        register_candidate(setname, member);
+    // an argument, rooted by the caller: the analyzer moves its root to the svec register_candidate
+    // stores it in, and releases it with that frame
+    JL_GC_PROMISE_ROOTED(member);
     if (jl_declared_memberships == NULL)
         jl_declared_memberships = jl_alloc_vec_any(0);
     jl_array_ptr_1d_push(jl_declared_memberships, (jl_value_t*)home);
@@ -1206,6 +1273,7 @@ JL_DLLEXPORT void jl_delete_membership(jl_value_t *member, jl_value_t *set_insta
     jl_set_membership_query_world(mq);
     jl_deep_ending_pop(pushed);
     // the member's kept check answers go with the membership
+    unregister_candidates(setname, found->member);
     jl_member_states_forget(found->member, setname);
     jl_atomic_store_release(&jl_world_counter, world + 1);
     JL_UNLOCK(&world_counter_lock);
@@ -1379,6 +1447,41 @@ JL_DLLEXPORT jl_value_t *jl_contract_operations(jl_value_t *T)
     if (!has_contract(T))
         return jl_nothing;
     return jl_svecref(jl_atomic_load_relaxed(&((jl_datatype_t*)jl_unwrap_unionall(T))->name->contract), 0);
+}
+
+// a member of a pattern joins its set's candidates at its first use (the library, compiler §10.4);
+// a closed type's candidates are its contract's, named once with it (§7.2)
+JL_DLLEXPORT void jl_register_candidate(jl_value_t *set, jl_value_t *T)
+{
+    jl_value_t *uw = jl_unwrap_unionall(set);
+    if (has_contract(set))
+        jl_errorf("the candidates of %s are its contract's", jl_symbol_name(((jl_datatype_t*)uw)->name->name));
+    if (jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->open_set && jl_is_concrete_type(T))
+        register_candidate(((jl_datatype_t*)uw)->name, T);
+}
+
+JL_DLLEXPORT jl_value_t *jl_candidates_of(jl_value_t *set)
+{
+    jl_value_t *uw = jl_unwrap_unionall(set);
+    jl_value_t *r = NULL;
+    if (has_contract(set)) {
+        // a closed type's: its contract's, as a fresh list
+        jl_svec_t *cands = (jl_svec_t*)jl_svecref(jl_atomic_load_relaxed(&((jl_datatype_t*)uw)->name->contract), 1);
+        JL_GC_PUSH1(&cands);
+        size_t n = jl_svec_len(cands);
+        jl_array_t *a = jl_alloc_vec_any(n);
+        for (size_t i = 0; i < n; i++)
+            jl_array_ptr_set(a, i, jl_svecref(cands, i));
+        JL_GC_POP();
+        return (jl_value_t*)a;
+    }
+    if (jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->open_set) {
+        JL_LOCK(&candidates_lock);
+        if (jl_set_candidates != NULL)
+            r = jl_eqtable_get(jl_set_candidates, (jl_value_t*)((jl_datatype_t*)uw)->name, NULL);
+        JL_UNLOCK(&candidates_lock);
+    }
+    return r ? r : (jl_value_t*)jl_alloc_vec_any(0);
 }
 
 JL_DLLEXPORT int jl_is_open_set(jl_value_t *T)

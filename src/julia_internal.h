@@ -957,6 +957,8 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
                                                jl_value_t *declarer, jl_value_t *by,
                                                jl_value_t *receiver);
 extern jl_genericmemory_t *jl_set_entries JL_GLOBALLY_ROOTED; // the entries at each set (datatype.c)
+extern jl_genericmemory_t *jl_set_candidates JL_GLOBALLY_ROOTED; // the sets' candidates (datatype.c)
+extern jl_value_t *jl_split_table_miss_func JL_GLOBALLY_ROOTED; // the split tables' miss (gf.c)
 // whether the TypeName `from` reaches `to` along declared supertypes and the entries live in `world`
 // (0: every entry)
 int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world) JL_NOTSAFEPOINT;

@@ -2,6 +2,8 @@
 
 const start_base_include = time_ns()
 
+include("splittarget.jl")
+
 include("reflection.jl")
 include("refpointer.jl")
 
@@ -249,6 +251,9 @@ using .MathConstants: ℯ, π, pi
 
 # experimental API's
 include("experimental.jl")
+include("splittable.jl")
+# the miss of the split tables while Base is built too: code with a split runs here
+ccall(:jl_set_split_table_miss, Cvoid, (Any,), _split_table_miss!)
 
 # utilities
 include("deepcopy.jl")
@@ -369,6 +374,9 @@ function start_profile_listener()
 end
 
 function __init__()
+    # the miss of the compiler's split tables (splittable.jl), first: code with a split reaches it
+    # from the first value past the split's candidates
+    ccall(:jl_set_split_table_miss, Cvoid, (Any,), _split_table_miss!)
     # Base library init
     global _atexit_hooks_finished = false
     Filesystem.__postinit__()
