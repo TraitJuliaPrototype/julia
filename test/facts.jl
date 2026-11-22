@@ -200,3 +200,29 @@ end
         ccall(:jl_set_fully_typed_hook, Cvoid, (Any,), nothing)
     end
 end
+
+equiv_f(x::Int) = x + 12
+
+@testset "a compile request takes the code of a compiled equivalent entry" begin
+    @test equiv_f(1) == 13
+    mi = Base.method_instance(equiv_f, (Int,))
+    world = Base.get_world_counter()
+    compiled = only(filter(ci -> ci.invoke != C_NULL, native_cis(equiv_f, (Int,))))
+    entry() = Core.CodeInstance(mi, nothing, compiled.rettype, compiled.exctype, nothing, compiled.inferred,
+        Int32(0), compiled.min_world, compiled.max_world, compiled.ipo_purity_bits, nothing,
+        compiled.debuginfo, compiled.edges)
+    # an equivalent entry without code at the head of the instance's cache, the compiled one after it
+    uncompiled = entry()
+    ccall(:jl_mi_cache_insert, Cvoid, (Any, Any), mi, uncompiled)
+    @test mi.cache === uncompiled
+    request = entry()
+    # the first entry by its ABI is the one without code; the request takes the compiled one
+    @test ccall(:jl_get_ci_equiv, Any, (Any, UInt), request, world) === uncompiled
+    @test CC.equivalent_cached_ci(request, world) === compiled
+    # no equivalent entry: the request itself
+    other = Core.CodeInstance(mi, nothing, Any, compiled.exctype, nothing, compiled.inferred,
+        Int32(0), compiled.min_world, compiled.max_world, compiled.ipo_purity_bits, nothing,
+        compiled.debuginfo, compiled.edges)
+    @test CC.equivalent_cached_ci(other, world) === other
+    @test equiv_f(1) == 13
+end
