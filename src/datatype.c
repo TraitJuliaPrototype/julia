@@ -82,6 +82,8 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     jl_atomic_store_relaxed(&tn->linearcache, jl_emptysvec);
     tn->names = NULL;
     tn->hash = bitmix(bitmix(module ? module->build_id.lo : 0, name->hash), 0xa1ada1da);
+    tn->open_set = 0;
+    tn->never_member = 0;
     tn->_unused = 0;
     tn->abstract = abstract;
     tn->mutabl = mutabl;
@@ -94,7 +96,33 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     jl_atomic_store_relaxed(&tn->cache_entry_count, 0);
     tn->constprop_heustic = 0;
     tn->concrete_only = 0;
+    tn->input_params = 0;
+    jl_atomic_store_relaxed(&tn->memberships, jl_emptysvec);
     return tn;
+}
+
+// Whether a set occurs in v: as the type, a parameter, a union component or a bound. A DataType's bit
+// is final from its construction, since a set is a set from its declaration, so the recursion stops there.
+static int open_set_witness(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    jl_value_t *uw = jl_is_unionall(v) ? jl_unwrap_unionall(v) : v;
+    if (jl_is_vararg(uw))
+        uw = ((jl_vararg_t*)uw)->T;
+    if (uw == NULL)
+        return 0;
+    if (jl_is_datatype(uw))
+        return ((jl_datatype_t*)uw)->has_open_set;
+    if (jl_is_uniontype(uw))
+        return open_set_witness(((jl_uniontype_t*)uw)->a) ||
+               open_set_witness(((jl_uniontype_t*)uw)->b);
+    if (jl_is_typevar(uw))
+        return open_set_witness(((jl_tvar_t*)uw)->ub);
+    return 0;
+}
+
+int jl_open_set_witness(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    return open_set_witness(v);
 }
 
 // allocating DataTypes -----------------------------------------------------------
@@ -117,6 +145,7 @@ jl_datatype_t *jl_new_uninitialized_datatype(void)
     t->zeroinit = 0;
     t->has_concrete_subtype = 1;
     t->maybe_subtype_of_cache = 1;
+    t->has_open_set = 0;
     t->ismutationfree = 0;
     t->isidentityfree = 0;
     t->smalltag = 0;
