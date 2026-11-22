@@ -565,11 +565,11 @@ function rewrap_unionall(t::Core.TypeofVararg, @nospecialize(u))
     if !isa(u, UnionAll)
         return t
     end
-    T = rewrap_unionall(t.T, u)
-    if !isdefined(t, :N) || t.N === u.var
+    T = invoke(rewrap_unionall, Tuple{Any, Any}, getfield(t, :T), u)
+    if !isdefined(t, :N) || getfield(t, :N) === getfield(u, :var)
         return Vararg{T}
     end
-    return Vararg{T, t.N}
+    return Vararg{T, getfield(t, :N)}
 end
 
 # replace TypeVars in all enclosing UnionAlls with fresh TypeVars
