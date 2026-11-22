@@ -58,8 +58,11 @@ struct UnionSplit
     atype::DataType
     cases::Vector{InliningCase}
     bbs::Vector{Int}
-    UnionSplit(handled_all_cases::Bool, fully_covered::Bool, atype::DataType, cases::Vector{InliningCase}) =
-        new(handled_all_cases, fully_covered, atype, cases, Int[])
+    trusted::UInt32  # the call's `IR_FLAGS_TRUSTED`: the fallback's result is checked, and a case's at an
+                     # instance of wider types
+    UnionSplit(handled_all_cases::Bool, fully_covered::Bool, atype::DataType, cases::Vector{InliningCase},
+               trusted::UInt32 = UInt32(0)) =
+        new(handled_all_cases, fully_covered, atype, cases, Int[], trusted)
 end
 
 struct InliningEdgeTracker
@@ -526,7 +529,7 @@ assuming their order stays the same post-discovery in `ml_matches`.
 function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::Vector{Any},
                                union_split::UnionSplit, boundscheck::Symbol,
                                todo_bbs::Vector{Tuple{Int,Int}}, interp::AbstractInterpreter)
-    (; handled_all_cases, fully_covered, atype, cases, bbs) = union_split
+    (; handled_all_cases, fully_covered, atype, cases, bbs, trusted) = union_split
     stmt, typ, line = compact.result[idx][:stmt], compact.result[idx][:type], compact.result[idx][:line]
     join_bb = bbs[end]
     pn = PhiNode()
@@ -583,6 +586,15 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
             invoke_stmt = Expr(:invoke, case.invoke, argexprs′...)
             flag = flags_for_effects(case.effects)
             val = insert_node_here!(compact, NewInstruction(invoke_stmt, typ, case.info, line, flag))
+            # (a call whose type rests on a declared result its members' own code does not check, its case an
+            # instance at wider types than the case's: the result checked)
+            if trusted != 0 && widenconst(typ) !== Any
+                mi = case.invoke isa CodeInstance ? get_ci_mi(case.invoke) : case.invoke
+                if !(mi.specTypes <: mtype)
+                    check = trusted_result_check(val, widenconst(typ), trusted, get_inference_world(interp))
+                    val = insert_node_here!(compact, NewInstruction(check, typ, line))
+                end
+            end
         else
             case = case::ConstantCase
             val = case.val
@@ -601,7 +613,15 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
     bb += 1
     # We're now in the fall through block, decide what to do
     if !handled_all_cases
-        ssa = insert_node_here!(compact, NewInstruction(stmt, typ, line))
+        if trusted != 0 && widenconst(typ) !== Any
+            # a call whose type rests on a declared result its members' own code does not check: the
+            # fallback is left to dispatch, its result checked
+            ssa = insert_node_here!(compact, NewInstruction(stmt, Any, line))
+            check = trusted_result_check(ssa, widenconst(typ), trusted, get_inference_world(interp))
+            ssa = insert_node_here!(compact, NewInstruction(check, typ, line))
+        else
+            ssa = insert_node_here!(compact, NewInstruction(stmt, typ, line))
+        end
         push!(pn.edges, bb)
         push!(pn.values, ssa)
         insert_node_here!(compact, NewInstruction(GotoNode(join_bb), Any, line))
@@ -1453,6 +1473,7 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
     handle_cases!(todo, ir, idx, stmt, atype, cases, handled_all_cases, fully_covered, joint_effects)
 end
 
+
 function handle_match!(cases::Vector{InliningCase},
     match::MethodMatch, argtypes::Vector{Any}, @nospecialize(info::CallInfo), flag::UInt32,
     state::InliningState;
@@ -1661,8 +1682,15 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
         inst = ir.stmts[idx]
         flag = inst[:flag]
 
+        # (a call whose type rests on a declared result its members' own code does not check)
+        trusted = flag & IR_FLAGS_TRUSTED
+        ntodo = length(todo)
+
         simpleres = process_simple!(todo, ir, idx, flag, state)
-        simpleres === nothing && continue
+        if simpleres === nothing
+            trusted == 0 || check_trusted_result!(todo, ntodo, ir, idx, nothing, trusted, state)
+            continue
+        end
         stmt, sig = simpleres
         info = inst[:info]
 
@@ -1700,13 +1728,56 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
             # cascade to the generic (and extendable) handler
             handle_call!(todo, ir, idx, stmt, info, flag, sig, state)
         end
+        trusted == 0 || check_trusted_result!(todo, ntodo, ir, idx, sig, trusted, state)
     end
 
     return todo
 end
 
-# An operation's call at a receiver typed by its set: the dynamic call, its result asserted to the
-# declared result, which inference took as the call's type.
+# A call whose type rests on a declared result that the code compiled for a member's own type does not
+# check (the `trusted` flags), after the inliner has handled it. Where the code that runs
+# is the code inferred, the result holds: an inlined body, an invoke of the instance at the call's
+# types. Where it may be another instance, the result is checked against the type inferred for the
+# call: a call left to dispatch (with no case, a builtin's call such as a splat or `Core.invoke` that
+# stays one), a split's fallback, an invoke of an instance at wider types (a method that does not
+# specialize). Compiled code never takes a value that its call's type excludes.
+function check_trusted_result!(todo::Vector{Pair{Int,Any}}, ntodo::Int, ir::IRCode, idx::Int,
+                               sig::Union{Nothing,Signature}, trusted::UInt32, state::InliningState)
+    if length(todo) > ntodo && todo[end].first == idx
+        item = todo[end].second
+        if item isa UnionSplit
+            todo[end] = idx => UnionSplit(item.handled_all_cases, item.fully_covered, item.atype, item.cases,
+                                          trusted)
+        end
+        return nothing
+    end
+    inst = ir[SSAValue(idx)]
+    stmt = inst[:stmt]
+    stmt isa Expr || return nothing
+    if stmt.head === :invoke
+        sig === nothing && return nothing
+        edge = stmt.args[1]
+        mi = isa(edge, MethodInstance) ? edge : get_ci_mi(edge::CodeInstance)
+        mi.specTypes <: argtypes_to_type(sig.argtypes) && return nothing
+    elseif stmt.head !== :call
+        return nothing
+    end
+    T = widenconst(inst[:type])
+    T === Any && return nothing
+    call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], inst[:flag] & ~IR_FLAGS_TRUSTED))
+    inst[:stmt] = trusted_result_check(call, T, trusted, state.world)
+    inst[:info] = NoCallInfo()
+    inst[:flag] = IR_FLAG_NULL
+    return nothing
+end
+
+# The check of a result `val` against `T`: `typeassert`'s, as the operation's own call asserts
+trusted_result_check(@nospecialize(val), @nospecialize(T), trusted::UInt32, world::UInt) =
+    Expr(:call, GlobalRef(Core, :typeassert), val, T)
+
+# An operation's call at a receiver typed by its set: the
+# dynamic call, its result asserted to the declared result, which inference took as the
+# call's type.
 function handle_declared_result!(ir::IRCode, idx::Int, stmt::Expr, info::DeclaredResultInfo)
     inst = ir[SSAValue(idx)]
     call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], nothing))
@@ -1715,6 +1786,7 @@ function handle_declared_result!(ir::IRCode, idx::Int, stmt::Expr, info::Declare
     inst[:flag] = IR_FLAG_NULL
     return nothing
 end
+
 
 function linear_inline_eligible(ir::IRCode)
     length(ir.cfg.blocks) == 1 || return false

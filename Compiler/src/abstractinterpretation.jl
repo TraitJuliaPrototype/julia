@@ -287,6 +287,11 @@ function declared_field_in(@nospecialize(c), name::Symbol, depth::Int)
     return nothing
 end
 
+# The effects of a call whose result is a declared result its members' own code is not checked against:
+# `TRUSTED_CALLABLE` or `TRUSTED_OPERATION`
+trusted_effects(interp::AbstractInterpreter, bits::UInt8, effects::Effects = Effects()) =
+    Effects(effects; trusted = bits)
+
 # a declared result at the call's types: the declared signature's variables instantiated where the
 # call fixes them, else bounded by their bounds
 function declared_result_at(@nospecialize(sig), @nospecialize(rt), @nospecialize(atype))
@@ -313,7 +318,13 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     # an operation of a set at a receiver typed by the set: the operation's declared result, the call
     # left to dispatch and its result asserted
     drt = declared_operation_result(interp, argtypes, atype)
-    drt === nothing || return Future(CallMeta(drt, Any, Effects(), DeclaredResultInfo(drt)))
+    if drt !== nothing
+        # (trusted: a member's own instance is not checked against the declared result in every world
+        # it runs in, a member of a pattern before its first use among them; nothing is trusted where
+        # the result is `Any`)
+        opeffects = drt === Any ? Effects() : trusted_effects(interp, TRUSTED_OPERATION)
+        return Future(CallMeta(drt, Any, opeffects, DeclaredResultInfo(drt)))
+    end
     matches = find_method_matches(interp, argtypes, atype; max_methods)
     if isa(matches, FailedMethodMatch)
         add_remark!(interp, sv, matches.reason)
@@ -324,9 +335,9 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     update_valid_age!(sv, valid_worlds) # need to record the negative world now, since even if we don't generate any useful information, inlining might want to add an invoke edge and it won't have this information anymore
     # (in an inference frame, and where the IR interpreter infers the call again: both hold edges)
     record_match_memberships!(interp, sv, applicable)
-    # a member's check: inference reads the answers and runs no check. A call at a member whose check
-    # failed is left to dispatch, which raises the failure; a member with no answer is noted, and the
-    # compile queue asks the hook before the code runs
+    # a member's check: inference reads the answers and runs no check. A call at a
+    # member whose check failed is left to dispatch, which raises the failure; a member with no answer
+    # is noted, and the compile queue asks the hook before the code runs
     if sv isa InferenceState && interp isa NativeInterpreter && member_check_failed(sv, applicable)
         add_remark!(interp, sv, "Call at a member whose check failed: left to dispatch")
         return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
@@ -422,6 +433,15 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
                         (; const_result, const_edge) = const_call_result
                     else
                         add_remark!(interp, sv, "[constprop] Discarded exception type because result was wider than inference")
+                    end
+                    # The const result's code runs at this call where it was taken for its effects or its
+                    # exception type, so its type joins the call's: a declared result makes inference at
+                    # a wider argument (an operation's result through the set) and at a narrower one (the
+                    # member's own method, known by constant propagation) non-monotone, and code must
+                    # never return a type its call's type excludes
+                    if const_result !== volatile_inf_result && !(this_const_rt ⊑ₚ this_rt)
+                        this_rt = this_rt ⊔ₚ this_const_rt
+                        this_conditional = this_rt
                     end
                     if const_edge !== nothing
                         edge = const_edge
@@ -560,7 +580,22 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
             infercalls2(interp, sv) || push!(sv.tasks, infercalls2)
         end
 
-        gfresult[] = CallMeta(state.rettype, state.exctype, state.all_effects, retinfo, state.slotrefinements)
+        rettype, exctype, effects = state.rettype, state.exctype, state.all_effects
+        # a result that rests on a declared result its members' own code does not check holds for the
+        # instance inferred. At concrete argument types that instance is the one that
+        # runs: nothing is trusted past the call. Else dispatch may run another instance: the call keeps
+        # the mark, so its callers' and the optimizer's checks see it, and its result is the type alone
+        # (a constant, a field's type or a condition read from the instance at the signature is not
+        # what another instance gives)
+        if is_trusted(effects)
+            if isdispatchtuple(atype)
+                effects = Effects(effects; trusted = 0x00)
+            else
+                rettype = widenconst(rettype)
+            end
+        end
+        gfresult[] = CallMeta(rettype, exctype, effects,
+                              retinfo, state.slotrefinements)
         return true
     end # function infercalls
     # start making progress on the first call
@@ -2637,6 +2672,8 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
     env = tienv[2]::SimpleVector
     mresult = abstract_call_method(interp, method, ti, env, false, si, sv)::Future
     match = MethodMatch(ti, env, method, argtype <: method.sig)
+    # (the builtin specializes at the values' types: the instance inferred runs where they are concrete)
+    concrete_args = isdispatchtuple(argtype)
     ft′_box = Core.Box(ft′)
     lookupsig_box = Core.Box(lookupsig)
     invokecall = InvokeCall(types)
@@ -2673,6 +2710,8 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
             end
         end
         rt = from_interprocedural!(interp, rt, sv, arginfo′, sig)
+        # a marked result where another instance may run is its type alone, as at a call
+        is_trusted(effects) && !concrete_args && (rt = widenconst(rt))
         info = InvokeCallInfo(edge, match, const_result, lookupsig_box.contents)
         if !match.fully_covers
             effects = Effects(effects; nothrow=false)
@@ -3911,7 +3950,7 @@ function merge_override_effects!(interp::AbstractInterpreter, effects::Effects, 
         override = decode_statement_effects_override(sv)
         effects = override_effects(effects, override)
     end
-    set_curr_ssaflag!(sv, flags_for_effects(effects), IR_FLAGS_EFFECTS)
+    set_curr_ssaflag!(sv, flags_for_effects(effects), IR_FLAGS_EFFECTS | IR_FLAGS_TRUSTED)
     merge_effects!(interp, sv, effects)
     return effects
 end
