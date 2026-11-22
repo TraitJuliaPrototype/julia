@@ -552,11 +552,15 @@ static int jl_typemap_intersection_node_visitor(jl_typemap_entry_t *ml, struct t
         // for this answer (by a task in an older world) is not used once a membership changes it. An
         // empty intersection rests on no entry where the query's types hold none (the common case: a
         // non-member of the set), and then nothing narrows the range. Unchanged without sets (one bit).
-        if (!closure->skip_ranges && jl_has_open_set_in((jl_value_t*)ml->sig) &&
-            (closure->ti != (jl_value_t*)jl_bottom_type || jl_membership_range_is_fast(closure->world) ||
+        // A signature whose variable's lower bound holds membership entries (`h(::Ph{T}) where T >: S`) meets a
+        // query at the set through them, though it names no set.
+        int lbm = 0;
+        if (!closure->skip_ranges && (jl_has_open_set_in((jl_value_t*)ml->sig) ||
+             (lbm = jl_sig_lower_bounds_have_memberships((jl_value_t*)ml->sig))) &&
+            (closure->ti != (jl_value_t*)jl_bottom_type || jl_membership_range_is_fast(closure->world) || lbm ||
              jl_type_has_memberships(closure->type))) {
             size_t lo = closure->min_valid, hi = closure->max_valid;
-            jl_value_t *msig = closure->ti != (jl_value_t*)jl_bottom_type ? (jl_value_t*)ml->sig : NULL;
+            jl_value_t *msig = closure->ti != (jl_value_t*)jl_bottom_type || lbm ? (jl_value_t*)ml->sig : NULL;
             if (jl_membership_world_range(closure->type, msig, closure->world, &lo, &hi)) {
                 closure->min_valid = lo;
                 closure->max_valid = hi;
