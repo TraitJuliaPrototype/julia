@@ -758,6 +758,13 @@ jl_code_instance_t *jl_method_compiled_policy(jl_method_instance_t *mi JL_PROPAG
 JL_DLLEXPORT jl_code_instance_t *jl_engine_reserve_policy(jl_method_instance_t *m, jl_value_t *owner, int facts);
 JL_DLLEXPORT jl_value_t *jl_rettype_inferred_policy(jl_value_t *owner, jl_method_instance_t *mi, size_t min_world, size_t max_world, int policy) JL_NOTSAFEPOINT;
 int jl_engine_hasreserved_policy(jl_method_instance_t *m, jl_value_t *owner, int facts) JL_NOTSAFEPOINT;
+// dispatch with the policy of the code that dispatches
+JL_DLLEXPORT jl_value_t *jl_apply_generic_reach(jl_value_t *F, jl_value_t **args, uint32_t nargs, int reach);
+JL_DLLEXPORT jl_value_t *jl_invoke_reach(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc, int reach);
+jl_value_t *jl_gf_invoke_by_method_reach(jl_method_t *method, jl_value_t *gf, jl_value_t **args, size_t nargs, int reach);
+jl_value_t *jl_gf_invoke_reach(jl_value_t *types, jl_value_t *f, jl_value_t **args, size_t nargs, int reach);
+// a call the interpreter makes: a builtin that calls a function gets the interpreted code's policy
+jl_value_t *jl_apply_reach(jl_value_t **args, uint32_t nargs, int reach);
 JL_DLLEXPORT jl_code_instance_t *jl_get_method_inferred(
         jl_method_instance_t *mi JL_PROPAGATES_ROOT, jl_value_t *rettype,
         size_t min_world, size_t max_world, jl_debuginfo_t *di, jl_svec_t *edges);
