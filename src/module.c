@@ -523,6 +523,7 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
     m->max_methods = -1;
     // a submodule takes its parent's policy
     m->facts = parent != NULL && parent != m ? parent->facts : 0;
+    m->options = parent != NULL && parent != m ? parent->options : 0;
     m->file = jl_empty_sym;
     m->line = 0;
     m->hash = parent == NULL ? bitmix(name->hash, jl_module_type->hash) :
@@ -740,6 +741,21 @@ JL_DLLEXPORT void jl_set_module_facts_never(jl_module_t *self)
 JL_DLLEXPORT int jl_get_module_facts(jl_module_t *m)
 {
     return m->facts;
+}
+// A module's options word, set by `@compiler_options` (a bit and its value), inherited by a submodule
+// at its creation.
+JL_DLLEXPORT void jl_set_module_option(jl_module_t *self, int bit, int value)
+{
+    if (bit != JL_MODULE_OPTION_OWNER_ONLY)
+        jl_errorf("unknown module option bit %d", bit);
+    if (value)
+        self->options |= (uint8_t)bit;
+    else
+        self->options &= (uint8_t)~bit;
+}
+JL_DLLEXPORT int jl_get_module_options(jl_module_t *m)
+{
+    return m->options;
 }
 // The test bed: with JULIA_COMPILE_BY_FACTS=1 (read once; never while generating output) a method of
 // a module that declares no option takes the policy of the code that reaches it, and the runtime's
@@ -1576,6 +1592,19 @@ JL_DLLEXPORT int jl_module_public_p(jl_module_t *m, jl_sym_t *var)
 {
     jl_binding_t *b = jl_get_module_binding(m, var, 0);
     return b && (jl_atomic_load_relaxed(&b->flags) & BINDING_FLAG_PUBLICP);
+}
+
+// An owner-only function by declaration: its methods are its owner's only, exported or not. Kept on
+// the function's binding, beside its public flag.
+JL_DLLEXPORT void jl_set_owner_only(jl_module_t *m, jl_sym_t *var)
+{
+    jl_binding_t *b = jl_get_module_binding(m, var, 1);
+    jl_atomic_fetch_or_relaxed(&b->flags, BINDING_FLAG_OWNER_ONLY);
+}
+JL_DLLEXPORT int jl_binding_owner_only_p(jl_module_t *m, jl_sym_t *var)
+{
+    jl_binding_t *b = jl_get_module_binding(m, var, 0);
+    return b && (jl_atomic_load_relaxed(&b->flags) & BINDING_FLAG_OWNER_ONLY);
 }
 
 uint_t bindingkey_hash(size_t idx, jl_value_t *data)
