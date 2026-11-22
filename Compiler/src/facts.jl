@@ -30,8 +30,9 @@ is_fact_sig(@nospecialize(T), max_union_splitting::Int = FACT_UNION_SPLITTING) =
 Whether `F` (a function's type) is owner-only (compiler §1.2; facts §1): only its owner may define its
 methods, so a call of it is a fact at any signature (Lemma O with a pirate's wider reading). A function
 of a module whose `owner_only` option is on (a trait module, its submodules included) that the module
-neither exports nor declares `public`, a closure of such a module among them; or a function its owner
-declared so (`jl_set_owner_only`). Read where the call is inferred.
+neither exports nor declares `public`, a closure of such a module among them, but for a trait's operation,
+open to its members (`jl_set_open_operation`, traits §12.2); or a function its owner declared so
+(`jl_set_owner_only`), an operation too. Read where the call is inferred.
 """
 function is_owner_only(@nospecialize(F))
     F isa DataType || return false
@@ -40,6 +41,8 @@ function is_owner_only(@nospecialize(F))
     m = tn.module
     name = tn.singletonname
     ccall(:jl_binding_owner_only_p, Cint, (Any, Any), m, name) != 0 && return true
+    # a trait's operation is open to its members, exported or not (traits §12.2)
+    ccall(:jl_binding_open_operation_p, Cint, (Any, Any), m, name) != 0 && return false
     (ccall(:jl_get_module_trait_options, Cint, (Any,), m) & Cint(64)) != 0 || return false
     return ccall(:jl_module_public_p, Cint, (Any, Any), m, name) == 0
 end

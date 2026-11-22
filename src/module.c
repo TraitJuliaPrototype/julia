@@ -1616,6 +1616,19 @@ JL_DLLEXPORT int jl_binding_owner_only_p(jl_module_t *m, jl_sym_t *var)
     jl_binding_t *b = jl_get_module_binding(m, var, 0);
     return b && (jl_atomic_load_relaxed(&b->flags) & BINDING_FLAG_OWNER_ONLY);
 }
+// A trait's operation (traits §12.2): open to its members from its declaration, so not owner-only by its
+// module's default; `@owner_only` still closes it. Set by the library where the trait is declared, kept on the
+// function's binding, so an image keeps it.
+JL_DLLEXPORT void jl_set_open_operation(jl_module_t *m, jl_sym_t *var)
+{
+    jl_binding_t *b = jl_get_module_binding(m, var, 1);
+    jl_atomic_fetch_or_relaxed(&b->flags, BINDING_FLAG_OPEN_OPERATION);
+}
+JL_DLLEXPORT int jl_binding_open_operation_p(jl_module_t *m, jl_sym_t *var)
+{
+    jl_binding_t *b = jl_get_module_binding(m, var, 0);
+    return b && (jl_atomic_load_relaxed(&b->flags) & BINDING_FLAG_OPEN_OPERATION);
+}
 
 uint_t bindingkey_hash(size_t idx, jl_value_t *data)
 {
