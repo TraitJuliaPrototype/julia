@@ -1037,6 +1037,11 @@ extern jl_mutex_t jl_member_state_lock;
 void jl_member_checks_activated(jl_array_t *checks);
 jl_array_t *jl_member_checks_passed_here(void);
 JL_DLLEXPORT void jl_member_states_forget(jl_value_t *member, jl_typename_t *setname);
+// a library's strict mode (datatype.c): the ambiguities images' memberships met at activation, and the
+// report's findings, each svec(method at X, X, tied signatures, member, joint signature)
+extern jl_array_t *jl_activation_ambiguities JL_GLOBALLY_ROOTED;
+JL_DLLEXPORT void jl_membership_ambiguities(jl_value_t *member, jl_value_t *set_instance,
+                                            size_t entry_min_world, jl_array_t *found);
 JL_DLLEXPORT size_t jl_membership_stat(int which);
 // what a membership ends of the deep class, kept as a definition's is (gf.c)
 JL_DLLEXPORT int jl_deep_ending_push(const char *kind, jl_value_t *cause);

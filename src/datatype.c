@@ -846,12 +846,72 @@ void jl_activate_memberships(jl_array_t *list, size_t world)
     JL_GC_POP();
 }
 
+// A library's strict mode: a membership that makes methods ambiguous is refused at its declaration,
+// and the ambiguities that images' memberships meet at activation are kept, one message each, until
+// the library takes and reports them.
+static _Atomic(int) strict_memberships;
+jl_array_t *jl_activation_ambiguities JL_GLOBALLY_ROOTED = NULL; // rooted in the collectors' lists (gc-stock.c, gc-mmtk.c)
+JL_DLLEXPORT int jl_set_strict_memberships(int on)
+{
+    return jl_atomic_exchange_relaxed(&strict_memberships, on != 0);
+}
+JL_DLLEXPORT jl_value_t *jl_take_activation_ambiguities(void)
+{
+    JL_LOCK(&world_counter_lock);
+    jl_value_t *a = jl_activation_ambiguities ? (jl_value_t*)jl_activation_ambiguities : jl_nothing;
+    jl_activation_ambiguities = NULL;
+    JL_UNLOCK(&world_counter_lock);
+    return a;
+}
+
+// the error of a membership strict mode refuses: each ambiguity as the report's warning names it
+static jl_value_t *ambiguity_message(const char *head, jl_value_t *member, jl_value_t *set_instance,
+                                     jl_array_t *found)
+{
+    ios_t str_;
+    ios_mem(&str_, 0);
+    JL_STREAM *s = (JL_STREAM*)&str_;
+    jl_printf(s, "%s", head);
+    jl_static_show(s, member);
+    jl_printf(s, " in ");
+    jl_static_show(s, set_instance);
+    jl_printf(s, ": it makes methods ambiguous for ");
+    jl_static_show(s, member);
+    for (size_t i = 0; i < jl_array_nrows(found); i++) {
+        jl_svec_t *f = (jl_svec_t*)jl_array_ptr_ref(found, i);
+        jl_method_t *m = (jl_method_t*)jl_svecref(f, 0);
+        jl_svec_t *tied = (jl_svec_t*)jl_svecref(f, 2);
+        jl_printf(s, "\n  method %s at ", jl_symbol_name(m->name));
+        jl_static_show_func_sig(s, (jl_value_t*)m->sig);
+        jl_printf(s, " with the method at ");
+        for (size_t k = 0; k < jl_svec_len(tied); k++) {
+            if (k > 0)
+                jl_printf(s, " and ");
+            jl_static_show_func_sig(s, jl_svecref(tied, k));
+        }
+        jl_value_t *joint = jl_svecref(f, 4);
+        if (joint != jl_nothing) {
+            jl_printf(s, ": a method at ");
+            jl_static_show_func_sig(s, joint);
+            jl_printf(s, " would resolve it");
+        }
+    }
+    jl_value_t *msg = jl_pchar_to_string(str_.buf, str_.size);
+    ios_close(&str_);
+    return msg;
+}
+
 // Once `world` is published: the walk and the ambiguity report for each activated entry, as at a
-// declaration, still under the world counter's lock.
+// declaration, still under the world counter's lock. Under strict mode in a session the ambiguities
+// are kept as messages for the library, in place of the warning.
 void jl_memberships_activated(jl_array_t *list, size_t world)
 {
     size_t n = jl_array_nrows(list);
     size_t mq = jl_set_membership_query_world(world);
+    int collect = jl_atomic_load_relaxed(&strict_memberships) && !jl_generating_output();
+    jl_array_t *found = NULL;
+    jl_value_t *msg = NULL;
+    JL_GC_PUSH2(&found, &msg);
     for (size_t i = 0; i + 1 < n; i += 2) {
         jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i + 1);
         if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
@@ -860,8 +920,20 @@ void jl_memberships_activated(jl_array_t *list, size_t world)
         int pushed = jl_deep_ending_push("membership", en->method != jl_nothing ? en->method : (jl_value_t*)en);
         jl_membership_dispatch_walk(en->member, en->instance, world);
         jl_deep_ending_pop(pushed);
-        jl_membership_ambiguity_report(en->member, en->instance, world);
+        if (!collect) {
+            jl_membership_ambiguity_report(en->member, en->instance, world);
+            continue;
+        }
+        found = jl_alloc_vec_any(0);
+        jl_membership_ambiguities(en->member, en->instance, world, found);
+        if (jl_array_nrows(found) > 0) {
+            msg = ambiguity_message("the membership of ", en->member, en->instance, found);
+            if (jl_activation_ambiguities == NULL)
+                jl_activation_ambiguities = jl_alloc_vec_any(0);
+            jl_array_ptr_1d_push(jl_activation_ambiguities, msg);
+        }
     }
+    JL_GC_POP();
     jl_set_membership_query_world(mq);
 }
 
@@ -887,6 +959,16 @@ static jl_value_t *membership_method_sig(jl_value_t *member, jl_value_t *set_ins
     sig = jl_rewrap_unionall(sig, member);
     JL_GC_POP();
     return sig;
+}
+
+// The signature of the method a membership of the pair would have, for a library's check before a
+// pirate's membership under its strict mode; `nothing` where it has none.
+JL_DLLEXPORT jl_value_t *jl_membership_method_sig(jl_value_t *member, jl_value_t *set_instance)
+{
+    if (!jl_is_type(member) || !jl_is_type(set_instance))
+        return jl_nothing;
+    jl_value_t *sig = membership_method_sig(member, set_instance);
+    return sig == NULL ? jl_nothing : sig;
 }
 
 // Declare `member` (a DataType, a UnionAll member pattern, Type{S}, or a set instance) a member of the
@@ -931,7 +1013,9 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     jl_method_t *mmeth = NULL;
     jl_typemap_entry_t *mentry = NULL;
     jl_value_t *entry = NULL;
-    JL_GC_PUSH4(&msig, &mmeth, &mentry, &entry);
+    jl_array_t *ended = NULL, *found = NULL;
+    jl_value_t *msg = NULL;
+    JL_GC_PUSH7(&msig, &mmeth, &mentry, &entry, &ended, &found, &msg);
     msig = membership_method_sig(member, set_instance);
     if (msig != NULL)
         mmeth = jl_new_membership_method(jl_is_module(declarer) ? (jl_module_t*)declarer : jl_main_module, msig);
@@ -953,6 +1037,7 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     // pattern is checked against the patterns at the set, and ends an entry of the same pattern at the
     // same inputs.
     int redeclare = 0;
+    int strict = jl_atomic_load_relaxed(&strict_memberships);
     if (jl_is_concrete_type(member)) {
         size_t mq = jl_set_membership_query_world(world);
         entry = set_at_inputs(setname, (jl_datatype_t*)setuw);
@@ -993,14 +1078,39 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         for (size_t i = 0; i < jl_svec_len(list); i++) {
             jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
             if (en->set == setname && jl_atomic_load_relaxed(&en->max_world) == ~(uint64_t)0 &&
-                jl_types_equal(en->member, member) && same_inputs(setname, en->instance, set_instance))
+                jl_types_equal(en->member, member) && same_inputs(setname, en->instance, set_instance)) {
                 jl_atomic_store_release(&en->max_world, world);
+                if (strict) {
+                    if (ended == NULL)
+                        ended = jl_alloc_vec_any(0);
+                    jl_array_ptr_1d_push(ended, (jl_value_t*)en);
+                }
+            }
         }
     }
     // the entry begins at min_world, past every task's world until the counter advances
     entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world,
                           mmeth != NULL ? (jl_value_t*)mmeth : jl_nothing);
     index_entry((jl_membership_t*)entry);
+    if (strict) {
+        // strict mode: the ambiguities the entry makes, asked in its world before the counter advances
+        // to it; under the lock nothing else can enter that world. A hit retires the entry before it
+        // begins: live in no world, never removed from its lists, the counter unchanged
+        found = jl_alloc_vec_any(0);
+        size_t mq = jl_set_membership_query_world(min_world);
+        jl_membership_ambiguities(member, set_instance, min_world, found);
+        jl_set_membership_query_world(mq);
+        if (jl_array_nrows(found) > 0) {
+            jl_atomic_store_release(&((jl_membership_t*)entry)->max_world, world);
+            for (size_t i = 0; ended && i < jl_array_nrows(ended); i++)
+                jl_atomic_store_release(&((jl_membership_t*)jl_array_ptr_ref(ended, i))->max_world, ~(uint64_t)0);
+            msg = ambiguity_message("strict mode refuses the membership of ", member, set_instance, found);
+            JL_UNLOCK(&world_counter_lock);
+            msg = jl_new_struct(jl_errorexception_type, msg);
+            JL_GC_POP();
+            jl_throw(msg);
+        }
+    }
     // the session's list, from which an image built here takes its own modules' memberships
     if (jl_declared_memberships == NULL)
         jl_declared_memberships = jl_alloc_vec_any(0);
