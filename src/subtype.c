@@ -1741,13 +1741,14 @@ JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_
     return found;
 }
 
-// the TypeNames of the open sets that occur in t: through parameters, unions, UnionAlls,
-// varargs and an intersection's components
+// the TypeNames of the open sets that occur in t: through parameters, unions, UnionAlls (a
+// variable's lower and upper bound), varargs and an intersection's components
 static void open_sets_in(jl_value_t *t, arraylist_t *out) JL_NOTSAFEPOINT
 {
     if (t == NULL)
         return;
     if (jl_is_unionall(t)) {
+        open_sets_in(((jl_unionall_t*)t)->var->lb, out);
         open_sets_in(((jl_unionall_t*)t)->var->ub, out);
         open_sets_in(((jl_unionall_t*)t)->body, out);
         return;
@@ -1776,14 +1777,15 @@ static void open_sets_in(jl_value_t *t, arraylist_t *out) JL_NOTSAFEPOINT
         open_sets_in(jl_tparam(t, i), out);
 }
 
-// the entries live in `world` on a TypeName reachable from t (through parameters,
-// supertypes and entries' instances) whose set reaches one of `targets`
+// the entries live in `world` on a TypeName reachable from t (through parameters, a variable's
+// bounds, supertypes and entries' instances) whose set reaches one of `targets`
 static void membership_entries_visit(jl_value_t *t, size_t world, arraylist_t *targets,
                                      arraylist_t *out, arraylist_t *seen)
 {
     if (t == NULL)
         return;
     if (jl_is_unionall(t)) {
+        membership_entries_visit(((jl_unionall_t*)t)->var->lb, world, targets, out, seen);
         membership_entries_visit(((jl_unionall_t*)t)->var->ub, world, targets, out, seen);
         membership_entries_visit(((jl_unionall_t*)t)->body, world, targets, out, seen);
         return;
@@ -1829,9 +1831,11 @@ static void membership_entries_visit(jl_value_t *t, size_t world, arraylist_t *t
 }
 
 // The entries a positive answer `S <: X` may rest on in `world` (compiler §3.1, §4.8): each
-// entry live there, on a TypeName reachable from S, whose set reaches an open set that X names.
-// Inference records them in the code's record when it folds the answer, and bounds the code's
-// worlds by theirs. Empty where S reaches none.
+// entry live there, on a TypeName reachable from S or X, whose set reaches an open set that S or
+// X names. A lower bound turns the question around: in `Ref{Y} <: Ref{T} where T >: Z` the walk
+// asks `Z <: Y`, the member in X and the set in S; so both sides are read, both bounds of each
+// variable. Inference records them in the code's record when it folds the answer, and bounds the
+// code's worlds by theirs. Empty where neither side reaches one.
 JL_DLLEXPORT jl_value_t *jl_membership_entries_for(jl_value_t *S, jl_value_t *X, size_t world)
 {
     arraylist_t targets, out, seen;
@@ -1839,8 +1843,11 @@ JL_DLLEXPORT jl_value_t *jl_membership_entries_for(jl_value_t *S, jl_value_t *X,
     arraylist_new(&out, 0);
     arraylist_new(&seen, 0);
     open_sets_in(X, &targets);
-    if (targets.len > 0)
+    open_sets_in(S, &targets);
+    if (targets.len > 0) {
         membership_entries_visit(S, world, &targets, &out, &seen);
+        membership_entries_visit(X, world, &targets, &out, &seen);
+    }
     jl_svec_t *r = jl_alloc_svec_uninit(out.len);
     for (size_t i = 0; i < out.len; i++)
         jl_svecset(r, i, (jl_value_t*)out.items[i]);
