@@ -1584,6 +1584,15 @@ static int subtype_membership(jl_datatype_t *x, jl_value_t *y, jl_stenv_t *e, in
     return 0;
 }
 
+// x <: y at an explicit world: the walk of a declaration asks at the declaration's world
+int jl_membership_holds_at(jl_value_t *x, jl_value_t *y, size_t world)
+{
+    size_t last = jl_set_membership_query_world(world);
+    int ans = jl_subtype(x, y);
+    jl_set_membership_query_world(last);
+    return ans;
+}
+
 // The world range over which the memberships that a question about t can read
 // are what they are in `world`: each entry on a TypeName reachable from t, through
 // parameters, supertypes and entries' instances, narrows [*lo, *hi] to the worlds
