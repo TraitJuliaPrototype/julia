@@ -4945,13 +4945,15 @@ JL_DLLEXPORT void jl_membership_removal_walk(jl_value_t *member, jl_value_t *set
                     continue;
                 jl_array_ptr_1d_push(shadowed, (jl_value_t*)mi);
                 if (jl_subtype((jl_value_t*)mi->specTypes, substsig)) {
-                    // an instance compiled at the member (a default's method compiled for it): it ends, with its callers
+                    // an instance at the member (a default's method compiled for it): it ends, with its callers;
+                    // also the callers of an instance with no code (an `applicable` or `hasmethod` folded through
+                    // the membership names the instance alone), as a method's deletion ends them
                     jl_code_instance_t *ci = jl_atomic_load_relaxed(&mi->cache);
                     while (ci) {
                         invalidate_code_instance(ci, world, 1);
                         ci = jl_atomic_load_relaxed(&ci->next);
                     }
-                    jl_atomic_store_relaxed(&mi->dispatch_status, 0);
+                    invalidate_backedges(mi, world, "jl_membership_removal_walk");
                 }
                 else {
                     membership_removal_backedges(mi, substsig, m, world);
