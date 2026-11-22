@@ -3218,6 +3218,18 @@ JL_DLLEXPORT void jl_disable_new_worlds(void)
     JL_GC_POP();
 }
 
+// A membership that an image's load refuses: its method, activated at `world` with the image's methods,
+// is live in no world, as its entry is. Called before `world` is published, under the world counter's
+// lock.
+void jl_membership_method_retire(jl_method_t *method, size_t world)
+{
+    jl_typemap_entry_t *methodentry = do_typemap_search(jl_method_get_table(method), method);
+    if (methodentry == NULL)
+        return;
+    jl_atomic_store_relaxed(&method->dispatch_status, 0);
+    jl_atomic_store_release(&methodentry->max_world, world - 1);
+}
+
 JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
 {
     if (jl_is_implements_sig(method->sig))

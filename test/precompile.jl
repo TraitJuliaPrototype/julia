@@ -1949,6 +1949,83 @@ precompile_test_harness("delete_method") do dir
     end
 end
 
+# a package image keeps the memberships its modules declared, also on another package's type, and
+# activates them at load in its methods' world, before its code is validated
+precompile_test_harness("memberships in package images") do dir
+    setmacro = """
+        macro set(name, params...)
+            tvs = [:(\$p = TypeVar(\$(QuoteNode(p)))) for p in params]
+            t = gensym(:set)
+            return esc(quote
+                Core.declare_global(\$__module__, \$(QuoteNode(name)), false)
+                \$(Expr(:latestworld))
+                let \$(tvs...)
+                    local \$t = Core._abstracttype(\$__module__, \$(QuoteNode(name)), Core.svec(\$(params...)))
+                    ccall(:jl_set_open_set, Cvoid, (Any,), \$t)
+                    Core._setsuper!(\$t, Any)
+                    Core._typebody!(false, \$t)
+                    Core.declare_const(\$__module__, \$(QuoteNode(name)), \$t)
+                end
+                \$(Expr(:latestworld))
+                nothing
+            end)
+        end
+        member!(X, S, declarer = @__MODULE__) =
+            ccall(:jl_declare_membership, Any, (Any, Any, Any, Any, Any), S, X, declarer, nothing, :self)
+        """
+    write(joinpath(dir, "MembA.jl"), """
+        module MembA
+        $setmacro
+        @set X
+        @set P T
+        struct S end
+        struct T end
+        struct U end
+        member!(X, S)
+        f(x) = :any
+        f(::X) = :set
+        h(s) = f(s)
+        precompile(h, (S,)); precompile(h, (T,))
+        end
+        """)
+    write(joinpath(dir, "MembB.jl"), """
+        module MembB
+        using MembA
+        MembA.member!(MembA.X, MembA.T, @__MODULE__)
+        end
+        """)
+    write(joinpath(dir, "MembD.jl"), """
+        module MembD
+        using MembA
+        MembA.member!(MembA.P{Int}, MembA.U, @__MODULE__)
+        end
+        """)
+    write(joinpath(dir, "MembC.jl"), """
+        module MembC
+        using MembA
+        MembA.member!(MembA.P{String}, MembA.U, @__MODULE__)
+        end
+        """)
+    A = Base.require(Main, :MembA)
+    @test Base.invokelatest(() -> A.S <: A.X && !(A.T <: A.X))
+    @test Base.invokelatest(() -> A.h(A.S())) === :set
+    @test Base.invokelatest(() -> A.h(A.T())) === :any
+    m = Base.invokelatest(() -> only(methods(Core.implements, Tuple{Type{A.X}, Type{A.S}})))
+    @test m.module === A
+    en = only(A.S.name.memberships)
+    @test en.method === m && en.min_world == m.primary_world
+    n0 = ccall(:jl_activated_memberships_count, Csize_t, ())
+    Base.require(Main, :MembB)
+    @test Base.invokelatest(() -> A.T <: A.X)
+    @test Base.invokelatest(() -> A.h(A.T())) === :set     # the image's code for `h(::T)` ended
+    @test ccall(:jl_activated_memberships_count, Csize_t, ()) == n0 + 1
+    # an image's membership that would give its member a second instance of a set is refused
+    Base.require(Main, :MembD)
+    Base.require(Main, :MembC)
+    @test Base.invokelatest(() -> A.U <: A.P{Int} && !(A.U <: A.P{String}))
+    @test Base.invokelatest(() -> isempty(methods(Core.implements, Tuple{Type{A.P{String}}, Type{A.U}})))
+end
+
 precompile_test_harness("Issues #19030 and #25279") do load_path
     ModuleA = :Issue19030
     write(joinpath(load_path, "$ModuleA.jl"),

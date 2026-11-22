@@ -1011,6 +1011,12 @@ JL_DLLEXPORT jl_value_t *jl_membership_final_cell(jl_value_t *member, jl_value_t
 JL_DLLEXPORT jl_value_t *jl_membership_final_cells(jl_value_t *a, jl_value_t *b);
 JL_DLLEXPORT int jl_has_unmet_argument(jl_value_t *ti, size_t world);
 JL_DLLEXPORT jl_value_t *jl_unmet_final_cells(jl_value_t *spec);
+// memberships in package images (datatype.c, gf.c)
+extern jl_array_t *jl_declared_memberships JL_GLOBALLY_ROOTED;  // this session's, for images
+extern _Atomic(jl_svec_t*) jl_activated_entries JL_GLOBALLY_ROOTED; // the entries images activated
+void jl_activate_memberships(jl_array_t *list, size_t world);
+void jl_memberships_activated(jl_array_t *list, size_t world);
+void jl_membership_method_retire(jl_method_t *m, size_t world);
 JL_DLLEXPORT size_t jl_membership_stat(int which);
 // what a membership ends of the deep class, kept as a definition's is (gf.c)
 JL_DLLEXPORT int jl_deep_ending_push(const char *kind, jl_value_t *cause);
