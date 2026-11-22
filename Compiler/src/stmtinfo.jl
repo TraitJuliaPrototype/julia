@@ -77,6 +77,19 @@ function _add_edges_impl(edges::Vector{Any}, info::MethodMatchInfo, mi_edge::Boo
             return nothing
         end
     end
+    if nmatches == 1 && fully_covering(info)
+        # a union at the call's top level is split as inference splits it, each split with its own
+        # edge, each a fact signature where its types are concrete: the one match covers every split
+        sigs = callsig_splits(info.atype)
+        if sigs !== nothing
+            edge = info.edges[1]
+            edge === nothing && (edge = mi_edge ? specialize_method(info.results[1]) : info.results[1].method)
+            for sig in sigs
+                any(i::Int -> edges[i] === 1 && edges[i+1] == sig, 1:length(edges)-1) || push!(edges, 1, sig, edge)
+            end
+            return nothing
+        end
+    end
     # add check for whether this lookup already existed in the edges list
     # encode nmatches as negative if fully_covers is false
     encoded_nmatches = fully_covering(info) ? nmatches : -nmatches
@@ -98,6 +111,12 @@ function _add_edges_impl(edges::Vector{Any}, info::MethodMatchInfo, mi_edge::Boo
         push!(edges, edge)
     end
     nothing
+end
+"The splits of a call's signature at its top-level unions, within Julia's union-splitting cost; else `nothing`."
+function callsig_splits(@nospecialize(atype))
+    atype isa DataType || return nothing
+    1 < unionsplitcost(JLTypeLattice(), atype.parameters) <= FACT_UNION_SPLITTING || return nothing
+    return switchtupleunion(atype)
 end
 function add_one_edge!(edges::Vector{Any}, edge::MethodInstance)
     i = 1
