@@ -547,6 +547,11 @@ JL_DLLEXPORT void jl_gc_scan_vm_specific_roots(RootsWorkClosure* closure)
     add_node_to_roots_buffer(closure, &buf, &len, jl_absence_sigs); // each set's absence signatures (datatype.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_declared_memberships); // this session's memberships (datatype.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_atomic_load_relaxed(&jl_activated_entries)); // the entries images activated
+    add_node_to_roots_buffer(closure, &buf, &len, jl_method_definition_hook); // the library's hooks (gf.c)
+    add_node_to_roots_buffer(closure, &buf, &len, jl_method_expansion_hook);
+    add_node_to_roots_buffer(closure, &buf, &len, jl_image_methods_hook);
+    add_node_to_roots_buffer(closure, &buf, &len, jl_module_end_hook);
+    add_node_to_roots_buffer(closure, &buf, &len, jl_method_deletion_hook);
     add_node_to_roots_buffer(closure, &buf, &len, open_set_methods); // the methods at sets (gf.c)
 
     // constants

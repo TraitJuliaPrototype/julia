@@ -3304,6 +3304,7 @@ JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
 {
     if (jl_is_implements_sig(method->sig))
         jl_error("a membership's method is deleted only with its membership: take the membership back");
+    jl_call_deletion_hook(method); // a library's strict mode may refuse it
     jl_methtable_t *mt = jl_method_get_table(method);
     jl_typemap_entry_t *methodentry = do_typemap_search(mt, method);
     JL_LOCK(&world_counter_lock);
@@ -6083,6 +6084,183 @@ void call_cache_stats()
             pick_which_stat[0], pick_which_stat[1], pick_which_stat[2], pick_which_stat[3]);
 }
 #endif
+
+// The library's definition, image and module-end hooks. Each runs in the latest
+// world, outside the world counter's lock, not for a definition a hook makes, and not while the
+// system image is built. They are rooted for the collectors.
+jl_value_t *jl_method_definition_hook JL_GLOBALLY_ROOTED = NULL;
+jl_value_t *jl_method_expansion_hook JL_GLOBALLY_ROOTED = NULL;
+jl_value_t *jl_image_methods_hook JL_GLOBALLY_ROOTED = NULL;
+jl_value_t *jl_module_end_hook JL_GLOBALLY_ROOTED = NULL;
+JL_DLLEXPORT void jl_set_method_definition_hook(jl_value_t *hook)
+{
+    jl_method_definition_hook = hook == jl_nothing ? NULL : hook;
+}
+// The expansion hook: hook(argdata, code, module) -> nothing, or an svec of svec(argdata, code)
+// pairs that the one definition makes in its place, in order (a method at a set that erases by
+// default makes the method at the kept forms, then its forwarder)
+JL_DLLEXPORT void jl_set_method_expansion_hook(jl_value_t *hook)
+{
+    jl_method_expansion_hook = hook == jl_nothing ? NULL : hook;
+}
+JL_DLLEXPORT void jl_set_image_methods_hook(jl_value_t *hook)
+{
+    jl_image_methods_hook = hook == jl_nothing ? NULL : hook;
+}
+JL_DLLEXPORT void jl_set_module_end_hook(jl_value_t *hook)
+{
+    jl_module_end_hook = hook == jl_nothing ? NULL : hook;
+}
+// Strict mode's deletion hook: hook(m), before a method is deleted; it may throw to
+// refuse the deletion.
+jl_value_t *jl_method_deletion_hook JL_GLOBALLY_ROOTED = NULL;
+JL_DLLEXPORT void jl_set_method_deletion_hook(jl_value_t *hook)
+{
+    jl_method_deletion_hook = hook == jl_nothing ? NULL : hook;
+}
+
+static _Thread_local int library_hook_depth = 0;
+
+// args[0] is the hook; returns its result, or NULL where it does not run
+static jl_value_t *call_library_hook(jl_value_t **args, int nargs)
+{
+    // not while the system image is built; a trimmed build (also a non-incremental output) loads its program
+    // as a session does
+    if (args[0] == NULL || library_hook_depth > 0 ||
+        (jl_generating_output() && !jl_options.incremental && jl_options.trim == JL_TRIM_NO))
+        return NULL;
+    jl_task_t *ct = jl_current_task;
+    size_t last_age = ct->world_age;
+    ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
+    library_hook_depth++;
+    jl_value_t *r = NULL;
+    JL_TRY {
+        r = jl_apply(args, nargs);
+    }
+    JL_CATCH {
+        library_hook_depth--;
+        ct->world_age = last_age;
+        jl_rethrow();
+    }
+    library_hook_depth--;
+    ct->world_age = last_age;
+    return r;
+}
+
+// before a method enters its table (it may throw to refuse it), and once it is visible
+void jl_call_definition_hook(jl_method_t *m, int after)
+{
+    if (jl_method_definition_hook == NULL)
+        return;
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 3);
+    args[0] = jl_method_definition_hook;
+    args[1] = (jl_value_t*)m;
+    args[2] = after ? jl_true : jl_false;
+    // a check's error that the hook returns is raised here, so that its first frame is the
+    // definition's line and not the library's
+    jl_value_t *r = call_library_hook(args, 3);
+    if (r != NULL && r != jl_nothing) {
+        args[0] = r;
+        jl_value_t *ext = jl_get_global(jl_core_module, jl_symbol("Exception"));
+        if (ext != NULL && jl_isa(r, ext)) {
+            JL_GC_POP();
+            jl_throw(r);
+        }
+    }
+    JL_GC_POP();
+}
+
+// before a method is made, where its signature names a set: the methods the definition makes
+// instead, or NULL where it makes the one it is
+jl_svec_t *jl_call_expansion_hook(jl_svec_t *argdata, jl_code_info_t *code, jl_module_t *module)
+{
+    if (jl_method_expansion_hook == NULL)
+        return NULL;
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 4);
+    args[0] = jl_method_expansion_hook;
+    args[1] = (jl_value_t*)argdata;
+    args[2] = (jl_value_t*)code;
+    args[3] = (jl_value_t*)module;
+    jl_value_t *r = call_library_hook(args, 4);
+    JL_GC_POP();
+    if (r == NULL || !jl_is_svec(r) || jl_svec_len(r) == 0)
+        return NULL;
+    for (size_t i = 0; i < jl_svec_len(r); i++) {
+        jl_value_t *p = jl_svecref(r, i);
+        if (!jl_is_svec(p) || jl_svec_len(p) != 2 || !jl_is_svec(jl_svecref(p, 0)) ||
+                !jl_is_code_info(jl_svecref(p, 1)))
+            jl_error("the expansion hook returned no list of (argdata, code) pairs");
+    }
+    return (jl_svec_t*)r;
+}
+
+// before a method is deleted (it may throw to refuse it)
+void jl_call_deletion_hook(jl_method_t *m)
+{
+    if (jl_method_deletion_hook == NULL)
+        return;
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 2);
+    args[0] = jl_method_deletion_hook;
+    args[1] = (jl_value_t*)m;
+    call_library_hook(args, 2);
+    JL_GC_POP();
+}
+
+// once per package image, with its methods for other modules' functions, before any is activated:
+// the methods the hook returns stay inactive. `entries` holds the image's typemap entries for
+// them (jl_add_methods made them); returns the entries to activate.
+static jl_value_t *entry_method(jl_value_t *e) JL_NOTSAFEPOINT
+{
+    return jl_typetagis(e, jl_typemap_entry_type) ? (jl_value_t*)((jl_typemap_entry_t*)e)->func.method : e;
+}
+jl_array_t *jl_call_image_methods_hook(jl_array_t *entries, const char *pkgname)
+{
+    if (jl_image_methods_hook == NULL || jl_array_nrows(entries) == 0)
+        return entries;
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 5);
+    jl_array_t *ms = jl_alloc_vec_any(0);
+    args[4] = (jl_value_t*)ms;
+    for (size_t i = 0; i < jl_array_nrows(entries); i++)
+        jl_array_ptr_1d_push(ms, entry_method(jl_array_ptr_ref(entries, i)));
+    args[0] = jl_image_methods_hook;
+    args[1] = (jl_value_t*)ms;
+    args[2] = jl_cstr_to_string(pkgname ? pkgname : "");
+    args[3] = call_library_hook(args, 3);
+    jl_array_t *keep = entries;
+    if (args[3] != NULL && jl_is_array(args[3]) && jl_array_nrows((jl_array_t*)args[3]) > 0) {
+        jl_array_t *drop = (jl_array_t*)args[3];
+        keep = jl_alloc_vec_any(0);
+        args[1] = (jl_value_t*)keep;
+        for (size_t i = 0; i < jl_array_nrows(entries); i++) {
+            jl_value_t *e = jl_array_ptr_ref(entries, i);
+            jl_value_t *m = entry_method(e);
+            int dropped = 0;
+            for (size_t j = 0; j < jl_array_nrows(drop) && !dropped; j++)
+                dropped = jl_array_ptr_ref(drop, j) == m;
+            if (!dropped)
+                jl_array_ptr_1d_push(keep, e);
+        }
+    }
+    JL_GC_POP();
+    return keep;
+}
+
+// when a module's definition ends, before its __init__ runs
+void jl_call_module_end_hook(jl_module_t *m)
+{
+    if (jl_module_end_hook == NULL)
+        return;
+    jl_value_t **args;
+    JL_GC_PUSHARGS(args, 2);
+    args[0] = jl_module_end_hook;
+    args[1] = (jl_value_t*)m;
+    call_library_hook(args, 2);
+    JL_GC_POP();
+}
 
 STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t **args, uint32_t nargs,
                                                        uint32_t callsite, size_t world)
