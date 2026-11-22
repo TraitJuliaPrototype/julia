@@ -559,6 +559,7 @@
           name positional-sparams pargl-all
           `(block
             ,@(keep-first linenum? (without-generated prologue))
+            ,@(policy-metas prologue)
             ,(let (;; call mangled(vals..., [rest_kw,] pargs..., [vararg]...)
                    (ret `(return (call ,mangled
                                        ,@(if ordered-defaults keynames vals)
