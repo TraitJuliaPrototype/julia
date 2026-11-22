@@ -3254,4 +3254,23 @@ end
     end
     @test ccall(:jl_get_module_options, Cint, (Any,), ScopedMod) & 3 == 3
 end
+
+# the member hook: a library checks the member of a set at its first use, before dispatch selects a
+# method at the set for it; a failed check raises at the call, and is kept
+memberhook(@nospecialize(T), @nospecialize(X)) =
+    (push!(hook_log, (:member, T, X)); T === HBad && error("HBad fails its check"); nothing)
+hm(::HX) = :hx
+member!(HX, HBad)
+
+@testset "the member hook" begin
+    ccall(:jl_set_member_hook, Cvoid, (Any,), memberhook)
+    try
+        @test Base.invokelatest(hm, HS()) === :hx
+        @test (:member, HS, HX) in hook_log
+        @test_throws ErrorException Base.invokelatest(hm, HBad())
+        @test_throws ErrorException Base.invokelatest(hm, HBad())   # the failure is kept
+    finally
+        ccall(:jl_set_member_hook, Cvoid, (Any,), nothing)
+    end
+end
 end # module SetsAndMemberships
