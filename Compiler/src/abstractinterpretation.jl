@@ -61,6 +61,20 @@ struct MethodMatches
     info::MethodMatchInfo
     valid_worlds::WorldRange
 end
+
+# A match through a membership entry rests on it: the entries join the frame's record, beside the
+# dispatch edge the match gives.
+function record_match_memberships!(interp::AbstractInterpreter, sv::AbsIntState, applicable::Vector{MethodMatchTarget})
+    for target in applicable
+        m = target.match
+        sig = m.method.sig
+        ccall(:jl_has_open_set, Cint, (Any,), sig) == 0 && continue
+        # (a positive membership is recorded in an inference frame: its world is the frame's)
+        sv isa InferenceState && record_memberships!(sv, m.spec_types, sig)
+    end
+    return nothing
+end
+
 any_ambig(result::MethodLookupResult) = result.ambig
 any_ambig(info::MethodMatchInfo) = any_ambig(info.results)
 any_ambig(m::MethodMatches) = any_ambig(m.info)
@@ -137,6 +151,8 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
 
     (; valid_worlds, applicable) = matches
     update_valid_age!(sv, valid_worlds) # need to record the negative world now, since even if we don't generate any useful information, inlining might want to add an invoke edge and it won't have this information anymore
+    # (in an inference frame, and where the IR interpreter infers the call again: both hold edges)
+    record_match_memberships!(interp, sv, applicable)
     # Concrete-only functions refuse to commit (and record no backedge) when any
     # applicable match has a non-concrete signature, regardless of scope. This is the
     # generalization of the top-level `!isdispatchtuple` bail below to a per-function opt-in.
@@ -2002,8 +2018,11 @@ end
     if isexact_tty && !isa(tty_ub, TypeVar)
         tty_lb = tty_ub # TODO: this would be wrong if !isexact_tty, but instanceof_tfunc doesn't preserve this info
         if !has_free_typevars(tty_lb) && !has_free_typevars(tty_ub)
-            # no branch is narrowed where a membership could change the test's answer
-            negative_fold_blocked(tty, tty_ub) && return nothing
+            if negative_fold_blocked(tty, tty_ub)
+                # no negative is folded here. The test itself proves the positive when it runs: where
+                # the set is under what is known of the value, the value is of the set there
+                return (tty_ub <: tty && tty_ub !== tty) ? ConditionalTypes(tty_ub, tty) : nothing
+            end
             thentype = typeintersect(tty, tty_ub)
             if iskindtype(tty_ub) && thentype !== Bottom
                 # `typeintersect` may be unable narrow down `Type`-type
@@ -2039,6 +2058,39 @@ end
     return ConditionalTypes(thentype, elsetype)
 end
 
+# A store's or an assertion's type test that holds at the value's type (a field's type for `setfield!`,
+# an element's for `memoryrefset!`, the asserted type), recorded with the membership entries it rests
+# on: code generation emits no run-time test for the statement
+function prove_type_test!(@nospecialize(f), argtypes::Vector{Any}, sv::AbsIntState)
+    sv isa InferenceState || return nothing
+    if f === typeassert && length(argtypes) == 3
+        expected, isexact = instanceof_tfunc(argtypes[3], true)
+        isexact || return nothing
+        v = argtypes[2]
+    elseif f === setfield! && 4 <= length(argtypes) <= 5
+        s = widenconst(argtypes[2])
+        name = argtypes[3]
+        (s isa DataType && isconcretetype(s) && name isa Const) || return nothing
+        idx = try_compute_fieldidx(s, name.val)
+        idx === nothing && return nothing
+        expected = fieldtype(s, idx)
+        v = argtypes[4]
+    elseif f === memoryrefset! && length(argtypes) == 5
+        m = widenconst(argtypes[2])
+        m isa DataType || return nothing
+        expected = memoryref_elemtype(m)
+        v = argtypes[3]
+    else
+        return nothing
+    end
+    vt = widenconst(v)
+    (expected isa Type && !has_free_typevars(expected) && expected !== Union{}) || return nothing
+    (vt <: expected && isnotbrokensubtype(vt, expected)) || return nothing
+    positive_fold_blocked(vt, expected, sv) && return nothing
+    add_curr_ssaflag!(sv, IR_FLAG_TYPES_PROVEN)
+    return nothing
+end
+
 function abstract_call_builtin(interp::AbstractInterpreter, f::Builtin, (; fargs, argtypes)::ArgInfo,
                                sv::AbsIntState)
     @nospecialize f
@@ -2071,6 +2123,7 @@ function abstract_call_builtin(interp::AbstractInterpreter, f::Builtin, (; fargs
     ft = popfirst!(argtypes)
     rt = builtin_tfunction(interp, f, argtypes, sv)
     pushfirst!(argtypes, ft)
+    rt === Bottom || !isa(fargs, Vector{Any}) || prove_type_test!(f, argtypes, sv)
     if has_mustalias(𝕃ᵢ) && f === getfield && isa(fargs, Vector{Any}) && la ≥ 3
         a3 = argtypes[3]
         if isa(a3, Const)
@@ -3201,9 +3254,9 @@ function abstract_eval_new(interp::AbstractInterpreter, e::Expr, sstate::Stateme
                 at = widenslotwrapper(abstract_eval_value(interp, e.args[i+1], sstate, sv))
                 ft = fieldtype(rt, i)
                 nothrow && (nothrow = ⊑(𝕃ᵢ, at, ft))
-                # a field's test that holds through a membership entry is not proved: it holds in some
-                # worlds only
-                nothrow && (nothrow = !positive_fold_blocked(widenconst(at), ft))
+                # a field's test that holds through a membership entry is relied on with an edge on
+                # the entry, as `isa`'s positive is
+                nothrow && (nothrow = !positive_fold_blocked(widenconst(at), ft, sv))
                 at = tmeet(𝕃ᵢ, at, ft)
                 at === Bottom && return RTEffects(Bottom, TypeError, EFFECTS_THROWS)
                 if ismutable && !isconst(rt, i)
@@ -3217,7 +3270,9 @@ function abstract_eval_new(interp::AbstractInterpreter, e::Expr, sstate::Stateme
                 end
                 ats[i] = at
             end
-            if fcount == nargs && consistent === ALWAYS_TRUE && allconst
+            # every field's test proved: code generation emits none of them
+            nothrow && add_curr_ssaflag!(sv, IR_FLAG_TYPES_PROVEN)
+            if fcount == nargs && consistent === ALWAYS_TRUE && allconst && nothrow
                 argvals = Vector{Any}(undef, nargs)
                 for j in 1:nargs
                     argvals[j] = (ats[j]::Const).val

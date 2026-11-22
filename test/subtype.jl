@@ -3116,4 +3116,61 @@ ccall(:jl_delete_membership, Cvoid, (Any, Any, Any), IS, IX, @__MODULE__)
     @test icall(IS()) === :any && ikind(IS()) === :any
     @test_throws ErrorException ccall(:jl_delete_membership, Cvoid, (Any, Any, Any), IS, IX, @__MODULE__)
 end
+
+# a membership is a method of `Core.implements`: an answer folded through a membership holds an edge
+# to that method's instance, its code's worlds start at the membership's, and it ends with it
+@set MX
+@set MZ
+struct MS end
+struct MC end
+struct MD end
+struct HoldsMX
+    x::MX
+end
+isa_mx(y) = y isa MX
+sub_mx(::Type{T}) where {T} = T <: MX
+gm(::MX) = :set
+call_gm(s) = gm(s)
+hold_mx(s::MS) = HoldsMX(s)
+narrow_mx(x) = x isa MX ? x : nothing
+other_mx(x) = x isa MX ? nothing : x
+const w_m = world()
+const em = member!(MX, MS)
+const emc = member!(MZ, MC)
+const emz = member!(MX, MZ)
+membership_edges(ci) = Any[e.def for e in ci.edges if e isa Core.MethodInstance && e.def isa Method && e.def.name === :implements]
+folds_true(f, T) = only(code_typed(f, (T,))).first.code[end] == Core.ReturnNode(true)
+
+@testset "a membership's method, and the edges of answers folded through it" begin
+    m = em.method
+    @test m isa Method && m.module === (@__MODULE__) && m.primary_world == em.min_world
+    @test m.sig === Tuple{typeof(Core.implements), Type{MX}, Type{MS}}
+    @test only(methods(Core.implements, Tuple{Type{MX}, Type{MS}})) === m
+    @test isa_mx(MS()) && folds_true(isa_mx, MS)
+    ci = native_ci(isa_mx, (MS,))
+    @test membership_edges(ci) == [m] && ci.min_world >= em.min_world
+    @test !Base.invoke_in_world(w_m, isa_mx, MS())
+    @test isa_mx(MC()) && Set(membership_edges(native_ci(isa_mx, (MC,)))) == Set([emc.method, emz.method])
+    @test sub_mx(MS) && folds_true(sub_mx, Type{MS})
+    @test call_gm(MS()) === :set && membership_edges(native_ci(call_gm, (MS,))) == [m]
+    # `new`'s field test through the entry is proved: code generation emits no test for it
+    src = only(code_typed(HoldsMX, (MS,); optimize = false)).first
+    i = findfirst(x -> Meta.isexpr(x, :new), src.code)
+    @test i !== nothing && (src.ssaflags[i] & (UInt32(1) << 20)) != 0
+    @test hold_mx(MS()).x === MS()
+    # a test at a set narrows its true branch to the set and folds no negative
+    @test Base.return_types(narrow_mx, (Any,)) == Any[Union{Nothing, MX}]
+    @test Base.return_types(other_mx, (Any,)) == Any[Any]
+    # the methods of `Core.implements` are the runtime's: none by a program, none deleted
+    @test_throws ErrorException Core.eval(@__MODULE__, :(Core.implements(::Type{MX}, ::Type{MD}) = nothing))
+    @test !(MD <: MX)
+    @test_throws ErrorException Base.delete_method(m)
+    # taken back, the membership's method ends, and the code folded through it with it
+    ci = native_ci(isa_mx, (MS,))
+    ccall(:jl_delete_membership, Cvoid, (Any, Any, Any), MS, MX, @__MODULE__)
+    @test ci.max_world < typemax(UInt)
+    @test !Base.invokelatest(isa_mx, MS())
+    @test_throws MethodError Base.invokelatest(call_gm, MS())
+    @test isempty(methods(Core.implements, Tuple{Type{MX}, Type{MS}}))
+end
 end # module SetsAndMemberships

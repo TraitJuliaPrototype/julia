@@ -1977,14 +1977,17 @@ static std::pair<Value*, bool> emit_isa(jl_codectx_t &ctx, const jl_cgval_t &x, 
     jl_value_t *intersected_type = type;
     if (x.constant) {
         // a membership can change this answer in another world: keep the run-time check where the
-        // pair names a set and the answer could come from, or be changed by, an entry
+        // pair names a set and the answer could come from, or be changed by, an entry, unless
+        // inference proved the statement's tests with the entries recorded
         bool v = jl_isa(x.constant, type);
-        if (!(v ? jl_subtype_via_membership(jl_typeof(x.constant), type)
+        if (!(v ? !ctx.types_proven && jl_subtype_via_membership(jl_typeof(x.constant), type)
                 : jl_membership_flip_possible(jl_typeof(x.constant), type)))
             known_isa = v;
     }
     else if (jl_is_not_broken_subtype(x.typ, type) && jl_subtype(x.typ, type) &&
-             !jl_subtype_via_membership(x.typ, type)) {
+             (ctx.types_proven || !jl_subtype_via_membership(x.typ, type))) {
+        // a positive through a membership entry is decided where inference proved the
+        // statement's tests, the entry recorded as an edge
         known_isa = true;
     } else {
         intersected_type = jl_type_intersection(x.typ, type);

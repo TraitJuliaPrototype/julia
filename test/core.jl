@@ -63,7 +63,7 @@ end
 @test typeof(+).name.flags & 0x10 == 0x00
 @test typeof(Core.isa).name.flags & 0x10 == 0x10
 @test fieldnames(Core.MembershipEntry) ==
-    (:set, :member, :instance, :receiver, :min_world, :max_world, :declarer, :by)
+    (:set, :member, :instance, :receiver, :min_world, :max_world, :declarer, :by, :method)
 @test Base.isfieldatomic(Core.MembershipEntry, :max_world)
 @test ismutabletype(Core.MembershipEntry)
 

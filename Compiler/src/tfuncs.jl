@@ -875,7 +875,9 @@ add_tfunc(typeassert, 2, 2, typeassert_tfunc, 4)
     return false
 end
 
-@nospecs function isa_tfunc(𝕃::AbstractLattice, v, tt)
+# `sv`: the frame a positive fold through a membership entry is recorded in
+@nospecs isa_tfunc(𝕃::AbstractLattice, v, tt) = isa_tfunc(𝕃, v, tt, nothing)
+@nospecs function isa_tfunc(𝕃::AbstractLattice, v, tt, sv::Union{Nothing,AbsIntState})
     t, isexact = instanceof_tfunc(tt, true)
     if t === Bottom
         # check if t could be equivalent to typeof(Bottom), since that's valid in `isa`, but the set of `v` is empty
@@ -886,26 +888,26 @@ end
     if !has_free_typevars(t)
         if ⊑(𝕃, v, t)
             if isexact && isnotbrokensubtype(v, t)
-                positive_fold_blocked(widenconst(v), t) && return Bool
+                positive_fold_blocked(widenconst(v), t, sv) && return Bool
                 return Const(true)
             end
         else
             if isa(v, Const) || isa(v, Conditional)
                 # this and the `isdispatchelem` below test for knowledge of a
                 # leaftype appearing on the LHS (ensuring the isa is precise)
-                negative_fold_blocked(widenconst(v), t) && return Bool
+                negative_fold_blocked(widenconst(v), t, sv) && return Bool
                 return Const(false)
             end
             v = widenconst(v)
             if isdispatchelem(v)
-                negative_fold_blocked(v, t) && return Bool
+                negative_fold_blocked(v, t, sv) && return Bool
                 return Const(false)
             end
             if !hasintersect(v, t)
                 # similar to `isnotbrokensubtype` check above, `typeintersect(v, t)`
                 # can't be trusted for kind types so we do an extra check here
                 if !iskindtype(v)
-                    negative_fold_blocked(v, t) && return Bool
+                    negative_fold_blocked(v, t, sv) && return Bool
                     return Const(false)
                 end
             end
@@ -921,18 +923,19 @@ add_tfunc(isa, 2, 2, isa_tfunc, 1)
     return typ ⊑ Type
 end
 
-@nospecs function subtype_tfunc(𝕃::AbstractLattice, a, b)
+@nospecs subtype_tfunc(𝕃::AbstractLattice, a, b) = subtype_tfunc(𝕃, a, b, nothing)
+@nospecs function subtype_tfunc(𝕃::AbstractLattice, a, b, sv::Union{Nothing,AbsIntState})
     a, isexact_a = instanceof_tfunc(a, false)
     b, isexact_b = instanceof_tfunc(b, false)
     if !has_free_typevars(a) && !has_free_typevars(b)
         if a <: b
             if isexact_b || a === Bottom
-                positive_fold_blocked(a, b) && return Bool
+                positive_fold_blocked(a, b, sv) && return Bool
                 return Const(true)
             end
         else
             if isexact_a || (b !== Bottom && !hasintersect(a, b))
-                negative_fold_blocked(a, b) && return Bool
+                negative_fold_blocked(a, b, sv) && return Bool
                 return Const(false)
             end
         end
@@ -2890,6 +2893,10 @@ function builtin_tfunction(interp::AbstractInterpreter, @nospecialize(f), argtyp
     elseif !(tf[1] <= length(argtypes) <= tf[2])
         # wrong # of args
         return Bottom
+    end
+    if (f === isa || f === (<:)) && length(argtypes) == 2
+        # a positive answer through a membership entry folds with the frame's record
+        return (f === isa ? isa_tfunc : subtype_tfunc)(𝕃ᵢ, argtypes[1], argtypes[2], sv)
     end
     return tf[3](𝕃ᵢ, argtypes...)
 end
