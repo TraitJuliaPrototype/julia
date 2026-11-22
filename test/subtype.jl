@@ -2995,4 +2995,79 @@ member!(PX, SX)
     @test typeintersect(HP{:a, Int}, HP{:a, String}) === Union{}
     @test sprint(show, A) == "All{$(PX), $(PY)}"
 end
+
+# dispatch at sets: a method at a set is selected for its members from the membership's world on
+@set DX
+@set DY
+@set DW
+abstract type AbsZ end
+struct DS end
+struct DZ <: AbsZ end
+struct DN end
+dkind(::DX) = :dx
+dkind(::Any) = :any
+dabs(::DX) = :set
+dabs(::AbsZ) = :abs
+dord(::DY) = :y
+dord(::DX) = :x
+const w_dispatch = world()
+member!(DX, DS)
+member!(DX, DZ)
+member!(DY, DX)                    # DX joins DY
+
+@testset "dispatch at sets" begin
+    @test dkind(DS()) === :dx && dkind(DN()) === :any
+    @test which(dkind, (DS,)).sig == Tuple{typeof(dkind), DX}
+    @test Base.invoke_in_world(w_dispatch, dkind, DS()) === :any
+    @test length(methods(dkind, (DS,))) == 1
+    # at a position, a closed type other than Any is more specific than a set
+    @test dabs(DZ()) === :abs
+    @test Base.morespecific(Tuple{typeof(dabs), AbsZ}, Tuple{typeof(dabs), DX})
+    # of two sets, the one below the other by its entries is more specific
+    @test dord(DS()) === :x
+    @test Base.morespecific(Tuple{typeof(dord), DX}, Tuple{typeof(dord), DY})
+    @test !Base.morespecific(Tuple{typeof(dord), DY}, Tuple{typeof(dord), DX})
+    # an intersection's match at a member of both
+    @test only(methods(dkind, (All{DX, DW},))).sig == Tuple{typeof(dkind), DX}
+end
+
+@testset "the ambiguity report at a membership" begin
+    prog = """
+        macro set(name)
+            t = gensym(:set)
+            esc(quote
+                Core.declare_global(\$__module__, \$(QuoteNode(name)), false)
+                \$(Expr(:latestworld))
+                local \$t = Core._abstracttype(\$__module__, \$(QuoteNode(name)), Core.svec())
+                ccall(:jl_set_open_set, Cvoid, (Any,), \$t)
+                Core._setsuper!(\$t, Any)
+                Core._typebody!(false, \$t)
+                Core.declare_const(\$__module__, \$(QuoteNode(name)), \$t)
+                \$(Expr(:latestworld))
+                nothing
+            end)
+        end
+        member!(X, S) = ccall(:jl_declare_membership, Any, (Any, Any, Any, Any, Any), S, X, @__MODULE__, nothing, :self)
+        @set XA
+        @set YA
+        f(::XA) = :x
+        f(::YA) = :y
+        struct MA end
+        member!(XA, MA)
+        println(stderr, "FIRST")
+        member!(YA, MA)            # a member of both: f's two methods tie at MA
+        println(stderr, "SECOND")
+        print(try f(MA()); "nothrow" catch e; e isa MethodError ? "raised" : "wrong" end)
+        """
+    err = IOBuffer()
+    out = read(pipeline(`$(Base.julia_cmd()) --startup-file=no -e $prog`; stderr = err), String)
+    msg = String(take!(err))
+    @test out == "raised"
+    i1, i2 = findfirst("FIRST", msg), findfirst("SECOND", msg)
+    @test i1 !== nothing && i2 !== nothing
+    report = msg[last(i1)+1:first(i2)-1]
+    @test occursin("WARNING: method f at", report)
+    @test occursin("is ambiguous for", report) && occursin("YA", report)
+    @test !occursin("ambiguous", msg[1:first(i1)])
+end
 end # module SetsAndMemberships
