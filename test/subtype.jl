@@ -3173,4 +3173,39 @@ folds_true(f, T) = only(code_typed(f, (T,))).first.code[end] == Core.ReturnNode(
     @test_throws MethodError Base.invokelatest(call_gm, MS())
     @test isempty(methods(Core.implements, Tuple{Type{MX}, Type{MS}}))
 end
+
+# a negative about a set is final where it holds: code relies on it with an edge at the pair's absence
+# signature, and a membership declared later ends that code, as a method ends the callers that found none
+@set FX
+struct FS end
+fnot(x) = x isa FX
+const ci_fnot = (fnot(FS()); native_ci(fnot, (FS,)))
+absence_edges(ci) = unique(Any[e for e in ci.edges if e isa Type && Base.unwrap_unionall(e) isa DataType &&
+                        Base.unwrap_unionall(e).parameters[1] === typeof(Core.implements)])
+@set UX
+abstract type UA end
+struct UC <: UA end
+v(::UX, ::Int) = :x
+v(::UA, ::Any) = :a
+callv(x::UA) = v(x, 1)
+const ci_callv = (callv(UC()); native_ci(callv, (UC,)))
+callva(xs::Vector{UA}) = v(xs[1], 1)
+const ci_callva = (callva(UA[UC()]); native_ci(callva, (Vector{UA},)))
+
+@testset "final negatives" begin
+    @test !fnot(FS()) && only(code_typed(fnot, (FS,))).first.code[end] == Core.ReturnNode(false)
+    @test length(absence_edges(ci_fnot)) == 1
+    # a match met only at an intersection no type is in is dropped, and so is its ambiguity
+    @test length(Base.methods_including_ambiguous(v, (UA, Int))) == 1
+    @test !Base.isambiguous(which(v, (UX, Int)), which(v, (UA, Any)))
+    @test callv(UC()) === :a
+    @test length(absence_edges(ci_callva)) == 1      # the dropped match's pair, `Type{<:UA}` at `UX`
+    member!(FX, FS)
+    @test ci_fnot.max_world < typemax(UInt) && Base.invokelatest(fnot, FS())
+    member!(UX, UC)
+    @test length(Base.methods_including_ambiguous(v, (UA, Int))) == 2
+    @test Base.isambiguous(which(v, (UX, Int)), which(v, (UA, Any)))
+    @test ci_callv.max_world < typemax(UInt) && ci_callva.max_world < typemax(UInt)
+    @test_throws MethodError Base.invokelatest(callv, UC())
+end
 end # module SetsAndMemberships

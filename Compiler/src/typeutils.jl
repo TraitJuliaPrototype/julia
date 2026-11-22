@@ -48,6 +48,12 @@ has_extended_info(@nospecialize x) = (!isa(x, Type) && !isvarargtype(x)) || isTy
 # certain combinations of `a` and `b` where one/both isa/are `Union`/`UnionAll` type(s)s.
 isnotbrokensubtype(@nospecialize(a), @nospecialize(b)) = (!iskindtype(b) || !isType(a) || hasuniquerep(a.parameters[1]) || b <: a)
 
+# an intersection type `All{X, Y, …}`, under its variables
+function is_all_type(@nospecialize(t))
+    u = unwrap_unionall(t)
+    return u isa DataType && u.name === (unwrap_unionall(Core.All)::DataType).name
+end
+
 # The gates of a fold about a pair that names a set: a negative that a later membership could make
 # true never folds. A positive answered through a membership entry folds only where the fold can be
 # recorded: the frame being inferred takes the entries into its record (an edge to each membership's
@@ -58,8 +64,39 @@ function negative_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
     return ccall(:jl_could_join, Cint, (Any, Any), a, b) != 0 ||
            ccall(:jl_could_join, Cint, (Any, Any), b, a) != 0
 end
-negative_fold_blocked(@nospecialize(a), @nospecialize(b), ::Union{Nothing,AbsIntState}) =
-    negative_fold_blocked(a, b)
+# A final negative folds: the frame records the pair's absence signature, which a membership of the
+# pair meets, ending the code. Without a frame to record it in, the negative stays blocked.
+function negative_fold_blocked(@nospecialize(a), @nospecialize(b), sv::Union{Nothing,AbsIntState})::Bool
+    negative_fold_blocked(a, b) || return false
+    sv isa InferenceState || return true
+    cells = ccall(:jl_membership_final_cells, Any, (Any, Any), a, b)
+    cells isa SimpleVector || return true
+    for c in cells
+        add_absence_edge!(sv.edges, c)
+        update_valid_age!(sv, absence_worlds(c, frame_world(sv)))
+    end
+    return false
+end
+# The worlds around `world` in which no method meets the absence signature `sig`: no membership of the
+# pair is in force. Code that relies on the pair's absence is valid only there.
+function absence_worlds(@nospecialize(sig), world::UInt)
+    min_valid = RefValue{UInt}(typemin(UInt))
+    max_valid = RefValue{UInt}(typemax(UInt))
+    ambig = RefValue{Int32}(0)
+    _methods_by_ftype(sig, nothing, -1, world, false, min_valid, max_valid, ambig)
+    return WorldRange(min_valid[], max_valid[])
+end
+# The edge of a negative the code relied on: the signature of `Core.implements` at the pair, with no
+# method. As a call that found no method, it holds a backedge at the method table (`sig,
+# Core.methodtable`) and is validated by a lookup (`0, sig`).
+function add_absence_edge!(edges::Vector{Any}, @nospecialize(sig))
+    for i in 2:length(edges)
+        edges[i] === Core.methodtable && edges[i-1] === sig && return nothing
+    end
+    push!(edges, sig, Core.methodtable)
+    push!(edges, 0, sig)
+    return nothing
+end
 function positive_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
     (ccall(:jl_has_open_set, Cint, (Any,), a) != 0 || ccall(:jl_has_open_set, Cint, (Any,), b) != 0) || return false
     return ccall(:jl_subtype_via_membership, Cint, (Any, Any), a, b) != 0

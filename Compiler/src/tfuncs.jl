@@ -910,6 +910,10 @@ end
                     negative_fold_blocked(v, t, sv) && return Bool
                     return Const(false)
                 end
+            elseif is_all_type(typeintersect(v, t))
+                # an intersection folds as a negative where it is final: no type of the world is in it
+                negative_fold_blocked(v, t, sv) && return Bool
+                return Const(false)
             end
         end
     end

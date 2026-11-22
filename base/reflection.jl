@@ -1156,6 +1156,12 @@ function bodyfunction(basemethod::Method)
     return nothing
 end
 
+# An argument of a signature met only as an intersection `All{…}` that no type of the world is in
+# (the runtime's `jl_has_unmet_argument`): no value has those types there. Two methods are ambiguous
+# only over values that exist; a membership that makes them meet is reported at its declaration.
+has_unmet_intersection(@nospecialize(sig), world::UInt = get_world_counter()) =
+    ccall(:jl_has_unmet_argument, Cint, (Any, UInt), sig, world) != 0
+
 """
     Base.isambiguous(m1, m2; ambiguous_bottom=false)::Bool
 
@@ -1196,6 +1202,7 @@ function isambiguous(m1::Method, m2::Method; ambiguous_bottom::Bool=false)
     ti === Bottom && return false
     function inner(ti)
         ti === Bottom && return false
+        has_unmet_intersection(ti) && return false
         if !ambiguous_bottom
             has_bottom_parameter(ti) && return false
         end
@@ -1206,6 +1213,7 @@ function isambiguous(m1::Method, m2::Method; ambiguous_bottom::Bool=false)
         has_ambig = Ref{Int32}(0)
         ms = collect(Core.MethodMatch, _methods_by_ftype(ti, nothing, -1, world, true, min, max, has_ambig)::Vector)
         has_ambig[] == 0 && return false
+        filter!(m::Core.MethodMatch -> !has_unmet_intersection(m.spec_types, world), ms)
         if !ambiguous_bottom
             filter!(ms) do m::Core.MethodMatch
                 return !has_bottom_parameter(m.spec_types)

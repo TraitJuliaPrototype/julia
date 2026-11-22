@@ -253,6 +253,338 @@ static int entry_live_at(jl_membership_t *en, size_t world)
     return en->min_world <= world && world <= jl_atomic_load_relaxed(&en->max_world);
 }
 
+// Final negatives -------------------------------------------------------------------
+// A negative about a set is final where it holds: code may rely on "S is not a member of X" with an
+// edge at the pair's absence signature, a signature of `Core.implements` with no method. A membership
+// declared later adds the method that meets it, and ends the code, as a method definition ends the
+// callers that found no method.
+
+// The signatures at which a pair's absence is relied on: each set's TypeName to a list [member,
+// signature, ...] (a SimpleVector, replaced, never mutated). One signature per pair in a session, so
+// that a frame's edges compare by identity. The functions below name it "the pair's final cell".
+jl_genericmemory_t *jl_absence_sigs JL_GLOBALLY_ROOTED = NULL;
+static jl_mutex_t absence_lock;
+
+// Whether the member pattern `m`, found by an entry at the set of the component `skip` of an
+// intersection's components `comps`, could be in each component: a concrete type by subtyping, a pattern
+// by intersection (which can answer yes where no type is: the answer errs toward "met"). The component
+// `skip` is asked too: the entry may be at another instance of its set (`All{X{A}, X{B}}`
+// is met where the entries put a type in both).
+static int member_meets_others(jl_value_t *m, jl_value_t *comps, size_t skip)
+{
+    (void)skip;
+    size_t n = jl_nparams(comps);
+    for (size_t k = 0; k < n; k++) {
+        jl_value_t *c = jl_tparam(comps, k);
+        jl_array_t *fv = NULL;
+        JL_GC_PUSH2(&c, &fv);
+        // a component of an intersection under a `where` (`All{AbstractVector{T}, X} where T`) names
+        // the variable free: it is closed over it here, each component by itself, which errs toward
+        // "met" (no type is a subtype of a type with a free variable)
+        if (jl_has_free_typevars(c)) {
+            fv = jl_find_free_typevars(c);
+            for (size_t j = jl_array_nrows(fv); j-- > 0; )
+                c = jl_type_unionall((jl_tvar_t*)jl_array_ptr_ref(fv, j), c);
+        }
+        int out = jl_is_concrete_type(m) ? !jl_subtype(m, c) : jl_has_empty_intersection(m, c);
+        JL_GC_POP();
+        if (out)
+            return 0;
+    }
+    return 1;
+}
+
+// Whether an entry at the set `sname` live in `world`, or at a set that joins it (sets have no
+// cycles), has a member that could be in the other components.
+static int set_entries_meet(jl_typename_t *sname, jl_value_t *comps, size_t skip, size_t world)
+{
+    jl_array_t *list = jl_set_entries == NULL ? NULL : (jl_array_t*)jl_eqtable_get(jl_set_entries, (jl_value_t*)sname, NULL);
+    if (list == NULL)
+        return 0;
+    int met = 0;
+    JL_GC_PUSH1(&list);
+    for (size_t e = 0; e < jl_array_nrows(list) && !met; e++) {
+        jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, e);
+        if (en == NULL || !entry_live_at(en, world))
+            continue;
+        jl_value_t *mu = jl_unwrap_unionall(en->member);
+        if (jl_is_datatype(mu) && ((jl_datatype_t*)mu)->name->open_set &&
+            set_entries_meet(((jl_datatype_t*)mu)->name, comps, skip, world))
+            met = 1;
+        else
+            met = member_meets_others(en->member, comps, skip);
+    }
+    JL_GC_POP();
+    return met;
+}
+
+// Whether the intersection `a` (`All{X, Y, …}`) has a value in `world`: a type in each
+// component. Nominal supertypes form a tree, so such a type is in some set component by an entry;
+// the entries at each set component are read.
+static int all_type_met(jl_value_t *a, size_t world)
+{
+    jl_value_t *comps = jl_tparam0(a);
+    if (!jl_is_tuple_type(comps))
+        return 1;
+    for (size_t i = 0; i < jl_nparams(comps); i++) {
+        jl_value_t *c = jl_unwrap_unionall(jl_tparam(comps, i));
+        if (jl_is_datatype(c) && ((jl_datatype_t*)c)->name->open_set &&
+            set_entries_meet(((jl_datatype_t*)c)->name, comps, i, world))
+            return 1;
+    }
+    return 0;
+}
+
+// An abstract type, not a set: its negative holds where its
+// intersection with the set has no type, not where the type itself is no member.
+static int abstract_member(jl_value_t *member)
+{
+    jl_value_t *u = jl_unwrap_unionall(member);
+    return jl_is_datatype(u) && jl_is_abstracttype(u) && !((jl_datatype_t*)u)->name->open_set &&
+           !jl_is_all_type(u) && !jl_is_type_type(u) && u != (jl_value_t*)jl_any_type;
+}
+
+// whether the intersection of `member` and the set has a type in `world`
+static int intersection_met(jl_value_t *member, jl_typename_t *setname, size_t world)
+{
+    jl_value_t *ti = jl_type_intersection(member, setname->wrapper);
+    if (ti == jl_bottom_type)
+        return 0;
+    JL_GC_PUSH1(&ti);
+    jl_value_t *tu = jl_unwrap_unionall(ti);
+    int met = jl_is_all_type(tu) ? all_type_met(tu, world) : 1;
+    JL_GC_POP();
+    return met;
+}
+
+static void absence_list_add(jl_typename_t *setname, jl_value_t *cell)
+{
+    jl_svec_t *old = jl_absence_sigs ? (jl_svec_t*)jl_eqtable_get(jl_absence_sigs, (jl_value_t*)setname, NULL) : NULL;
+    size_t n = old ? jl_svec_len(old) : 0;
+    jl_svec_t *nw = jl_alloc_svec_uninit(n + 1);
+    JL_GC_PUSH1(&nw);
+    for (size_t i = 0; i < n; i++)
+        jl_svecset(nw, i, jl_svecref(old, i));
+    jl_svecset(nw, n, cell);
+    if (jl_absence_sigs == NULL)
+        jl_absence_sigs = jl_alloc_memory_any(16);
+    jl_absence_sigs = jl_eqtable_put(jl_absence_sigs, (jl_value_t*)setname, (jl_value_t*)nw, NULL);
+    JL_GC_POP();
+}
+
+// The signature at which a negative of the pair (`member`, the set `set`) is relied on: `Tuple{typeof(implements), Type{<:X}, Type{S}}`, with `Type{<:S}` for an abstract type, whose
+// negative says that no type under it is in the set. A membership's method that meets it ends the code
+// that recorded it, as a method ends a call that found none. One object per pair in a session, so that
+// a frame's edges compare by identity.
+static jl_value_t *absence_sig(jl_value_t *member, jl_typename_t *setname)
+{
+    jl_value_t *ft = jl_implements_functype();
+    if (ft == NULL)
+        jl_error("Core.implements is not defined");
+    jl_value_t *tvx = NULL, *tvm = NULL, *px = NULL, *pm = NULL, *sig = NULL;
+    JL_GC_PUSH5(&tvx, &tvm, &px, &pm, &sig);
+    tvx = (jl_value_t*)jl_new_typevar(jl_symbol("X"), jl_bottom_type, setname->wrapper);
+    px = jl_apply_type1((jl_value_t*)jl_type_type, tvx);
+    if (abstract_member(member))
+        tvm = (jl_value_t*)jl_new_typevar(jl_symbol("S"), jl_bottom_type, member);
+    pm = jl_apply_type1((jl_value_t*)jl_type_type, tvm ? tvm : member);
+    jl_value_t *params[3] = {ft, px, pm};
+    sig = jl_apply_tuple_type_v(params, 3);
+    if (tvm)
+        sig = jl_new_struct(jl_unionall_type, tvm, sig);
+    sig = jl_new_struct(jl_unionall_type, tvx, sig);
+    JL_GC_POP();
+    return sig;
+}
+
+static jl_value_t *membership_absence(jl_value_t *member, jl_value_t *set)
+{
+    jl_typename_t *setname;
+    if (jl_is_typename(set))
+        setname = (jl_typename_t*)set;
+    else {
+        jl_value_t *u = jl_unwrap_unionall(set);
+        if (!jl_is_datatype(u) || !((jl_datatype_t*)u)->name->open_set)
+            jl_error("a membership's absence is asked of a set");
+        setname = ((jl_datatype_t*)u)->name;
+    }
+    jl_value_t *sig = NULL;
+    JL_GC_PUSH1(&sig);
+    JL_LOCK(&absence_lock);
+    // the session's signatures at this set: [member, signature, ...]
+    jl_svec_t *list = jl_absence_sigs ? (jl_svec_t*)jl_eqtable_get(jl_absence_sigs, (jl_value_t*)setname, NULL) : NULL;
+    for (size_t i = 0; list != NULL && i + 1 < jl_svec_len(list); i += 2) {
+        jl_value_t *m = jl_svecref(list, i);
+        if (m == member || jl_types_equal(m, member)) {
+            sig = jl_svecref(list, i + 1);
+            break;
+        }
+    }
+    if (sig == NULL) {
+        sig = absence_sig(member, setname);
+        absence_list_add(setname, member);
+        absence_list_add(setname, sig);
+        // rooted in this frame: the analyzer moves a value's root to the svec it is stored in, and
+        // releases it with absence_list_add's frame
+        JL_GC_PROMISE_ROOTED(sig);
+    }
+    JL_UNLOCK(&absence_lock);
+    JL_GC_POP();
+    return sig;
+}
+
+JL_DLLEXPORT jl_value_t *jl_membership_final_cell(jl_value_t *member, jl_value_t *set)
+{
+    return membership_absence(member, set);
+}
+
+// Is "S is not a member of X" final? X is a set, S a concrete type that is not a member of X in the
+// query world (or an abstract type whose intersection with X has no type there). Code that relies on it
+// records the pair's absence signature, and a membership declared later invalidates it, as a method
+// definition invalidates the callers that found no method.
+JL_DLLEXPORT int jl_membership_final(jl_value_t *S, jl_value_t *X)
+{
+    jl_value_t *xu = jl_unwrap_unionall(X);
+    if (!jl_is_datatype(xu) || jl_is_all_type(xu))
+        return 0;
+    jl_typename_t *xn = ((jl_datatype_t*)xu)->name;
+    if (!xn->open_set)
+        return 0;
+    if (abstract_member(S)) {
+        // an abstract type: no subtype of it is in X while their intersection has no
+        // type in the world; its final cell opens when one joins
+        size_t world = jl_membership_query_world();
+        if (world == 0)
+            world = jl_atomic_load_acquire(&jl_world_counter);
+        return !intersection_met(S, xn, world);
+    }
+    if (!jl_is_concrete_type(S) || jl_is_type_type(S) || ((jl_datatype_t*)S)->name->never_member)
+        return 0;
+    // relied on wherever it holds, while a declarer loads and for a type or set of Main too
+    return !jl_subtype(S, xn->wrapper);
+}
+
+// The absence signatures of a negative `a` vs `b` that the compiler would fold: `nothing` unless each
+// direction in which one could join the other is a final pair.
+JL_DLLEXPORT jl_value_t *jl_membership_final_cells(jl_value_t *a, jl_value_t *b)
+{
+    int join_ab = jl_could_join(a, b), join_ba = jl_could_join(b, a);
+    if (!join_ab && !join_ba)
+        return jl_nothing;
+    if ((join_ab && !jl_membership_final(a, b)) || (join_ba && !jl_membership_final(b, a)))
+        return jl_nothing;
+    jl_value_t *c1 = NULL, *c2 = NULL;
+    JL_GC_PUSH2(&c1, &c2);
+    if (join_ab)
+        c1 = jl_membership_final_cell(a, b);
+    if (join_ba)
+        c2 = jl_membership_final_cell(b, a);
+    jl_value_t *out = (c1 && c2) ? (jl_value_t*)jl_svec2(c1, c2) : (jl_value_t*)jl_svec1(c1 ? c1 : c2);
+    JL_GC_POP();
+    return out;
+}
+
+// an argument met only as an intersection that no type of `world` is in; a
+// `Vararg` whose length is not a positive constant is met by its empty tail
+static int unmet_argument(jl_value_t *p, size_t world)
+{
+    if (jl_is_vararg(p)) {
+        jl_value_t *n = jl_unwrap_vararg_num(p);
+        if (n == NULL || !jl_is_long(n) || jl_unbox_long(n) <= 0)
+            return 0;
+        p = jl_unwrap_vararg(p);
+        if (p == NULL)
+            return 0;
+    }
+    if (jl_is_typevar(p))
+        return unmet_argument(((jl_tvar_t*)p)->ub, world);
+    if (jl_is_uniontype(p))
+        return unmet_argument(((jl_uniontype_t*)p)->a, world) &&
+               unmet_argument(((jl_uniontype_t*)p)->b, world);
+    p = jl_unwrap_unionall(p);
+    return jl_is_all_type(p) && !all_type_met(p, world);
+}
+
+// Whether the call types `ti` (a tuple type, or a union of them, each) hold an argument met only as an
+// intersection that no type of `world` is in: no value has those types there.
+JL_DLLEXPORT int jl_has_unmet_argument(jl_value_t *ti, size_t world)
+{
+    ti = jl_unwrap_unionall(ti);
+    if (jl_is_uniontype(ti))
+        return jl_has_unmet_argument(((jl_uniontype_t*)ti)->a, world) &&
+               jl_has_unmet_argument(((jl_uniontype_t*)ti)->b, world);
+    if (!jl_is_tuple_type(ti) || !((jl_datatype_t*)ti)->has_open_set)
+        return 0;
+    for (size_t i = 0; i < jl_nparams(ti); i++)
+        if (unmet_argument(jl_tparam(ti, i), world))
+            return 1;
+    return 0;
+}
+
+// A component of an unmet intersection as its final pair names it: an abstract type with free variables
+// (`AbstractDict{K, V}` under `where {K, V}`) by its type name, whose pair is final where no type under
+// any of its instances meets the set; NULL for another component with free variables.
+// the result is `c` or a type name's wrapper reached from it
+static jl_value_t *final_pair_component(jl_value_t *c JL_PROPAGATES_ROOT)
+{
+    if (!jl_has_free_typevars(c))
+        return c;
+    jl_value_t *u = jl_unwrap_unionall(c);
+    if (jl_is_datatype(u) && abstract_member(u))
+        return ((jl_datatype_t*)u)->name->wrapper;
+    // a set with free variables (`Callable{A, S}`, a parametric set written bare) by its name: a pair's
+    // cell is per set (membership_absence), and the negative is asked of every instance
+    if (jl_is_datatype(u) && ((jl_datatype_t*)u)->name->open_set && !jl_is_all_type(u))
+        return ((jl_datatype_t*)u)->name->wrapper;
+    return NULL;
+}
+
+// The absence signatures on which a method match's signature `spec` is unreachable: `nothing` unless it
+// has an argument no type of the world is in and each such argument is an intersection of two
+// components whose negative is final, `All{S, X}` with X a set.
+JL_DLLEXPORT jl_value_t *jl_unmet_final_cells(jl_value_t *spec)
+{
+    jl_value_t *ti = jl_unwrap_unionall(spec);
+    if (!jl_is_tuple_type(ti) || !((jl_datatype_t*)ti)->has_open_set)
+        return jl_nothing;
+    size_t world = jl_membership_query_world();
+    if (world == 0)
+        world = jl_atomic_load_acquire(&jl_world_counter);
+    jl_value_t *out = jl_nothing, *cells = NULL;
+    JL_GC_PUSH2(&out, &cells);
+    for (size_t i = 0; i < jl_nparams(ti); i++) {
+        jl_value_t *p = jl_tparam(ti, i);
+        if (!unmet_argument(p, world))
+            continue;
+        jl_value_t *pu = jl_unwrap_unionall(p);
+        jl_value_t *comps = jl_is_all_type(pu) ? jl_tparam0(pu) : NULL;
+        jl_value_t *c0 = comps && jl_is_tuple_type(comps) && jl_nparams(comps) == 2 ? final_pair_component(jl_tparam(comps, 0)) : NULL;
+        jl_value_t *c1 = c0 ? final_pair_component(jl_tparam(comps, 1)) : NULL;
+        if (c1 == NULL) {
+            out = jl_nothing;
+            break;
+        }
+        cells = jl_membership_final_cells(c0, c1);
+        if (!jl_is_svec(cells)) {
+            out = jl_nothing;
+            break;
+        }
+        if (out == jl_nothing)
+            out = cells;
+        else {
+            size_t n = jl_svec_len(out), m = jl_svec_len(cells);
+            jl_svec_t *both = jl_alloc_svec(n + m);
+            for (size_t k = 0; k < n; k++)
+                jl_svecset(both, k, jl_svecref(out, k));
+            for (size_t k = 0; k < m; k++)
+                jl_svecset(both, n + k, jl_svecref(cells, k));
+            out = (jl_value_t*)both;
+        }
+    }
+    JL_GC_POP();
+    return out;
+}
+
 // An entry's instance with its pattern's variables free: an instance may be wrapped in them.
 static jl_value_t *instance_body(jl_value_t *inst JL_PROPAGATES_ROOT, jl_value_t *pattern) JL_NOTSAFEPOINT
 {
