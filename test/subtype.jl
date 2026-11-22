@@ -3016,4 +3016,43 @@ const e7b = member!(X1, Late7)     # a redeclaration ends the old entry
     @test_throws ErrorException ccall(:jl_set_open_set, Cvoid, (Any,), Integer)  # published already
     @test_throws ErrorException ccall(:jl_set_open_set, Cvoid, (Any,), Int)      # not abstract
 end
+
+# intersections: All{X, Y} is the type of the members of each component, in its normal form
+const All = Core.All
+@set PX
+@set PY
+@set PZ
+struct SXY end
+struct SX end
+member!(PX, SXY)
+member!(PY, SXY)
+member!(PX, SX)
+
+@testset "intersections All{X, Y}" begin
+    A = All{PX, PY}
+    @test All{PX, PY} === All{PY, PX}
+    @test All{PX, PX} === PX && All{PX} === PX && All{} === Any
+    @test All{PX, All{PY, PZ}} === All{PX, PY, PZ} === All{PZ, PY, PX}
+    @test All{PX, Any} === PX && All{PX, Union{}} === Union{}
+    @test All{AbstractVector, AbstractArray} === AbstractVector   # a declared supertype absorbs
+    @test All{AbstractArray, Number} === Union{}                  # closed, nothing in common
+    @test All{Vector{Int}, PX} isa DataType                       # a membership never absorbs
+    @test SXY <: A && SXY() isa A
+    @test !(SX <: A) && !(SX() isa A)
+    @test A <: PX && A <: PY && !(A <: PZ)
+    @test All{PX, PY, PZ} <: A && !(A <: All{PX, PY, PZ})
+    @test A <: Union{PX, Int} && !(Int <: A)
+    @test Vector{SXY} <: Vector{<:A} && !(Vector{SX} <: Vector{<:A})
+    @test Tuple{SXY, Vararg{SXY}} <: Tuple{Vararg{A}}
+    @test Vector{A} <: Vector{All{PY, PX}}
+    # two sets that no entry relates meet as their intersection; a concrete non-member does not
+    @test typeintersect(PX, PY) === A
+    @test typeintersect(PX, AbstractString) === All{AbstractString, PX}
+    @test All{PX, PY} <: Core.All
+    @test typeintersect(Int, PX) === Union{}
+    # two instances of a set at different values of an input may share a member
+    @test typeintersect(HP{:a, Int}, HP{:b, String}) === All{HP{:a, Int}, HP{:b, String}}
+    @test typeintersect(HP{:a, Int}, HP{:a, String}) === Union{}
+    @test sprint(show, A) == "All{$(PX), $(PY)}"
+end
 end # module SetsAndMemberships
