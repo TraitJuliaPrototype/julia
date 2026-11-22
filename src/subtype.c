@@ -1718,6 +1718,56 @@ int jl_membership_range_is_fast(size_t world) JL_NOTSAFEPOINT
     return world != 0 && world >= jl_atomic_load_acquire(&membership_last_change);
 }
 
+static void open_sets_in(jl_value_t *t, arraylist_t *out) JL_NOTSAFEPOINT;
+
+// whether a kind of type object (`DataType`, `UnionAll`, `Union`, `Type{T}` with a free `T`) is at a covariant place
+// of `t`: an argument, a union's component, a tuple's element (compiler §4.10)
+JL_DLLEXPORT int jl_type_has_kind(jl_value_t *t) JL_NOTSAFEPOINT
+{
+    t = jl_unwrap_unionall(t);
+    if (jl_is_uniontype(t))
+        return jl_type_has_kind(((jl_uniontype_t*)t)->a) || jl_type_has_kind(((jl_uniontype_t*)t)->b);
+    if (jl_is_vararg(t))
+        return ((jl_vararg_t*)t)->T != NULL && jl_type_has_kind(((jl_vararg_t*)t)->T);
+    if (!jl_is_datatype(t))
+        return 0;
+    jl_datatype_t *dt = (jl_datatype_t*)t;
+    if (dt == jl_datatype_type || dt == jl_unionall_type || dt == jl_uniontype_type ||
+        (dt->name == jl_type_typename && jl_has_free_typevars(t)))
+        return 1;
+    if (jl_is_tuple_type(t))
+        for (size_t i = 0; i < jl_nparams(dt); i++)
+            if (jl_type_has_kind(jl_tparam(dt, i)))
+                return 1;
+    return 0;
+}
+
+// The entries on which whether the set `yname` takes type values rests (`set_takes_type_values`): its entries
+// for a type value and its entries of a set, followed into that set. Each narrows [*lo, *hi] around `world`.
+static int value_entries_range(jl_typename_t *yname, size_t world, size_t *lo, size_t *hi, int depth) JL_NOTSAFEPOINT
+{
+    jl_genericmemory_t *index = jl_set_entries;
+    jl_array_t *list = index == NULL ? NULL : (jl_array_t*)jl_eqtable_get(index, (jl_value_t*)yname, NULL);
+    int found = 0;
+    for (size_t i = 0; list != NULL && i < jl_array_nrows(list); i++) {
+        jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i);
+        if (en == NULL)
+            continue;
+        jl_value_t *mu = jl_unwrap_unionall(en->member);
+        if (entry_for_value(en)) {
+            narrow_by_entry(en, world, lo, hi);
+            found = 1;
+        }
+        else if (jl_is_datatype(mu) && ((jl_datatype_t*)mu)->name->open_set && depth < 16) {
+            if (value_entries_range(((jl_datatype_t*)mu)->name, world, lo, hi, depth + 1)) {
+                narrow_by_entry(en, world, lo, hi);
+                found = 1;
+            }
+        }
+    }
+    return found;
+}
+
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_t world, size_t *lo, size_t *hi)
 {
     if (world == 0)     // no range asked: whether `t` reaches an entry
@@ -1736,8 +1786,19 @@ JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_
         arraylist_new(&seen, 0);
         found = membership_range_visit(t, world, lo, hi, &seen);
         arraylist_free(&seen);
+        // A kind meets a set where the set takes a type value (§4.10): the answer at a kind rests on the
+        // set's entries for type values, which no type in `t` holds (they are on each value's TypeName). So
+        // the worlds of a match at a kind against a method at a set, or of its absence, are those in which
+        // the set's entries for type values are as they are in `world` (§5.3).
+        if (sig != NULL && jl_type_has_kind(t)) {
+            arraylist_t sets;
+            arraylist_new(&sets, 0);
+            open_sets_in(sig, &sets);
+            for (size_t i = 0; i < sets.len; i++)
+                found |= value_entries_range((jl_typename_t*)sets.items[i], world, lo, hi, 0);
+            arraylist_free(&sets);
+        }
     }
-    (void)sig;
     return found;
 }
 

@@ -555,12 +555,13 @@ static int jl_typemap_intersection_node_visitor(jl_typemap_entry_t *ml, struct t
         // Bit-identical without open sets (a memoized bit).
         // An empty intersection rests on no entry where the query's types hold none (the
         // common case: a non-member of the set), and then nothing narrows the range.
+        // A query at a kind meets the set where the set takes a type value: that rests on the set's
+        // entries for type values, held on no type of the query (compiler §4.10).
         if (!closure->skip_ranges && jl_has_open_set_in((jl_value_t*)ml->sig) &&
             (closure->ti != (jl_value_t*)jl_bottom_type || jl_membership_range_is_fast(closure->world) ||
-             jl_type_has_memberships(closure->type))) {
+             jl_type_has_memberships(closure->type) || jl_type_has_kind(closure->type))) {
             size_t lo = closure->min_valid, hi = closure->max_valid;
-            jl_value_t *msig = closure->ti != (jl_value_t*)jl_bottom_type ? (jl_value_t*)ml->sig : NULL;
-            if (jl_membership_world_range(closure->type, msig, closure->world, &lo, &hi)) {
+            if (jl_membership_world_range(closure->type, (jl_value_t*)ml->sig, closure->world, &lo, &hi)) {
                 closure->min_valid = lo;
                 closure->max_valid = hi;
             }
