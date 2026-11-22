@@ -177,6 +177,7 @@ include("libuv.jl")
 include("asyncevent.jl")
 include("iostream.jl")
 include("stream.jl")
+include("iotrait.jl")
 # `Callable{A, S}`: every function is a member of every instance, by one entry whose instance,
 # `Callable` itself, leaves both inputs free; a callable type that is no `Function` joins by its own declaration
 ccall(:jl_declare_membership, Any, (Any, Any, Any, Any, Any), Function, Core.Callable, Core, nothing, :self)
