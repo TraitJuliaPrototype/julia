@@ -6737,4 +6737,12 @@ for f in (TypeVar, UnionAll), m in methods(f), mi in Base.specializations(m)
     @test all(p -> p === Any, mi.specTypes.parameters[2:end])
 end
 
+
+# a call's signature with a union at its top level is split as inference splits a call, for its edges
+let sigs = Compiler.callsig_splits(Tuple{typeof(!==), Union{Nothing,Int}, Nothing})
+    @test sigs !== nothing && Set(sigs) == Set(Any[Tuple{typeof(!==), Nothing, Nothing}, Tuple{typeof(!==), Int, Nothing}])
+end
+@test Compiler.callsig_splits(Tuple{typeof(!==), Int, Nothing}) === nothing
+@test Compiler.callsig_splits(Tuple{typeof(!==), Union{Int8,Int16,Int32,Int64,Int128}, Nothing}) === nothing
+
 end # module inference
