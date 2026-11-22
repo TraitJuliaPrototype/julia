@@ -695,7 +695,7 @@ typedef struct _jl_datatype_t {
     uint32_t isprimitivetype:1; // whether this is declared with 'primitive type' keyword (sized, no fields, and immutable)
     uint32_t ismutationfree:1; // whether any mutable memory is reachable through this type (in the type or via fields)
     uint32_t isidentityfree:1; // whether this type or any object reachable through its fields has non-content-based identity
-    uint32_t has_open_set:1; // whether an open set occurs structurally in this type, incl. via parameters and unions; when clear, no membership can ever affect a query about this type. A set is open from its declaration, so the bit is final when the type is built
+    uint32_t has_open_set:1; // whether an open set occurs structurally in this type, incl. via parameters, unions and type variables' bounds (lower and upper); when clear, no membership can ever affect a query about this type. A set is open from its declaration, so the bit is final when the type is built
     uint32_t _unused_flags:15; // with the flags above and smalltag this fills the word (11+15+6)
     uint32_t smalltag:6; // whether this type has a small-tag optimization
 } jl_datatype_t;
