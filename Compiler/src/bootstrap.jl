@@ -29,15 +29,41 @@ function bootstrap!()
         typeinf_tt = Tuple{typeof(typeinf), NativeInterpreter, InferenceState}
         typeinf_edge_tt = Tuple{typeof(typeinf_edge), NativeInterpreter, Method, Any, SimpleVector, InferenceState, Bool, Bool}
         # the entry of `return_type` at run time (`collect` of a generator, `map` over an empty
-        # collection): otherwise it has no code in the system image and its first call in a
-        # session compiles it
+        # collection): without it, its first call in every session compiled it (80-90 ms)
         return_type_tt = Tuple{typeof(_return_type), NativeInterpreter, DataType}
+        # the definition-time check's entries: a library runs it in this world, where no
+        # package's method ends the compiler's code; without them each session compiled the
+        # compiler again for the check's interpreter (2 s at a session's first definition)
+        check_frame_tt = Tuple{typeof(typeinf_frame), DefinitionCheckInterpreter, Method, Any, SimpleVector, Bool}
+        check_typeinf_tt = Tuple{typeof(typeinf), DefinitionCheckInterpreter, InferenceState}
+        check_edge_tt = Tuple{typeof(typeinf_edge), DefinitionCheckInterpreter, Method, Any, SimpleVector, InferenceState, Bool, Bool}
+        # its entries that the three above do not reach by a static call (a session's trace of the
+        # first check)
+        check_escape = EscapeAnalysis.AnalysisState{GetNativeEscapeCache{WorldView{DefinitionCheckCache}}, PartialsLattice{ConstsLattice}}
+        check_tts = Any[
+            Tuple{typeof(typeinf_local), DefinitionCheckInterpreter, InferenceState, CurrentState},
+            Tuple{typeof(doworkloop), DefinitionCheckInterpreter, InferenceState},
+            Tuple{typeof(optimize), DefinitionCheckInterpreter, OptimizationState{DefinitionCheckInterpreter}, InferenceResult},
+            Tuple{typeof(ssa_inlining_pass!), IRCode, InliningState{DefinitionCheckInterpreter}, Bool},
+            Tuple{typeof(retrieve_ir_for_inlining), MethodInstance, OptimizationState{DefinitionCheckInterpreter}, Bool},
+            Tuple{typeof(compute_inlining_cost), DefinitionCheckInterpreter, InferenceResult, OptimizationResult},
+            Tuple{typeof(finish!), DefinitionCheckInterpreter, InferenceState, UInt64, UInt64},
+            Tuple{typeof(finish_nocycle), DefinitionCheckInterpreter, InferenceState, UInt64},
+            Tuple{typeof(finish_cycle), DefinitionCheckInterpreter, Vector{Union{IRInterpretationState, InferenceState}}, Int, UInt64},
+            Tuple{typeof(finishinfer!), InferenceState, DefinitionCheckInterpreter, Int, IdDict{MethodInstance, CodeInstance}},
+            Tuple{typeof(is_already_cached), DefinitionCheckInterpreter, InferenceResult, CodeInstance},
+            Tuple{typeof(abstract_eval_isdefinedglobal), DefinitionCheckInterpreter, Module, Symbol, Bool, Bool, InferenceState},
+            Tuple{typeof(EscapeAnalysis.escape_builtin!), typeof(setfield!), check_escape, Int, Vector{Any}},
+            Tuple{typeof(EscapeAnalysis.escape_builtin!), typeof(getfield), check_escape, Int, Vector{Any}},
+            Tuple{typeof(EscapeAnalysis.escape_builtin!), typeof(tuple), check_escape, Int, Vector{Any}},
+        ]
         fs = Any[
             # we first create caches for the optimizer, because they contain many loop constructions
             # and they're better to not run in interpreter even during bootstrapping
             compact!, ssa_inlining_pass!_tt, optimize_tt,
             # then we create caches for inference entries
             typeinf_ext_tt, typeinf_tt, typeinf_edge_tt, return_type_tt,
+            check_frame_tt, check_typeinf_tt, check_edge_tt, check_tts...,
         ]
         # tfuncs can't be inferred from the inference entries above, so here we infer them manually
         for x in T_FFUNC_VAL
