@@ -434,6 +434,10 @@ static int tname_intersection(jl_value_t *a, jl_typename_t *bname, int8_t tparam
             if (!jl_is_datatype(a))
                 return tname_intersection(a, bname, 0);
         }
+        // a set's members need not have it on their supertype chains, nor an intersection's: any name
+        // may meet them
+        if (((jl_datatype_t*)a)->name->open_set || jl_is_all_type(a))
+            return 1;
         return tname_intersection_dt((jl_datatype_t*)a, bname, jl_supertype_height((jl_datatype_t*)a));
     }
     return 0;
@@ -472,6 +476,8 @@ static int jl_typemap_intersection_memory_visitor(jl_genericmemory_t *a, jl_valu
             ttype = jl_type_extract_name(ttype, tparam & 1);
             tydt = ttype ? (jl_datatype_t*)jl_unwrap_unionall(((jl_typename_t*)ttype)->wrapper) : NULL;
         }
+        if (tydt != NULL && tydt != jl_any_type && (tydt->name->open_set || jl_is_all_type((jl_value_t*)tydt)))
+            tydt = jl_any_type;                     // a set or an intersection meets any name
         if (tydt == jl_any_type)
             ty = (jl_value_t*)jl_any_type;
         else if (tydt == NULL)
@@ -541,6 +547,21 @@ static int jl_typemap_intersection_node_visitor(jl_typemap_entry_t *ml, struct t
             penv = &closure->env;
         }
         closure->ti = jl_type_intersection_env_s(closure->type, (jl_value_t*)ml->sig, penv, &closure->issubty);
+        // the answer at a method at a set holds while the memberships the query's types can read stay
+        // as they are in this world: the walk's range is bounded by them, so a cache entry made later
+        // for this answer (by a task in an older world) is not used once a membership changes it. An
+        // empty intersection rests on no entry where the query's types hold none (the common case: a
+        // non-member of the set), and then nothing narrows the range. Unchanged without sets (one bit).
+        if (!closure->skip_ranges && jl_has_open_set_in((jl_value_t*)ml->sig) &&
+            (closure->ti != (jl_value_t*)jl_bottom_type || jl_membership_range_is_fast(closure->world) ||
+             jl_type_has_memberships(closure->type))) {
+            size_t lo = closure->min_valid, hi = closure->max_valid;
+            jl_value_t *msig = closure->ti != (jl_value_t*)jl_bottom_type ? (jl_value_t*)ml->sig : NULL;
+            if (jl_membership_world_range(closure->type, msig, closure->world, &lo, &hi)) {
+                closure->min_valid = lo;
+                closure->max_valid = hi;
+            }
+        }
         if (closure->ti != (jl_value_t*)jl_bottom_type) {
             // In some corner cases type intersection is conservative and returns something
             // for intersect(A, B) even though A is a dispatch tuple and !(A <: B).
@@ -1423,6 +1444,21 @@ static void jl_typemap_level_insert_(
     }
     if (t1 == (jl_value_t*)jl_typeofbottom_type)
         t1 = (jl_value_t*)jl_assume(jl_typeofbottom_type)->super;
+    // a method whose type at this position names a set: its entry stays in this level's linear list,
+    // which every walk reaching the level visits. The name probes key on the query's supertype chain,
+    // and a membership is in no chain. At the other positions the entry is indexed as any other, so a
+    // set at the second argument does not put the method in the list of the function's level
+    // (`show(io::IO, x)` is filed under `typeof(show)` and listed one level down). This holds also when
+    // a list overflows MAX_METHLIST_COUNT and jl_method_convert_list_to_cache inserts every entry
+    // again: the entry goes back to the linear list of the level of its set's position, which every
+    // lookup that meets the earlier positions reaches (assoc_exact and assoc_by_type walk the linear
+    // list after the name probes, before the any bucket; the intersection visitor and the any bucket
+    // always visit it). The lookups that return before a level's linear list (subtype=0) reach only
+    // jl_method_table->defs, the builtins' table, where no set occurs. One memoized bit read.
+    if (t1 && jl_has_open_set_in(t1)) {
+        jl_typemap_list_insert_(map, &cache->linear, (jl_value_t*)cache, newrec);
+        return;
+    }
     // If the type at `offs` is Any, put it in the Any list
     if (t1 && jl_is_any(t1)) {
         jl_typemap_insert_generic(map, &cache->any, (jl_value_t*)cache, newrec, 0, offs+1, NULL);

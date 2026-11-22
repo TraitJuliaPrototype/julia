@@ -184,6 +184,7 @@ static jl_value_t *publish_entry(jl_typename_t *tn, jl_typename_t *setname, jl_v
     entry->receiver = receiver;
     entry->min_world = world;
     jl_atomic_store_relaxed(&entry->max_world, ~(uint64_t)0);
+    jl_membership_changed(world);   // a redeclaration's old entry ends at world - 1 too
     entry->declarer = declarer;
     entry->by = by;
     jl_svec_t *old = jl_typename_memberships(tn);
@@ -490,6 +491,10 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world);
     index_entry((jl_membership_t*)entry);
     jl_atomic_store_release(&jl_world_counter, min_world);
+    // the ambiguities the membership creates, at the entry's world
+    size_t mq = jl_set_membership_query_world(min_world);
+    jl_membership_ambiguity_report(member, set_instance, min_world);
+    jl_set_membership_query_world(mq);
     JL_UNLOCK(&world_counter_lock);
     JL_GC_POP();
     return entry;
