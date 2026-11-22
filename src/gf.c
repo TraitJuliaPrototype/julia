@@ -1313,21 +1313,6 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
                         min_valid, max_valid, ambig, NULL);
 }
 
-static int is_trait_arg_type(jl_value_t *decl_i) JL_NOTSAFEPOINT
-{
-    // a set or an intersection, also where its type names the method's variables (`X{T}`): declared
-    // `@nospecialize`, compiled once at its instance with those variables' values
-    if (jl_is_typevar(decl_i))
-        return 0;
-    jl_value_t *u = jl_unwrap_unionall(decl_i);
-    return jl_is_datatype(u) && (((jl_datatype_t*)u)->name->open_set || jl_is_all_type(u));
-}
-
-JL_DLLEXPORT int jl_is_trait_arg_type(jl_value_t *t) JL_NOTSAFEPOINT
-{
-    return is_trait_arg_type(t);
-}
-
 // get the compilation signature specialization for this method
 static void jl_compilation_sig(
     jl_tupletype_t *const tt, // the original tupletype of the call (or DataType from precompile)
@@ -1441,19 +1426,6 @@ static void jl_compilation_sig(
                 }
                 continue;
             }
-            // a trait argument whose type names the method's variables (`X{T}`): compiled once at that
-            // instance with the variables' values from the match
-            if (is_trait_arg_type(decl_i) && sparams != NULL && jl_svec_len(sparams) > 0 && jl_is_unionall(decl)) {
-                type_i = jl_instantiate_type_in_env(decl_i, (jl_unionall_t*)decl, jl_svec_data(sparams));
-                if (!jl_has_free_typevars(type_i)) {
-                    if (type_i != elt) {
-                        if (!*newparams) *newparams = jl_svec_copy(tt->parameters);
-                        jl_svecset(*newparams, i, type_i);
-                    }
-                    continue;
-                }
-                type_i = jl_rewrap_unionall(decl_i, decl);
-            }
         }
 
         if (jl_types_equal(elt, (jl_value_t*)jl_type_type)) { // elt == Type{T} where T
@@ -1520,10 +1492,8 @@ static void jl_compilation_sig(
             }
         }
 
-        // (not an argument declared at a set, `Callable{A, S}`: how it is compiled is the set's rule,
-        //, and `Function` is merely one of its members)
         int notcalled_func = (i_arg > 0 && i_arg <= 8 && !(definition->called & (1 << (i_arg - 1))) &&
-                              !jl_has_free_typevars(decl_i) && !is_trait_arg_type(decl_i) &&
+                              !jl_has_free_typevars(decl_i) &&
                               jl_subtype(elt, (jl_value_t*)jl_function_type));
         if (notcalled_func && (jl_subtype((jl_value_t*)jl_function_type, type_i))) {
             // and attempt to despecialize types marked as a supertype of Function (i.e.
@@ -1670,12 +1640,6 @@ JL_DLLEXPORT int jl_isa_compileable_sig(
                 JL_GC_POP();
                 return 0;
             }
-            // a trait argument whose type names the method's variables: its instance with their
-            // values, as `jl_compilation_sig` gives it
-            if (is_trait_arg_type(decl_i) && is_trait_arg_type(elt) && !jl_has_free_typevars(elt) &&
-                    ((jl_datatype_t*)jl_unwrap_unionall(elt))->name == ((jl_datatype_t*)jl_unwrap_unionall(decl_i))->name &&
-                    jl_subtype(elt, type_i))
-                continue;
         }
 
         if (jl_is_kind(elt)) {
@@ -1756,9 +1720,8 @@ JL_DLLEXPORT int jl_isa_compileable_sig(
             continue;
         }
 
-        // (not an argument declared at a set: as in `jl_compilation_sig`)
         int notcalled_func = (i_arg > 0 && i_arg <= 8 && !(definition->called & (1 << (i_arg - 1))) &&
-                              !jl_has_free_typevars(decl_i) && !is_trait_arg_type(decl_i) &&
+                              !jl_has_free_typevars(decl_i) &&
                               jl_subtype(elt, (jl_value_t*)jl_function_type));
         if (notcalled_func && jl_subtype((jl_value_t*)jl_function_type, type_i)) {
             // and attempt to despecialize types marked as a supertype of Function (i.e.
@@ -2412,34 +2375,6 @@ static void jl_index_open_set_methods(jl_method_t *m)
     if (jl_is_implements_sig(m->sig)) // a membership's method is no method at a set
         return;
     open_set_walk_names((jl_value_t*)m->sig, m, 0);
-}
-
-// The methods whose signatures name the set (its TypeName, or a type of it): the set-to-methods
-// index, for compiling ahead. Each method once, in index order.
-JL_DLLEXPORT jl_value_t *jl_open_set_methods_of(jl_value_t *set)
-{
-    jl_value_t *uw = jl_unwrap_unionall(set);
-    jl_typename_t *tn = jl_is_typename(uw) ? (jl_typename_t*)uw :
-                        jl_is_datatype(uw) ? ((jl_datatype_t*)uw)->name : NULL;
-    jl_array_t *out = jl_alloc_vec_any(0);
-    if (tn == NULL)
-        return (jl_value_t*)out;
-    JL_GC_PUSH1(&out);
-    JL_LOCK(&open_set_methods_lock);
-    size_t n = open_set_methods ? jl_array_nrows(open_set_methods) : 0;
-    for (size_t i = 0; i + 1 < n; i += 2) {
-        if (jl_array_ptr_ref(open_set_methods, i) != (jl_value_t*)tn)
-            continue;
-        jl_value_t *m = jl_array_ptr_ref(open_set_methods, i + 1);
-        int dup = 0;
-        for (size_t k = 0; k < jl_array_nrows(out); k++)
-            dup |= jl_array_ptr_ref(out, k) == m;
-        if (!dup)
-            jl_array_ptr_1d_push(out, m);
-    }
-    JL_UNLOCK(&open_set_methods_lock);
-    JL_GC_POP();
-    return (jl_value_t*)out;
 }
 
 // the methods indexed under `tn`

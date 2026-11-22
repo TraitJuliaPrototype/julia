@@ -648,9 +648,6 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     return gfresult
 end
 
-# a set or an intersection of sets, its parameters given or not
-is_trait_arg_type(@nospecialize(t)) = ccall(:jl_is_trait_arg_type, Cint, (Any,), t) != 0
-
 function find_method_matches(interp::AbstractInterpreter, argtypes::Vector{Any}, @nospecialize(atype);
                              max_union_splitting::Int = InferenceParams(interp).max_union_splitting,
                              max_methods::Int = InferenceParams(interp).max_methods)

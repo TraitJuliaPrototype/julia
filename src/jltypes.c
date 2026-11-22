@@ -4185,7 +4185,6 @@ void post_boot_hooks(void)
     {
         jl_datatype_t *cb = (jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type);
         cb->name->open_set = 1;
-        cb->name->erases = 1;
         cb->has_open_set = 1;
         cb->name->input_params = 0x03;
     }

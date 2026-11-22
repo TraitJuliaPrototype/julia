@@ -84,7 +84,6 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     tn->hash = bitmix(bitmix(module ? module->build_id.lo : 0, name->hash), 0xa1ada1da);
     tn->open_set = 0;
     tn->never_member = 0;
-    tn->erases = 0;
     tn->_unused = 0;
     tn->abstract = abstract;
     tn->mutabl = mutabl;
@@ -1390,15 +1389,6 @@ JL_DLLEXPORT void jl_set_contract(jl_value_t *T, jl_value_t *contract)
         jl_errorf("the contract of %s is written once", jl_symbol_name(tn->name));
     jl_gc_wb(tn, contract);
 }
-
-// Whether a set erases by default: a bit Core's build sets on `Callable`; a
-// library's set carries it in its contract. The method definition's expansion hook reads it.
-JL_DLLEXPORT int jl_set_erases(jl_value_t *T)
-{
-    jl_value_t *uw = jl_unwrap_unionall(T);
-    return jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->erases;
-}
-
 
 // A closed abstract type with a contract: its declaring module writes it once on the type's contract
 // slot, which images keep with the TypeName: `svec(ops, cands)`, the operations' methods (each with its
