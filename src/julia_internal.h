@@ -1031,6 +1031,15 @@ jl_svec_t *jl_call_expansion_hook(jl_svec_t *argdata, jl_code_info_t *code, jl_m
 jl_array_t *jl_call_image_methods_hook(jl_array_t *ms, const char *pkgname);
 void jl_call_module_end_hook(jl_module_t *m);
 void jl_call_deletion_hook(jl_method_t *m);
+// the member hook and its states (gf.c)
+extern jl_value_t *jl_member_hook JL_GLOBALLY_ROOTED;
+extern jl_genericmemory_t *jl_member_states JL_GLOBALLY_ROOTED; // the checks' states
+extern jl_array_t *jl_member_pending JL_GLOBALLY_ROOTED;
+extern jl_array_t *jl_member_failed_users JL_GLOBALLY_ROOTED;
+extern jl_mutex_t jl_member_state_lock;
+void jl_member_checks_activated(jl_array_t *checks);
+jl_array_t *jl_member_checks_passed_here(void);
+JL_DLLEXPORT void jl_member_states_forget(jl_value_t *member, jl_typename_t *setname);
 JL_DLLEXPORT size_t jl_membership_stat(int which);
 // what a membership ends of the deep class, kept as a definition's is (gf.c)
 JL_DLLEXPORT int jl_deep_ending_push(const char *kind, jl_value_t *cause);

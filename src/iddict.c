@@ -144,6 +144,8 @@ JL_DLLEXPORT
 jl_genericmemory_t *jl_eqtable_put(jl_genericmemory_t *h, jl_value_t *key, jl_value_t *val, int *p_inserted)
 {
     int inserted = jl_table_assign_bp(&h, key, val);
+    // a table jl_table_assign_bp made is its last allocation: nothing allocates after it
+    JL_GC_PROMISE_ROOTED(h);
     if (p_inserted)
         *p_inserted = inserted;
     return h;

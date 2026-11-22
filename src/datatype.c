@@ -1092,6 +1092,8 @@ JL_DLLEXPORT void jl_delete_membership(jl_value_t *member, jl_value_t *set_insta
     jl_membership_removal_walk(found->member, found->instance, world);
     jl_set_membership_query_world(mq);
     jl_deep_ending_pop(pushed);
+    // the member's kept check answers go with the membership
+    jl_member_states_forget(found->member, setname);
     jl_atomic_store_release(&jl_world_counter, world + 1);
     JL_UNLOCK(&world_counter_lock);
     JL_GC_POP();
