@@ -340,9 +340,12 @@ convert(::Type{IOContext{IO_t}}, io::IO) where {IO_t} = IOContext{IO_t}(io, iopr
 IOContext(io::IO) = convert(IOContext, io)
 IOContext{IO_t}(io::IO) where {IO_t} = convert(IOContext{IO_t}, io)
 
+# A property is stored by the dictionary's own constructor, through `invoke`: the value is kept whatever
+# its type (often a type, `:typeinfo => T`), and a call at the value's type is one that a package's
+# method for its own type could intercept.
 function IOContext(io::IO, KV::Pair)
     d = ioproperties(io)
-    return IOContext(io, ImmutableDict{Symbol,Any}(d, KV[1], KV[2]))
+    return IOContext(io, invoke(ImmutableDict{Symbol,Any}, Tuple{ImmutableDict, Any, Any}, d, KV[1], KV[2]))
 end
 
 """
