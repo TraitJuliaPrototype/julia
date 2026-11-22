@@ -797,6 +797,10 @@ JL_DLLEXPORT void jl_add_binding_backedge(jl_binding_t *b, jl_value_t *edge);
 static const uint8_t MI_FLAG_BACKEDGES_INUSE = 0b0100;
 static const uint8_t MI_FLAG_BACKEDGES_DIRTY = 0b1000;
 static const uint8_t MI_FLAG_BACKEDGES_ALL = 0b1100;
+// the policy of a method instance's code, cached at its first use: 0 not yet read, else the
+// policy + 1. An image does not keep it, since the setting is the session's.
+static const uint8_t MI_FLAG_POLICY_MASK = 0b110000;
+static const int MI_FLAG_POLICY_SHIFT = 4;
 
 STATIC_INLINE jl_array_t *jl_mi_get_backedges_mutate(jl_method_instance_t *mi JL_PROPAGATES_ROOT, uint8_t *flags) {
     *flags = jl_atomic_load_relaxed(&mi->flags) & (MI_FLAG_BACKEDGES_ALL);
