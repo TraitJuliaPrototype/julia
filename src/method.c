@@ -955,7 +955,23 @@ JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src)
         jl_value_t *st = jl_array_ptr_ref(stmts, i);
         if (jl_is_expr(st) && ((jl_expr_t*)st)->head == jl_meta_sym) {
             size_t nargs = jl_expr_nargs(st);
-            if (nargs >= 1 && jl_exprarg(st, 0) == (jl_value_t*)jl_nospecialize_sym) {
+            if (nargs > 1) {
+                // a policy marker merged into another meta (`pushmeta!`, as `@inline` does): the meta stays
+                for (size_t k = 0; k < nargs; k++) {
+                    jl_value_t *ak = jl_exprarg(st, k);
+                    if (ak == (jl_value_t*)jl_facts_boundary_sym)
+                        m->facts = (m->facts & ~3) | 1;
+                    else if (ak == (jl_value_t*)jl_facts_always_sym)
+                        m->facts = (m->facts & ~3) | 2;
+                }
+            }
+            if (nargs == 1 && (jl_exprarg(st, 0) == (jl_value_t*)jl_facts_boundary_sym ||
+                               jl_exprarg(st, 0) == (jl_value_t*)jl_facts_always_sym)) {
+                // the method's policy: a boundary, or always facts
+                m->facts = (m->facts & ~3) | (jl_exprarg(st, 0) == (jl_value_t*)jl_facts_always_sym ? 2 : 1);
+                st = jl_nothing;
+            }
+            else if (nargs >= 1 && jl_exprarg(st, 0) == (jl_value_t*)jl_nospecialize_sym) {
                 if (nargs == 1) // bare `@nospecialize` is special: it prevents specialization on all args
                     m->nospecialize = -1;
                 size_t j;
