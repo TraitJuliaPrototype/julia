@@ -791,7 +791,11 @@ function Base.iterate(it::ForwardToBackedgeIterator, i::Int = 1)
                     mi = callee isa CodeInstance ? get_ci_mi(callee) : callee
                     sig = edges[i+1]
                     if sig isa Type && mi.specTypes !== sig
-                        return ((CallSigBackedge(sig), mi), i + 3)
+                        # typed `Any` for inference, so that the iterator's result stays the union it is
+                        # without this case: one more member widens it to `Tuple{Any, Int}`, and the
+                        # duplicate check of `store_backedges`, quadratic in the edges and run for every
+                        # CodeInstance a package image loads, then dispatches at every step
+                        return ((compilerbarrier(:type, CallSigBackedge(sig)), mi), i + 3)
                     end
                 end
             end
@@ -837,18 +841,13 @@ end
 function store_backedges(caller::CodeInstance, edges::SimpleVector)
     isa(get_ci_mi(caller).def, Method) || return # don't add backedges to toplevel method instance
 
-    # the backedges, collected once: the duplicate check compares the pairs, not the iterator's steps
-    backedges = Any[]
-    for be in ForwardToBackedgeIterator(edges)
-        push!(backedges, be)
-    end
-    for i in 1:length(backedges)
-        invokesig, item = backedges[i]::Tuple{Any,Any}
+    backedges = ForwardToBackedgeIterator(edges)
+    for (i, (invokesig, item)) in enumerate(backedges)
         # check for any duplicate edges we've already registered
         duplicate_found = false
-        for i′ in 1:(i - 1)
-            invokesig′, item′ = backedges[i′]::Tuple{Any,Any}
-            if item′ === item && invokesig′ === invokesig
+        for (i′, (invokesig′, item′)) in enumerate(backedges)
+            i == i′ && break
+            if item′ === item && invokesig′ == invokesig
                 duplicate_found = true
                 break
             end
