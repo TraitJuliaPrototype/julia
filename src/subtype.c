@@ -1906,13 +1906,14 @@ JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X)
         return jl_could_join(((jl_uniontype_t*)su)->a, X) || jl_could_join(((jl_uniontype_t*)su)->b, X);
     if (!jl_is_datatype(su) || !jl_is_datatype(xu))
         return 1; // unknown shapes are conservative
-    if (jl_is_type_type(su)) {
-        // Type{S} joins X exactly when S does (the induced entry, §2.8)
+    jl_datatype_t *sud = (jl_datatype_t*)su, *xud = (jl_datatype_t*)xu;
+    if (jl_is_type_type(su) && xud->name->open_set) {
+        // Type{S} joins a set X exactly when S does (the induced entry, §2.8); against any other
+        // type (`Type{<:X}`) the parameters are compared below
         jl_value_t *tp0 = jl_tparam0((jl_datatype_t*)su);
         if (jl_is_datatype(tp0) && !jl_has_free_typevars(tp0))
             return jl_could_join(tp0, X);
     }
-    jl_datatype_t *sud = (jl_datatype_t*)su, *xud = (jl_datatype_t*)xu;
     if (xud->name->open_set && sud->name != xud->name) {
         if (sud->name == jl_datatype_type->name || sud->name == jl_type_typename ||
             sud->name == jl_unionall_type->name || sud->name == jl_uniontype_type->name)
@@ -1924,6 +1925,10 @@ JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X)
     // same open family (PS{Union{Baz,X2}} vs PS{X2}) falls through to the
     // parameter recursion below — it is conservative and catches membership flips
     // at parameter positions that the head rule would have short-circuited
+    if (sud->name == xud->name && jl_nparams(su) != jl_nparams(xu))
+        // two tuples of different lengths (a Vararg tail): the positions do not pair, so any set in
+        // either may decide the answer
+        return jl_has_open_set_in(su) || jl_has_open_set_in(xu);
     if (sud->name == xud->name && jl_nparams(su) == jl_nparams(xu)) {
         // inside a container a membership can flip the answer at a position
         // (Tuple{S} vs Tuple{X}); invariant parameters count too, since a union
@@ -1941,6 +1946,12 @@ JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X)
                 return 1;
         }
         return 0;
+    }
+    // a different head: S reaches X's type name only through its declared supertypes, which carry
+    // S's parameters (`P{S} <: AP{<:X}` through `struct P{T} <: AP{T}`): the answer is the supertype's
+    for (jl_datatype_t *d = sud->super; d != NULL && d != jl_any_type; d = d->super) {
+        if (d->name == xud->name)
+            return jl_could_join((jl_value_t*)d, (jl_value_t*)xud);
     }
     return 0;
 }
