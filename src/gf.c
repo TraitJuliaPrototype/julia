@@ -2181,9 +2181,13 @@ static jl_value_t *get_intersect_matches(jl_typemap_t *defs, jl_typemap_entry_t 
     }
     // search for all intersecting methods active in the previous world, to determine the changes needed to be made for the next world
     struct matches_env env = {{get_intersect_visitor, (jl_value_t*)type, va, /* .search_slurp = */ 0,
+            /* .world = */ world,
             /* .min_valid = */ world, /* .max_valid = */ world,
             /* .ti = */ NULL, /* .env = */ jl_emptysvec, /* .issubty = */ 0},
         /* .newentry = */ newentry, /* .shadowed */ NULL, /* .replaced */ NULL};
+    // the shadowed and replaced methods are the answer, not the matches' worlds: no membership range is
+    // taken
+    env.match.skip_ranges = 1;
     JL_GC_PUSH3(&env.match.env, &env.match.ti, &env.shadowed);
     jl_typemap_intersection_visitor(defs, 0, &env.match);
     env.match.env = NULL;
@@ -2249,6 +2253,73 @@ static void update_max_args(jl_value_t *type)
     // update occurs inside global writelock
     if (na > jl_atomic_load_relaxed(&tn->max_args))
         jl_atomic_store_relaxed(&tn->max_args, na);
+}
+
+// The methods whose signatures name a set: the set's TypeName and the method, a pair per set named, in
+// a vector rooted by the collectors. A membership's report and its walk find the methods at the set
+// here. Such methods are rare, so a flat list with a linear scan serves; pairs are never removed.
+jl_array_t *open_set_methods JL_GLOBALLY_ROOTED = NULL;
+static jl_mutex_t open_set_methods_lock;
+
+// register m under every set inside the signature: a position's type, a union's arm, a variable's
+// bound, a Vararg's element, a parameter
+static void open_set_walk_names(jl_value_t *v, jl_method_t *m, int depth)
+{
+    v = jl_unwrap_unionall(v);
+    if (depth > 8)
+        return;
+    if (jl_is_typevar(v)) {
+        // `f(c::C) where C <: X{T}`: the variable's bound names the set
+        open_set_walk_names(((jl_tvar_t*)v)->ub, m, depth + 1);
+        return;
+    }
+    if (jl_is_vararg(v)) {
+        open_set_walk_names(jl_unwrap_vararg(v), m, depth + 1);
+        return;
+    }
+    if (jl_is_uniontype(v)) {
+        open_set_walk_names(((jl_uniontype_t*)v)->a, m, depth + 1);
+        open_set_walk_names(((jl_uniontype_t*)v)->b, m, depth + 1);
+        return;
+    }
+    if (!jl_is_datatype(v))
+        return;
+    jl_datatype_t *dt = (jl_datatype_t*)v;
+    if (dt->name->open_set) {
+        JL_LOCK(&open_set_methods_lock);
+        if (!open_set_methods)
+            open_set_methods = jl_alloc_vec_any(0);
+        jl_array_ptr_1d_push(open_set_methods, (jl_value_t*)dt->name);
+        jl_array_ptr_1d_push(open_set_methods, (jl_value_t*)m);
+        JL_UNLOCK(&open_set_methods_lock);
+    }
+    for (size_t i = 0; i < jl_nparams(dt); i++)
+        open_set_walk_names(jl_tparam(dt, i), m, depth + 1);
+}
+
+// called from jl_method_table_add, the only writer, before the insertion takes world_counter_lock
+static void jl_index_open_set_methods(jl_method_t *m)
+{
+    if (!jl_has_open_set_in((jl_value_t*)m->sig)) // one bit
+        return;
+    open_set_walk_names((jl_value_t*)m->sig, m, 0);
+}
+
+// the methods indexed under `tn`
+static jl_array_t *jl_methods_at_set(jl_typename_t *tn)
+{
+    jl_array_t *out = jl_alloc_vec_any(0);
+    JL_GC_PUSH1(&out);
+    JL_LOCK(&open_set_methods_lock);
+    if (open_set_methods) {
+        size_t i, l = jl_array_nrows(open_set_methods);
+        for (i = 0; i + 1 < l; i += 2)
+            if (jl_array_ptr_ref(open_set_methods, i) == (jl_value_t*)tn)
+                jl_array_ptr_1d_push(out, jl_array_ptr_ref(open_set_methods, i + 1));
+    }
+    JL_UNLOCK(&open_set_methods_lock);
+    JL_GC_POP();
+    return out;
 }
 
 jl_array_t *_jl_debug_method_invalidation JL_GLOBALLY_ROOTED = NULL;
@@ -2985,6 +3056,9 @@ jl_typemap_entry_t *jl_method_table_add(jl_methtable_t *mt, jl_method_t *method,
     newentry = jl_typemap_alloc((jl_tupletype_t*)method->sig, simpletype, jl_emptysvec, (jl_value_t*)method, ~(size_t)0, 1);
     jl_typemap_insert(&mt->defs, (jl_value_t*)mt, newentry, 0);
 
+    // index the methods whose signatures name a set
+    jl_index_open_set_methods(method);
+
     if (mt == jl_method_table)
         update_max_args(method->sig);
     JL_UNLOCK(&mt->cache->writelock);
@@ -3004,9 +3078,22 @@ static int has_key(jl_genericmemory_t *keys, jl_value_t *key)
     return 0;
 }
 
-// Check if m2 is in m1's interferences set, which means !morespecific(m1, m2)
+// a signature's open-set bit (its tuple type's, which covers its variables' bounds); inline
+STATIC_INLINE int sig_has_open_set(jl_value_t *sig) JL_NOTSAFEPOINT
+{
+    while (jl_is_unionall(sig))
+        sig = ((jl_unionall_t*)sig)->body;
+    return jl_is_datatype(sig) && ((jl_datatype_t*)sig)->has_open_set;
+}
+
+// Check if m2 is in m1's interferences set, which means !morespecific(m1, m2).
+// The set is recorded when a method is inserted. A pair with a method at a set is asked in the query's
+// world instead: a later membership can make two methods meet that were disjoint at insertion (a method
+// at a set and one at a type that later joins it), or order two sets, and the record knows neither.
 static int method_in_interferences(jl_method_t *m2, jl_method_t *m1)
 {
+    if (sig_has_open_set((jl_value_t*)m1->sig) || sig_has_open_set((jl_value_t*)m2->sig))
+        return !jl_method_morespecific(m1, m2);
     return has_key(jl_atomic_load_relaxed(&m1->interferences), (jl_value_t*)m2);
 }
 
@@ -5123,6 +5210,18 @@ static int ml_matches_visitor(jl_typemap_entry_t *ml, struct typemap_intersectio
         }
         closure->lim--;
     }
+    // a match that holds only through membership entries is valid only while those entries keep the
+    // visibility they have in the query's world: the match's worlds are bounded by them, as by the
+    // method's own (inference takes the bound into the code's worlds)
+    if (sig_has_open_set((jl_value_t*)ml->sig)) {
+        size_t lo = 1, hi = ~(size_t)0;
+        if (jl_membership_world_range(closure->match.ti, (jl_value_t*)ml->sig, closure->world, &lo, &hi)) {
+            if (closure->match.min_valid < lo)
+                closure->match.min_valid = lo;
+            if (closure->match.max_valid > hi)
+                closure->match.max_valid = hi;
+        }
+    }
     closure->matc = make_method_match((jl_tupletype_t*)closure->match.ti,
         closure->match.env, meth,
         closure->match.issubty ? FULLY_COVERS : NOT_FULLY_COVERS);
@@ -5454,6 +5553,7 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
 
             /* temporaries */
             /* .search_slurp = */ 0,
+            /* .world = */ world,
 
             /* outputs */
             /* .min_valid = */ *min_valid,
@@ -5754,6 +5854,350 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
     if (lim >= 0 && len > lim)
         return jl_nothing;
     return env.t;
+}
+
+
+// the set `set_instance` and the sets it joins by the entries in force in `entry_min_world`: an entry
+// (M, Y) on a visited S's TypeName with S <: M makes Y one more. Lists are short and declarations refuse
+// a cycle among sets; the bound is a belt.
+static void membership_superset_sets(jl_value_t *set_instance, size_t entry_min_world, jl_array_t *sets)
+{
+    jl_array_ptr_1d_push(sets, set_instance);
+    size_t i = 0;
+    while (i < jl_array_nrows(sets) && jl_array_nrows(sets) < 16) {
+        jl_value_t *S = jl_array_ptr_ref(sets, i++);
+        jl_value_t *Suw = jl_unwrap_unionall(S);
+        if (!jl_is_datatype(Suw))
+            continue;
+        jl_typename_t *tn = ((jl_datatype_t*)Suw)->name;
+        jl_svec_t *list = jl_typename_memberships(tn);
+        size_t l = jl_svec_len(list);
+        for (size_t j = 0; j < l; j++) {
+            jl_membership_t *en = (jl_membership_t*)jl_svecref(list, j);
+            if (en->min_world > entry_min_world || jl_atomic_load_relaxed(&en->max_world) < entry_min_world)
+                continue; // not live in the world this walk answers for (a retired entry is live in none)
+            if (!jl_subtype(S, (jl_value_t*)en->member))
+                continue;
+            jl_value_t *Y = en->instance;
+            size_t k;
+            for (k = 0; k < jl_array_nrows(sets); k++)
+                if (jl_array_ptr_ref(sets, k) == Y)
+                    break;
+            if (k == jl_array_nrows(sets))
+                jl_array_ptr_1d_push(sets, Y);
+        }
+    }
+}
+
+// The ambiguity report at a membership. The membership makes the methods at the new
+// set, and at the sets it joins, applicable at the member. Each such method is asked against the
+// method table at the member: a method tied with it there, with none more specific than both, is a
+// real ambiguity, and Julia's own dispatch raises it at the call. It runs under world_counter_lock
+// and throws nothing: without strict mode it warns, at the declaration, where the whole picture
+// exists; under strict mode jl_declare_membership asks it for its findings before the counter
+// advances and refuses the entry.
+// Each finding is svec(method at the set, the set, svec of the tied methods' signatures, member,
+// joint signature).
+static void membership_ambig_found(jl_array_t *found, jl_method_t *m, jl_value_t *X, jl_svec_t *tied,
+                                   jl_value_t *member, jl_value_t *joint)
+{
+    if (found) {
+        jl_value_t *f = (jl_value_t*)jl_svec(5, (jl_value_t*)m, X, (jl_value_t*)tied, member, joint ? joint : jl_nothing);
+        JL_GC_PUSH1(&f);
+        jl_array_ptr_1d_push(found, f);
+        JL_GC_POP();
+        return;
+    }
+    // a signature prints as a call, `f(X, Int64)`, not as its tuple type
+    jl_printf(JL_STDERR, "WARNING: method %s at ", jl_symbol_name(m->name));
+    jl_static_show_func_sig(JL_STDERR, (jl_value_t*)m->sig);
+    jl_printf(JL_STDERR, " is ambiguous for ");
+    jl_static_show(JL_STDERR, member);
+    jl_printf(JL_STDERR, ", a member of ");
+    jl_static_show(JL_STDERR, X);
+    jl_printf(JL_STDERR, ", with the method at ");
+    for (size_t i = 0; i < jl_svec_len(tied); i++) {
+        if (i > 0)
+            jl_printf(JL_STDERR, " and ");
+        jl_static_show_func_sig(JL_STDERR, jl_svecref(tied, i));
+    }
+    if (joint) {
+        jl_printf(JL_STDERR, "; a method at ");
+        jl_static_show_func_sig(JL_STDERR, joint);
+        jl_printf(JL_STDERR, " would resolve it");
+    }
+    jl_printf(JL_STDERR, "\n");
+}
+
+// whether the set `tn` types the position `v` itself: as the position's type, an arm of its union, a
+// component of its intersection or a variable's bound. A set inside another type's parameter
+// (`Vector{<:X}`) does not: a membership makes no new type applicable there.
+static int set_types_position(jl_value_t *v, jl_typename_t *tn, int depth)
+{
+    v = jl_unwrap_unionall(v);
+    if (v == NULL || depth > 8)
+        return 0;
+    if (jl_is_uniontype(v))
+        return set_types_position(((jl_uniontype_t*)v)->a, tn, depth + 1) ||
+               set_types_position(((jl_uniontype_t*)v)->b, tn, depth + 1);
+    if (jl_is_typevar(v))
+        return set_types_position(((jl_tvar_t*)v)->ub, tn, depth + 1);
+    if (jl_is_all_type(v)) {
+        jl_value_t *cs = jl_unwrap_unionall(jl_tparam0(v));
+        if (jl_is_tuple_type(cs))
+            for (size_t i = 0; i < jl_nparams(cs); i++)
+                if (set_types_position(jl_tparam(cs, i), tn, depth + 1))
+                    return 1;
+        return 0;
+    }
+    return jl_is_datatype(v) && ((jl_datatype_t*)v)->name == tn;
+}
+
+// whether any open set types the position `v` itself (as set_types_position, for every set)
+static int open_set_types_position(jl_value_t *v, int depth)
+{
+    v = jl_unwrap_unionall(v);
+    if (v == NULL || depth > 8)
+        return 0;
+    if (jl_is_uniontype(v))
+        return open_set_types_position(((jl_uniontype_t*)v)->a, depth + 1) ||
+               open_set_types_position(((jl_uniontype_t*)v)->b, depth + 1);
+    if (jl_is_typevar(v))
+        return open_set_types_position(((jl_tvar_t*)v)->ub, depth + 1);
+    if (jl_is_all_type(v))
+        return 1;
+    return jl_is_datatype(v) && ((jl_datatype_t*)v)->name->open_set;
+}
+
+// the type of position `p` of the signature `sig` as a closed type: a Vararg's element, a
+// variable's bound, the signature's variables wrapped around it
+static jl_value_t *position_type(jl_value_t *p, jl_value_t *sig)
+{
+    if (jl_is_vararg(p))
+        p = jl_unwrap_vararg(p);
+    if (p == NULL)
+        return (jl_value_t*)jl_any_type;
+    while (jl_is_typevar(p))
+        p = ((jl_tvar_t*)p)->ub;
+    return jl_has_free_typevars(p) ? jl_rewrap_unionall(p, sig) : p;
+}
+
+// `sig` with `member` in place of each argument that one of `sets` types (set_types_position) and
+// that the member is under in the query's world, also inside a Vararg; NULL where no argument is.
+// The method's other arguments stay as they are, so the query has the method's own arity
+// `mask` gets the positions replaced.
+static jl_value_t *sig_at_member(jl_value_t *sig, jl_array_t *sets, jl_value_t *member, uint64_t *mask)
+{
+    jl_value_t *body = jl_unwrap_unionall(sig);
+    *mask = 0;
+    if (!jl_is_tuple_type(body))
+        return NULL;
+    size_t n = jl_nparams((jl_datatype_t*)body);
+    int ground = !jl_has_free_typevars(member);
+    jl_svec_t *ps = NULL;
+    jl_value_t *res = NULL;
+    JL_GC_PUSH2(&ps, &res);
+    ps = jl_svec_copy(((jl_datatype_t*)body)->parameters);
+    for (size_t i = 1; i < n && i < 64; i++) {
+        jl_value_t *p = jl_svecref(ps, i);
+        jl_value_t *t = jl_is_vararg(p) ? jl_unwrap_vararg(p) : p;
+        if (t == NULL)
+            continue;
+        int named = 0;
+        for (size_t s = 0; s < jl_array_nrows(sets) && !named; s++) {
+            jl_value_t *Yuw = jl_unwrap_unionall(jl_array_ptr_ref(sets, s));
+            if (!jl_is_datatype(Yuw))
+                continue;
+            jl_typename_t *tn = ((jl_datatype_t*)Yuw)->name;
+            if (ground)
+                named = set_types_position(t, tn, 0);
+            else { // a family's declaration shares its variables: the position typed by the set itself
+                jl_value_t *tu = jl_unwrap_unionall(t);
+                named = jl_is_datatype(tu) && ((jl_datatype_t*)tu)->name == tn;
+            }
+        }
+        if (!named)
+            continue;
+        if (ground) {
+            res = position_type(p, sig);
+            if (!jl_subtype(member, res))
+                continue; // another instance of the set, or an intersection the member is not in
+        }
+        if (jl_is_vararg(p)) {
+            res = (jl_value_t*)jl_wrap_vararg(member, ((jl_vararg_t*)p)->N, 1, 0);
+            jl_svecset(ps, i, res);
+        }
+        else {
+            jl_svecset(ps, i, member);
+        }
+        *mask |= (uint64_t)1 << i;
+    }
+    res = NULL;
+    if (*mask) {
+        res = (jl_value_t*)jl_apply_tuple_type(ps, 1);
+        res = jl_rewrap_unionall(res, sig);
+    }
+    JL_GC_POP();
+    return res;
+}
+
+// whether the match `m` covers the member through no set the member is not in: at
+// each position where the query holds the member, m's type is a closed type, or one the member is
+// under in the query's world. For a concrete member every match is (a concrete type that is no
+// member meets no method at a set); for a pattern or a set as member, a method at another set
+// meets the query only at an intersection, whose members are not the membership's.
+static int match_at_member(jl_method_t *m, jl_value_t *member, uint64_t mask)
+{
+    if (jl_has_free_typevars(member))
+        return 1;
+    jl_value_t *body = jl_unwrap_unionall((jl_value_t*)m->sig);
+    if (!jl_is_tuple_type(body))
+        return 0;
+    size_t n = jl_nparams((jl_datatype_t*)body);
+    jl_value_t *t = NULL;
+    JL_GC_PUSH1(&t);
+    int ok = 1;
+    for (size_t i = 1; i < 64 && ok; i++) {
+        if (!(mask & ((uint64_t)1 << i)))
+            continue;
+        if (n == 0)
+            break;
+        jl_value_t *p = jl_tparam(body, i < n ? i : n - 1);
+        if (i >= n && !jl_is_vararg(p))
+            break;
+        if (!open_set_types_position(jl_is_vararg(p) ? jl_unwrap_vararg(p) : p, 0))
+            continue;
+        t = position_type(p, (jl_value_t*)m->sig);
+        ok = jl_subtype(member, t);
+    }
+    JL_GC_POP();
+    return ok;
+}
+
+static int method_in(jl_array_t *a, jl_method_t *m) JL_NOTSAFEPOINT
+{
+    for (size_t i = 0; i < jl_array_nrows(a); i++)
+        if (jl_array_ptr_ref(a, i) == (jl_value_t*)m)
+            return 1;
+    return 0;
+}
+
+// the ambiguities the membership of `member` in `set_instance` (an entry published at
+// `entry_min_world`) creates: pushed to `found`, or warned where `found` is NULL.
+// The search reads the method table, never a dispatch cache: a cache entry made before the
+// membership may still answer for the call types. It asks in the entry's world, which the counter has
+// reached, under world_counter_lock.
+static void membership_ambiguities(jl_value_t *member, jl_value_t *set_instance,
+                                   size_t entry_min_world, jl_array_t *found)
+{
+    if (!jl_atomic_load_relaxed(&allow_new_worlds))
+        return;
+    if (!jl_is_datatype(jl_unwrap_unionall(member)))
+        return;
+    // gc slots: 0 sets, 1 the methods at a set, 2 the query, 3 the matches, 4 the tied methods,
+    // 5 the methods already reported, 6 and 7 scratch
+    jl_value_t **gc;
+    JL_GC_PUSHARGS(gc, 8);
+    // the new set and the sets it joins by entries live in the entry's world
+    jl_array_t *sets = (jl_array_t*)(gc[0] = (jl_value_t*)jl_alloc_vec_any(0));
+    membership_superset_sets(set_instance, entry_min_world, sets);
+    jl_array_t *asked = (jl_array_t*)(gc[5] = (jl_value_t*)jl_alloc_vec_any(0));
+    size_t mq0 = jl_set_membership_query_world(entry_min_world);
+    for (size_t s = 0; s < jl_array_nrows(sets); s++) {
+        jl_value_t *X = jl_array_ptr_ref(sets, s);
+        jl_value_t *Xuw = jl_unwrap_unionall(X);
+        if (!jl_is_datatype(Xuw))
+            continue;
+        jl_array_t *listX = (jl_array_t*)(gc[1] = (jl_value_t*)jl_methods_at_set(((jl_datatype_t*)Xuw)->name));
+        for (size_t x = 0; x < jl_array_nrows(listX); x++) {
+            jl_method_t *mX = (jl_method_t*)jl_array_ptr_ref(listX, x);
+            if (method_in(asked, mX))
+                continue; // a method at All{X, Y} is listed at both sets
+            jl_methtable_t *mt = jl_method_get_table(mX);
+            if (!jl_is_mtable(mt))
+                continue;
+            // the call types at which the membership makes mX apply to the member
+            uint64_t mask;
+            jl_value_t *q = gc[2] = sig_at_member((jl_value_t*)mX->sig, sets, member, &mask);
+            if (q == NULL)
+                continue;
+            // the ambiguities the membership creates: a method that applied there in the world
+            // before the entry is not asked (the counter's world at a declaration)
+            if (entry_min_world > 1) {
+                jl_set_membership_query_world(entry_min_world - 1);
+                int before = jl_subtype(q, (jl_value_t*)mX->sig);
+                jl_set_membership_query_world(entry_min_world);
+                if (before)
+                    continue;
+            }
+            size_t min_valid = 1, max_valid = ~(size_t)0;
+            int ambig = 0;
+            jl_value_t *res = gc[3] = ml_matches(mt, NULL, (jl_tupletype_t*)q, -1, 1, 1,
+                                                 entry_min_world, 0, &min_valid, &max_valid, &ambig);
+            if (!jl_is_array(res))
+                continue;
+            size_t l = jl_array_nrows((jl_array_t*)res);
+            int hasX = 0;
+            for (size_t i = 0; i < l && !hasX; i++)
+                hasX = ((jl_method_match_t*)jl_array_ptr_ref((jl_array_t*)res, i))->method == mX;
+            if (!hasX)
+                continue;
+            jl_array_ptr_1d_push(asked, (jl_value_t*)mX);
+            // the tied matches: Base.isambiguous's rule at the call types both reach. Neither is
+            // more specific, and no match more specific than both covers those types.
+            jl_array_t *tied = (jl_array_t*)(gc[4] = (jl_value_t*)jl_alloc_vec_any(0));
+            for (size_t i = 0; i < l; i++) {
+                jl_method_t *m = ((jl_method_match_t*)jl_array_ptr_ref((jl_array_t*)res, i))->method;
+                if (m == mX || method_in(asked, m))
+                    continue; // asked before: the pair is in that method's finding
+                if (jl_method_morespecific(mX, m) || jl_method_morespecific(m, mX))
+                    continue;
+                if (!match_at_member(m, member, mask))
+                    continue;
+                jl_value_t *ti = gc[6] = jl_type_intersection(q, (jl_value_t*)m->sig);
+                if (ti == jl_bottom_type)
+                    continue;
+                int dominated = 0;
+                for (size_t k = 0; k < l && !dominated; k++) {
+                    jl_method_t *m3 = ((jl_method_match_t*)jl_array_ptr_ref((jl_array_t*)res, k))->method;
+                    dominated = m3 != mX && m3 != m && jl_method_morespecific(m3, mX) &&
+                                jl_method_morespecific(m3, m) && jl_subtype(ti, (jl_value_t*)m3->sig);
+                }
+                if (!dominated)
+                    jl_array_ptr_1d_push(tied, (jl_value_t*)m);
+            }
+            size_t nt = jl_array_nrows(tied);
+            if (nt > 0) {
+                // the joint method: the signatures' intersection, where the sets meet as All{X, Y};
+                // at the member where that is empty
+                jl_value_t *joint = gc[6] = (jl_value_t*)mX->sig;
+                jl_value_t *at = gc[7] = q;
+                jl_svec_t *sigs = jl_alloc_svec(nt);
+                gc[3] = (jl_value_t*)sigs;
+                for (size_t i = 0; i < nt; i++) {
+                    jl_value_t *sg = (jl_value_t*)((jl_method_t*)jl_array_ptr_ref(tied, i))->sig;
+                    jl_svecset(sigs, i, sg);
+                    if (joint != jl_bottom_type)
+                        joint = gc[6] = jl_type_intersection(joint, sg);
+                    if (at != jl_bottom_type)
+                        at = gc[7] = jl_type_intersection(at, sg);
+                }
+                if (joint == jl_bottom_type)
+                    joint = at != jl_bottom_type ? at : q;
+                membership_ambig_found(found, mX, X, sigs, member, joint);
+            }
+            gc[2] = gc[3] = gc[4] = gc[6] = gc[7] = NULL;
+        }
+        gc[1] = NULL;
+    }
+    jl_set_membership_query_world(mq0);
+    JL_GC_POP();
+}
+
+JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t *set_instance,
+                                                 size_t entry_min_world)
+{
+    membership_ambiguities(member, set_instance, entry_min_world, NULL);
 }
 
 // see if it might be possible to construct an instance of `typ`
