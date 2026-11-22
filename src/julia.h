@@ -386,6 +386,9 @@ typedef struct _jl_method_t {
     // Override the conclusions of inter-procedural effect analysis,
     // forcing the conclusion to always true.
     _jl_purity_overrides_t purity;
+    // a declared result: an upper bound of what the method returns (`f(…)::RT` where `RT` is a type at
+    // the definition), or NULL. Inference reads it for an operation of a closed type's contract
+    jl_value_t *declared_result;
     // the method's policy, bits 0-1: 0 as its module says, 1 a boundary (compiled in the policy
     // of the code that reaches it), 2 always compiled by facts; fully typed mode, bits 2-3: 4 warn,
     // 8 enforce
@@ -577,6 +580,17 @@ typedef struct {
     // jl_emptysvec when none was declared. The entry of a type value (member pattern Type{S}) is kept on
     // S's TypeName.
     _Atomic(jl_svec_t*) memberships;
+    // a set's contract, written once by a library at the declaration and read without an edge; a
+    // closed abstract type's, svec(operations, candidates), written once by its declaring module;
+    // nothing until then
+    _Atomic(jl_value_t*) contract;
+    // a set's declared fields, svec(names, types), the types in the wrapper's variables: written once
+    // by a library, read by inference; nothing until then
+    _Atomic(jl_value_t*) declared_fields;
+    // a set's operations, an svec of entries svec(f, sig, rt, default): the function, the declared
+    // signature and result as types in the set's and the operation's variables, the default's method or
+    // nothing. Written once by a library at the declaration, read by inference; nothing until then
+    _Atomic(jl_value_t*) operations;
 } jl_typename_t;
 
 // One declared membership of a member type in a set, kept on the member's TypeName. The member pattern
@@ -846,7 +860,9 @@ enum jl_binding_flags {
     // this binding. If not, invalidation is optimized.
     BINDING_FLAG_ANY_IMPLICIT_EDGES                   = 0x8,
     // an owner-only function by its owner's declaration: only its owner defines its methods
-    BINDING_FLAG_OWNER_ONLY                           = 0x10
+    BINDING_FLAG_OWNER_ONLY                           = 0x10,
+    // a trait's operation, open to the set's members: not owner-only by its module's default
+    BINDING_FLAG_OPEN_OPERATION                       = 0x20
 };
 
 // the bits of a module's options word

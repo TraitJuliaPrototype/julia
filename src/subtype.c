@@ -1395,6 +1395,31 @@ jl_value_t *jl_membership_instance(jl_value_t *x, jl_membership_t *en)
     return membership_instance(x, en);
 }
 
+// The instances of the sets that the set instance `x` joins by the entries on its own TypeName, live
+// in the query world: its supertraits' instances at x's parameters. Inference reads them without an
+// edge, as it reads the declared fields. Empty where x has free variables.
+JL_DLLEXPORT jl_value_t *jl_supertrait_instances(jl_value_t *x)
+{
+    jl_array_t *out = jl_alloc_vec_any(0);
+    jl_value_t *inst = NULL;
+    JL_GC_PUSH2(&out, &inst);
+    if (jl_is_datatype(x) && !jl_has_free_typevars(x)) {
+        size_t world = jl_membership_world();
+        jl_svec_t *list = jl_typename_memberships(((jl_datatype_t*)x)->name);
+        for (size_t i = 0; i < jl_svec_len(list); i++) {
+            jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
+            if (entry_for_value(en) || !entry_live(en, world))
+                continue;
+            JL_GC_PROMISE_ROOTED(en); // entries are never removed from a TypeName's list
+            inst = membership_instance(x, en);
+            if (inst != NULL)
+                jl_array_ptr_1d_push(out, inst);
+        }
+    }
+    JL_GC_POP();
+    return (jl_value_t*)out;
+}
+
 static size_t jl_membership_world(void) JL_NOTSAFEPOINT
 {
     jl_task_t *ct = query_task();

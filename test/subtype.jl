@@ -3292,4 +3292,51 @@ sf(::HY) = 2
         ccall(:jl_set_strict_memberships, Cint, (Cint,), old)
     end
 end
+
+# a set's contract: an operation's call at a receiver typed by the set is inferred as the operation's
+# declared result and its result asserted; a declared field read there has its declared type, also one a
+# set it joins declares; `f(…)::RT` records the method's declared result, which a closed abstract
+# type's contract operations give
+@set OX
+@set OY
+function area end
+function perimeter end
+struct OS
+    r::Int
+    name::String
+end
+area(s::OS) = 1.0
+member!(OX, OS)
+member!(OY, OX)
+ccall(:jl_set_contract_operations, Cvoid, (Any, Any), OX,
+      Core.svec(Core.svec(area, Tuple{typeof(area), OX}, Float64, nothing)))
+ccall(:jl_set_declared_fields, Cvoid, (Any, Any, Any), OX, Core.svec(:r), Core.svec(Int))
+ccall(:jl_set_declared_fields, Cvoid, (Any, Any, Any), OY, Core.svec(:name), Core.svec(String))
+first_area(v::Vector{OX}) = area(v[1])
+first_r(v::Vector{OX}) = v[1].r
+first_name(v::Vector{OX}) = v[1].name
+abstract type CA end
+struct CB <: CA end
+cop(::CB) = 1
+cop(x::CA)::Int = error("no cop")
+ccall(:jl_declare_contract, Cvoid, (Any, Any, Any), CA, Core.svec(which(cop, (CA,))), Core.svec(CB))
+first_cop(v::Vector{CA}) = cop(v[1])
+
+@testset "declared results, fields and operations" begin
+    @test Base.return_types(first_area, (Vector{OX},)) == Any[Float64]
+    @test first_area(OX[OS(1, "a")]) === 1.0
+    src = only(code_typed(first_area, (Vector{OX},))).first
+    @test any(x -> Meta.isexpr(x, :call) && x.args[1] == GlobalRef(Core, :typeassert), src.code)
+    @test Base.return_types(first_r, (Vector{OX},)) == Any[Int]
+    @test Base.return_types(first_name, (Vector{OX},)) == Any[String]   # a set it joins declares it
+    @test first_r(OX[OS(2, "b")]) == 2
+    @test_throws ErrorException ccall(:jl_set_contract_operations, Cvoid, (Any, Any), OX, Core.svec())
+    @test_throws ErrorException ccall(:jl_set_declared_fields, Cvoid, (Any, Any, Any), Int, Core.svec(), Core.svec())
+    @test which(cop, (CA,)).declared_result === Int && !isdefined(which(cop, (CB,)), :declared_result)
+    @test Base.return_types(first_cop, (Vector{CA},)) == Any[Int]
+    @test first_cop(CA[CB()]) == 1
+    @test_throws ErrorException ccall(:jl_declare_contract, Cvoid, (Any, Any, Any), CA, Core.svec(), Core.svec())
+    ccall(:jl_set_open_operation, Cvoid, (Any, Any), @__MODULE__, :area)
+    @test ccall(:jl_binding_open_operation_p, Cint, (Any, Any), @__MODULE__, :area) == 1
+end
 end # module SetsAndMemberships
