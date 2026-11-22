@@ -2256,6 +2256,79 @@ JL_DLLEXPORT jl_value_t *jl_debug_method_invalidation(int state)
     return jl_nothing;
 }
 
+// What a definition ended of the deep class: for each method definition, deletion and image
+// validation that ends code compiled by facts and deep G2, the cause and the instance ended, as
+// [kind, cause, code, ...], kind :definition, :deletion or :validation. A tool (a library that reports
+// a pirate) switches it on (jl_set_deep_endings) and takes the list after a definition or a load
+// (jl_take_deep_endings). It is filled only where such code ends, and only while switched on.
+jl_array_t *jl_deep_endings JL_GLOBALLY_ROOTED = NULL;
+static int deep_endings_on = 0;
+// rooted by the collectors (gc-stock.c, gc-mmtk.c): a cause is read back after allocations (the
+// invalidations it names)
+jl_value_t *jl_deep_ending_kind JL_GLOBALLY_ROOTED = NULL;   // a Symbol, set under the world counter's lock
+jl_value_t *jl_deep_ending_cause JL_GLOBALLY_ROOTED = NULL;  // a Method in the table
+static jl_mutex_t deep_endings_lock;
+
+JL_DLLEXPORT int jl_set_deep_endings(int on)
+{
+    int old = deep_endings_on;
+    deep_endings_on = on != 0;
+    return old;
+}
+
+JL_DLLEXPORT jl_value_t *jl_take_deep_endings(void)
+{
+    JL_LOCK(&deep_endings_lock);
+    jl_value_t *r = jl_deep_endings ? (jl_value_t*)jl_deep_endings : jl_nothing;
+    jl_deep_endings = NULL;
+    JL_UNLOCK(&deep_endings_lock);
+    return r;
+}
+
+static void note_deep_ending(jl_value_t *kind, jl_value_t *cause, jl_code_instance_t *ci)
+{
+    JL_LOCK(&deep_endings_lock);
+    if (jl_deep_endings == NULL)
+        jl_deep_endings = jl_alloc_vec_any(0);
+    jl_array_ptr_1d_push(jl_deep_endings, kind ? kind : jl_nothing);
+    jl_array_ptr_1d_push(jl_deep_endings, cause ? cause : jl_nothing);
+    jl_array_ptr_1d_push(jl_deep_endings, (jl_value_t*)ci);
+    JL_UNLOCK(&deep_endings_lock);
+}
+
+static int is_deep_facts_code(jl_code_instance_t *ci) JL_NOTSAFEPOINT
+{
+    uint8_t f = jl_atomic_load_relaxed(&ci->flags);
+    return (f & JL_CI_FLAGS_G2) && (f & JL_CI_FLAGS_FACTS);
+}
+
+// image validation (Compiler's reinfer.jl): an edge of a loaded CodeInstance that fails in this session
+JL_DLLEXPORT void jl_note_deep_ending(jl_value_t *edge, jl_code_instance_t *ci)
+{
+    if (deep_endings_on && jl_is_code_instance(ci) && is_deep_facts_code(ci))
+        note_deep_ending((jl_value_t*)jl_symbol("validation"), edge, ci);
+}
+
+// the cause of what the invalidations below end, set by the definition or deletion that runs them;
+// only the outermost push sets the cause, and its pop clears it. Returns whether it set the cause.
+// The globals hold the cause while it is in force, so no caller holds it in a local across the
+// invalidations.
+static int deep_ending_push(const char *kind, jl_value_t *cause)
+{
+    if (jl_deep_ending_kind != NULL || !deep_endings_on)
+        return 0;
+    jl_deep_ending_cause = cause;
+    jl_deep_ending_kind = (jl_value_t*)jl_symbol(kind);
+    return 1;
+}
+static void deep_ending_pop(int pushed) JL_NOTSAFEPOINT
+{
+    if (pushed) {
+        jl_deep_ending_kind = NULL;
+        jl_deep_ending_cause = NULL;
+    }
+}
+
 static void _invalidate_backedges(jl_method_instance_t *replaced_mi, jl_code_instance_t *replaced_ci, size_t max_world, int depth);
 
 // recursively invalidate cached methods that had an edge to a replaced method
@@ -2279,6 +2352,9 @@ static void invalidate_code_instance(jl_code_instance_t *replaced, size_t max_wo
     if (replacedmaxworld == ~(size_t)0) {
         assert(jl_atomic_load_relaxed(&replaced->min_world) - 1 <= max_world && "attempting to set illogical world constraints (probable race condition)");
         jl_atomic_store_release(&replaced->max_world, max_world);
+        // deep G2 code compiled by facts ended: kept for a tool's report
+        if (deep_endings_on && is_deep_facts_code(replaced))
+            note_deep_ending(jl_deep_ending_kind, jl_deep_ending_cause, replaced);
         // recurse to all backedges to update their valid range also
         _invalidate_backedges(replaced_mi, replaced, max_world, depth + 1);
         // TODO: should we visit all forward edges now and delete ourself from all of those lists too?
@@ -2872,7 +2948,9 @@ JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
         jl_atomic_store_relaxed(&method->dispatch_status, 0);
         assert(jl_atomic_load_relaxed(&methodentry->max_world) == ~(size_t)0);
         jl_atomic_store_relaxed(&methodentry->max_world, world);
+        int pushed = deep_ending_push("deletion", (jl_value_t*)method);
         jl_method_table_invalidate(method, world, 1);
+        deep_ending_pop(pushed);
         jl_atomic_store_release(&jl_world_counter, world + 1);
     }
     JL_UNLOCK(&world_counter_lock);
@@ -3064,6 +3142,8 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     assert(jl_is_mtable(mt));
     assert(jl_is_method(method));
     jl_timing_show_method(method, JL_TIMING_DEFAULT_BLOCK);
+    // what this definition ends of the deep class is the method's
+    int pushed = deep_ending_push("definition", (jl_value_t*)method);
     jl_value_t *type = (jl_value_t*)newentry->sig;
     jl_value_t *oldvalue = NULL;
     jl_array_t *oldmi = NULL;
@@ -3304,6 +3384,7 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     jl_atomic_store_relaxed(&method->dispatch_status, dispatch_bits); // TODO: this should be sequenced fully after the world counter store
     jl_atomic_store_release(&method->interferences, interferences);
     jl_gc_wb(method, interferences);
+    deep_ending_pop(pushed);
     JL_GC_POP();
 }
 
