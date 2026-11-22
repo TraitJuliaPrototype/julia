@@ -4851,7 +4851,7 @@ static NOINLINE jl_value_t *apply_generic_reach(jl_value_t *F, jl_value_t **args
 {
     size_t world = jl_current_task->world_age;
     if (__unlikely(dp_on > 0))
-        dp_ip = (void*)jl_return_address();
+        dp_ip = ip; // the dynamic call's return address, taken by the entry that jumped here
     jl_method_instance_t *mfunc = jl_lookup_generic_(F, args, nargs,
                                                      jl_int32hash_fast((uint32_t)(uintptr_t)ip),
                                                      world);
