@@ -3339,4 +3339,21 @@ first_cop(v::Vector{CA}) = cop(v[1])
     ccall(:jl_set_open_operation, Cvoid, (Any, Any), @__MODULE__, :area)
     @test ccall(:jl_binding_open_operation_p, Cint, (Any, Any), @__MODULE__, :area) == 1
 end
+# a set that occurs only as a type variable's lower bound: subtyping walks the bound, so a membership
+# decides the question there, and the bit "a set occurs in this type" must see it
+@set XLB
+struct LBM end
+const LBU = Union{XLB, LBM}                                    # made before the membership
+const LBA = let S = TypeVar(:S, XLB, Any); UnionAll(S, Ref{S}) end   # Ref{S} where S >: XLB
+const LBB = let S = TypeVar(:S, LBU, Any); UnionAll(S, Ref{S}) end   # Ref{S} where S >: Union{XLB, LBM}
+lbq() = Vector{LBA} <: Vector{LBB}                             # compiled before the membership
+@test !lbq()
+member!(XLB, LBM)
+
+@testset "a set in a type variable's lower bound" begin
+    @test ccall(:jl_has_open_set, Cint, (Any,), LBA) == 1
+    @test ccall(:jl_has_open_set, Cint, (Any,), Vector{LBA}) == 1
+    @test LBA == LBB
+    @test lbq()
+end
 end # module SetsAndMemberships

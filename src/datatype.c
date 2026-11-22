@@ -104,8 +104,10 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     return tn;
 }
 
-// Whether a set occurs in v: as the type, a parameter, a union component or a bound. A DataType's bit
-// is final from its construction, since a set is a set from its declaration, so the recursion stops there.
+// Whether a set occurs in v: as the type, a parameter, a union component or a variable's bound, lower
+// or upper (subtyping walks both bounds, so a membership decides a question where a set occurs only as
+// a lower bound). A DataType's bit is final from its construction, since a set is a set from its
+// declaration, so the recursion stops there.
 static int open_set_witness(jl_value_t *v) JL_NOTSAFEPOINT
 {
     jl_value_t *uw = jl_is_unionall(v) ? jl_unwrap_unionall(v) : v;
@@ -119,7 +121,7 @@ static int open_set_witness(jl_value_t *v) JL_NOTSAFEPOINT
         return open_set_witness(((jl_uniontype_t*)uw)->a) ||
                open_set_witness(((jl_uniontype_t*)uw)->b);
     if (jl_is_typevar(uw))
-        return open_set_witness(((jl_tvar_t*)uw)->ub);
+        return open_set_witness(((jl_tvar_t*)uw)->lb) || open_set_witness(((jl_tvar_t*)uw)->ub);
     return 0;
 }
 
