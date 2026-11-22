@@ -2337,8 +2337,20 @@ static int _invalidate_dispatch_backedges(jl_method_instance_t *mi, jl_value_t *
             continue;
         }
         JL_GC_PROMISE_ROOTED(caller); // propagated by get_next_edge from backedges
+        JL_GC_PROMISE_ROOTED(invokeTypes); // as caller: propagated by get_next_edge from backedges
         int replaced_edge;
-        if (invokeTypes) {
+        if (invokeTypes && jl_is_svec(invokeTypes)) {
+            // an ordinary call that reached this instance from a narrower signature (a `@nospecialize`
+            // argument inferred so): its dispatch changes only where the new method replaces this one over
+            // the part of the call's signature it meets, whatever else of the instance's signature it meets
+            jl_value_t *callsig = jl_svecref(invokeTypes, 0);
+            jl_value_t *cisect = NULL, *cisect2 = NULL;
+            JL_GC_PUSH2(&cisect, &cisect2);
+            replaced_edge = jl_type_intersection2(type, callsig, &cisect, &cisect2) &&
+                            is_replacing(ambig, type, m, d, n, cisect, cisect2, morespec);
+            JL_GC_POP();
+        }
+        else if (invokeTypes) {
             // n.b. normally we must have mi.specTypes <: invokeTypes <: m.sig (though it might not strictly hold), so we only need to check the other subtypes
             if (jl_egal(invokeTypes, jl_get_ci_mi(caller)->def.method->sig))
                 replaced_edge = 0; // if invokeTypes == m.sig, then the only way to change this invoke is to replace the method itself
@@ -2388,7 +2400,7 @@ JL_DLLEXPORT void jl_method_instance_add_backedge(jl_method_instance_t *callee, 
         invokesig = NULL;      // julia uses `nothing` but C uses NULL (#undef)
     assert(jl_is_method_instance(callee));
     assert(jl_is_code_instance(caller));
-    assert(invokesig == NULL || jl_is_type(invokesig));
+    assert(invokesig == NULL || jl_is_type(invokesig) || (jl_is_svec(invokesig) && jl_svec_len(invokesig) == 1));
     JL_LOCK(&callee->def.method->writelock);
     if (jl_atomic_load_relaxed(&allow_new_worlds)) {
         jl_array_t *backedges = jl_mi_get_backedges(callee);
