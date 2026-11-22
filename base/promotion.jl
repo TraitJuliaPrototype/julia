@@ -186,12 +186,12 @@ function promote_typejoin(@nospecialize(a), @nospecialize(b))
     c = invoke(typejoin, Tuple{Any, Any}, invoke(_promote_typesubtract, Tuple{Any}, a), invoke(_promote_typesubtract, Tuple{Any}, b))
     return Union{a, b, c}::Type
 end
-_promote_typesubtract(@nospecialize(a)) =
+_promote_typesubtract(@nospecialize(a)) = (@_nospecializeinfer_meta;
     a === Any ? a :
     Union{Nothing, Missing} <: a ? invoke(typesplit, Tuple{Any, Any}, a, Union{Nothing, Missing}) :
     Nothing <: a ? invoke(typesplit, Tuple{Any, Any}, a, Nothing) :
     Missing <: a ? invoke(typesplit, Tuple{Any, Any}, a, Missing) :
-    a
+    a)
 
 function promote_typejoin_union(::Type{T}) where T
     if T === Union{}
