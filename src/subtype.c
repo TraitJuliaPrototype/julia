@@ -542,6 +542,7 @@ static int obviously_in_union(jl_value_t *u, jl_value_t *x)
     return obviously_egal(u, x);
 }
 
+static int membership_may_reach(jl_datatype_t *x, jl_typename_t *yname);
 static size_t jl_membership_world(void) JL_NOTSAFEPOINT;
 static int entry_live(jl_membership_t *en, size_t world) JL_NOTSAFEPOINT;
 static int entry_for_value(jl_membership_t *en) JL_NOTSAFEPOINT;
@@ -607,8 +608,14 @@ int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
                     // either side is a set, or a kind of type object meets a set that takes a type value
                     if (kind_meets_set(ad, bd) || kind_meets_set(bd, ad))
                         return 0;
-                    if (bd->name->open_set || ad->name->open_set)
-                        return 0;
+                    // a concrete type no entry of whose chain can reach the set is disjoint from it:
+                    // subtyping's fast path for a non-member
+                    if (bd->name->open_set)
+                        return !specificity && !ad->name->open_set && jl_is_concrete_type((jl_value_t*)ad) &&
+                               !membership_may_reach(ad, bd->name);
+                    if (ad->name->open_set)
+                        return !specificity && jl_is_concrete_type((jl_value_t*)bd) &&
+                               !membership_may_reach(bd, ad->name);
                     return 1;
                 }
                 bd = temp;
@@ -1205,11 +1212,97 @@ static int entry_for_value(jl_membership_t *en) JL_NOTSAFEPOINT
     return jl_is_datatype(p) && ((jl_datatype_t*)p)->name == jl_type_typename;
 }
 
+// Reachability between TypeNames, memoized per world range. An answer holds for the worlds in which
+// every entry its walk examined keeps the visibility it had in the asked world; it is capped at the
+// world counter when computed, since a later membership has a later min_world. Lock-free: a seqlock per
+// slot; a racing writer skips. Keys are TypeName addresses, which TypeNames keep for the session.
+#define REACH_MEMO_SIZE 4096
+typedef struct {
+    _Atomic(size_t) seq;
+    _Atomic(void*) from;
+    _Atomic(void*) to;
+    _Atomic(size_t) lo;
+    _Atomic(size_t) hi;
+    _Atomic(int) mode_ans;
+} reach_slot_t;
+static reach_slot_t reach_memo[REACH_MEMO_SIZE];
+
+static reach_slot_t *reach_slot(void *from, void *to, int mode) JL_NOTSAFEPOINT
+{
+    uint64_t h = ((uint64_t)(uintptr_t)from * 0x9E3779B97F4A7C15ull) ^
+                 ((uint64_t)(uintptr_t)to * 0xC2B2AE3D27D4EB4Full) ^ (uint64_t)mode;
+    return &reach_memo[(h >> 32) & (REACH_MEMO_SIZE - 1)];
+}
+
+static int reach_memo_get(void *from, void *to, int mode, size_t world, int *ans,
+                          size_t *lo, size_t *hi) JL_NOTSAFEPOINT
+{
+    reach_slot_t *sl = reach_slot(from, to, mode);
+    size_t q = jl_atomic_load_acquire(&sl->seq);
+    if (q & 1)
+        return 0;
+    void *f = jl_atomic_load_relaxed(&sl->from);
+    void *t = jl_atomic_load_relaxed(&sl->to);
+    size_t l = jl_atomic_load_relaxed(&sl->lo);
+    size_t h = jl_atomic_load_relaxed(&sl->hi);
+    int ma = jl_atomic_load_relaxed(&sl->mode_ans);
+    atomic_thread_fence(memory_order_acquire); // the field loads before the second seq load
+    if (jl_atomic_load_acquire(&sl->seq) != q)
+        return 0;
+    if (f != from || t != to || (ma >> 1) != mode || world < l || world > h)
+        return 0;
+    *ans = ma & 1;
+    if (*lo < l)
+        *lo = l;
+    if (*hi > h)
+        *hi = h;
+    return 1;
+}
+
+static void reach_memo_put(void *from, void *to, int mode, size_t lo, size_t hi, int ans) JL_NOTSAFEPOINT
+{
+    reach_slot_t *sl = reach_slot(from, to, mode);
+    size_t q = jl_atomic_load_relaxed(&sl->seq);
+    if ((q & 1) || !jl_atomic_cmpswap(&sl->seq, &q, q + 1))
+        return;
+    jl_atomic_store_relaxed(&sl->from, from);
+    jl_atomic_store_relaxed(&sl->to, to);
+    jl_atomic_store_relaxed(&sl->lo, lo);
+    jl_atomic_store_relaxed(&sl->hi, hi);
+    jl_atomic_store_relaxed(&sl->mode_ans, mode * 2 + ans);
+    jl_atomic_store_release(&sl->seq, q + 2);
+}
+
+// narrow [*lo, *hi] around `world` to the worlds in which `en` has the visibility it has in `world`
+static void narrow_by_entry(jl_membership_t *en, size_t world, size_t *lo, size_t *hi) JL_NOTSAFEPOINT
+{
+    size_t mn = en->min_world, mx = jl_atomic_load_relaxed(&en->max_world);
+    if (mn > world) {
+        if (*hi >= mn)
+            *hi = mn - 1;
+    }
+    else if (mx < world) {
+        if (*lo <= mx)
+            *lo = mx + 1;
+    }
+    else {
+        if (*lo < mn)
+            *lo = mn;
+        if (*hi > mx)
+            *hi = mx;
+    }
+}
+
 // Does the TypeName `from` reach `to` along declared supertypes and the entries of types live in
-// `world` (0: every entry)? The cycle check of a declaration and the walk's choice of entries ask it.
-int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world) JL_NOTSAFEPOINT
+// `world` (0: every entry)? Narrows [*lo, *hi] to the worlds in which the answer holds. The cycle check
+// of a declaration and the walk's choice of entries ask it.
+static int typename_reaches_r(jl_typename_t *from, jl_typename_t *to, size_t world,
+                              size_t *lo, size_t *hi) JL_NOTSAFEPOINT
 {
     int ans = 0;
+    if (world != 0 && reach_memo_get(from, to, 0, world, &ans, lo, hi))
+        return ans;
+    size_t mlo = 1, mhi = jl_atomic_load_acquire(&jl_world_counter);
     arraylist_t todo, seen;
     arraylist_new(&todo, 0);
     arraylist_new(&seen, 0);
@@ -1235,13 +1328,30 @@ int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world) JL
         jl_svec_t *list = jl_typename_memberships(tn);
         for (i = 0; i < jl_svec_len(list); i++) {
             jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
-            if (!entry_for_value(en) && entry_live(en, world))
+            if (entry_for_value(en))
+                continue;
+            if (world != 0)
+                narrow_by_entry(en, world, &mlo, &mhi);
+            if (entry_live(en, world))
                 arraylist_push(&todo, en->set);
         }
     }
     arraylist_free(&todo);
     arraylist_free(&seen);
+    if (world != 0) {
+        reach_memo_put(from, to, 0, mlo, mhi, ans);
+        if (*lo < mlo)
+            *lo = mlo;
+        if (*hi > mhi)
+            *hi = mhi;
+    }
     return ans;
+}
+
+int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world) JL_NOTSAFEPOINT
+{
+    size_t lo = 0, hi = ~(size_t)0;
+    return typename_reaches_r(from, to, world, &lo, &hi);
 }
 
 // the instance of the entry for x, when x matches the entry's pattern, else NULL. The match is a query
@@ -1301,6 +1411,47 @@ static int entry_counts(jl_membership_t *en, int value, jl_typename_t *yname, si
     if (!entry_live(en, world) || entry_for_value(en) != value)
         return 0;
     return yname == NULL || en->set == yname || jl_typename_reaches(en->set, yname, world);
+}
+
+// whether an entry of x's can lead to the set `yname` in the current query world: an entry of x's
+// TypeName or of a type on its supertype chain, or, for the type value Type{S}, an entry of S's for the
+// value. When none can, `x <: y` is false without the walk. Memoized as reachability is.
+static int list_may_reach(jl_svec_t *list, int value, jl_typename_t *yname, size_t world,
+                          size_t *lo, size_t *hi) JL_NOTSAFEPOINT
+{
+    for (size_t i = 0; i < jl_svec_len(list); i++) {
+        jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
+        if (entry_for_value(en) != value)
+            continue;
+        narrow_by_entry(en, world, lo, hi);
+        if (entry_live(en, world) &&
+            (en->set == yname || typename_reaches_r(en->set, yname, world, lo, hi)))
+            return 1;
+    }
+    return 0;
+}
+
+static int membership_may_reach(jl_datatype_t *x, jl_typename_t *yname)
+{
+    size_t world = jl_membership_world();
+    if (world == 0)
+        return 1;
+    jl_typename_t *vhome = value_entries_home(x);
+    int mode = vhome != NULL ? 2 : 1;
+    jl_typename_t *from = vhome != NULL ? vhome : x->name;
+    int ans = 0;
+    size_t lo = 1, hi = jl_atomic_load_acquire(&jl_world_counter);
+    if (reach_memo_get(from, yname, mode, world, &ans, &lo, &hi))
+        return ans;
+    if (vhome != NULL) {
+        ans = list_may_reach(jl_typename_memberships(vhome), 1, yname, world, &lo, &hi);
+    }
+    else {
+        for (jl_datatype_t *xd = x; !ans && xd != NULL && xd != jl_any_type; xd = xd->super)
+            ans = list_may_reach(jl_typename_memberships(xd->name), 0, yname, world, &lo, &hi);
+    }
+    reach_memo_put(from, yname, mode, lo, hi, ans);
+    return ans;
 }
 
 // the instance side of an entry: its own variables (an instance for every value of a parameter that is
@@ -2461,8 +2612,12 @@ static int obvious_subtype(jl_value_t *x, jl_value_t *y, jl_value_t *y0, int *su
                         return 0;
                     if (temp == jl_any_type) {
                         // a membership can still relate the pair: abstain, so that the full subtype
-                        // walks the entries
-                        if (((jl_datatype_t*)y)->name->open_set && !((jl_datatype_t*)x)->name->never_member)
+                        // walks the entries, unless no entry of x's can lead to y (with free variables
+                        // in x, abstain)
+                        jl_datatype_t *ydd = (jl_datatype_t*)y;
+                        if (ydd->name->open_set && !((jl_datatype_t*)x)->name->never_member &&
+                            (((jl_datatype_t*)x)->hasfreetypevars ||
+                             membership_may_reach((jl_datatype_t*)x, ydd->name)))
                             return 0;
                         *subtype = 0;
                         return 1;
