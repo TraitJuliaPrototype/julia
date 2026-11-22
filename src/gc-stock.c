@@ -2911,8 +2911,6 @@ static void gc_mark_roots(jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT
     gc_try_claim_and_push(mq, jl_deep_ending_cause, NULL);
     gc_try_claim_and_push(mq, jl_fully_typed_hook, NULL); // fully typed mode's hook (gf.c)
     gc_try_claim_and_push(mq, jl_set_entries, NULL); // the entries at each set (datatype.c)
-    gc_try_claim_and_push(mq, jl_set_candidates, NULL); // the sets' candidates (datatype.c)
-    gc_try_claim_and_push(mq, jl_split_table_miss_func, NULL); // the split tables' miss (gf.c)
     gc_try_claim_and_push(mq, jl_absence_sigs, NULL); // each set's absence signatures (datatype.c)
     gc_try_claim_and_push(mq, jl_declared_memberships, NULL); // this session's memberships (datatype.c)
     gc_try_claim_and_push(mq, jl_atomic_load_relaxed(&jl_activated_entries), NULL); // the entries images activated

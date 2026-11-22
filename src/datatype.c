@@ -203,60 +203,6 @@ static jl_value_t *publish_entry(jl_typename_t *tn, jl_typename_t *setname, jl_v
     return entry_v;
 }
 
-jl_genericmemory_t *jl_set_candidates JL_GLOBALLY_ROOTED = NULL;
-
-static jl_mutex_t candidates_lock;
-
-static void register_candidate(jl_typename_t *set, jl_value_t *T)
-{
-    jl_array_t *nw = NULL;
-    JL_GC_PUSH1(&nw);
-    JL_LOCK(&candidates_lock);
-    if (jl_set_candidates == NULL)
-        jl_set_candidates = jl_alloc_memory_any(16);
-    jl_array_t *old = (jl_array_t*)jl_eqtable_get(jl_set_candidates, (jl_value_t*)set, NULL);
-    size_t n = old ? jl_array_nrows(old) : 0;
-    int seen = 0;
-    for (size_t i = 0; i < n && !seen; i++)
-        seen = jl_array_ptr_ref(old, i) == T;
-    if (!seen) {
-        nw = jl_alloc_vec_any(n + 1);
-        for (size_t i = 0; i < n; i++)
-            jl_array_ptr_set(nw, i, jl_array_ptr_ref(old, i));
-        jl_array_ptr_set(nw, n, T);
-        jl_set_candidates = jl_eqtable_put(jl_set_candidates, (jl_value_t*)set, (jl_value_t*)nw, NULL);
-    }
-    JL_UNLOCK(&candidates_lock);
-    JL_GC_POP();
-}
-
-// a member taken back leaves its set's candidates, a pattern's every member with
-// it: the list replaced without them. Called under the world counter's lock, so no declaration adds one
-// meanwhile.
-static void unregister_candidates(jl_typename_t *set, jl_value_t *member)
-{
-    jl_array_t *old = NULL, *nw = NULL;
-    JL_GC_PUSH2(&old, &nw);
-    JL_LOCK(&candidates_lock);
-    old = jl_set_candidates ? (jl_array_t*)jl_eqtable_get(jl_set_candidates, (jl_value_t*)set, NULL) : NULL;
-    JL_UNLOCK(&candidates_lock);
-    size_t n = old ? jl_array_nrows(old) : 0;
-    int concrete = jl_is_concrete_type(member);
-    nw = jl_alloc_vec_any(0);
-    for (size_t i = 0; i < n; i++) {
-        jl_value_t *T = jl_array_ptr_ref(old, i);
-        int drop = T == member || (!concrete && jl_is_type(T) && jl_subtype(T, member));
-        if (!drop)
-            jl_array_ptr_1d_push(nw, T);
-    }
-    if (n > 0 && jl_array_nrows(nw) < n) {
-        JL_LOCK(&candidates_lock);
-        jl_set_candidates = jl_eqtable_put(jl_set_candidates, (jl_value_t*)set, (jl_value_t*)nw, NULL);
-        JL_UNLOCK(&candidates_lock);
-    }
-    JL_GC_POP();
-}
-
 // The entries at each set: a set's TypeName to a Vector{Any} of the entries whose set it is, in force
 // or ended. The check of a member pattern reads it. Written under the world counter's lock; a list is
 // replaced, never mutated.
@@ -858,8 +804,8 @@ void jl_activate_memberships(jl_array_t *list, size_t world)
         en->min_world = world;
         if (jl_is_method(en->method) &&
             !(jl_atomic_load_relaxed(&((jl_method_t*)en->method)->dispatch_status) & METHOD_SIG_LATEST_WHICH)) {
-            // its method was not activated: the library's image hook left it inactive,
-            // as strict mode does with a pirate's membership. The membership is in force in no world
+            // its method was not activated: the library's image hook left it inactive, as a strict
+            // mode does with a pirate's membership. The membership is in force in no world
             jl_atomic_store_release(&en->max_world, world - 1);
             continue;
         }
@@ -887,8 +833,8 @@ void jl_activate_memberships(jl_array_t *list, size_t world)
                 present = 1;
                 continue;
             }
-            // as at a declaration: an older entry in force for the same member, set and
-            // inputs ends where this one begins
+            // as at a declaration: an older entry in force for the same member, set and inputs ends
+            // where this one begins
             if (o->set == en->set && jl_atomic_load_relaxed(&o->max_world) == ~(uint64_t)0 &&
                 jl_types_equal(o->member, en->member) && same_inputs(en->set, o->instance, en->instance))
                 jl_atomic_store_release(&o->max_world, world - 1);
@@ -901,12 +847,6 @@ void jl_activate_memberships(jl_array_t *list, size_t world)
         jl_svecset(nd, jl_svec_len(old), (jl_value_t*)en);
         jl_atomic_store_release(&home->memberships, (jl_svec_t*)nd);
         jl_gc_wb(home, nd);
-    }
-    nd = NULL;
-    for (size_t i = 0; i + 1 < n; i += 2) {
-        jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i + 1);
-        if (jl_atomic_load_relaxed(&en->max_world) == ~(uint64_t)0 && jl_is_concrete_type(en->member))
-            register_candidate(en->set, en->member);
     }
     JL_GC_POP();
 }
@@ -1072,8 +1012,8 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         jl_error("a membership's forwarding field is a Symbol or nothing");
     if (names_foreign_var(set_instance, member))
         jl_error("a membership's set instance names a type variable its member pattern does not");
-    // the membership's method, which the edges of folded answers rest on: made here, added
-    // to the table once the membership is accepted, and activated in the entry's world
+    // the membership's method, which the edges of folded answers rest on: made here, added to the
+    // table once the membership is accepted, and activated in the entry's world
     jl_value_t *msig = NULL;
     jl_method_t *mmeth = NULL;
     jl_typemap_entry_t *mentry = NULL;
@@ -1090,17 +1030,17 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         jl_error("Membership changes have been disabled via a call to disable_new_worlds.");
     }
     size_t world = jl_atomic_load_relaxed(&jl_world_counter);
-    // a membership that would close a cycle among sets would make them equal: refused,
-    // by a walk over every path
+    // a membership that would close a cycle among sets would make them equal: refused, by a walk over
+    // every path
     if (home->open_set && jl_typename_reaches(setname, home, world)) {
         JL_UNLOCK(&world_counter_lock);
         jl_errorf("the membership %s <: %s would close a cycle among sets",
                   jl_symbol_name(home->name), jl_symbol_name(setname->name));
     }
-    // one instance per member and value of the set's inputs: a member of the set at
-    // these inputs already must be a member of this instance. For a concrete member this is a
-    // redeclaration; a pattern is checked against the patterns at the set, and ends an entry of
-    // the same pattern at the same inputs.
+    // one instance per member and value of the set's inputs: a member of the set at these inputs
+    // already must be a member of this instance. For a concrete member this is a redeclaration; a
+    // pattern is checked against the patterns at the set, and ends an entry of the same pattern at the
+    // same inputs.
     int redeclare = 0;
     int strict = jl_atomic_load_relaxed(&strict_memberships);
     if (jl_is_concrete_type(member)) {
@@ -1153,15 +1093,14 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
             }
         }
     }
-    // what the ambiguity search reads: the member's list and the set's entries. The entry begins at
-    // min_world, past every task's world until the counter advances
+    // the entry begins at min_world, past every task's world until the counter advances
     entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world,
                           mmeth != NULL ? (jl_value_t*)mmeth : jl_nothing);
     index_entry((jl_membership_t*)entry);
     if (strict) {
-        // strict mode: the ambiguities the entry makes, asked in its world before the
-        // counter advances to it; under the lock nothing else can enter that world. A hit retires the
-        // entry before it begins: live in no world, never removed from its lists, the counter unchanged
+        // strict mode: the ambiguities the entry makes, asked in its world before the counter advances
+        // to it; under the lock nothing else can enter that world. A hit retires the entry before it
+        // begins: live in no world, never removed from its lists, the counter unchanged
         found = jl_alloc_vec_any(0);
         size_t mq = jl_set_membership_query_world(min_world);
         jl_membership_ambiguities(member, set_instance, min_world, found);
@@ -1177,11 +1116,7 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
             jl_throw(msg);
         }
     }
-    if (jl_is_concrete_type(member))
-        register_candidate(setname, member);
-    // an argument, rooted by the caller: the analyzer moves its root to the svec register_candidate
-    // stores it in, and releases it with that frame
-    JL_GC_PROMISE_ROOTED(member);
+    // the session's list, from which an image built here takes its own modules' memberships
     if (jl_declared_memberships == NULL)
         jl_declared_memberships = jl_alloc_vec_any(0);
     jl_array_ptr_1d_push(jl_declared_memberships, (jl_value_t*)home);
@@ -1189,8 +1124,7 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     // what the membership ends of the deep class is the membership's, named by its method
     int pushed = jl_deep_ending_push("membership", mmeth != NULL ? (jl_value_t*)mmeth : entry);
     if (mmeth != NULL) {
-        // the method begins in the entry's world; its insertion ends the code that relied on the
-        // pair's absence, through the table's backedges. No refusal is past this point
+        // the method begins in the entry's world. No refusal is past this point
         mentry = jl_method_table_add(jl_method_table, mmeth, NULL);
         size_t mqm = jl_set_membership_query_world(min_world);
         jl_atomic_store_relaxed(&mmeth->primary_world, min_world);
@@ -1198,8 +1132,7 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         jl_set_membership_query_world(mqm);
     }
     jl_atomic_store_release(&jl_world_counter, min_world);
-    // the stopgap (compiler ): replay dispatch for the methods the member can now
-    // reach, then report the ambiguities, both at the entry's world
+    // what the membership changes of dispatch, then the ambiguities it creates, at the entry's world
     size_t mq = jl_set_membership_query_world(min_world);
     jl_membership_dispatch_walk(member, set_instance, min_world);
     jl_deep_ending_pop(pushed);
@@ -1263,14 +1196,16 @@ JL_DLLEXPORT void jl_delete_membership(jl_value_t *member, jl_value_t *set_insta
     size_t mq = jl_set_membership_query_world(world);
     jl_atomic_store_release(&found->max_world, world);
     // the entry's visibility changes at world + 1: a dispatch's range asked from then on is exact at its
-    // end, and one asked at an older world is cut at `world` (subtype.c, the range's fast path)
+    // end, and one asked at an older world is cut at `world`
     jl_membership_changed(world + 1);
+    // its method ends as a deleted method does: the code that folded the positive holds an edge to
+    // the method's instance and ends with it
     if (jl_is_method(mmeth))
         jl_membership_method_end((jl_method_t*)mmeth, world);
     jl_membership_removal_walk(found->member, found->instance, world);
     jl_set_membership_query_world(mq);
     jl_deep_ending_pop(pushed);
-    unregister_candidates(setname, found->member);
+    // the member's kept check answers go with the membership
     jl_member_states_forget(found->member, setname);
     jl_atomic_store_release(&jl_world_counter, world + 1);
     JL_UNLOCK(&world_counter_lock);
@@ -1390,6 +1325,7 @@ JL_DLLEXPORT void jl_set_contract(jl_value_t *T, jl_value_t *contract)
     jl_gc_wb(tn, contract);
 }
 
+
 // A closed abstract type with a contract: its declaring module writes it once on the type's contract
 // slot, which images keep with the TypeName: `svec(ops, cands)`, the operations' methods (each with its
 // declared result) and the split's candidates in order. Inference reads the operations where a call's
@@ -1443,41 +1379,6 @@ JL_DLLEXPORT jl_value_t *jl_contract_operations(jl_value_t *T)
     if (!has_contract(T))
         return jl_nothing;
     return jl_svecref(jl_atomic_load_relaxed(&((jl_datatype_t*)jl_unwrap_unionall(T))->name->contract), 0);
-}
-
-// a member of a pattern joins its set's candidates at its first use (the library);
-// a closed type's candidates are its contract's, named once with it
-JL_DLLEXPORT void jl_register_candidate(jl_value_t *set, jl_value_t *T)
-{
-    jl_value_t *uw = jl_unwrap_unionall(set);
-    if (has_contract(set))
-        jl_errorf("the candidates of %s are its contract's", jl_symbol_name(((jl_datatype_t*)uw)->name->name));
-    if (jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->open_set && jl_is_concrete_type(T))
-        register_candidate(((jl_datatype_t*)uw)->name, T);
-}
-
-JL_DLLEXPORT jl_value_t *jl_candidates_of(jl_value_t *set)
-{
-    jl_value_t *uw = jl_unwrap_unionall(set);
-    jl_value_t *r = NULL;
-    if (has_contract(set)) {
-        // a closed type's: its contract's, as a fresh list
-        jl_svec_t *cands = (jl_svec_t*)jl_svecref(jl_atomic_load_relaxed(&((jl_datatype_t*)uw)->name->contract), 1);
-        JL_GC_PUSH1(&cands);
-        size_t n = jl_svec_len(cands);
-        jl_array_t *a = jl_alloc_vec_any(n);
-        for (size_t i = 0; i < n; i++)
-            jl_array_ptr_set(a, i, jl_svecref(cands, i));
-        JL_GC_POP();
-        return (jl_value_t*)a;
-    }
-    if (jl_is_datatype(uw) && ((jl_datatype_t*)uw)->name->open_set) {
-        JL_LOCK(&candidates_lock);
-        if (jl_set_candidates != NULL)
-            r = jl_eqtable_get(jl_set_candidates, (jl_value_t*)((jl_datatype_t*)uw)->name, NULL);
-        JL_UNLOCK(&candidates_lock);
-    }
-    return r ? r : (jl_value_t*)jl_alloc_vec_any(0);
 }
 
 JL_DLLEXPORT int jl_is_open_set(jl_value_t *T)

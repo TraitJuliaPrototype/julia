@@ -179,7 +179,6 @@ include("ssair/tarjan.jl")
 
 include("abstractlattice.jl")
 include("stmtinfo.jl")
-include("splittable.jl")
 include("inferenceresult.jl")
 include("inferencestate.jl")
 

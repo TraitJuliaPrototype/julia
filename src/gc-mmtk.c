@@ -544,8 +544,6 @@ JL_DLLEXPORT void jl_gc_scan_vm_specific_roots(RootsWorkClosure* closure)
     add_node_to_roots_buffer(closure, &buf, &len, jl_deep_ending_cause);
     add_node_to_roots_buffer(closure, &buf, &len, jl_fully_typed_hook); // fully typed mode's hook (gf.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_set_entries); // the entries at each set (datatype.c)
-    add_node_to_roots_buffer(closure, &buf, &len, jl_set_candidates); // the sets' candidates (datatype.c)
-    add_node_to_roots_buffer(closure, &buf, &len, jl_split_table_miss_func); // the split tables' miss (gf.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_absence_sigs); // each set's absence signatures (datatype.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_declared_memberships); // this session's memberships (datatype.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_atomic_load_relaxed(&jl_activated_entries)); // the entries images activated
