@@ -1970,6 +1970,8 @@ JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X)
         return 1;
     if (jl_is_type_type(su) && ((jl_datatype_t*)xu)->name->open_set)
         return 1; // the induced Type{S} rule is always entry-answered
+    if (((jl_datatype_t*)su)->name == ((jl_datatype_t*)xu)->name && jl_nparams(su) != jl_nparams(xu))
+        return 1; // two tuples of different lengths (a Vararg tail): the positions do not pair
     if (((jl_datatype_t*)su)->name == ((jl_datatype_t*)xu)->name && jl_nparams(su) == jl_nparams(xu)) {
         // the same container: the truth may come from a PARAMETER
         // (Tuple{Bar,Int} vs Tuple{SetB,Int} with Bar a declared member) — mirror
@@ -1995,7 +1997,11 @@ JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X)
             return 1;
         xd = xd->super;
     }
-    return xd == jl_any_type; // the chain missed: only an entry could say true
+    if (xd == jl_any_type)
+        return 1; // the chain missed: only an entry could say true
+    // the chain reached X's type name: the declared supertype carries S's parameters
+    // (`P{S} <: AP{<:X}` through `struct P{T} <: AP{T}`), whose answer may come from an entry
+    return xd == (jl_datatype_t*)su ? 0 : jl_subtype_via_membership((jl_value_t*)xd, X);
 }
 
 // orientation-free pair relevance used by codegen (item 10e)
