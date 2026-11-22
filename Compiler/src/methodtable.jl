@@ -121,7 +121,14 @@ function _findall(@nospecialize(sig::Type), mt::Union{Nothing,MethodTable}, worl
         r = r[1]
     end
     isa(r, Vector) || return nothing
-    return MethodLookupResult(r, WorldRange(_min_val[], _max_val[]), _ambig[] != 0, cells)
+    worlds = WorldRange(_min_val[], _max_val[])
+    if cells !== nothing
+        # the lookup relies on each dropped pair's absence: its result holds only where that does
+        for c in cells::SimpleVector
+            worlds = intersect(worlds, absence_worlds(c, world))
+        end
+    end
+    return MethodLookupResult(r, worlds, _ambig[] != 0, cells)
 end
 
 function findall(@nospecialize(sig::Type), table::CachedMethodTable; limit::Int=-1)
