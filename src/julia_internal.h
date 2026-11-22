@@ -738,6 +738,12 @@ JL_DLLEXPORT int8_t jl_get_precompile_keep_ir(void);
 JL_DLLEXPORT void jl_set_precompile_keep_ir(int8_t v);
 JL_DLLEXPORT jl_code_info_t *jl_gdbcodetyped1(jl_method_instance_t *mi, size_t world);
 JL_DLLEXPORT jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *meth JL_PROPAGATES_ROOT, size_t world);
+
+// The policy of a method's code: plain, facts, or the policy of the code that reaches it (a boundary).
+#define JL_POLICY_PLAIN 0
+#define JL_POLICY_FACTS 1
+#define JL_POLICY_CALLER 2
+JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_code_instance_t *jl_get_method_inferred(
         jl_method_instance_t *mi JL_PROPAGATES_ROOT, jl_value_t *rettype,
         size_t min_world, size_t max_world, jl_debuginfo_t *di, jl_svec_t *edges);
@@ -2000,6 +2006,9 @@ JL_DLLEXPORT int jl_isabspath(const char *in) JL_NOTSAFEPOINT;
     XX(loopinfo_sym) \
     XX(macrocall_sym) \
     XX(max_methods_sym) \
+    XX(facts_sym) \
+    XX(facts_boundary_sym) \
+    XX(facts_always_sym) \
     XX(meta_sym) \
     XX(method_sym) \
     XX(module_sym) \
