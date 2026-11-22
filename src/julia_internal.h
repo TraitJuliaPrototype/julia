@@ -1017,6 +1017,17 @@ extern _Atomic(jl_svec_t*) jl_activated_entries JL_GLOBALLY_ROOTED; // the entri
 void jl_activate_memberships(jl_array_t *list, size_t world);
 void jl_memberships_activated(jl_array_t *list, size_t world);
 void jl_membership_method_retire(jl_method_t *m, size_t world);
+// the library's hooks (gf.c): definition, expansion, image, module end, deletion
+extern jl_value_t *jl_method_definition_hook JL_GLOBALLY_ROOTED;
+extern jl_value_t *jl_method_expansion_hook JL_GLOBALLY_ROOTED;
+extern jl_value_t *jl_image_methods_hook JL_GLOBALLY_ROOTED;
+extern jl_value_t *jl_module_end_hook JL_GLOBALLY_ROOTED;
+extern jl_value_t *jl_method_deletion_hook JL_GLOBALLY_ROOTED;
+void jl_call_definition_hook(jl_method_t *m, int after);
+jl_svec_t *jl_call_expansion_hook(jl_svec_t *argdata, jl_code_info_t *code, jl_module_t *module);
+jl_array_t *jl_call_image_methods_hook(jl_array_t *ms, const char *pkgname);
+void jl_call_module_end_hook(jl_module_t *m);
+void jl_call_deletion_hook(jl_method_t *m);
 JL_DLLEXPORT size_t jl_membership_stat(int which);
 // what a membership ends of the deep class, kept as a definition's is (gf.c)
 JL_DLLEXPORT int jl_deep_ending_push(const char *kind, jl_value_t *cause);

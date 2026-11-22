@@ -747,7 +747,8 @@ JL_DLLEXPORT int jl_get_module_facts(jl_module_t *m)
 JL_DLLEXPORT void jl_set_module_option(jl_module_t *self, int bit, int value)
 {
     if (bit != JL_MODULE_OPTION_OWNER_ONLY && bit != JL_MODULE_OPTION_FULLY_TYPED_WARN &&
-        bit != JL_MODULE_OPTION_FULLY_TYPED_ENFORCE)
+        bit != JL_MODULE_OPTION_FULLY_TYPED_ENFORCE && bit != JL_MODULE_OPTION_BOUNDED &&
+        bit != JL_MODULE_OPTION_NO_PIRATES)
         jl_errorf("unknown module option bit %d", bit);
     if (value)
         self->options |= (uint8_t)bit;

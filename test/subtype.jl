@@ -3208,4 +3208,50 @@ const ci_callva = (callva(UA[UC()]); native_ci(callva, (Vector{UA},)))
     @test ci_callv.max_world < typemax(UInt) && ci_callva.max_world < typemax(UInt)
     @test_throws MethodError Base.invokelatest(callv, UC())
 end
+
+# the hooks a trait library sets: before and after a definition (it may refuse one), at a module's
+# end, before a deletion (it may refuse one), and at a definition whose signature names a set (which
+# may make several methods in its place)
+@set HX
+@set HY
+struct HS end
+struct HBad end
+struct HM end
+member!(HX, HS)
+const hook_log = Any[]
+defhook(m::Method, after::Bool) =
+    (push!(hook_log, (:def, m.name, after)); m.name === :refused_def && !after ? ErrorException("refused") : nothing)
+endhook(m::Module) = (push!(hook_log, (:end, nameof(m))); nothing)
+delhook(m::Method) = (push!(hook_log, (:del, m.name)); m.name === :kept_def && error("kept"); nothing)
+exphook(argdata, code, mod) = (push!(hook_log, (:exp, mod)); nothing)
+function sethooks(def, mend, del, exp)
+    ccall(:jl_set_method_definition_hook, Cvoid, (Any,), def)
+    ccall(:jl_set_module_end_hook, Cvoid, (Any,), mend)
+    ccall(:jl_set_method_deletion_hook, Cvoid, (Any,), del)
+    ccall(:jl_set_method_expansion_hook, Cvoid, (Any,), exp)
+end
+
+@testset "a library's hooks at a definition, a deletion and a module's end" begin
+    sethooks(defhook, endhook, delhook, exphook)
+    try
+        @eval hooked_def(x) = 1
+        @test (:def, :hooked_def, false) in hook_log && (:def, :hooked_def, true) in hook_log
+        @test_throws ErrorException @eval refused_def(x) = 1
+        @test !isdefined(@__MODULE__, :refused_def) || isempty(methods(refused_def))
+        @eval module HookedMod end
+        @test (:end, :HookedMod) in hook_log
+        @eval kept_def(x) = 1
+        @test_throws ErrorException Base.delete_method(only(methods(kept_def)))
+        @test length(methods(kept_def)) == 1 && (:del, :kept_def) in hook_log
+        @eval hx_def(::HX) = 2
+        @test (:exp, @__MODULE__) in hook_log && hx_def(HS()) == 2
+    finally
+        sethooks(nothing, nothing, nothing, nothing)
+    end
+    # the scope options a library reads
+    @eval module ScopedMod
+        Base.Experimental.@compiler_options bounded=true no_pirates=true
+    end
+    @test ccall(:jl_get_module_options, Cint, (Any,), ScopedMod) & 3 == 3
+end
 end # module SetsAndMemberships

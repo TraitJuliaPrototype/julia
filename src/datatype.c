@@ -797,6 +797,13 @@ void jl_activate_memberships(jl_array_t *list, size_t world)
         if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
             continue;   // superseded while the image was built: never in force
         en->min_world = world;
+        if (jl_is_method(en->method) &&
+            !(jl_atomic_load_relaxed(&((jl_method_t*)en->method)->dispatch_status) & METHOD_SIG_LATEST_WHICH)) {
+            // its method was not activated: the library's image hook left it inactive, as a strict
+            // mode does with a pirate's membership. The membership is in force in no world
+            jl_atomic_store_release(&en->max_world, world - 1);
+            continue;
+        }
         if (activation_conflicts(en, world)) {
             // refused as at a declaration: never in force, and said
             jl_atomic_store_release(&en->max_world, world - 1);

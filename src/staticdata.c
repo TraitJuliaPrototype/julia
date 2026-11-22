@@ -4501,6 +4501,8 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
                     }
                 }
             }
+            // the library's image hook: the methods it returns stay inactive
+            extext_methods = jl_call_image_methods_hook(extext_methods, pkgname);
             // the memberships the image's modules declared
             int new_memberships = jl_array_nrows(ext_memberships) > 0;
             JL_LOCK(&world_counter_lock);
