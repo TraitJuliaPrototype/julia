@@ -3292,6 +3292,27 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
             ft, ArgInfo(arginfo.fargs, newargtypes), si, sv, #=check=#true)
     end
     wft = widenconst(ft)
+    # a call of a value known as a `Callable{A, S}`: its result is `S`, asserted. A
+    # builtin is never a member, though the set meets `Builtin` as an intersection
+    S = callable_result(wft, arginfo.argtypes)
+    if S !== nothing
+        # its arguments must be of `A`, or the call raises `MethodError`: checked when it runs
+        # where inference cannot prove them; an intersection's component is chosen by the arguments
+        A = callable_args(wft)
+        if A !== nothing
+            args = argtypes_to_type(arginfo.argtypes[2:end])
+            if !hasintersect(args, A)
+                # proved outside `A`: the check still runs, and raises, before the call would
+                # (the function's own code may take them: trusted)
+                return Future(CallMeta(Union{}, MethodError, trusted_effects(interp, TRUSTED_CALLABLE, EFFECTS_THROWS),
+                                       CallableCallInfo(Union{}, A)))
+            elseif !(args <: A)
+                return Future(CallMeta(S, Any, callable_effects(interp, S), CallableCallInfo(S, A)))
+            end
+        end
+        # (the arguments are of `A`: no check of them, the result's check alone)
+        return Future(CallMeta(S, Any, callable_effects(interp, S), CallableCallInfo(S, nothing)))
+    end
     if hasintersect(wft, Builtin)
         add_remark!(interp, sv, "Could not identify method table for call")
         return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
@@ -3306,6 +3327,69 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
     atype = argtypes_to_type(arginfo.argtypes)
     atype === Bottom && return Future(CallMeta(Union{}, Union{}, EFFECTS_THROWS, NoCallInfo())) # accidentally unreachable
     return abstract_call_gf_by_type(interp, nothing, arginfo, si, atype, sv, max_methods)::Future
+end
+
+# A `Callable{A, S}`'s call: its result `S` is checked in the code that calls the function known only by
+# the signature, not in the function's own code; trusted, but where `S` is `Any`
+callable_effects(interp::AbstractInterpreter, @nospecialize(S)) =
+    S === Any ? Effects() : trusted_effects(interp, TRUSTED_CALLABLE)
+
+# whether `T` types a function known only by its signature: `Callable{A, S}`, or an intersection of such
+function callable_set_type(@nospecialize(T))
+    u = unwrap_unionall(T)
+    u isa DataType || return false
+    cname = unwrap_unionall(Core.Callable).name
+    u.name === cname && return true
+    u.name === unwrap_unionall(Core.All).name || return false
+    tup = u.parameters[1]
+    tup isa DataType || return false
+    for c in tup.parameters
+        cu = unwrap_unionall(c)
+        (cu isa DataType && cu.name === cname) || return false
+    end
+    return true
+end
+
+# The argument types `A` of a value known as `Callable{A, S}`, where `A` is a type with no free variable
+function callable_args(@nospecialize(ft))
+    u = unwrap_unionall(ft)
+    u isa DataType || return nothing
+    u.name === unwrap_unionall(Core.Callable).name || return nothing
+    length(u.parameters) == 2 || return nothing
+    A = u.parameters[1]
+    A isa Type || return nothing
+    has_free_typevars(A) && return nothing
+    return A
+end
+
+# The declared result of a call of a value known as `Callable{A, S}`, or of an
+# intersection of such, the one whose signature the arguments match: `S`, where it is a type with no
+# free variable; else `nothing`
+function callable_result(@nospecialize(ft), argtypes::Vector{Any})
+    u = unwrap_unionall(ft)
+    u isa DataType || return nothing
+    if u.name === unwrap_unionall(Core.Callable).name
+        length(u.parameters) == 2 || return nothing
+        S = u.parameters[2]
+        S isa Type || return nothing
+        !has_free_typevars(S) || return nothing
+        return S
+    elseif u.name === unwrap_unionall(Core.All).name
+        tup = u.parameters[1]
+        tup isa DataType || return nothing
+        args = argtypes_to_type(argtypes[2:end])
+        for c in tup.parameters
+            cu = unwrap_unionall(c)
+            cu isa DataType || continue
+            (cu.name === unwrap_unionall(Core.Callable).name && length(cu.parameters) == 2) || continue
+            A = cu.parameters[1]
+            A isa Type || continue
+            args <: A || continue
+            S = cu.parameters[2]
+            (S isa Type && !has_free_typevars(S)) && return S
+        end
+    end
+    return nothing
 end
 
 # call where the function is any lattice element
