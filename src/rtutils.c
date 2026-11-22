@@ -271,6 +271,7 @@ JL_DLLEXPORT void jl_enter_handler(jl_task_t *ct, jl_handler_t *eh)
     eh->locks_len = ct->ptls->locks.len;
     eh->defer_signal = ct->ptls->defer_signal;
     eh->world_age = ct->world_age;
+    eh->membership_world = ct->membership_world;
 #ifdef ENABLE_TIMINGS
     eh->timing_stack = ct->ptls->timing_stack;
 #endif
@@ -306,6 +307,7 @@ JL_DLLEXPORT void jl_eh_restore_state(jl_task_t *ct, jl_handler_t *eh)
         locks->len = eh->locks_len;
     }
     ct->world_age = eh->world_age;
+    ct->membership_world = eh->membership_world;
     ptls->defer_signal = eh->defer_signal;
     int8_t old_gc_state = jl_atomic_load_relaxed(&ptls->gc_state);
     if (old_gc_state != eh->gc_state)
