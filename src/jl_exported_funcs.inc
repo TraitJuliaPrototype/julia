@@ -231,6 +231,7 @@
     XX(jl_gf_invoke_lookup) \
     XX(jl_has_open_set) \
     XX(jl_is_open_set) \
+    XX(jl_is_trait_arg_type) \
     XX(jl_membership_stat) \
     XX(jl_method_lookup_by_tt) \
     XX(jl_method_lookup) \
