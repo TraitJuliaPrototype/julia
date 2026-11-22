@@ -1095,9 +1095,11 @@ julia> f(Val(true))
 ```
 """
 struct Val{x}
+    Val{x}() where {x} = new{x}()
+    # built with `new`: a call of the constructor at `Val{x}` for a value `x` not known where `Val(x)` is
+    # compiled is a call at a type no caller names, which a method for another `Val{y}` can intercept
+    Val(x) = new{x}()
 end
-
-Val(x) = Val{x}()
 
 """
     inferencebarrier(x)
