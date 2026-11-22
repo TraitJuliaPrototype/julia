@@ -2326,11 +2326,34 @@ static void index_lower_bound_method(jl_method_t *m)
     JL_UNLOCK(&open_set_methods_lock);
 }
 
+// `Core.implements`: each membership has a method of it. Its type, once Core defines it.
+static jl_value_t *jl_implements_ft JL_GLOBALLY_ROOTED = NULL;
+JL_DLLEXPORT jl_value_t *jl_implements_functype(void)
+{
+    if (jl_implements_ft == NULL && jl_core_module != NULL) {
+        jl_value_t *f = jl_get_global(jl_core_module, jl_symbol("implements"));
+        if (f != NULL)
+            jl_implements_ft = jl_typeof(f);
+    }
+    return jl_implements_ft;
+}
+int jl_is_implements_sig(jl_value_t *sig)
+{
+    jl_value_t *u = jl_unwrap_unionall(sig);
+    if (!jl_is_datatype(u) || !jl_is_tuple_type(u) || jl_nparams(u) < 1)
+        return 0;
+    jl_value_t *ft = jl_implements_functype();
+    return ft != NULL && jl_tparam0(u) == ft;
+}
+
 // called from jl_method_table_add, the only writer, before the insertion takes world_counter_lock
 static void jl_index_open_set_methods(jl_method_t *m)
 {
-    index_lower_bound_method(m);
+    if (!jl_is_implements_sig(m->sig))
+        index_lower_bound_method(m);
     if (!jl_has_open_set_in((jl_value_t*)m->sig)) // one bit
+        return;
+    if (jl_is_implements_sig(m->sig)) // a membership's method is no method at a set
         return;
     open_set_walk_names((jl_value_t*)m->sig, m, 0);
 }
@@ -3242,6 +3265,8 @@ JL_DLLEXPORT void jl_disable_new_worlds(void)
 
 JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
 {
+    if (jl_is_implements_sig(method->sig))
+        jl_error("a membership's method is deleted only with its membership: take the membership back");
     jl_methtable_t *mt = jl_method_get_table(method);
     jl_typemap_entry_t *methodentry = do_typemap_search(mt, method);
     JL_LOCK(&world_counter_lock);
@@ -4499,6 +4524,19 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
     JL_GC_POP();
 }
 
+// A membership taken back: its method ends as a deleted method does, in `world`, the last world the
+// membership holds in: the code that folded the positive holds an edge to the method's instance and
+// ends with it. Called under the world counter's lock.
+JL_DLLEXPORT void jl_membership_method_end(jl_method_t *m, size_t world)
+{
+    jl_methtable_t *mt = jl_method_get_table(m);
+    jl_typemap_entry_t *me = do_typemap_search(mt, m);
+    if (me == NULL || jl_atomic_load_relaxed(&me->max_world) != ~(size_t)0)
+        return;
+    jl_atomic_store_relaxed(&m->dispatch_status, 0);
+    jl_atomic_store_relaxed(&me->max_world, world);
+    jl_method_invalidate_core(m, world, 1);
+}
 
 // the callers of an instance of a replayed method `m` that is wider than the member's signature
 // (compiled once at the set): a caller whose call's signature was under `m`'s while the membership

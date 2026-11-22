@@ -236,8 +236,9 @@ CodeInstance itself, or the members of its inference cycle (their CodeInstances 
 which are judged as one: an edge to a member counts, whether it names the member's CodeInstance or its
 MethodInstance. Another CodeInstance of the same MethodInstance is judged by its bit. Any other callee
 named by its MethodInstance alone is outside the class: its backedge carries whatever code it gets.
-An edge that names a Method alone names no code. An invoke at a declared signature is not gated; a
-binding edge is not a dispatch.
+A membership's method, which a folded positive's edge names by its instance (an instance with no
+code), needs nothing more: only the membership's end breaks it. An edge that names a Method alone
+names no code. An invoke at a declared signature is not gated; a binding edge is not a dispatch.
 """
 function edges_satisfy_g2(edges::SimpleVector, own::Union{CodeInstance,IdSet{Any}})
     for e in edges
@@ -246,7 +247,9 @@ function edges_satisfy_g2(edges::SimpleVector, own::Union{CodeInstance,IdSet{Any
             # its G2 bit (`JL_CI_FLAGS_G2`)
             (getfield(e, :flags, :monotonic)::UInt8 & 0x10) == 0x00 && return false
         elseif e isa MethodInstance
-            is_own(own, e) || return false
+            # a folded positive membership names its membership's method by its instance, which has no
+            # code: a membership edge, which the class allows
+            is_own(own, e) || is_membership_mi(e) || return false
         end
     end
     for (invokesig, item) in ForwardToBackedgeIterator(edges)
@@ -254,6 +257,8 @@ function edges_satisfy_g2(edges::SimpleVector, own::Union{CodeInstance,IdSet{Any
             continue
         elseif item isa MethodTable
             is_fact_sig(invokesig) || return false
+        elseif item isa MethodInstance && is_membership_mi(item)
+            continue
         elseif item isa MethodInstance
             # an `invoke` edge is skipped; an ordinary call is checked at its own signature: a call
             # that reached an instance wider than its match carries that signature (`CallSigBackedge`),
@@ -272,7 +277,8 @@ call (a recursion through it, a limited inference), and the callee was finished 
 CodeInstance is the one of the policy the caller's call reaches, valid in the caller's worlds. The backedge
 is the same, on the instance: a definition that changes dispatch at the callee ends the caller as before;
 of the callee's code, only the CodeInstance named ends it. The caller's own instance, the members of its
-inference cycle (not yet cached) and an interpreter of no policy are left as they are.
+inference cycle (not yet cached), a membership's instance and an interpreter of no policy are left as they
+are.
 """
 function name_callee_code(interp::AbstractInterpreter, caller::MethodInstance, edges::SimpleVector, worlds::WorldRange)
     interp isa NativeInterpreter && !interp.plainrt || return edges
@@ -280,7 +286,7 @@ function name_callee_code(interp::AbstractInterpreter, caller::MethodInstance, e
     for i in 1:length(edges)
         e = edges[i]
         e isa MethodInstance || continue
-        (e === caller || !(e.def isa Method)) && continue
+        (e === caller || !(e.def isa Method) || is_membership_mi(e)) && continue
         cache = WorldView(InternalCodeCache(cache_owner(interp), Cint(mi_policy_facts_at(e, interp.facts))), worlds)
         ci = get(cache, e, nothing)
         ci isa CodeInstance || continue
@@ -288,6 +294,15 @@ function name_callee_code(interp::AbstractInterpreter, caller::MethodInstance, e
         out[i] = ci
     end
     return out === nothing ? edges : Core.svec(out...)
+end
+
+"Whether `mi` is an instance of a membership's method, which a folded positive's edge names."
+is_membership_mi(mi::MethodInstance) = (m = mi.def; m isa Method && is_implements_sig(m.sig))
+
+"Whether `sig` is a signature of `Core.implements`, whose methods are the memberships."
+function is_implements_sig(@nospecialize(sig))
+    b = unwrap_unionall(sig)
+    return b isa DataType && length(b.parameters) == 3 && b.parameters[1] === typeof(Core.implements)
 end
 
 is_own(own::CodeInstance, e::CodeInstance) = own === e

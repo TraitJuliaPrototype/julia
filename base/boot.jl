@@ -438,6 +438,13 @@ end
 struct ArgumentError <: Exception
     msg::AbstractString
 end
+
+# A membership is a method of `implements`: `S <: X` by a membership holds where it has a method at
+# `(Type{X}, Type{S})`. The runtime defines the method when a membership is declared, in the
+# membership's world; its body is the template's. Code that relies on the membership holds an edge
+# to the method's instance, and ends when the method does.
+function implements end
+_implements_body(@nospecialize(X), @nospecialize(S)) = nothing
 struct UndefKeywordError <: Exception
     var::Symbol
 end

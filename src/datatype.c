@@ -171,7 +171,7 @@ static int names_foreign_var(jl_value_t *v, jl_value_t *pattern)
 // range, so it stays invisible until the caller publishes `world`
 static jl_value_t *publish_entry(jl_typename_t *tn, jl_typename_t *setname, jl_value_t *member,
                                  jl_value_t *set_instance, jl_value_t *declarer, jl_value_t *by,
-                                 jl_value_t *receiver, size_t world)
+                                 jl_value_t *receiver, size_t world, jl_value_t *method)
 {
     jl_value_t *entry_v = jl_gc_alloc(jl_current_task->ptls, sizeof(jl_membership_t),
                                       jl_membership_type);
@@ -187,6 +187,7 @@ static jl_value_t *publish_entry(jl_typename_t *tn, jl_typename_t *setname, jl_v
     jl_membership_changed(world);   // a redeclaration's old entry ends at world - 1 too
     entry->declarer = declarer;
     entry->by = by;
+    entry->method = method;
     jl_svec_t *old = jl_typename_memberships(tn);
     nd = (jl_value_t*)jl_alloc_svec_uninit(jl_svec_len(old) + 1);
     jl_svec_t *newsvec = (jl_svec_t*)nd;
@@ -387,6 +388,30 @@ static int same_inputs(jl_typename_t *tn, jl_value_t *a, jl_value_t *b)
     return 1;
 }
 
+// The signature of a membership's method: `Tuple{typeof(implements), Type{X}, Type{S}}` under the member
+// pattern's variables; `Type{<:S}` for an abstract member, every type under which is a member. NULL
+// before Core defines `implements`.
+static jl_value_t *membership_method_sig(jl_value_t *member, jl_value_t *set_instance)
+{
+    jl_value_t *ft = jl_implements_functype();
+    jl_value_t *pattern = jl_unwrap_unionall(member);
+    if (ft == NULL || !jl_is_datatype(pattern))
+        return NULL;
+    jl_value_t *tvm = NULL, *px = NULL, *pm = NULL, *sig = NULL;
+    JL_GC_PUSH4(&tvm, &px, &pm, &sig);
+    px = jl_apply_type1((jl_value_t*)jl_type_type, instance_body(set_instance, member));
+    if (((jl_datatype_t*)pattern)->name->abstract)
+        tvm = (jl_value_t*)jl_new_typevar(jl_symbol("S"), jl_bottom_type, pattern);
+    pm = jl_apply_type1((jl_value_t*)jl_type_type, tvm ? tvm : pattern);
+    jl_value_t *params[3] = {ft, px, pm};
+    sig = jl_apply_tuple_type_v(params, 3);
+    if (tvm)
+        sig = jl_new_struct(jl_unionall_type, tvm, sig);
+    sig = jl_rewrap_unionall(sig, member);
+    JL_GC_POP();
+    return sig;
+}
+
 // Declare `member` (a DataType, a UnionAll member pattern, Type{S}, or a set instance) a member of the
 // set named by `set_instance` (X, or an instance X{...} sharing the pattern's variables), in a new world.
 // Under the world counter's lock: the checks; the entry, in force from the world after the counter;
@@ -423,8 +448,16 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         jl_error("a membership's forwarding field is a Symbol or nothing");
     if (names_foreign_var(set_instance, member))
         jl_error("a membership's set instance names a type variable its member pattern does not");
+    // the membership's method, which the edges of folded answers rest on: made here, added to the
+    // table once the membership is accepted, and activated in the entry's world
+    jl_value_t *msig = NULL;
+    jl_method_t *mmeth = NULL;
+    jl_typemap_entry_t *mentry = NULL;
     jl_value_t *entry = NULL;
-    JL_GC_PUSH1(&entry);
+    JL_GC_PUSH4(&msig, &mmeth, &mentry, &entry);
+    msig = membership_method_sig(member, set_instance);
+    if (msig != NULL)
+        mmeth = jl_new_membership_method(jl_is_module(declarer) ? (jl_module_t*)declarer : jl_main_module, msig);
     JL_LOCK(&world_counter_lock);
     if (!jl_atomic_load_relaxed(&allow_new_worlds)) {
         JL_UNLOCK(&world_counter_lock);
@@ -488,10 +521,19 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         }
     }
     // the entry begins at min_world, past every task's world until the counter advances
-    entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world);
+    entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world,
+                          mmeth != NULL ? (jl_value_t*)mmeth : jl_nothing);
     index_entry((jl_membership_t*)entry);
-    // what the membership ends of the deep class is the membership's, named by its entry
-    int pushed = jl_deep_ending_push("membership", entry);
+    // what the membership ends of the deep class is the membership's, named by its method
+    int pushed = jl_deep_ending_push("membership", mmeth != NULL ? (jl_value_t*)mmeth : entry);
+    if (mmeth != NULL) {
+        // the method begins in the entry's world. No refusal is past this point
+        mentry = jl_method_table_add(jl_method_table, mmeth, NULL);
+        size_t mqm = jl_set_membership_query_world(min_world);
+        jl_atomic_store_relaxed(&mmeth->primary_world, min_world);
+        jl_method_table_activate(mentry);
+        jl_set_membership_query_world(mqm);
+    }
     jl_atomic_store_release(&jl_world_counter, min_world);
     // what the membership changes of dispatch, then the ambiguities it creates, at the entry's world
     size_t mq = jl_set_membership_query_world(min_world);
@@ -528,8 +570,9 @@ JL_DLLEXPORT void jl_delete_membership(jl_value_t *member, jl_value_t *set_insta
                       jl_symbol_name(home->name), jl_symbol_name(setname->name));
     }
     (void)deleter;
+    jl_value_t *mmeth = NULL;
     jl_membership_t *found = NULL;
-    JL_GC_PUSH1(&found); // also in home's list, which the analyzer cannot see
+    JL_GC_PUSH2(&mmeth, &found); // found: also in home's list, which the analyzer cannot see
     JL_LOCK(&world_counter_lock);
     if (!jl_atomic_load_relaxed(&allow_new_worlds)) {
         JL_UNLOCK(&world_counter_lock);
@@ -550,13 +593,18 @@ JL_DLLEXPORT void jl_delete_membership(jl_value_t *member, jl_value_t *set_insta
         jl_errorf("no membership of %s in %s is in force to take back", jl_symbol_name(home->name),
                   jl_symbol_name(setname->name));
     }
-    // what ending the membership ends of the deep class is the membership's, named by its entry
-    int pushed = jl_deep_ending_push("membership", (jl_value_t*)found);
+    // what ending the membership ends of the deep class is the membership's, named by its method
+    mmeth = found->method;
+    int pushed = jl_deep_ending_push("membership", jl_is_method(mmeth) ? mmeth : (jl_value_t*)found);
     size_t mq = jl_set_membership_query_world(world);
     jl_atomic_store_release(&found->max_world, world);
     // the entry's visibility changes at world + 1: a dispatch's range asked from then on is exact at its
     // end, and one asked at an older world is cut at `world`
     jl_membership_changed(world + 1);
+    // its method ends as a deleted method does: the code that folded the positive holds an edge to
+    // the method's instance and ends with it
+    if (jl_is_method(mmeth))
+        jl_membership_method_end((jl_method_t*)mmeth, world);
     jl_membership_removal_walk(found->member, found->instance, world);
     jl_set_membership_query_world(mq);
     jl_deep_ending_pop(pushed);
