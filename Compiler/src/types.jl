@@ -392,34 +392,18 @@ struct NativeInterpreter <: AbstractInterpreter
     inf_params::InferenceParams
     opt_params::OptimizationParams
 
-    # whether calls are inferred only at facts
+    # whether calls are inferred only at facts (facts.jl)
     facts::Bool
     # how many inferences of the other policy this one is nested in
     crossings::Int
     # `return_type`'s run-time answers: every method inferred plainly, under an owner of its own
     plainrt::Bool
-    # the closed build's check in a session: the owner of its code, or `nothing`.
-    # It infers by a closed build's rules, every method plainly, into a cache of its own
-    closed::Any
-    # the check's method table: the session's with the build's replacements of Base's
-    # methods laid over it, or `nothing` (a check without replacements, and every other interpreter)
-    overlay_table::Union{Nothing,CachedMethodTable{OverlayMethodTable}}
 end
-
-"""
-The owner of the code of one closed build's check in a session. `overlay` holds
-the methods the build replaces in Base, as an overlay method table, or `nothing`.
-"""
-mutable struct ClosedCheck
-    overlay::Union{Nothing,MethodTable}
-end
-ClosedCheck() = ClosedCheck(nothing)
 
 function NativeInterpreter(world::UInt = get_world_counter();
                            inf_params::InferenceParams = InferenceParams(),
                            opt_params::OptimizationParams = OptimizationParams(),
-                           facts::Bool = false, crossings::Int = 0, plainrt::Bool = false,
-                           @nospecialize(closed = nothing))
+                           facts::Bool = false, crossings::Int = 0, plainrt::Bool = false)
     curr_max_world = get_world_counter()
     # Sometimes the caller is lazy and passes typemax(UInt).
     # we cap it to the current world age for correctness
@@ -432,10 +416,7 @@ function NativeInterpreter(world::UInt = get_world_counter();
     method_table = CachedMethodTable(InternalMethodTable(world))
     inf_cache = Vector{InferenceResult}() # Initially empty cache
     codegen = IdDict{CodeInstance,CodeInfo}()
-    closed === nothing || (plainrt = true)
-    overlay_table = (closed isa ClosedCheck && closed.overlay !== nothing) ?
-        CachedMethodTable(OverlayMethodTable(world, closed.overlay::MethodTable)) : nothing
-    return NativeInterpreter(world, method_table, inf_cache, codegen, inf_params, opt_params, facts && !plainrt, crossings, plainrt, closed, overlay_table)
+    return NativeInterpreter(world, method_table, inf_cache, codegen, inf_params, opt_params, facts && !plainrt, crossings, plainrt)
 end
 
 # Quickly and easily satisfy the AbstractInterpreter API contract
@@ -445,10 +426,10 @@ get_inference_world(interp::NativeInterpreter) = interp.world
 get_inference_cache(interp::NativeInterpreter) = interp.inf_cache
 # code of either policy is cached under Julia's own owner, with the policy in its flags;
 # `return_type`'s run-time answers under one of their own
-cache_owner(interp::NativeInterpreter) = interp.closed !== nothing ? interp.closed : interp.plainrt ? :plain_rt : nothing
+cache_owner(interp::NativeInterpreter) = interp.plainrt ? :plain_rt : nothing
 
-# the policy of the code an interpreter makes and looks up under Julia's own owner: 0
-# plain, 1 facts, -1 the policy the runtime reaches a method with
+# the policy of the code an interpreter makes and looks up under Julia's own owner: 0 plain,
+# 1 facts, -1 the policy the runtime reaches a method with
 code_policy(::AbstractInterpreter) = Cint(-1)
 code_policy(interp::NativeInterpreter) = interp.plainrt ? Cint(-1) : Cint(interp.facts)
 "A CodeInstance records the policy it is compiled in, before it is published."
