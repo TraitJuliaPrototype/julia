@@ -188,6 +188,7 @@ include("typelattice.jl")
 include("tfuncs.jl")
 
 include("abstractinterpretation.jl")
+include("facts.jl")
 include("typeinfer.jl")
 include("optimize.jl")
 
