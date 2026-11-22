@@ -156,21 +156,22 @@ function policy_interp(interp::NativeInterpreter, facts::Bool; nested::Bool = tr
     world = get_inference_world(interp)
     return NativeInterpreter(world, CachedMethodTable(InternalMethodTable(world)), InferenceResult[],
                              interp.codegen, InferenceParams(interp), OptimizationParams(interp),
-                             facts, interp.crossings + Int(nested))
+                             facts, interp.crossings + Int(nested), false)
 end
 
 "Whether `interp` infers `mi`'s top frame under the other policy than its method's (reflection)."
 infers_other_policy(::AbstractInterpreter, ::MethodInstance) = false
 infers_other_policy(interp::NativeInterpreter, mi::MethodInstance) =
-    mi.def isa Method && mi_policy_facts_at(mi, interp.facts) !== interp.facts
+    !interp.plainrt && mi.def isa Method && mi_policy_facts_at(mi, interp.facts) !== interp.facts
 
 """
 The interpreter that infers code of policy `facts` at the top level: `interp` where it has that
-policy, else the other policy's, sharing its codegen cache.
+policy, else the other policy's, sharing its codegen cache. `return_type`'s run-time interpreter
+infers every method plainly, under an owner of its own.
 """
 interp_for_policy(interp::AbstractInterpreter, ::Bool) = interp
 interp_for_policy(interp::NativeInterpreter, facts::Bool) =
-    interp.facts === facts ? interp : policy_interp(interp, facts; nested = false)
+    interp.plainrt || interp.facts === facts ? interp : policy_interp(interp, facts; nested = false)
 
 # How many inferences of the other policy may nest: past it a call is answered as unknown, so that
 # two policies' inferences of a cycle do not recurse into each other.
