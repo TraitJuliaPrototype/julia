@@ -543,6 +543,7 @@ JL_DLLEXPORT void jl_gc_scan_vm_specific_roots(RootsWorkClosure* closure)
     add_node_to_roots_buffer(closure, &buf, &len, jl_deep_ending_kind); // and the cause being recorded (gf.c)
     add_node_to_roots_buffer(closure, &buf, &len, jl_deep_ending_cause);
     add_node_to_roots_buffer(closure, &buf, &len, jl_fully_typed_hook); // fully typed mode's hook (gf.c)
+    add_node_to_roots_buffer(closure, &buf, &len, jl_set_entries); // the entries at each set (datatype.c)
 
     // constants
     add_node_to_roots_buffer(closure, &buf, &len, jl_emptytuple_type);

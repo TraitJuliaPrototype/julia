@@ -1100,6 +1100,126 @@ static int check_vararg_length(jl_value_t *v, ssize_t n, jl_stenv_t *e)
 
 static int forall_exists_equal(jl_value_t *x, jl_value_t *y, jl_stenv_t *e);
 
+// Memberships. An entry on a TypeName relates the types its member pattern matches to its set's
+// instance as a declared supertype relates a type to its supertype, in the worlds in which it is in
+// force.
+
+// The world membership questions are answered in: the task's query world, set for the length of a
+// query by the contexts whose task world is frozen below the entries (inference, method matching, a
+// declaration) and restored by exception handlers as the world age is; else the task's world age.
+// With no task (0), a query sees every entry.
+
+// the current task, or NULL on a thread without one; inline, since method matching and subtyping ask
+// it on every query
+STATIC_INLINE jl_task_t *query_task(void) JL_NOTSAFEPOINT
+{
+    jl_gcframe_t **pgcstack = jl_get_pgcstack();
+    return pgcstack == NULL ? NULL : container_of(pgcstack, jl_task_t, gcstack);
+}
+
+// set the task's query world, returning the previous value for the caller to restore; 0 clears it
+JL_DLLEXPORT size_t jl_set_membership_query_world(size_t world) JL_NOTSAFEPOINT
+{
+    jl_task_t *ct = query_task();
+    if (ct == NULL)
+        return 0;
+    size_t last = ct->membership_world;
+    ct->membership_world = world;
+    return last;
+}
+
+// the task's query world (0: unset)
+JL_DLLEXPORT size_t jl_membership_query_world(void) JL_NOTSAFEPOINT
+{
+    jl_task_t *ct = query_task();
+    return ct ? ct->membership_world : 0;
+}
+
+static int entry_live(jl_membership_t *en, size_t world) JL_NOTSAFEPOINT
+{
+    return world == 0 || (en->min_world <= world && world <= jl_atomic_load_relaxed(&en->max_world));
+}
+
+// an entry for a type value: its pattern is Type{S}, kept on S's TypeName. It answers `Type{S} <: X`
+// (S isa X), never `S <: X`.
+static int entry_for_value(jl_membership_t *en) JL_NOTSAFEPOINT
+{
+    jl_value_t *p = jl_unwrap_unionall(en->member);
+    return jl_is_datatype(p) && ((jl_datatype_t*)p)->name == jl_type_typename;
+}
+
+// Does the TypeName `from` reach `to` along declared supertypes and the entries of types live in
+// `world` (0: every entry)? The cycle check of a declaration and the walk's choice of entries ask it.
+int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world) JL_NOTSAFEPOINT
+{
+    int ans = 0;
+    arraylist_t todo, seen;
+    arraylist_new(&todo, 0);
+    arraylist_new(&seen, 0);
+    arraylist_push(&todo, from);
+    while (!ans && todo.len > 0) {
+        jl_typename_t *tn = (jl_typename_t*)arraylist_pop(&todo);
+        if (tn == to) {
+            ans = 1;
+            break;
+        }
+        size_t i;
+        for (i = 0; i < seen.len; i++)
+            if (seen.items[i] == tn)
+                break;
+        if (i < seen.len)
+            continue;
+        arraylist_push(&seen, tn);
+        if (tn->wrapper != NULL) {
+            jl_datatype_t *super = ((jl_datatype_t*)jl_unwrap_unionall(tn->wrapper))->super;
+            if (super != NULL && super != jl_any_type)
+                arraylist_push(&todo, super->name);
+        }
+        jl_svec_t *list = jl_typename_memberships(tn);
+        for (i = 0; i < jl_svec_len(list); i++) {
+            jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
+            if (!entry_for_value(en) && entry_live(en, world))
+                arraylist_push(&todo, en->set);
+        }
+    }
+    arraylist_free(&todo);
+    arraylist_free(&seen);
+    return ans;
+}
+
+// the instance of the entry for x, when x matches the entry's pattern, else NULL. The match is a query
+// of its own: x's variables are black boxes to it.
+static jl_value_t *membership_instance(jl_value_t *x, jl_membership_t *en)
+{
+    int n = 0;
+    for (jl_value_t *p = en->member; jl_is_unionall(p); p = ((jl_unionall_t*)p)->body)
+        n++;
+    jl_value_t **env;
+    JL_GC_PUSHARGS(env, n + 1);
+    if (!jl_subtype_env(x, en->member, env, n)) {
+        JL_GC_POP();
+        return NULL;
+    }
+    env[n] = en->instance;
+    jl_value_t *p = en->member;
+    for (int k = 0; k < n && env[n] != NULL; k++, p = ((jl_unionall_t*)p)->body) {
+        jl_tvar_t *v = ((jl_unionall_t*)p)->var;
+        if (jl_is_unionall(env[n]) && ((jl_unionall_t*)env[n])->var == v)
+            env[n] = ((jl_unionall_t*)env[n])->body;
+        env[n] = jl_substitute_var_nothrow(env[n], v, env[k], 1);
+    }
+    jl_value_t *inst = env[n];
+    JL_GC_POP();
+    return inst;
+}
+
+// the same, for the one-instance check of a member pattern (datatype.c)
+jl_value_t *jl_membership_instance(jl_value_t *x, jl_membership_t *en)
+{
+    return membership_instance(x, en);
+}
+
+
 static int subtype_tuple_varargs(
     jl_vararg_t *vtx, jl_vararg_t *vty,
     jl_value_t *lastx, jl_value_t *lasty,
@@ -4464,6 +4584,12 @@ static jl_value_t *intersect_types(jl_value_t *x, jl_value_t *y, int emptiness_o
 }
 
 JL_DLLEXPORT jl_value_t *jl_intersect_types(jl_value_t *x, jl_value_t *y)
+{
+    return intersect_types(x, y, 0);
+}
+
+// The intersection of two entries, each a member pattern with its instance (one instance per member)
+JL_DLLEXPORT jl_value_t *jl_entry_intersection(jl_value_t *x, jl_value_t *y)
 {
     return intersect_types(x, y, 0);
 }
