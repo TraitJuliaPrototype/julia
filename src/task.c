@@ -1157,6 +1157,7 @@ JL_DLLEXPORT jl_task_t *jl_new_task(jl_value_t *start, jl_value_t *completion_fu
     t->threadpoolid = ct->threadpoolid;
     t->ptls = NULL;
     t->world_age = ct->world_age;
+    t->membership_world = 0;
     t->reentrant_timing = 0;
     t->metrics_enabled = jl_atomic_load_relaxed(&jl_task_metrics_enabled) != 0;
     jl_atomic_store_relaxed(&t->first_enqueued_at, 0);
