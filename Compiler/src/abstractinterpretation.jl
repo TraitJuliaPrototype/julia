@@ -467,7 +467,9 @@ function closed_candidates(@nospecialize(p))
     memo === missing || return memo::Union{Nothing,Vector{Any}}
     X = closed_set_of(p)
     out = nothing
-    if X !== nothing
+    if X === nothing && closed_record_family(p)
+        out = closed_record_candidates(p)
+    elseif X !== nothing
         R = closed_reaching_places(p)
         out = closed_candidates_in(X, R, Any[], 0)
         if out !== nothing
@@ -479,6 +481,43 @@ function closed_candidates(@nospecialize(p))
         end
     end
     CLOSED_CANDIDATES_MEMO[p] = out
+    return out
+end
+# A record's family (compiler §7.6; traits §8.2): `T` is a struct's family, not one of its types, and the
+# struct has a parameter bounded by a set (`Trip{C <: Callable{…}, …}`): its types record the form of each
+# value it keeps (a box, a wrapper, a plain member), and a join of records of different forms is the family.
+# Plain code bounds no parameter by a set.
+function closed_record_family(@nospecialize(T))
+    T isa UnionAll || return false
+    u = unwrap_unionall(T)
+    (u isa DataType && !isabstracttype(u) && !closed_kept_form(u)) || return false
+    w = u.name.wrapper
+    while w isa UnionAll
+        ccall(:jl_has_open_set, Cint, (Any,), w.var.ub) != 0 && return true
+        w = w.body
+    end
+    return false
+end
+# The types of a record's family `p` a closed build counted (compiler §7.6): those it forgets at a place
+# typed `p`, or at a place whose values flow there, as a set's members by use are counted
+function closed_record_candidates(@nospecialize(p))
+    P = closed_place(p)
+    R = IdSet{Any}()
+    push!(R, P)
+    work = Any[P]
+    while !isempty(work)
+        from = get(CLOSED_FLOWS, pop!(work), nothing)
+        from === nothing && continue
+        for S in from
+            S in R && continue
+            push!(R, S)
+            push!(work, S)
+        end
+    end
+    out = Any[]
+    for T in CLOSED_USED_TYPES
+        T <: p && closed_reaches(T, R) && push!(out, T)
+    end
     return out
 end
 function closed_reaches(@nospecialize(T), R::IdSet{Any})
@@ -612,8 +651,10 @@ function closed_member_type(argtypes::Vector{Any}, i::Int)
     end
     (isconcretetype(T) || has_free_typevars(T)) && return nothing
     u = unwrap_unionall(T)
-    (u isa DataType && ccall(:jl_is_open_set, Cint, (Any,), u) != 0) || return nothing
-    # its members by use at `T`, and the box where the build forgets one at a place typed by `T`
+    family = closed_record_family(T)
+    (u isa DataType && (family || ccall(:jl_is_open_set, Cint, (Any,), u) != 0)) || return nothing
+    # its members by use at `T`, and the box where the build forgets one at a place typed by `T`; at a
+    # record's family, the record types counted there
     cands = closed_candidates(T)
     cands === nothing && return nothing
     # (the count before the test: a set with no member yet gains them in a later round)
@@ -627,7 +668,7 @@ function closed_member_type(argtypes::Vector{Any}, i::Int)
     end
     n <= MAX_CLOSED_SPLITS || return nothing
     n == 0 && !CLOSED_NO_MEMBER[] && (CLOSED_NO_MEMBER_MET[] = true; return nothing)
-    return (U, n, closed_wrapper_of(T))
+    return (U, n, family ? nothing : closed_wrapper_of(T))
 end
 
 # Whether the argument `i` of a call is the object a box holds, `getfield(d::Dynamic, :object)`: never a
@@ -728,6 +769,8 @@ function closed_choice_bits(argtypes::Vector{Any}, applicable::Vector{MethodMatc
         isvarargtype(a) && break
         T = widenconst(a)
         (isconcretetype(T) || has_free_typevars(T)) && continue
+        # a record known only by its family: the code for each record type, as a session runs it
+        closed_record_family(T) && (bits |= UInt32(1) << (i - 2); continue)
         u = unwrap_unionall(T)
         (u isa DataType && ccall(:jl_is_open_set, Cint, (Any,), u) != 0) || continue
         for t in applicable
@@ -775,8 +818,25 @@ function closed_has_set_argument(argtypes::Vector{Any})
         closed_wrapper_set(T) === nothing || return true
         u = unwrap_unionall(T)
         u isa DataType && ccall(:jl_is_open_set, Cint, (Any,), u) != 0 && return true
+        closed_record_family(T) && return true
     end
     return false
+end
+# whether a call's arguments of a union type are each a union of kept forms, a box beside a wrapper
+# (compiler §7.6: the call at the boxes where an argument's members hold a wrapper), and one is
+function closed_kept_unions(argtypes::Vector{Any})
+    found = false
+    for i = 2:length(argtypes)
+        a = argtypes[i]
+        isvarargtype(a) && return false
+        T = widenconst(a)
+        T isa Union || continue
+        for C in uniontypes(T)
+            (C isa DataType && isconcretetype(C) && closed_kept_form(C)) || return false
+        end
+        found = true
+    end
+    return found
 end
 
 # Whether `m` is a forwarder (compiler §6.3): its code carries the mark `Expr(:meta, :erasing_forwarder)`.
@@ -1091,6 +1151,10 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     # bound of a split, not Julia's few: the methods are final, §7.6)
     closedset = closed_build(interp) && member_split && closed_has_set_argument(argtypes)
     closedset && (max_methods = max(max_methods, MAX_CLOSED_SPLITS))
+    # (and splits a call at unions of kept forms over each combination, up to that bound: the call at the
+    # boxes where an argument's members hold a wrapper beside its box, §7.6)
+    closed_build(interp) && member_split && closed_kept_unions(argtypes) &&
+        (max_union_splitting = max(max_union_splitting, MAX_CLOSED_SPLITS))
     matches = find_method_matches(interp, argtypes, atype; max_methods, max_union_splitting)
     # (in a closed build, a call at a value known only by its trait is one a later member may resolve)
     closed_process(interp) && closed_has_set_argument(argtypes) && note_closed_operation!(sv)
