@@ -743,9 +743,12 @@ JL_DLLEXPORT int jl_get_module_facts(jl_module_t *m)
 }
 // The policy of a method's code: the compiler's own code (a module of flag 2) is plain, whatever its
 // methods' flags say; then the method's flag: always facts, or a boundary, which takes the policy of
-// the code that reaches it; then its module's: flag 1 facts; any other method plain.
+// the code that reaches it; then its module's: flag 1 facts; any other method plain. A trimmed build
+// compiles every method plainly.
 JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT
 {
+    if (jl_options.trim != JL_TRIM_NO)
+        return JL_POLICY_PLAIN; // a trimmed build has no facts policy
     int8_t mf = m->module->facts;
     if (mf == 2)
         return JL_POLICY_PLAIN;

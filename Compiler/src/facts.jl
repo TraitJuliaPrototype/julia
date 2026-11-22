@@ -266,3 +266,60 @@ is_own(own::IdSet{Any}, @nospecialize(e)) = e in own
 "Set the G2 bit of `ci` where its record is deep G2."
 set_g2!(ci::CodeInstance, edges::SimpleVector) =
     (edges_satisfy_g2(edges, ci) && ccall(:jl_ci_set_g2, Cvoid, (Any,), ci); nothing)
+
+# The code a run-time site reaches whatever the values: while an image is built, a
+# run-time site in facts code whose types match one method that specializes on none of the site's
+# abstract arguments reaches that method's one instance; the image holds it, as plain inference
+# compiles a callee at abstract types. The site still dispatches when it runs and records no edge.
+
+"The instances the run-time sites of the facts code `src` reach whatever the values."
+function rtsite_targets(interp::AbstractInterpreter, src::CodeInfo, sptypes::Vector{VarState})
+    out = MethodInstance[]
+    for stmt in src.code
+        isexpr(stmt, :(=)) && (stmt = stmt.args[2])
+        isexpr(stmt, :call) || continue
+        mi = rtsite_target(interp, stmt.args, src, sptypes)
+        mi === nothing || push!(out, mi)
+    end
+    return out
+end
+
+function rtsite_target(interp::AbstractInterpreter, args::Vector{Any}, src::CodeInfo, sptypes::Vector{VarState})
+    argtypes = Any[]
+    for a in args
+        applicable(argextype, a, src, sptypes) || return nothing
+        # an argument that is no value of the IR (an expression nested in the call): no target
+        a isa Expr && !(a.head === :static_parameter || a.head === :boundscheck || a.head === :copyast) && return nothing
+        t = widenconst(argextype(a, src, sptypes))
+        t === Bottom && return nothing
+        push!(argtypes, t)
+    end
+    isempty(argtypes) && return nothing
+    ft = argtypes[1]
+    (isdispatchelem(ft) && !(ft <: Builtin)) || return nothing
+    atype = argtypes_to_type(argtypes)
+    (atype isa DataType && !isdispatchtuple(atype)) || return nothing
+    matches = findall(atype, method_table(interp); limit = 1)
+    matches === nothing && return nothing
+    length(matches.matches) == 1 || return nothing
+    m = (only(matches.matches)::MethodMatch).method
+    nospec = reinterpret(UInt32, m.nospecialize)
+    decl = unwrap_unionall(m.sig)
+    decl isa DataType || return nothing
+    nd = length(decl.parameters)
+    ps = atype.parameters
+    for i in 2:length(ps)
+        p = ps[i]
+        isvarargtype(p) && return nothing
+        isdispatchelem(p) && continue
+        # an abstract argument: not specialized on (`@nospecialize`), at a declared type the runtime
+        # compiles at whatever the value (gf.c, `jl_compilation_sig`)
+        iarg = m.isva ? min(i - 1, m.nargs - 1) : i - 1
+        (1 <= iarg <= 32 && nd >= 1) || return nothing
+        bit = UInt32(1) << (iarg - 1)
+        nospec & bit != 0 || return nothing
+        d = unwrapva(decl.parameters[min(i, nd)])
+        (has_free_typevars(d) || iskindtype(d)) && return nothing
+    end
+    return compileable_specialization_for_call(interp, atype)
+end
