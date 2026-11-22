@@ -187,16 +187,14 @@ function declared_operation_result(interp::AbstractInterpreter, argtypes::Vector
     end
     rt = nothing
     if entries !== nothing
-        unchecked = false
         for e in entries
             e = e::SimpleVector
             sig = e[2]
             atype <: sig || continue
             r = declared_result_at(sig, e[3], atype)
             rt = rt === nothing ? r : typeintersect(rt, r)
-            unchecked |= operation_entry_unchecked(sig, atype)
         end
-        return unchecked && rt !== nothing && rt !== Any ? UncheckedDeclaredResult(rt) : rt
+        return rt
     end
     (ms === nothing || isempty(ms)) && return nothing
     world = get_inference_world(interp)
@@ -1012,36 +1010,6 @@ function operation_split_type(@nospecialize(atype), closed_rules::Bool)
     return nothing
 end
 
-# a declared result that a member's check does not reach at the call's types (compiler §7.4)
-struct UncheckedDeclaredResult
-    rt::Any
-end
-
-# whether a member's check leaves the operation's result unchecked at the call's types (traits §5.10):
-# the check infers a serving method at the declared signature with the receiver at the member, and not
-# where another argument is declared at a type that is not concrete (an iteration state, a second value
-# of the set, a variable of the operation's own). Read at the declared signature, its variables
-# instantiated where the call fixes them: the receiver is one argument that is not concrete, so a second
-# one leaves the result unchecked (compiler §7.4)
-function operation_entry_unchecked(@nospecialize(sig), @nospecialize(atype))
-    s = unwrap_unionall(sig)
-    if sig isa UnionAll
-        env = ccall(:jl_type_intersection_with_env, Any, (Any, Any), atype, sig)::SimpleVector
-        vals = env[2]::SimpleVector
-        if all(v -> !isa(v, TypeVar), vals)
-            s = ccall(:jl_instantiate_type_in_env, Any, (Any, Any, Ptr{Any}), s, sig, vals)
-        end
-    end
-    s isa DataType || return true
-    n = 0
-    for i in 2:length(s.parameters)
-        p = s.parameters[i]
-        isvarargtype(p) && return true
-        isconcretetype(p) || (n += 1)
-    end
-    return n > 1
-end
-
 # The effects of a call whose result is a declared result its members' own code is not checked against
 # (compiler §7.4): `TRUSTED_CALLABLE` or `TRUSTED_OPERATION`. A closed build leaves no call to dispatch
 # (§7.6): every call runs the instance inferred, and nothing is trusted there
@@ -1080,9 +1048,10 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     drt = operation ? declared_operation_result(interp, argtypes, atype) : nothing
     if drt !== nothing
         closed_process(interp) && note_closed_operation!(sv)
-        # (a result its members' check does not reach: trusted, compiler §7.4)
-        opeffects = drt isa UncheckedDeclaredResult ? trusted_effects(interp, TRUSTED_OPERATION) : Effects()
-        drt isa UncheckedDeclaredResult && (drt = drt.rt)
+        # (trusted, compiler §7.1, §7.4: a member's own instance is not checked against the declared result
+        # in every world it runs in, a member of a pattern before its first use among them; nothing is
+        # trusted where the result is `Any`)
+        opeffects = drt === Any ? Effects() : trusted_effects(interp, TRUSTED_OPERATION)
         split = operation_split_type(atype, closed_build(interp))
         split === nothing && return Future(CallMeta(drt, Any, opeffects, DeclaredResultInfo(drt)))
         # asserted, as the compiler's own results are: inferred while the compiler bootstraps itself,
@@ -3473,6 +3442,8 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
     env = tienv[2]::SimpleVector
     mresult = abstract_call_method(interp, method, ti, env, false, si, sv)::Future
     match = MethodMatch(ti, env, method, argtype <: method.sig)
+    # (the builtin specializes at the values' types: the instance inferred runs where they are concrete)
+    concrete_args = isdispatchtuple(argtype)
     ft′_box = Core.Box(ft′)
     lookupsig_box = Core.Box(lookupsig)
     invokecall = InvokeCall(types)
@@ -3509,6 +3480,8 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
             end
         end
         rt = from_interprocedural!(interp, rt, sv, arginfo′, sig)
+        # a marked result where another instance may run is its type alone, as at a call (compiler §7.4)
+        is_trusted(effects) && !concrete_args && (rt = widenconst(rt))
         info = InvokeCallInfo(edge, match, const_result, lookupsig_box.contents)
         if !match.fully_covers
             effects = Effects(effects; nothrow=false)
