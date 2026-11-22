@@ -297,6 +297,7 @@ void jl_init_common_symbols(void)
     jl_infer_sym = jl_symbol("infer");
     jl_max_methods_sym = jl_symbol("max_methods");
     jl_facts_sym = jl_symbol("facts");
+    jl_module_option_sym = jl_symbol("module_option");
     jl_facts_boundary_sym = jl_symbol("facts_boundary");
     jl_facts_always_sym = jl_symbol("facts_always");
     jl_macrocall_sym = jl_symbol("macrocall");
