@@ -98,6 +98,9 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     tn->concrete_only = 0;
     tn->input_params = 0;
     jl_atomic_store_relaxed(&tn->memberships, jl_emptysvec);
+    jl_atomic_store_relaxed(&tn->contract, NULL);
+    jl_atomic_store_relaxed(&tn->declared_fields, NULL);
+    jl_atomic_store_relaxed(&tn->operations, NULL);
     return tn;
 }
 
@@ -1256,6 +1259,126 @@ JL_DLLEXPORT void jl_set_input_params(jl_value_t *T, uint8_t mask)
     if (tn->input_params != 0)
         jl_errorf("the inputs of %s are written once", jl_symbol_name(tn->name));
     tn->input_params = mask;
+}
+
+// A set's declared fields, once: their names and types, the types in the variables of the set's
+// wrapper. Inference reads a declared field at a value typed by the set.
+JL_DLLEXPORT void jl_set_declared_fields(jl_value_t *T, jl_value_t *names, jl_value_t *types)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->open_set)
+        jl_error("only a set has declared fields");
+    if (!jl_is_svec(names) || !jl_is_svec(types) || jl_svec_len(names) != jl_svec_len(types))
+        jl_error("declared fields: an svec of names and an svec of types of the same length");
+    jl_typename_t *tn = ((jl_datatype_t*)uw)->name;
+    jl_value_t *df = (jl_value_t*)jl_svec2(names, types);
+    JL_GC_PUSH1(&df);
+    jl_value_t *expected = NULL;
+    if (!jl_atomic_cmpswap(&tn->declared_fields, &expected, df)) {
+        JL_GC_POP();
+        jl_errorf("the declared fields of %s are written once", jl_symbol_name(tn->name));
+    }
+    jl_gc_wb(tn, df);
+    JL_GC_POP();
+}
+
+// A set's operations, once: an svec of entries svec(f, sig, rt, default), the declared signature a tuple
+// type with the receiver at the set's instance under the set's and the operation's variables, the
+// declared result in the same variables, the default's method or nothing. Inference reads them where a
+// call's receiver is typed by the set: the call's result is the declared result.
+JL_DLLEXPORT void jl_set_contract_operations(jl_value_t *T, jl_value_t *ops)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->open_set)
+        jl_error("only a set has operations");
+    JL_TYPECHK(jl_set_contract_operations, simplevector, ops);
+    size_t n = jl_svec_len(ops);
+    for (size_t i = 0; i < n; i++) {
+        jl_value_t *e = jl_svecref(ops, i);
+        if (!jl_is_svec(e) || jl_svec_len(e) != 4)
+            jl_error("an operation's entry is svec(f, sig, rt, default)");
+        jl_value_t *sig = jl_unwrap_unionall(jl_svecref(e, 1));
+        jl_value_t *rt = jl_svecref(e, 2);
+        if (!jl_is_tuple_type(sig) || jl_nparams(sig) < 2 || (!jl_is_type(rt) && !jl_is_typevar(rt)))
+            jl_error("an operation's declared signature is a tuple type of the function and its arguments, its result a type");
+        jl_value_t *d = jl_svecref(e, 3);
+        if (d != jl_nothing && !jl_is_method(d))
+            jl_error("an operation's default is its method, or nothing");
+    }
+    jl_typename_t *tn = ((jl_datatype_t*)uw)->name;
+    jl_value_t *expected = NULL;
+    if (!jl_atomic_cmpswap(&tn->operations, &expected, ops))
+        jl_errorf("the operations of %s are written once", jl_symbol_name(tn->name));
+    jl_gc_wb(tn, ops);
+}
+
+// A set's contract, once (a library's record of what a member must have).
+JL_DLLEXPORT void jl_set_contract(jl_value_t *T, jl_value_t *contract)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->open_set)
+        jl_error("only a set has a contract");
+    jl_typename_t *tn = ((jl_datatype_t*)uw)->name;
+    jl_value_t *expected = NULL;
+    if (!jl_atomic_cmpswap(&tn->contract, &expected, contract))
+        jl_errorf("the contract of %s is written once", jl_symbol_name(tn->name));
+    jl_gc_wb(tn, contract);
+}
+
+
+// A closed abstract type with a contract: its declaring module writes it once on the type's contract
+// slot, which images keep with the TypeName: `svec(ops, cands)`, the operations' methods (each with its
+// declared result) and the split's candidates in order. Inference reads the operations where a call's
+// receiver is typed by the type. A set's contract slot is the library's.
+static int has_contract(jl_value_t *T) JL_NOTSAFEPOINT
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    if (!jl_is_datatype(uw))
+        return 0;
+    jl_typename_t *tn = ((jl_datatype_t*)uw)->name;
+    return tn->abstract && !tn->open_set && jl_atomic_load_relaxed(&tn->contract) != NULL;
+}
+
+JL_DLLEXPORT void jl_declare_contract(jl_value_t *T, jl_value_t *ops, jl_value_t *cands)
+{
+    jl_value_t *uw = jl_unwrap_unionall(T);
+    if (!jl_is_datatype(uw) || !((jl_datatype_t*)uw)->name->abstract || ((jl_datatype_t*)uw)->name->open_set)
+        jl_error("only a closed abstract type declares a contract by its operations");
+    JL_TYPECHK(jl_declare_contract, simplevector, ops);
+    JL_TYPECHK(jl_declare_contract, simplevector, cands);
+    jl_typename_t *tn = ((jl_datatype_t*)uw)->name;
+    // declared where the type is defined: a contract written on a type another image holds would not be
+    // kept by the writer's image (Base's build declares Core's `IO`'s)
+    if (jl_object_in_image((jl_value_t*)tn) && !(jl_generating_output() && !jl_options.incremental))
+        jl_errorf("the contract of %s is declared in the image that defines it", jl_symbol_name(tn->name));
+    size_t n = jl_svec_len(cands);
+    for (size_t i = 0; i < n; i++) {
+        jl_value_t *C = jl_svecref(cands, i);
+        if (!jl_is_concrete_type(C) || !jl_subtype(C, T))
+            jl_errorf("a candidate of %s is a concrete subtype of it", jl_symbol_name(tn->name));
+        for (size_t j = 0; j < i; j++)
+            if (jl_svecref(cands, j) == C)
+                jl_errorf("a candidate of %s is named once", jl_symbol_name(tn->name));
+    }
+    jl_value_t *c = (jl_value_t*)jl_svec2(ops, cands);
+    JL_GC_PUSH1(&c);
+    jl_value_t *expected = NULL;
+    if (!jl_atomic_cmpswap(&tn->contract, &expected, c))
+        jl_errorf("the contract of %s is written once", jl_symbol_name(tn->name));
+    jl_gc_wb(tn, c);
+    JL_GC_POP();
+}
+
+JL_DLLEXPORT int jl_has_contract(jl_value_t *T) JL_NOTSAFEPOINT
+{
+    return has_contract(T);
+}
+
+JL_DLLEXPORT jl_value_t *jl_contract_operations(jl_value_t *T)
+{
+    if (!has_contract(T))
+        return jl_nothing;
+    return jl_svecref(jl_atomic_load_relaxed(&((jl_datatype_t*)jl_unwrap_unionall(T))->name->contract), 0);
 }
 
 JL_DLLEXPORT int jl_is_open_set(jl_value_t *T)
