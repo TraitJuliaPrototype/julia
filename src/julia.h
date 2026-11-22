@@ -451,6 +451,7 @@ typedef struct _jl_opaque_closure_t {
 #define JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR   0b0010
 #define JL_CI_FLAGS_FROM_IMAGE               0b0100
 #define JL_CI_FLAGS_NATIVE_CACHE_VALID       0b1000
+#define JL_CI_FLAGS_G2                      0b010000  // deep G2: its dispatch edges, and every callee's at any depth, at fact signatures
 #define JL_CI_FLAGS_FACTS                   0b100000  // compiled by facts (its calls inferred only at fact signatures)
 
 typedef struct _jl_code_instance_t {

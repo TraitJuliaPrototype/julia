@@ -1114,7 +1114,7 @@ JL_DLLEXPORT jl_method_t *jl_new_method_uninit(jl_module_t *module)
 // `*invokesig` will be NULL if the call was made by ordinary dispatch at the instance's
 // signature, a type if it is the signature supplied in an `invoke` call, and a one-element
 // svec holding the call's signature if an ordinary call reached an instance wider than its
-// own match (a `@nospecialize` argument that inference does not specialize on).
+// own match (a `@nospecialize` argument, or a call of `!==`).
 // If you don't need `invokesig`, you can set it to NULL on input.
 // Initialize iteration with `i = 0`. Returns `i` for the next backedge to be extracted.
 int get_next_edge(jl_array_t *list, int i, jl_value_t** invokesig, jl_code_instance_t **caller) JL_NOTSAFEPOINT
