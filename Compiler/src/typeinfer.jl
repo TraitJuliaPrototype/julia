@@ -715,12 +715,35 @@ struct ForwardToBackedgeIterator
     forward_edges::SimpleVector
 end
 
+# a backedge by the call's own signature: the runtime stores it as `svec(sig)`
+struct CallSigBackedge
+    sig::Any
+end
+
 function Base.iterate(it::ForwardToBackedgeIterator, i::Int = 1)
     edges = it.forward_edges
     i > length(edges) && return nothing
     while i ≤ length(edges)
         item = edges[i]
         if item isa Int
+            # a call with one match, fully covering, that reached an instance wider than its own
+            # signature (a `@nospecialize` argument inferred so): the backedge keeps the call's
+            # signature, so a method defined later invalidates the caller only where it meets
+            # that signature
+            if item == 1 && i + 2 <= length(edges)
+                callee = edges[i+2]
+                if callee isa CodeInstance || callee isa MethodInstance
+                    mi = callee isa CodeInstance ? get_ci_mi(callee) : callee
+                    sig = edges[i+1]
+                    if sig isa Type && mi.specTypes !== sig
+                        # typed `Any` for inference, so that the iterator's result stays the union it is
+                        # without this case: one more member widens it to `Tuple{Any, Int}`, and the
+                        # duplicate check of `store_backedges`, quadratic in the edges and run for every
+                        # CodeInstance a package image loads, then dispatches at every step
+                        return ((compilerbarrier(:type, CallSigBackedge(sig)), mi), i + 3)
+                    end
+                end
+            end
             i += 2
             continue # ignore the query information if present but process the contents
         elseif isa(item, Method)
@@ -782,7 +805,8 @@ function store_backedges(caller::CodeInstance, edges::SimpleVector)
                 ccall(:jl_method_table_add_backedge, Cvoid, (Any, Any), invokesig, caller)
             else
                 item::MethodInstance
-                ccall(:jl_method_instance_add_backedge, Cvoid, (Any, Any, Any), item, invokesig, caller)
+                sig = invokesig isa CallSigBackedge ? Core.svec(invokesig.sig) : invokesig
+                ccall(:jl_method_instance_add_backedge, Cvoid, (Any, Any, Any), item, sig, caller)
             end
         end
     end
