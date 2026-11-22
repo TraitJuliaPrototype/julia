@@ -1853,13 +1853,25 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
         )
 
         append!(workqueue, methods)
-        compile!(codeinfos, workqueue; invokelatest_queue, external_linkage)
+        # memberships are asked in the world the code is compiled for, as `jl_type_infer` asks them:
+        # this function runs in the compiler's own world, where no membership of the program exists
+        mq = ccall(:jl_set_membership_query_world, UInt, (UInt,), this_world)
+        try
+            compile!(codeinfos, workqueue; invokelatest_queue, external_linkage)
+        finally
+            ccall(:jl_set_membership_query_world, UInt, (UInt,), mq)
+        end
     end
 
     if invokelatest_queue !== nothing
         # This queue is intentionally aliased, to handle e.g. a `finalizer` calling `Core.finalizer`
         # (it will enqueue into itself and immediately drain)
-        compile!(codeinfos, invokelatest_queue; invokelatest_queue, external_linkage)
+        mq = ccall(:jl_set_membership_query_world, UInt, (UInt,), get_inference_world(invokelatest_queue.interp::NativeInterpreter))
+        try
+            compile!(codeinfos, invokelatest_queue; invokelatest_queue, external_linkage)
+        finally
+            ccall(:jl_set_membership_query_world, UInt, (UInt,), mq)
+        end
     end
 
     if trim_mode != TRIM_NO && trim_mode != TRIM_UNSAFE

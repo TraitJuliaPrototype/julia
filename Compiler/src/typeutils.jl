@@ -48,6 +48,19 @@ has_extended_info(@nospecialize x) = (!isa(x, Type) && !isvarargtype(x)) || isTy
 # certain combinations of `a` and `b` where one/both isa/are `Union`/`UnionAll` type(s)s.
 isnotbrokensubtype(@nospecialize(a), @nospecialize(b)) = (!iskindtype(b) || !isType(a) || hasuniquerep(a.parameters[1]) || b <: a)
 
+# The gates of a fold about a pair that names a set: a negative that a later membership could make
+# true never folds; a positive answered through a membership entry does not fold either, since the
+# entry is in force in some worlds only. Both are cheap flag reads where no set is involved.
+function negative_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
+    (ccall(:jl_has_open_set, Cint, (Any,), a) != 0 || ccall(:jl_has_open_set, Cint, (Any,), b) != 0) || return false
+    return ccall(:jl_could_join, Cint, (Any, Any), a, b) != 0 ||
+           ccall(:jl_could_join, Cint, (Any, Any), b, a) != 0
+end
+function positive_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
+    (ccall(:jl_has_open_set, Cint, (Any,), a) != 0 || ccall(:jl_has_open_set, Cint, (Any,), b) != 0) || return false
+    return ccall(:jl_subtype_via_membership, Cint, (Any, Any), a, b) != 0
+end
+
 function argtypes_to_type(argtypes::Array{Any,1})
     argtypes = anymap(@nospecialize(a) -> isvarargtype(a) ? a : widenconst(a), argtypes)
     filter!(@nospecialize(x) -> !isvarargtype(x) || valid_as_lattice(unwrapva(x), true), argtypes)
