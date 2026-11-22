@@ -341,6 +341,11 @@ TypeVar(@nospecialize(n), @nospecialize(lb), @nospecialize(ub)) = (@_nospecializ
 # intersections: All{X, Y} is the type of the values that are members of each component; the runtime
 # builds it in its normal form as All{Tuple{X, Y}}
 abstract type All{T<:Tuple} end
+# `Callable{A, S}`: the functions called with arguments of `A`, returning an `S`. A set whose
+# members are declared: every `Function` by one entry (base/Base.jl), a callable type by its own; the signature
+# is checked at the box, the result on return. The runtime opens it when Core is built, both parameters inputs.
+abstract type Callable{A<:Tuple, S} end
+
 UnionAll(@nospecialize(v), @nospecialize(t)) = (@_nospecializeinfer_meta; ccall(:jl_type_unionall, Any, (Any, Any), v::TypeVar, t))
 
 const Memory{T} = GenericMemory{:not_atomic, T, CPU}
@@ -446,6 +451,15 @@ end
 function implements end
 _implements_body(@nospecialize(X), @nospecialize(S)) = nothing
 
+# a call of a value known as `Callable{A, S}`: its arguments are of `A`, or the call
+# raises `MethodError`; the compiler inserts the check where it cannot prove them
+_callable_argcheck(@nospecialize(f), @nospecialize(A), @nospecialize(args...)) =
+    (isa(args, A) || throw_methoderror(f, args...); nothing)
+# and its result, or the result of a call that passed such a value on to code compiled for the function's
+# own type, is of the type inferred for it, or the call raises the box's `TypeError`: the
+# compiler invokes it after the call
+_callable_result(@nospecialize(r), @nospecialize(T)) =
+    isa(r, T) ? r : throw(TypeError(:Callable, T === Nothing ? "end the function with `nothing`" : "", T, r))
 struct UndefKeywordError <: Exception
     var::Symbol
 end
