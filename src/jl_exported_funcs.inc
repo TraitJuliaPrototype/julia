@@ -30,6 +30,7 @@
     XX(jl_array_ptr_1d_append) \
     XX(jl_array_ptr_1d_push) \
     XX(jl_declare_membership) \
+    XX(jl_delete_membership) \
     XX(jl_genericmemory_owner) \
     XX(jl_genericmemoryref) \
     XX(jl_array_rank) \
@@ -230,6 +231,7 @@
     XX(jl_gf_invoke_lookup) \
     XX(jl_has_open_set) \
     XX(jl_is_open_set) \
+    XX(jl_membership_stat) \
     XX(jl_method_lookup_by_tt) \
     XX(jl_method_lookup) \
     XX(jl_gf_invoke_lookup_worlds) \

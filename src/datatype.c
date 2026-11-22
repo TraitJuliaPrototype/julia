@@ -488,14 +488,79 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     // the entry begins at min_world, past every task's world until the counter advances
     entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world);
     index_entry((jl_membership_t*)entry);
+    // what the membership ends of the deep class is the membership's, named by its entry
+    int pushed = jl_deep_ending_push("membership", entry);
     jl_atomic_store_release(&jl_world_counter, min_world);
-    // the ambiguities the membership creates, at the entry's world
+    // what the membership changes of dispatch, then the ambiguities it creates, at the entry's world
     size_t mq = jl_set_membership_query_world(min_world);
+    jl_membership_dispatch_walk(member, set_instance, min_world);
+    jl_deep_ending_pop(pushed);
     jl_membership_ambiguity_report(member, set_instance, min_world);
     jl_set_membership_query_world(mq);
     JL_UNLOCK(&world_counter_lock);
     JL_GC_POP();
     return entry;
+}
+
+// Take a membership back: its entry ends in the current world, and the code and the dispatch caches that
+// relied on it end with it (the removal walk), in a new world. A member by its definition (its declared
+// supertype) cannot be taken back; nor while a package image is built.
+JL_DLLEXPORT void jl_delete_membership(jl_value_t *member, jl_value_t *set_instance, jl_value_t *deleter)
+{
+    if (!jl_is_type(member) || !jl_is_type(set_instance))
+        jl_error("a membership's member and set are types");
+    jl_value_t *pattern = jl_unwrap_unionall(member);
+    jl_value_t *setuw = jl_unwrap_unionall(set_instance);
+    if (!jl_is_datatype(pattern) || !jl_is_datatype(setuw))
+        jl_error("a membership's member and set are DataTypes, or UnionAlls over one");
+    jl_typename_t *setname = ((jl_datatype_t*)setuw)->name;
+    if (!setname->open_set)
+        jl_errorf("%s is not an open set", jl_symbol_name(setname->name));
+    if (jl_options.incremental && jl_generating_output())
+        jl_error("a membership cannot be taken back while a package image is built");
+    jl_typename_t *home = membership_home((jl_datatype_t*)pattern);
+    // a member by its definition (`struct S <: X`): its declared supertype chain reaches the set
+    for (jl_datatype_t *d = (jl_datatype_t*)pattern; d != NULL && d != jl_any_type; d = d->super) {
+        if (d != (jl_datatype_t*)pattern && d->name == setname)
+            jl_errorf("%s is a member of %s by its definition: only a new definition changes its supertype",
+                      jl_symbol_name(home->name), jl_symbol_name(setname->name));
+    }
+    (void)deleter;
+    jl_membership_t *found = NULL;
+    JL_GC_PUSH1(&found); // also in home's list, which the analyzer cannot see
+    JL_LOCK(&world_counter_lock);
+    if (!jl_atomic_load_relaxed(&allow_new_worlds)) {
+        JL_UNLOCK(&world_counter_lock);
+        jl_error("Membership changes have been disabled via a call to disable_new_worlds.");
+    }
+    size_t world = jl_atomic_load_relaxed(&jl_world_counter);
+    jl_svec_t *list = jl_typename_memberships(home);
+    for (size_t i = 0; i < jl_svec_len(list) && found == NULL; i++) {
+        jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
+        if (en->set == setname && jl_atomic_load_relaxed(&en->max_world) == ~(uint64_t)0 &&
+            en->min_world <= world && jl_types_equal(en->member, member) &&
+            same_inputs(setname, en->instance, set_instance))
+            found = en;
+    }
+    if (found == NULL) {
+        JL_UNLOCK(&world_counter_lock);
+        JL_GC_POP();
+        jl_errorf("no membership of %s in %s is in force to take back", jl_symbol_name(home->name),
+                  jl_symbol_name(setname->name));
+    }
+    // what ending the membership ends of the deep class is the membership's, named by its entry
+    int pushed = jl_deep_ending_push("membership", (jl_value_t*)found);
+    size_t mq = jl_set_membership_query_world(world);
+    jl_atomic_store_release(&found->max_world, world);
+    // the entry's visibility changes at world + 1: a dispatch's range asked from then on is exact at its
+    // end, and one asked at an older world is cut at `world`
+    jl_membership_changed(world + 1);
+    jl_membership_removal_walk(found->member, found->instance, world);
+    jl_set_membership_query_world(mq);
+    jl_deep_ending_pop(pushed);
+    jl_atomic_store_release(&jl_world_counter, world + 1);
+    JL_UNLOCK(&world_counter_lock);
+    JL_GC_POP();
 }
 
 // Make an abstract type a set (a library's declaration macro), before its binding is published: then

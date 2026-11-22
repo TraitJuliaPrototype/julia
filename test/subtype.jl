@@ -3070,4 +3070,50 @@ end
     @test occursin("is ambiguous for", report) && occursin("YA", report)
     @test !occursin("ambiguous", msg[1:first(i1)])
 end
+
+# a membership invalidates the code that relied on its absence, as a method definition does
+@set IX
+struct IS end
+ikind(::IX) = :set
+ikind(::Any) = :any
+icall(x::IS) = ikind(x)
+dyncall(v::Vector{Any}) = ikind(v[1])         # the call dispatches when it runs
+vbound(::Vector{<:IX}) = :set
+vbound(::Any) = :any
+vboundcall(v::Vector{IS}) = vbound(v)
+vinv(::Vector{IX}) = :set
+vinv(::Any) = :any
+vinvcall(v::Vector{IS}) = vinv(v)
+native_ci(f, T) = Base.method_instance(f, T).cache
+@test icall(IS()) === :any && dyncall(Any[IS()]) === :any
+@test vboundcall([IS()]) === :any && vinvcall([IS()]) === :any
+const ci_icall = native_ci(icall, (IS,))
+const ci_dyn = native_ci(dyncall, (Vector{Any},))
+const ci_vinv = native_ci(vinvcall, (Vector{IS},))
+const w_inv = world()
+member!(IX, IS)
+
+@testset "a membership invalidates as a method does" begin
+    @test ci_icall.max_world < typemax(UInt)            # the caller's code ends
+    @test icall(IS()) === :set
+    @test Base.invoke_in_world(w_inv, icall, IS()) === :any
+    @test dyncall(Any[IS()]) === :set
+    @test ci_dyn.max_world == typemax(UInt)             # dispatched at run time: its code stays
+    @test vboundcall([IS()]) === :set                   # a variable's bound names the set
+    @test vinvcall([IS()]) === :any                     # an invariant parameter does not vary
+    @test ci_vinv.max_world == typemax(UInt)
+    @test ccall(:jl_membership_stat, Csize_t, (Cint,), 1) > 0   # the walk replayed methods
+end
+
+const ci_icall2 = native_ci(icall, (IS,))
+is_ix() = IS <: IX
+const w_taken = world()
+ccall(:jl_delete_membership, Cvoid, (Any, Any, Any), IS, IX, @__MODULE__)
+
+@testset "a membership taken back" begin
+    @test !is_ix() && Base.invoke_in_world(w_taken, is_ix)
+    @test ci_icall2.max_world < typemax(UInt)
+    @test icall(IS()) === :any && ikind(IS()) === :any
+    @test_throws ErrorException ccall(:jl_delete_membership, Cvoid, (Any, Any, Any), IS, IX, @__MODULE__)
+end
 end # module SetsAndMemberships
