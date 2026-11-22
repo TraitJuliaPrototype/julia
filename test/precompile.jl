@@ -974,7 +974,7 @@ precompile_test_harness("code caching") do dir
                 # internal callers
                 meths = Method[]
                 for be in mi.backedges
-                    push!(meths, (be.def::Method).def) # XXX
+                    push!(meths, (be.def::Core.MethodInstance).def::Method) # XXX
                 end
                 @test which(M.g1, ()) ∈ meths
                 @test which(M.g2, ()) ∈ meths
