@@ -6736,4 +6736,13 @@ not_identical(a, b) = a !== b
 @test all(mi -> mi.specTypes === Tuple{typeof(!==), Any, Any}, Base.specializations(only(methods(!==))))
 @test only(code_typed(not_identical, (Union{Nothing,Int}, Nothing)))[2] === Bool
 
+# `TypeVar` and `UnionAll` are inferred once, at `Any`, and a call of them is matched at the call's own types
+make_typevar(n) = TypeVar(n)
+make_unionall(v, t) = UnionAll(v, t)
+@test Base.infer_return_type(make_typevar, (Symbol,)) === TypeVar
+let tv = make_typevar(:T); @test make_unionall(tv, Ref{tv}) isa UnionAll; end
+for f in (TypeVar, UnionAll), m in methods(f), mi in Base.specializations(m)
+    @test all(p -> p === Any, mi.specTypes.parameters[2:end])
+end
+
 end # module inference
