@@ -75,6 +75,17 @@ function record_match_memberships!(interp::AbstractInterpreter, sv::AbsIntState,
     return nothing
 end
 
+# a member's check: whether a match rests on a member whose check failed (the runtime notes a member
+# with no answer yet for the compile queue)
+function member_check_failed(sv::InferenceState, applicable::Vector{MethodMatchTarget})
+    failed = false
+    for target in applicable
+        m = target.match
+        failed |= ccall(:jl_member_note_use, Cint, (Any, Any, Any), m.spec_types, m.method, sv.linfo) != 0
+    end
+    return failed
+end
+
 any_ambig(result::MethodLookupResult) = result.ambig
 any_ambig(info::MethodMatchInfo) = any_ambig(info.results)
 any_ambig(m::MethodMatches) = any_ambig(m.info)
@@ -153,6 +164,13 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     update_valid_age!(sv, valid_worlds) # need to record the negative world now, since even if we don't generate any useful information, inlining might want to add an invoke edge and it won't have this information anymore
     # (in an inference frame, and where the IR interpreter infers the call again: both hold edges)
     record_match_memberships!(interp, sv, applicable)
+    # a member's check: inference reads the answers and runs no check. A call at a member whose check
+    # failed is left to dispatch, which raises the failure; a member with no answer is noted, and the
+    # compile queue asks the hook before the code runs
+    if sv isa InferenceState && interp isa NativeInterpreter && member_check_failed(sv, applicable)
+        add_remark!(interp, sv, "Call at a member whose check failed: left to dispatch")
+        return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
+    end
     # Concrete-only functions refuse to commit (and record no backedge) when any
     # applicable match has a non-concrete signature, regardless of scope. This is the
     # generalization of the top-level `!isdispatchtuple` bail below to a per-function opt-in.

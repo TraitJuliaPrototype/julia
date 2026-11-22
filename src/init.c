@@ -669,6 +669,7 @@ static void init_global_mutexes(void) {
     JL_MUTEX_INIT(&typecache_lock, "typecache_lock");
     JL_MUTEX_INIT(&profile_show_peek_cond_lock, "profile_show_peek_cond_lock");
     JL_MUTEX_INIT(&jl_typeinf_lock, "jl_typeinf_lock");
+    JL_MUTEX_INIT(&jl_member_state_lock, "jl_member_state_lock");
 }
 
 JL_DLLEXPORT void jl_init_(jl_image_buf_t sysimage)
