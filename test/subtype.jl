@@ -3561,4 +3561,23 @@ member!(HX, HBad)
         ccall(:jl_set_member_hook, Cvoid, (Any,), nothing)
     end
 end
+
+# a strict mode a library sets: a membership that makes methods ambiguous is refused at its
+# declaration, and leaves no entry in force
+sf(::HX) = 1
+sf(::HY) = 2
+
+@testset "a strict mode" begin
+    old = ccall(:jl_set_strict_memberships, Cint, (Cint,), 1)
+    try
+        @test_throws ErrorException member!(HY, HS)       # sf's two methods would tie at HS
+        @test Base.invokelatest(() -> !(HS <: HY) && sf(HS()) == 1)
+        member!(HY, HM)                                   # no method is ambiguous at HM
+        @test Base.invokelatest(() -> HM <: HY)
+        @test ccall(:jl_membership_method_sig, Any, (Any, Any), HS, HY) ==
+              Tuple{typeof(Core.implements), Type{HY}, Type{HS}}
+    finally
+        ccall(:jl_set_strict_memberships, Cint, (Cint,), old)
+    end
+end
 end # module SetsAndMemberships
