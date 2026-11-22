@@ -195,3 +195,74 @@ function typeinf_other_policy(interp::NativeInterpreter, method::Method, mi::Met
         return Future(MethodCallResult(interp, caller, method, Any, Any, unedged_effects(interp), nothing, edgecycle, edgelimited))
     return return_cached_result(interp, method, codeinst, caller, edgecycle, edgelimited)
 end
+
+"""
+Whether a record is deep G2: every dispatch edge is at a fact signature, and every callee among its
+edges is a CodeInstance that carries the G2 bit. Such code is invalidated only by a definition of
+the owners of the functions and types its facts name, at any depth. A callee finishes before its
+callers and its bit is final then, so the edges' own bits decide the class, with no walk. `own` is the
+CodeInstance itself, or the members of its inference cycle (their CodeInstances and MethodInstances),
+which are judged as one: an edge to a member counts, whether it names the member's CodeInstance or its
+MethodInstance. Another CodeInstance of the same MethodInstance is judged by its bit. Any other callee
+named by its MethodInstance alone is outside the class: its backedge carries whatever code it gets.
+An edge that names a Method alone names no code. An invoke at a declared signature is not gated; a
+binding edge is not a dispatch.
+"""
+function edges_satisfy_g2(edges::SimpleVector, own::Union{CodeInstance,IdSet{Any}})
+    for e in edges
+        if e isa CodeInstance
+            is_own(own, e) && continue
+            # its G2 bit (`JL_CI_FLAGS_G2`)
+            (getfield(e, :flags, :monotonic)::UInt8 & 0x10) == 0x00 && return false
+        elseif e isa MethodInstance
+            is_own(own, e) || return false
+        end
+    end
+    for (invokesig, item) in ForwardToBackedgeIterator(edges)
+        if item isa Core.Binding
+            continue
+        elseif item isa MethodTable
+            is_fact_sig(invokesig) || return false
+        elseif item isa MethodInstance
+            # an `invoke` edge is skipped; an ordinary call is checked at its own signature: a call
+            # that reached an instance wider than its match carries that signature (`CallSigBackedge`),
+            # by which a later method invalidates it
+            (invokesig === nothing || invokesig isa CallSigBackedge) || continue
+            is_fact_sig(invokesig isa CallSigBackedge ? invokesig.sig : item.specTypes) || return false
+        end
+    end
+    return true
+end
+
+"""
+An edge that names a callee by its MethodInstance alone names the callee's CodeInstance where one exists
+when the caller finishes: inference had no CodeInstance for the callee where it reached the
+call (a recursion through it, a limited inference), and the callee was finished before the caller. The
+CodeInstance is the one of the policy the caller's call reaches, valid in the caller's worlds. The backedge
+is the same, on the instance: a definition that changes dispatch at the callee ends the caller as before;
+of the callee's code, only the CodeInstance named ends it. The caller's own instance, the members of its
+inference cycle (not yet cached) and an interpreter of no policy are left as they are.
+"""
+function name_callee_code(interp::AbstractInterpreter, caller::MethodInstance, edges::SimpleVector, worlds::WorldRange)
+    interp isa NativeInterpreter && !interp.plainrt || return edges
+    out = nothing
+    for i in 1:length(edges)
+        e = edges[i]
+        e isa MethodInstance || continue
+        (e === caller || !(e.def isa Method)) && continue
+        cache = WorldView(InternalCodeCache(cache_owner(interp), Cint(mi_policy_facts_at(e, interp.facts))), worlds)
+        ci = get(cache, e, nothing)
+        ci isa CodeInstance || continue
+        out === nothing && (out = Any[edges...])
+        out[i] = ci
+    end
+    return out === nothing ? edges : Core.svec(out...)
+end
+
+is_own(own::CodeInstance, e::CodeInstance) = own === e
+is_own(own::CodeInstance, e::MethodInstance) = get_ci_mi(own) === e
+is_own(own::IdSet{Any}, @nospecialize(e)) = e in own
+
+"Set the G2 bit of `ci` where its record is deep G2."
+set_g2!(ci::CodeInstance, edges::SimpleVector) =
+    (edges_satisfy_g2(edges, ci) && ccall(:jl_ci_set_g2, Cvoid, (Any,), ci); nothing)
