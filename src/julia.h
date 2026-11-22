@@ -387,7 +387,8 @@ typedef struct _jl_method_t {
     // forcing the conclusion to always true.
     _jl_purity_overrides_t purity;
     // the method's policy, bits 0-1: 0 as its module says, 1 a boundary (compiled in the policy
-    // of the code that reaches it), 2 always compiled by facts
+    // of the code that reaches it), 2 always compiled by facts; fully typed mode, bits 2-3: 4 warn,
+    // 8 enforce
     uint8_t facts;
 
 // hidden fields:
@@ -825,6 +826,9 @@ enum jl_binding_flags {
 enum jl_module_option {
     // the functions the module neither exports nor declares public take methods from their owner only
     JL_MODULE_OPTION_OWNER_ONLY = 64,
+    // fully typed mode for the module's methods: warn, or enforce
+    JL_MODULE_OPTION_FULLY_TYPED_WARN = 16,
+    JL_MODULE_OPTION_FULLY_TYPED_ENFORCE = 32,
 };
 
 typedef struct _jl_binding_t {
