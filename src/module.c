@@ -746,7 +746,8 @@ JL_DLLEXPORT int jl_get_module_facts(jl_module_t *m)
 // at its creation.
 JL_DLLEXPORT void jl_set_module_option(jl_module_t *self, int bit, int value)
 {
-    if (bit != JL_MODULE_OPTION_OWNER_ONLY)
+    if (bit != JL_MODULE_OPTION_OWNER_ONLY && bit != JL_MODULE_OPTION_FULLY_TYPED_WARN &&
+        bit != JL_MODULE_OPTION_FULLY_TYPED_ENFORCE)
         jl_errorf("unknown module option bit %d", bit);
     if (value)
         self->options |= (uint8_t)bit;
@@ -795,8 +796,8 @@ JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT
     if (mf == 2)
         return JL_POLICY_PLAIN;
     int flag = m->facts & 3;
-    if (flag == 2)
-        return JL_POLICY_FACTS;
+    if (flag == 2 || jl_method_fully_typed(m) != 0)
+        return JL_POLICY_FACTS; // fully typed mode is checked on the code compiled by facts
     if (flag == 1)
         return JL_POLICY_CALLER;
     if (mf == 1)
@@ -804,6 +805,17 @@ JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT
     if (!facts_all() || method_is_builtin(m))
         return JL_POLICY_PLAIN;
     return JL_POLICY_CALLER;
+}
+// Fully typed mode: 0 off, 1 warn, 2 enforce; the method's own (bits 4, 8 of its facts byte), else its
+// module's option.
+JL_DLLEXPORT int jl_method_fully_typed(jl_method_t *m) JL_NOTSAFEPOINT
+{
+    if (m->facts & 8)
+        return 2;
+    if (m->facts & 4)
+        return 1;
+    uint8_t o = m->module->options;
+    return (o & JL_MODULE_OPTION_FULLY_TYPED_ENFORCE) ? 2 : (o & JL_MODULE_OPTION_FULLY_TYPED_WARN) ? 1 : 0;
 }
 // whether a method's code is compiled by facts whoever reaches it
 JL_DLLEXPORT int jl_method_is_facts(jl_method_t *m) JL_NOTSAFEPOINT
