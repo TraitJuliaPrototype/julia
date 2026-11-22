@@ -332,10 +332,11 @@ macro _nospecializeinfer_meta() Expr(:meta, :nospecializeinfer) end
 
 macro _boundscheck() Expr(:boundscheck) end
 
-# n.b. the effects and model of these is refined in inference abstractinterpretation.jl
-TypeVar(@nospecialize(n)) = _typevar(n::Symbol, Union{}, Any)
-TypeVar(@nospecialize(n), @nospecialize(ub)) = _typevar(n::Symbol, Union{}, ub)
-TypeVar(@nospecialize(n), @nospecialize(lb), @nospecialize(ub)) = _typevar(n::Symbol, lb, ub)
+# n.b. the effects and model of these is refined in inference abstractinterpretation.jl; they are
+# inferred once, at `Any` (`Base.@nospecializeinfer`), and a call's dispatch backedge keeps its own signature
+TypeVar(@nospecialize(n)) = (@_nospecializeinfer_meta; _typevar(n::Symbol, Union{}, Any))
+TypeVar(@nospecialize(n), @nospecialize(ub)) = (@_nospecializeinfer_meta; _typevar(n::Symbol, Union{}, ub))
+TypeVar(@nospecialize(n), @nospecialize(lb), @nospecialize(ub)) = (@_nospecializeinfer_meta; _typevar(n::Symbol, lb, ub))
 
 # intersections (compiler §4.9): All{X, Y} is the type of the values that are members of each
 # component; the runtime builds it in its normal form as All{Tuple{X, Y}}
@@ -345,7 +346,7 @@ abstract type All{T<:Tuple} end
 # is checked at the box, the result on return. The runtime opens it when Core is built, both parameters inputs.
 abstract type Callable{A<:Tuple, S} end
 
-UnionAll(@nospecialize(v), @nospecialize(t)) = ccall(:jl_type_unionall, Any, (Any, Any), v::TypeVar, t)
+UnionAll(@nospecialize(v), @nospecialize(t)) = (@_nospecializeinfer_meta; ccall(:jl_type_unionall, Any, (Any, Any), v::TypeVar, t))
 
 const Memory{T} = GenericMemory{:not_atomic, T, CPU}
 const MemoryRef{T} = GenericMemoryRef{:not_atomic, T, CPU}
