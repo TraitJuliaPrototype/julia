@@ -727,6 +727,43 @@ JL_DLLEXPORT int jl_get_module_infer(jl_module_t *m)
     return value;
 }
 
+// The facts policy of a module: 0 plain, 1 facts, 2 never compiled by facts (the compiler's own modules).
+JL_DLLEXPORT void jl_set_module_facts(jl_module_t *self, int value)
+{
+    self->facts = value == 2 ? 2 : value != 0;
+}
+// the compiler's own modules: never compiled by facts (callable before Base's C types exist)
+JL_DLLEXPORT void jl_set_module_facts_never(jl_module_t *self)
+{
+    self->facts = 2;
+}
+JL_DLLEXPORT int jl_get_module_facts(jl_module_t *m)
+{
+    return m->facts;
+}
+// The policy of a method's code: the compiler's own code (a module of flag 2) is plain, whatever its
+// methods' flags say; then the method's flag: always facts, or a boundary, which takes the policy of
+// the code that reaches it; then its module's: flag 1 facts; any other method plain.
+JL_DLLEXPORT int jl_method_policy(jl_method_t *m) JL_NOTSAFEPOINT
+{
+    int8_t mf = m->module->facts;
+    if (mf == 2)
+        return JL_POLICY_PLAIN;
+    int flag = m->facts & 3;
+    if (flag == 2)
+        return JL_POLICY_FACTS;
+    if (flag == 1)
+        return JL_POLICY_CALLER;
+    if (mf == 1)
+        return JL_POLICY_FACTS;
+    return JL_POLICY_PLAIN;
+}
+// whether a method's code is compiled by facts whoever reaches it
+JL_DLLEXPORT int jl_method_is_facts(jl_method_t *m) JL_NOTSAFEPOINT
+{
+    return jl_method_policy(m) == JL_POLICY_FACTS;
+}
+
 JL_DLLEXPORT void jl_set_module_max_methods(jl_module_t *self, int value)
 {
     self->max_methods = value;
