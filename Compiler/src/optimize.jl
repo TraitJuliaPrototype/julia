@@ -54,6 +54,13 @@ const IR_FLAG_INACCESSIBLEMEM_OR_ARGMEM = one(UInt32) << 19
 # `typeassert`), recording the membership entries those that hold through one rest on: code
 # generation emits no run-time test for them
 const IR_FLAG_TYPES_PROVEN = one(UInt32) << 20
+# This statement's type rests on a declared result that the code compiled for a member's own type
+# does not check, and the code that runs may be another instance than the one inferred: a
+# `Callable{A, S}`'s `S`, an operation's result its members' check does not reach (the `trusted`
+# effect). The inliner checks its result where it is left to dispatch
+const IR_FLAG_TRUSTED_CALLABLE  = one(UInt32) << 21
+const IR_FLAG_TRUSTED_OPERATION = one(UInt32) << 22
+const IR_FLAGS_TRUSTED = IR_FLAG_TRUSTED_CALLABLE | IR_FLAG_TRUSTED_OPERATION
 
 const NUM_IR_FLAGS = 3 # sync with julia.h
 
@@ -98,6 +105,8 @@ function flags_for_effects(effects::Effects)
     if is_nortcall(effects)
         flags |= IR_FLAG_NORTCALL
     end
+    iszero(effects.trusted & TRUSTED_CALLABLE) || (flags |= IR_FLAG_TRUSTED_CALLABLE)
+    iszero(effects.trusted & TRUSTED_OPERATION) || (flags |= IR_FLAG_TRUSTED_OPERATION)
     return flags
 end
 

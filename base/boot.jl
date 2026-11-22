@@ -445,6 +445,7 @@ end
 # to the method's instance, and ends when the method does.
 function implements end
 _implements_body(@nospecialize(X), @nospecialize(S)) = nothing
+
 struct UndefKeywordError <: Exception
     var::Symbol
 end
