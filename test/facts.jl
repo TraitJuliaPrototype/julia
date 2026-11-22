@@ -144,3 +144,59 @@ deep_plain_f(x::Int) = deep_plain_g(x) + 1
     @test isempty(take())
     @test DeepEndings.f(1) == 31
 end
+
+module FullyTypedEnforce
+Base.Experimental.@compiler_options fully_typed=enforce
+typed(x::Int) = x + 1
+untyped(v::Vector{Any}) = v[1] + 1
+end
+module FullyTypedWarn
+Base.Experimental.@compiler_options fully_typed=warn
+untyped(v::Vector{Any}) = v[1] + 1
+end
+module FullyTypedOff
+untyped(v::Vector{Any}) = v[1] + 1
+end
+@eval FullyTypedOff bymeta(v::Vector{Any}) = $(Expr(:block, Expr(:meta, :fully_typed_enforce), :(v[1] + 1)))
+
+@testset "fully typed mode" begin
+    policy(f, T) = (Base.method_instance(f, T).cache.flags & CI_FLAG_FACTS) != 0 ? :facts : :plain
+    E, W, O = FullyTypedEnforce, FullyTypedWarn, FullyTypedOff
+    @test ccall(:jl_get_module_options, Cint, (Any,), E) == 32
+    @test ccall(:jl_get_module_options, Cint, (Any,), W) == 16
+    @test ccall(:jl_method_fully_typed, Cint, (Any,), which(E.typed, (Int,))) == 2
+    @test ccall(:jl_method_fully_typed, Cint, (Any,), which(W.untyped, (Vector{Any},))) == 1
+    @test ccall(:jl_method_fully_typed, Cint, (Any,), which(O.untyped, (Vector{Any},))) == 0
+    @test ccall(:jl_method_fully_typed, Cint, (Any,), which(O.bymeta, (Vector{Any},))) == 2
+    @test ccall(:jl_method_policy, Cint, (Any,), which(E.typed, (Int,))) == 1   # facts
+
+    # no hook: fully typed code runs; code with a run-time site raises under enforce, runs under warn
+    @test E.typed(1) == 2
+    @test policy(E.typed, (Int,)) === :facts
+    @test_throws "not fully typed" E.untyped(Any[1])
+    @test W.untyped(Any[1]) == 2
+    @test O.untyped(Any[1]) == 2
+    @test policy(O.untyped, (Vector{Any},)) === :plain
+    @test_throws "not fully typed" O.bymeta(Any[1])
+
+    # a hook gets the site (the instance, the level, warned, the kind): under warn once per site, under
+    # enforce at every run
+    seen = Any[]
+    hook(site) = (push!(seen, site); site[2] == 2 && error("hook: not fully typed"); nothing)
+    ccall(:jl_set_fully_typed_hook, Cvoid, (Any,), hook)
+    try
+        @eval FullyTypedWarn untyped2(v::Vector{Any}) = v[1] * 2
+        @test W.untyped2(Any[3]) == 6
+        @test W.untyped2(Any[4]) == 8
+        @test length(seen) == 1
+        @test seen[1][1] === Base.method_instance(W.untyped2, (Vector{Any},))
+        @test seen[1][2] == 1 && seen[1][4] == 1
+        @test_throws "hook: not fully typed" E.untyped(Any[1])
+        @test_throws "hook: not fully typed" E.untyped(Any[1])
+        @test length(seen) == 3
+        @test E.typed(5) == 6
+        @test length(seen) == 3
+    finally
+        ccall(:jl_set_fully_typed_hook, Cvoid, (Any,), nothing)
+    end
+end

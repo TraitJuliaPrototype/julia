@@ -2909,6 +2909,7 @@ static void gc_mark_roots(jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT
     gc_try_claim_and_push(mq, jl_deep_endings, NULL); // what definitions ended of the deep class (gf.c)
     gc_try_claim_and_push(mq, jl_deep_ending_kind, NULL); // and the cause being recorded (gf.c)
     gc_try_claim_and_push(mq, jl_deep_ending_cause, NULL);
+    gc_try_claim_and_push(mq, jl_fully_typed_hook, NULL); // fully typed mode's hook (gf.c)
     gc_heap_snapshot_record_gc_roots((jl_value_t*)_jl_debug_method_invalidation, "debug_method_invalidation");
     // constants
     gc_try_claim_and_push(mq, jl_emptytuple_type, NULL);
