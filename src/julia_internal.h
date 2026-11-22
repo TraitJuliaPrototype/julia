@@ -981,6 +981,22 @@ STATIC_INLINE int jl_is_all_type(jl_value_t *v) JL_NOTSAFEPOINT
            ((jl_datatype_t*)v)->name == ((jl_datatype_t*)((jl_unionall_t*)jl_all_type)->body)->name;
 }
 JL_DLLEXPORT jl_value_t *jl_type_all(jl_value_t **ts, size_t n);
+// the worlds of an answer that reads memberships (subtype.c): a declaration, a redeclaration's end of an
+// old entry and the like raise the last change's world; at a query in that world or later the range
+// is taken without a walk
+void jl_membership_changed(size_t world) JL_NOTSAFEPOINT;
+int jl_membership_range_is_fast(size_t world) JL_NOTSAFEPOINT;
+// the world range over which the memberships a question about t can read are what they are in
+// `world`; returns whether t reaches any entry (*lo, *hi untouched if not). `sig`, where given, is the
+// signature of the method matched.
+JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_t world, size_t *lo, size_t *hi);
+JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
+// the methods whose signatures name a set (gf.c), a collector root
+extern jl_array_t *open_set_methods JL_GLOBALLY_ROOTED;
+// the ambiguities a membership creates, reported as warnings (gf.c). Called under world_counter_lock,
+// the entry published and the counter advanced to `entry_min_world`.
+JL_DLLEXPORT void jl_membership_ambiguity_report(jl_value_t *member, jl_value_t *set_instance,
+                                                 size_t entry_min_world);
 jl_datatype_t *jl_new_uninitialized_datatype(void);
 void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable);
 JL_DLLEXPORT jl_datatype_t *jl_wrap_Type(jl_value_t *t);  // x -> Type{x}
@@ -1975,12 +1991,15 @@ struct typemap_intersection_env {
     jl_value_t *const type; // type to match
     jl_value_t *const va; // the tparam0 for the vararg in type, if applicable (or NULL)
     size_t search_slurp;
+    size_t world; // the query world for the walk: the membership arms ask the entries at this world;
+                  // every caller sets it
     // output values
     size_t min_valid;
     size_t max_valid;
     jl_value_t *ti; // intersection type
     jl_svec_t *env; // intersection env (initialize to null to perform intersection without an environment)
     int issubty;    // if `a <: b` is true in `intersect(a,b)`
+    int skip_ranges; // the caller reads no match's worlds: the membership range is not taken (zero by default)
 };
 int jl_typemap_intersection_visitor(jl_typemap_t *a, int offs, struct typemap_intersection_env *closure);
 void typemap_slurp_search(jl_typemap_entry_t *ml, struct typemap_intersection_env *closure);

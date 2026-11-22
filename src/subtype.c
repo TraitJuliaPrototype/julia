@@ -1584,6 +1584,140 @@ static int subtype_membership(jl_datatype_t *x, jl_value_t *y, jl_stenv_t *e, in
     return 0;
 }
 
+// The world range over which the memberships that a question about t can read
+// are what they are in `world`: each entry on a TypeName reachable from t, through
+// parameters, supertypes and entries' instances, narrows [*lo, *hi] to the worlds
+// in which its visibility equals its visibility in `world`. Dispatch bounds the
+// validity of a match by it. Returns whether t reaches any entry.
+static int membership_range_visit(jl_value_t *t, size_t world, size_t *lo, size_t *hi,
+                                  arraylist_t *seen) JL_NOTSAFEPOINT
+{
+    if (t == NULL)
+        return 0;
+    if (jl_is_unionall(t)) {
+        jl_unionall_t *u = (jl_unionall_t*)t;
+        int a = membership_range_visit(u->var->lb, world, lo, hi, seen);
+        int b = membership_range_visit(u->var->ub, world, lo, hi, seen);
+        int c = membership_range_visit(u->body, world, lo, hi, seen);
+        return a || b || c;
+    }
+    if (jl_is_uniontype(t)) {
+        int a = membership_range_visit(((jl_uniontype_t*)t)->a, world, lo, hi, seen);
+        int b = membership_range_visit(((jl_uniontype_t*)t)->b, world, lo, hi, seen);
+        return a || b;
+    }
+    if (jl_is_vararg(t))
+        return membership_range_visit(jl_unwrap_vararg(t), world, lo, hi, seen);
+    if (!jl_is_datatype(t))
+        return 0;
+    jl_datatype_t *dt = (jl_datatype_t*)t;
+    int found = 0;
+    for (size_t i = 0; i < jl_nparams(dt); i++)
+        found |= membership_range_visit(jl_tparam(dt, i), world, lo, hi, seen);
+    for (jl_datatype_t *d = dt; d != NULL && d != jl_any_type; d = d->super) {
+        size_t i;
+        for (i = 0; i < seen->len; i++)
+            if (seen->items[i] == d->name)
+                break;
+        if (i < seen->len)
+            continue;
+        arraylist_push(seen, d->name);
+        jl_svec_t *list = jl_typename_memberships(d->name);
+        for (i = 0; i < jl_svec_len(list); i++) {
+            jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
+            found = 1;
+            if (world != 0) {
+                if (en->min_world > world) {
+                    if (*hi >= en->min_world)
+                        *hi = en->min_world - 1;
+                }
+                else if (jl_atomic_load_relaxed(&en->max_world) < world) {
+                    if (*lo <= jl_atomic_load_relaxed(&en->max_world))
+                        *lo = jl_atomic_load_relaxed(&en->max_world) + 1;
+                }
+                else {
+                    if (*lo < en->min_world)
+                        *lo = en->min_world;
+                    if (*hi > jl_atomic_load_relaxed(&en->max_world))
+                        *hi = jl_atomic_load_relaxed(&en->max_world);
+                }
+            }
+            membership_range_visit(en->instance, world, lo, hi, seen);
+        }
+    }
+    return found;
+}
+
+// whether a type, a type inside it, or a type on one of their supertype chains holds membership
+// entries: without any, no membership can narrow the worlds of an answer about the type
+JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT
+{
+    if (t == NULL)
+        return 0;
+    if (jl_is_unionall(t)) {
+        jl_unionall_t *u = (jl_unionall_t*)t;
+        return jl_type_has_memberships(u->var->lb) || jl_type_has_memberships(u->var->ub) ||
+               jl_type_has_memberships(u->body);
+    }
+    if (jl_is_uniontype(t))
+        return jl_type_has_memberships(((jl_uniontype_t*)t)->a) ||
+               jl_type_has_memberships(((jl_uniontype_t*)t)->b);
+    if (jl_is_vararg(t))
+        return jl_type_has_memberships(((jl_vararg_t*)t)->T);
+    if (!jl_is_datatype(t))
+        return 0;
+    for (jl_datatype_t *d = (jl_datatype_t*)t; d != NULL && d != jl_any_type; d = d->super)
+        if (jl_svec_len(jl_typename_memberships(d->name)) != 0)
+            return 1;
+    for (size_t i = 0; i < jl_nparams(t); i++)
+        if (jl_type_has_memberships(jl_tparam(t, i)))
+            return 1;
+    return 0;
+}
+
+
+// The latest world in which an entry's visibility changed: a declaration and a redeclaration's end of
+// the old entry raise it, before their world is published.
+// At a query in this world or later every entry is either in force from a world no later than
+// it, with no end, or retired before it: the exact range is [w, ∞) with w no later than this world, so
+// starting the range here is exact at its end and narrower at its start, and needs no walk.
+static _Atomic(size_t) membership_last_change = 1;
+void jl_membership_changed(size_t world) JL_NOTSAFEPOINT
+{
+    size_t old = jl_atomic_load_relaxed(&membership_last_change);
+    while (old < world && !jl_atomic_cmpswap(&membership_last_change, &old, world))
+        ;
+}
+
+// whether a range asked at `world` is taken without a walk (and without asking anything of the type)
+int jl_membership_range_is_fast(size_t world) JL_NOTSAFEPOINT
+{
+    return world != 0 && world >= jl_atomic_load_acquire(&membership_last_change);
+}
+
+JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_t world, size_t *lo, size_t *hi)
+{
+    if (world == 0)     // no range asked: whether `t` reaches an entry
+        return jl_type_has_memberships(t);
+    int found;
+    size_t last = jl_atomic_load_acquire(&membership_last_change);
+    if (world >= last) {
+        // whether `t` reaches an entry at all is not asked: the callers ask only for a match at a
+        // signature that names an open set, and starting its range here is sound either way
+        if (*lo < last)
+            *lo = last;
+        found = 1;
+    }
+    else {
+        arraylist_t seen;
+        arraylist_new(&seen, 0);
+        found = membership_range_visit(t, world, lo, hi, &seen);
+        arraylist_free(&seen);
+    }
+    (void)sig;
+    return found;
+}
+
 // Subtyping by declared supertypes and parameters alone, for normal forms (a union's simplification):
 // no membership entry is in force in world 1, since each is declared in a later one.
 JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b)
@@ -6446,6 +6580,17 @@ static int type_morespecific_(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_v
             }
             tta = tta->super; super = 1;
         }
+        if (!invariant) {
+            // at a position, a closed type other than Any is more specific than a set; of two sets, one
+            // below the other by its entries is more specific, else they are unordered. Without sets
+            // this is two bit reads. Invariant (a container's parameter) positions keep Julia's rule.
+            jl_datatype_t *ua = (jl_datatype_t*)jl_unwrap_unionall(a);
+            jl_datatype_t *ub = (jl_datatype_t*)jl_unwrap_unionall(b);
+            if (ub->name->open_set && a != (jl_value_t*)jl_any_type && !ua->name->open_set)
+                return 1;
+            if (ua->name->open_set && ub->name->open_set)
+                return ua->name != ub->name && jl_typename_reaches(ua->name, ub->name, jl_membership_world());
+        }
         return 0;
     }
 
@@ -6514,7 +6659,9 @@ static int type_morespecific_(jl_value_t *a, jl_value_t *b, jl_value_t *a0, jl_v
 
 JL_DLLEXPORT int jl_type_morespecific(jl_value_t *a, jl_value_t *b)
 {
-    if (obviously_disjoint(a, b, 1))
+    // a closed type and a set are disjoint by their chains, so this short cut would refuse the pair
+    // before type_morespecific_ orders it: skipped where either side names a set (a memoized bit)
+    if (!(jl_has_open_set_in(a) || jl_has_open_set_in(b)) && obviously_disjoint(a, b, 1))
         return 0;
     if (jl_has_free_typevars(a) || jl_has_free_typevars(b))
         return 0;
@@ -6536,7 +6683,8 @@ JL_DLLEXPORT int jl_method_morespecific(jl_method_t *ma, jl_method_t *mb)
 {
     jl_value_t *a = (jl_value_t*)ma->sig;
     jl_value_t *b = (jl_value_t*)mb->sig;
-    if (obviously_disjoint(a, b, 1))
+    // the same as jl_type_morespecific above
+    if (!(jl_has_open_set_in(a) || jl_has_open_set_in(b)) && obviously_disjoint(a, b, 1))
         return 0;
     if (jl_has_free_typevars(a) || jl_has_free_typevars(b))
         return 0;
