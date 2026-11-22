@@ -1068,7 +1068,10 @@ julia> istaskdone(b)
 true
 ```
 """
-function schedule(t::Task, @nospecialize(arg); error=false)
+schedule(t::Task, @nospecialize(arg); error=false) = _schedule(t, arg, error)
+
+# the positional body of `schedule(t, arg; error)`, which `notify` calls through `invoke`
+function _schedule(t::Task, @nospecialize(arg), error)
     # schedule a task to be (re)started with the given value or exception
     t._state === task_state_runnable || Base.error("schedule: Task not runnable")
     if error
