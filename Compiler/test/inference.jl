@@ -6727,4 +6727,12 @@ irinterp_scan_d2(t) = irinterp_scan_derivative(irinterp_scan_d1, t)
 @test Base.infer_return_type(irinterp_scan_d2, (Int,)) === Int
 @test irinterp_scan_d2(2) == 2
 
+
+# a call's signature with a union at its top level is split as inference splits a call, for its edges
+let sigs = Compiler.callsig_splits(Tuple{typeof(!==), Union{Nothing,Int}, Nothing})
+    @test sigs !== nothing && Set(sigs) == Set(Any[Tuple{typeof(!==), Nothing, Nothing}, Tuple{typeof(!==), Int, Nothing}])
+end
+@test Compiler.callsig_splits(Tuple{typeof(!==), Int, Nothing}) === nothing
+@test Compiler.callsig_splits(Tuple{typeof(!==), Union{Int8,Int16,Int32,Int64,Int128}, Nothing}) === nothing
+
 end # module inference
