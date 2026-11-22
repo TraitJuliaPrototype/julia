@@ -1025,6 +1025,7 @@ function codeinst_as_edge(interp::AbstractInterpreter, sv::InferenceState, @nosp
     end
     ci = CodeInstance(mi, cache_owner(interp), Any, Any, nothing, nothing, zero(Int32),
         min_world, max_world, zero(UInt32), nothing, nothing, edges)
+    set_code_policy!(ci, interp)
     if max_world == typemax(UInt)
         # if we can record all of the backedges in the global reverse-cache,
         # we can now widen our applicability in the global cache too
@@ -1630,8 +1631,13 @@ end
 
 # This is a bridge for the C code calling `jl_typeinf_func()` on a single Method match
 function typeinf_ext_toplevel(mi::MethodInstance, world::UInt, source_mode::UInt8, trim_mode::UInt8)
+    return typeinf_ext_toplevel(mi, world, source_mode, trim_mode, mi_policy_facts(mi))
+end
+# the same, for code of a policy: the runtime asks for the policy of the code that
+# reaches `mi`
+function typeinf_ext_toplevel(mi::MethodInstance, world::UInt, source_mode::UInt8, trim_mode::UInt8, facts::Bool)
     inf_params = InferenceParams(; force_enable_inference = trim_mode != TRIM_NO)
-    interp = NativeInterpreter(world; inf_params)
+    interp = NativeInterpreter(world; inf_params, facts)
     return typeinf_ext_toplevel(interp, mi, source_mode)
 end
 

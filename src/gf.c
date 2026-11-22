@@ -398,12 +398,70 @@ static int emit_codeinst_and_edges(jl_code_instance_t *codeinst)
     return 0;
 }
 
+// The policy of a method instance's code: its method's; a top-level thunk's is its module's, plain
+// for a module that is not compiled by facts.
+static int mi_policy_uncached(jl_method_instance_t *mi) JL_NOTSAFEPOINT
+{
+    jl_value_t *def = mi->def.value;
+    if (jl_is_method(def))
+        return jl_method_policy((jl_method_t*)def);
+    if (jl_is_module(def) && ((jl_module_t*)def)->facts == 1)
+        return JL_POLICY_FACTS;
+    return JL_POLICY_PLAIN;
+}
+// The same, cached in the method instance's flags at its first use: dispatch asks it at every call.
+// A module's option set after one of its methods was first called does not change that method's
+// policy.
+STATIC_INLINE int mi_policy(jl_method_instance_t *mi) JL_NOTSAFEPOINT
+{
+    uint8_t c = (jl_atomic_load_relaxed(&mi->flags) & MI_FLAG_POLICY_MASK) >> MI_FLAG_POLICY_SHIFT;
+    if (__likely(c != 0))
+        return c - 1;
+    int p = mi_policy_uncached(mi);
+    jl_atomic_fetch_or_relaxed(&mi->flags, (uint8_t)((p + 1) << MI_FLAG_POLICY_SHIFT));
+    return p;
+}
+// Whether the code of `mi` reached with `reach` is compiled by facts: its own policy, or for a
+// method that takes the policy of the code reaching it, that code's; the runtime's own entries
+// reach with plain code.
+STATIC_INLINE int mi_policy_facts_at(jl_method_instance_t *mi, int reach) JL_NOTSAFEPOINT
+{
+    int p = mi_policy(mi);
+    if (p != JL_POLICY_CALLER)
+        return p;
+    return reach == JL_REACH_FACTS;
+}
+JL_DLLEXPORT int jl_mi_policy_at(jl_method_instance_t *mi, int reach) JL_NOTSAFEPOINT
+{
+    return mi_policy_facts_at(mi, reach);
+}
+// A CodeInstance of Julia's own owner records the policy it was compiled in; a lookup takes only
+// one of the policy wanted.
+STATIC_INLINE int ci_policy_is(jl_code_instance_t *ci, int facts) JL_NOTSAFEPOINT
+{
+    return ((jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_FACTS) != 0) == (facts != 0);
+}
+STATIC_INLINE int ci_policy_facts(jl_code_instance_t *ci) JL_NOTSAFEPOINT
+{
+    return (jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_FACTS) != 0;
+}
+// Records the policy a new CodeInstance is compiled in, before it is published.
+JL_DLLEXPORT void jl_ci_set_policy(jl_code_instance_t *ci, int facts) JL_NOTSAFEPOINT
+{
+    if (ci->owner != jl_nothing)
+        return;
+    if (facts)
+        jl_atomic_fetch_or_relaxed(&ci->flags, JL_CI_FLAGS_FACTS);
+    else
+        jl_atomic_fetch_and_relaxed(&ci->flags, (uint8_t)~JL_CI_FLAGS_FACTS);
+}
+
 // Opportunistic SOURCE_MODE_ABI cache lookup, only for bootstrapping.
-static jl_code_instance_t *jl_method_inferred_with_abi(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world)
+static jl_code_instance_t *jl_method_inferred_with_abi(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world, int facts)
 {
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     for (; codeinst; codeinst = jl_atomic_load_relaxed(&codeinst->next)) {
-        if (codeinst->owner != jl_nothing)
+        if (codeinst->owner != jl_nothing || !ci_policy_is(codeinst, facts))
             continue;
         if (jl_atomic_load_relaxed(&codeinst->min_world) <= world && world <= jl_atomic_load_relaxed(&codeinst->max_world)) {
             if (emit_codeinst_and_edges(codeinst))
@@ -421,9 +479,14 @@ jl_mutex_t jl_typeinf_lock;
 // if inference doesn't occur (or can't finish), returns NULL instead
 jl_code_instance_t *jl_type_infer(jl_method_instance_t *mi, size_t world, uint8_t source_mode, uint8_t trim_mode)
 {
+    return jl_type_infer_policy(mi, world, source_mode, trim_mode, mi_policy_facts_at(mi, JL_REACH_RUNTIME));
+}
+// the same, for code of a policy
+jl_code_instance_t *jl_type_infer_policy(jl_method_instance_t *mi, size_t world, uint8_t source_mode, uint8_t trim_mode, int facts)
+{
     if (jl_typeinf_func == NULL) {
         if (source_mode == SOURCE_MODE_ABI)
-            return jl_method_inferred_with_abi(mi, world);
+            return jl_method_inferred_with_abi(mi, world, facts);
         else
             return NULL;
     }
@@ -439,17 +502,18 @@ jl_code_instance_t *jl_type_infer(jl_method_instance_t *mi, size_t world, uint8_
 
     jl_code_instance_t *ci = NULL;
 #ifdef ENABLE_INFERENCE
-    if (jl_engine_hasreserved(mi, jl_nothing)) // don't recur on a thread on the same MethodInstance--force it to interpret it until the inference has finished
+    if (jl_engine_hasreserved_policy(mi, jl_nothing, facts)) // don't recur on a thread on the same MethodInstance--force it to interpret it until the inference has finished
         return NULL;
     JL_TIMING(INFERENCE, INFERENCE);
     jl_value_t **fargs;
     JL_GC_PUSH1(&ci);
-    JL_GC_PUSHARGS(fargs, 5);
+    JL_GC_PUSHARGS(fargs, 6);
     fargs[0] = (jl_value_t*)jl_typeinf_func;
     fargs[1] = (jl_value_t*)mi;
     fargs[2] = jl_box_ulong(world);
     fargs[3] = jl_box_uint8(source_mode);
     fargs[4] = jl_box_uint8(trim_mode);
+    fargs[5] = facts ? jl_true : jl_false;
     int last_errno = errno;
 #ifdef _OS_WINDOWS_
     DWORD last_error = GetLastError();
@@ -477,7 +541,7 @@ jl_code_instance_t *jl_type_infer(jl_method_instance_t *mi, size_t world, uint8_
     ct->reentrant_timing += 0b10;
     JL_LOCK(&jl_typeinf_lock);
     JL_TRY {
-        ci = (jl_code_instance_t*)jl_apply(fargs, 5);
+        ci = (jl_code_instance_t*)jl_apply(fargs, 6);
     }
     JL_CATCH {
         jl_value_t *e = jl_current_exception(ct);
@@ -576,16 +640,27 @@ JL_DLLEXPORT jl_value_t *jl_call_in_typeinf_world(jl_value_t **args, int nargs)
     return ret;
 }
 
+static jl_code_instance_t *jl_get_method_inferred_policy(
+        jl_method_instance_t *mi JL_PROPAGATES_ROOT, jl_value_t *rettype,
+        size_t min_world, size_t max_world, jl_debuginfo_t *di, jl_svec_t *edges, int facts);
 JL_DLLEXPORT jl_code_instance_t *jl_get_method_inferred(
         jl_method_instance_t *mi JL_PROPAGATES_ROOT, jl_value_t *rettype,
         size_t min_world, size_t max_world, jl_debuginfo_t *di, jl_svec_t *edges)
+{
+    return jl_get_method_inferred_policy(mi, rettype, min_world, max_world, di, edges,
+                                         mi_policy_facts_at(mi, JL_REACH_RUNTIME));
+}
+// the same, for code of a policy
+static jl_code_instance_t *jl_get_method_inferred_policy(
+        jl_method_instance_t *mi JL_PROPAGATES_ROOT, jl_value_t *rettype,
+        size_t min_world, size_t max_world, jl_debuginfo_t *di, jl_svec_t *edges, int facts)
 {
     jl_value_t *owner = jl_nothing; // TODO: owner should be arg
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     for (; codeinst; codeinst = jl_atomic_load_relaxed(&codeinst->next)) {
         if (jl_atomic_load_relaxed(&codeinst->min_world) == min_world &&
             jl_atomic_load_relaxed(&codeinst->max_world) == max_world &&
-            jl_egal(codeinst->owner, owner) &&
+            jl_egal(codeinst->owner, owner) && ci_policy_is(codeinst, facts) &&
             jl_egal(codeinst->rettype, rettype)) {
             if (di == NULL)
                 return codeinst;
@@ -604,6 +679,7 @@ JL_DLLEXPORT jl_code_instance_t *jl_get_method_inferred(
     codeinst = jl_new_codeinst(
         mi, owner, rettype, (jl_value_t*)jl_any_type, NULL, NULL,
         0, min_world, max_world, 0, jl_nothing, di, edges);
+    jl_ci_set_policy(codeinst, facts);
     jl_mi_cache_insert(mi, codeinst);
     return codeinst;
 }
@@ -638,6 +714,7 @@ JL_DLLEXPORT jl_code_instance_t *jl_get_ci_equiv(jl_code_instance_t *ci JL_PROPA
             jl_atomic_load_relaxed(&codeinst->max_world) >= (target_world ? target_world : max_world) &&
             jl_egal(codeinst->def, def) &&
             jl_egal(codeinst->owner, owner) &&
+            (owner != jl_nothing || ci_policy_is(codeinst, ci_policy_facts(ci))) &&
             jl_egal(codeinst->rettype, rettype)) {
             return codeinst;
         }
@@ -681,7 +758,10 @@ JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst(
     codeinst->time_infer_total = 0;
     codeinst->time_infer_self = 0;
     jl_atomic_store_relaxed(&codeinst->time_compile, 0);
-    jl_atomic_store_relaxed(&codeinst->flags, 0);
+    // Julia's own owner records the policy the code is compiled in: here the policy its
+    // method instance has where the runtime reaches it; a caller that compiles it for code of the
+    // other policy records that (jl_ci_set_policy)
+    jl_atomic_store_relaxed(&codeinst->flags, owner == jl_nothing && mi_policy_facts_at(mi, JL_REACH_RUNTIME) ? JL_CI_FLAGS_FACTS : 0);
     jl_atomic_store_relaxed(&codeinst->precompile, 0);
     jl_atomic_store_relaxed(&codeinst->next, NULL);
     jl_atomic_store_relaxed(&codeinst->ipo_purity_bits, effects);
@@ -3334,13 +3414,14 @@ JL_DLLEXPORT jl_method_instance_t *jl_get_unspecialized(jl_method_t *def JL_PROP
     return unspec;
 }
 
-STATIC_INLINE jl_value_t *_jl_rettype_inferred(jl_value_t *owner, jl_method_instance_t *mi, size_t min_world, size_t max_world) JL_NOTSAFEPOINT
+STATIC_INLINE jl_value_t *_jl_rettype_inferred(jl_value_t *owner, jl_method_instance_t *mi, size_t min_world, size_t max_world, int facts) JL_NOTSAFEPOINT
 {
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     while (codeinst) {
         if (jl_atomic_load_relaxed(&codeinst->min_world) <= min_world &&
             max_world <= jl_atomic_load_relaxed(&codeinst->max_world) &&
-            jl_egal(codeinst->owner, owner)) {
+            jl_egal(codeinst->owner, owner) &&
+            (owner != jl_nothing || ci_policy_is(codeinst, facts))) {
 
             jl_value_t *code = jl_atomic_load_relaxed(&codeinst->inferred);
             if (code)
@@ -3353,21 +3434,29 @@ STATIC_INLINE jl_value_t *_jl_rettype_inferred(jl_value_t *owner, jl_method_inst
 
 JL_DLLEXPORT jl_value_t *jl_rettype_inferred(jl_value_t *owner, jl_method_instance_t *mi, size_t min_world, size_t max_world) JL_NOTSAFEPOINT
 {
-    return (jl_value_t*)_jl_rettype_inferred(owner, mi, min_world, max_world);
+    return (jl_value_t*)_jl_rettype_inferred(owner, mi, min_world, max_world, mi_policy_facts_at(mi, JL_REACH_RUNTIME));
+}
+
+// the same, for code of a policy: `policy` is 0 plain, 1 facts, or -1 for the policy
+// the runtime reaches it with; a method of a policy of its own has code of that policy only
+JL_DLLEXPORT jl_value_t *jl_rettype_inferred_policy(jl_value_t *owner, jl_method_instance_t *mi, size_t min_world, size_t max_world, int policy) JL_NOTSAFEPOINT
+{
+    int facts = mi_policy_facts_at(mi, policy < 0 ? JL_REACH_RUNTIME : policy ? JL_REACH_FACTS : JL_REACH_PLAIN);
+    return (jl_value_t*)_jl_rettype_inferred(owner, mi, min_world, max_world, facts);
 }
 
 JL_DLLEXPORT jl_value_t *jl_rettype_inferred_native(jl_method_instance_t *mi, size_t min_world, size_t max_world) JL_NOTSAFEPOINT
 {
-    return (jl_value_t*)_jl_rettype_inferred(jl_nothing, mi, min_world, max_world);
+    return (jl_value_t*)_jl_rettype_inferred(jl_nothing, mi, min_world, max_world, mi_policy_facts_at(mi, JL_REACH_RUNTIME));
 }
 
 JL_DLLEXPORT jl_value_t *(*const jl_rettype_inferred_addr)(jl_method_instance_t *mi, size_t min_world, size_t max_world) JL_NOTSAFEPOINT = jl_rettype_inferred_native;
 
-STATIC_INLINE jl_callptr_t jl_method_compiled_callptr(jl_method_instance_t *mi, size_t world, jl_code_instance_t **codeinst_out) JL_NOTSAFEPOINT
+STATIC_INLINE jl_callptr_t jl_method_compiled_callptr(jl_method_instance_t *mi, size_t world, int facts, jl_code_instance_t **codeinst_out) JL_NOTSAFEPOINT
 {
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     for (; codeinst; codeinst = jl_atomic_load_relaxed(&codeinst->next)) {
-        if (codeinst->owner != jl_nothing)
+        if (codeinst->owner != jl_nothing || !ci_policy_is(codeinst, facts))
             continue;
         if (jl_atomic_load_relaxed(&codeinst->min_world) <= world && world <= jl_atomic_load_relaxed(&codeinst->max_world)) {
             jl_callptr_t invoke = jl_atomic_load_acquire(&codeinst->invoke);
@@ -3382,8 +3471,13 @@ STATIC_INLINE jl_callptr_t jl_method_compiled_callptr(jl_method_instance_t *mi, 
 
 jl_code_instance_t *jl_method_compiled(jl_method_instance_t *mi, size_t world) JL_NOTSAFEPOINT
 {
+    return jl_method_compiled_policy(mi, world, mi_policy_facts_at(mi, JL_REACH_RUNTIME));
+}
+
+jl_code_instance_t *jl_method_compiled_policy(jl_method_instance_t *mi, size_t world, int facts) JL_NOTSAFEPOINT
+{
     jl_code_instance_t *codeinst = NULL;
-    jl_method_compiled_callptr(mi, world, &codeinst);
+    jl_method_compiled_callptr(mi, world, facts, &codeinst);
     return codeinst;
 }
 
@@ -3575,8 +3669,14 @@ JL_DLLEXPORT int jl_method_is_macro(jl_method_t *m)
 
 jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t world)
 {
+    return jl_compile_method_internal_policy(mi, world, mi_policy_facts_at(mi, JL_REACH_RUNTIME));
+}
+
+// Compiles the code of `mi` of a policy: every CodeInstance made here records it.
+jl_code_instance_t *jl_compile_method_internal_policy(jl_method_instance_t *mi, size_t world, int facts)
+{
     // quick check if we already have a compiled result
-    jl_code_instance_t *codeinst = jl_method_compiled(mi, world);
+    jl_code_instance_t *codeinst = jl_method_compiled_policy(mi, world, facts);
     if (codeinst)
         return codeinst;
 
@@ -3584,13 +3684,13 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
     // instead and just copy it here for caching
     jl_method_instance_t *mi2 = jl_normalize_to_compilable_mi(mi);
     if (mi2 != mi) {
-        jl_code_instance_t *codeinst2 = jl_compile_method_internal(mi2, world);
-        jl_code_instance_t *codeinst = jl_get_method_inferred(
+        jl_code_instance_t *codeinst2 = jl_compile_method_internal_policy(mi2, world, facts);
+        jl_code_instance_t *codeinst = jl_get_method_inferred_policy(
                 mi, codeinst2->rettype,
                 jl_atomic_load_relaxed(&codeinst2->min_world),
                 jl_atomic_load_relaxed(&codeinst2->max_world),
                 jl_atomic_load_relaxed(&codeinst2->debuginfo),
-                jl_atomic_load_relaxed(&codeinst2->edges));
+                jl_atomic_load_relaxed(&codeinst2->edges), facts);
         if (jl_atomic_load_relaxed(&codeinst->invoke) == NULL) {
             codeinst->rettype_const = codeinst2->rettype_const;
             jl_gc_wb(codeinst, codeinst->rettype_const);
@@ -3641,7 +3741,10 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
         if (jl_is_method(def)) {
             jl_method_instance_t *unspecmi = jl_atomic_load_relaxed(&def->unspecialized);
             if (unspecmi) {
+                // the unspecialized code of the same policy
                 jl_code_instance_t *unspec = jl_atomic_load_relaxed(&unspecmi->cache);
+                while (unspec && (unspec->owner != jl_nothing || !ci_policy_is(unspec, facts)))
+                    unspec = jl_atomic_load_relaxed(&unspec->next);
                 if (unspec && jl_atomic_load_acquire(&unspec->invoke) != NULL) {
                     uint8_t specsigflags;
                     jl_callptr_t invoke;
@@ -3652,11 +3755,13 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
                     jl_code_instance_t *codeinst = jl_new_codeinst(mi, jl_nothing,
                         (jl_value_t*)jl_any_type, (jl_value_t*)jl_any_type, NULL, NULL,
                         0, 1, ~(size_t)0, 0, jl_nothing, di, edges);
+                    jl_ci_set_policy(codeinst, facts);
                     codeinst->rettype_const = unspec->rettype_const;
                     jl_atomic_store_relaxed(&codeinst->specptr.fptr, fptr);
                     jl_atomic_store_relaxed(&codeinst->invoke, invoke);
                     // unspec is probably not specsig, but might be using specptr
-                    jl_atomic_store_relaxed(&codeinst->flags, specsigflags & JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR);
+                    jl_atomic_store_relaxed(&codeinst->flags, (specsigflags & JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR) |
+                        (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FACTS)); // the policy stays
                     jl_mi_cache_insert(mi, codeinst);
                     record_precompile_statement(mi, 0, 0);
                     return codeinst;
@@ -3675,6 +3780,7 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
             jl_code_instance_t *codeinst = jl_new_codeinst(mi, jl_nothing,
                 (jl_value_t*)jl_any_type, (jl_value_t*)jl_any_type, NULL, NULL,
                 0, 1, ~(size_t)0, 0, jl_nothing, di, edges);
+            jl_ci_set_policy(codeinst, facts);
             jl_atomic_store_release(&codeinst->invoke, jl_fptr_interpret_call);
             jl_mi_cache_insert(mi, codeinst);
             record_precompile_statement(mi, 0, 0);
@@ -3712,7 +3818,7 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
         int should_skip_inference = !jl_is_method(mi->def.method) || jl_method_is_macro(mi->def.method);
 
         if (!should_skip_inference) {
-            codeinst = jl_type_infer(mi, world, SOURCE_MODE_ABI, jl_options.trim);
+            codeinst = jl_type_infer_policy(mi, world, SOURCE_MODE_ABI, jl_options.trim, facts);
         }
     }
 
@@ -3740,7 +3846,7 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
         jl_method_instance_t *unspec = jl_get_unspecialized(def);
         if ((jl_value_t*)unspec == jl_nothing)
             unspec = mi;
-        jl_code_instance_t *ucache = jl_get_method_inferred(unspec, (jl_value_t*)jl_any_type, 1, ~(size_t)0, NULL, NULL);
+        jl_code_instance_t *ucache = jl_get_method_inferred_policy(unspec, (jl_value_t*)jl_any_type, 1, ~(size_t)0, NULL, NULL, facts);
         // ask codegen to make the fptr for unspec
         jl_callptr_t ucache_invoke = jl_atomic_load_acquire(&ucache->invoke);
         if (ucache_invoke == NULL) {
@@ -3767,11 +3873,13 @@ jl_code_instance_t *jl_compile_method_internal(jl_method_instance_t *mi, size_t 
         codeinst = jl_new_codeinst(mi, jl_nothing,
             (jl_value_t*)jl_any_type, (jl_value_t*)jl_any_type, NULL, NULL,
             0, 1, ~(size_t)0, 0, jl_nothing, di, edges);
+        jl_ci_set_policy(codeinst, facts);
         codeinst->rettype_const = ucache->rettype_const;
         // unspec is always not specsig, but might use specptr
         jl_atomic_store_relaxed(&codeinst->specptr.fptr, fptr);
         jl_atomic_store_relaxed(&codeinst->invoke, invoke);
-        jl_atomic_store_relaxed(&codeinst->flags, specsigflags & JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR);
+        jl_atomic_store_relaxed(&codeinst->flags, (specsigflags & JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR) |
+                        (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FACTS)); // the policy stays
         jl_mi_cache_insert(mi, codeinst);
     }
     jl_atomic_store_relaxed(&codeinst->precompile, 1);
@@ -4176,7 +4284,9 @@ STATIC_INLINE jl_value_t *verify_type(jl_value_t *v) JL_NOTSAFEPOINT
 STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc, size_t world)
 {
     jl_code_instance_t *codeinst = NULL;
-    jl_callptr_t invoke = jl_method_compiled_callptr(mfunc, world, &codeinst);
+    // the code of the policy the method instance has where the runtime reaches it
+    int facts = mi_policy_facts_at(mfunc, JL_REACH_RUNTIME);
+    jl_callptr_t invoke = jl_method_compiled_callptr(mfunc, world, facts, &codeinst);
     if (invoke) {
         jl_value_t *res = invoke(F, args, nargs, codeinst);
         return verify_type(res);
@@ -4186,7 +4296,7 @@ STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t 
 #ifdef _OS_WINDOWS_
     DWORD last_error = GetLastError();
 #endif
-    codeinst = jl_compile_method_internal(mfunc, world);
+    codeinst = jl_compile_method_internal_policy(mfunc, world, facts);
 #ifdef _OS_WINDOWS_
     SetLastError(last_error);
 #endif
