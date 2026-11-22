@@ -116,6 +116,10 @@ typedef struct jl_stenv_t {
     // Used to represent the length difference between 2 vararg.
     // intersect(X, Y) ==> X = Y + Loffset
     int Loffset;
+    // inside the equality of an invariant parameter: a membership adds subtype answers, never type
+    // equalities, so no entry is consulted there; a variable's bound is a subtype question and is
+    // asked with entries (subtype_ccheck, intersect_var)
+    int noentry;
 } jl_stenv_t;
 
 // state manipulation utilities
@@ -538,6 +542,40 @@ static int obviously_in_union(jl_value_t *u, jl_value_t *x)
     return obviously_egal(u, x);
 }
 
+static size_t jl_membership_world(void) JL_NOTSAFEPOINT;
+static int entry_live(jl_membership_t *en, size_t world) JL_NOTSAFEPOINT;
+static int entry_for_value(jl_membership_t *en) JL_NOTSAFEPOINT;
+
+// whether the set `yname`, or a set that joins it, has an entry for a type value live in `world` (the
+// entries at each set, datatype.c). Sets have no cycles.
+static int set_takes_type_values(jl_typename_t *yname, size_t world) JL_NOTSAFEPOINT
+{
+    jl_genericmemory_t *index = jl_set_entries;
+    jl_array_t *list = index == NULL ? NULL : (jl_array_t*)jl_eqtable_get(index, (jl_value_t*)yname, NULL);
+    for (size_t i = 0; list != NULL && i < jl_array_nrows(list); i++) {
+        jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i);
+        if (en == NULL || !entry_live(en, world))
+            continue;
+        if (entry_for_value(en))
+            return 1;
+        jl_value_t *mu = jl_unwrap_unionall(en->member);
+        if (jl_is_datatype(mu) && ((jl_datatype_t*)mu)->name->open_set &&
+            set_takes_type_values(((jl_datatype_t*)mu)->name, world))
+            return 1;
+    }
+    return 0;
+}
+
+// whether `k` is a kind of type object and the set `c` takes some of its values in the query world: a
+// set with an entry for a type value, its own or that of a set that joins it
+static int kind_meets_set(jl_datatype_t *k, jl_datatype_t *c) JL_NOTSAFEPOINT
+{
+    if (!(k == jl_datatype_type || k == jl_unionall_type || k == jl_uniontype_type ||
+          (k->name == jl_type_typename && jl_has_free_typevars((jl_value_t*)k))))
+        return 0;
+    return c->name->open_set && set_takes_type_values(c->name, jl_membership_world());
+}
+
 int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
 {
     if (a == b || a == (jl_value_t*)jl_any_type || b == (jl_value_t*)jl_any_type)
@@ -564,8 +602,15 @@ int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity)
                 temp = bd;
                 while (temp != jl_any_type && temp->name != ad->name)
                     temp = temp->super;
-                if (temp == jl_any_type)
+                if (temp == jl_any_type) {
+                    // a membership can relate a pair the chains do not: not obviously disjoint where
+                    // either side is a set, or a kind of type object meets a set that takes a type value
+                    if (kind_meets_set(ad, bd) || kind_meets_set(bd, ad))
+                        return 0;
+                    if (bd->name->open_set || ad->name->open_set)
+                        return 0;
                     return 1;
+                }
                 bd = temp;
             }
             else {
@@ -681,6 +726,14 @@ static int local_forall_exists_subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t 
 
 static int is_leaf_typevar(jl_tvar_t *v) JL_NOTSAFEPOINT;
 
+static int subtype_noentry(jl_value_t *x, jl_value_t *y);
+// a question asked afresh from inside the walk keeps the walk's rule for membership entries: none
+// inside an invariant parameter's equality
+static int subtype_fresh(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
+{
+    return e->noentry ? subtype_noentry(x, y) : jl_subtype(x, y);
+}
+
 // Check whether env (variable bounds & diagonality) changed compared to saved env.
 static int env_unchanged(jl_stenv_t *e, jl_savedenv_t *se) JL_NOTSAFEPOINT
 {
@@ -728,7 +781,11 @@ static int subtype_ccheck(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     if (obviously_in_union(y, x))
         return 1;
     jl_saved_unionstate_t oldLunions; push_unionstate(&oldLunions, &e->Lunions);
+    // a variable's bound is a subtype question: memberships count
+    int noentry = e->noentry;
+    e->noentry = 0;
     int sub = local_forall_exists_subtype(x, y, e, 0, 1);
+    e->noentry = noentry;
     pop_unionstate(&e->Lunions, &oldLunions);
     return sub;
 }
@@ -1219,6 +1276,166 @@ jl_value_t *jl_membership_instance(jl_value_t *x, jl_membership_t *en)
     return membership_instance(x, en);
 }
 
+static size_t jl_membership_world(void) JL_NOTSAFEPOINT
+{
+    jl_task_t *ct = query_task();
+    if (ct && ct->membership_world)
+        return ct->membership_world;
+    return ct ? ct->world_age : 0;
+}
+
+// the TypeName holding the entries of the type value x = Type{S}, else NULL
+static jl_typename_t *value_entries_home(jl_datatype_t *x) JL_NOTSAFEPOINT
+{
+    if (x->name != jl_type_typename || jl_nparams(x) != 1)
+        return NULL;
+    jl_value_t *s = jl_unwrap_unionall(jl_tparam0(x));
+    return jl_is_datatype(s) ? ((jl_datatype_t*)s)->name : NULL;
+}
+
+// whether entry `en` is one of x's further supertypes toward the set `yname`: live, of the right kind
+// (a type value's or a type's), and its set reaches `yname` (only entries whose set reaches the
+// queried set are choices)
+static int entry_counts(jl_membership_t *en, int value, jl_typename_t *yname, size_t world) JL_NOTSAFEPOINT
+{
+    if (!entry_live(en, world) || entry_for_value(en) != value)
+        return 0;
+    return yname == NULL || en->set == yname || jl_typename_reaches(en->set, yname, world);
+}
+
+// the instance side of an entry: its own variables (an instance for every value of a parameter that is
+// no input) join the walk as existential variables, as a UnionAll's on the right of `<:` do
+static int subtype_entry_instance(jl_value_t *inst, jl_value_t *y, jl_stenv_t *e, int param)
+{
+    if (!jl_is_unionall(inst))
+        return subtype(inst, y, e, param);
+    jl_unionall_t *u = unalias_unionall((jl_unionall_t*)inst, e);
+    jl_varbinding_t vb = { u->var, u->var->lb, u->var->ub, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+                           e->invdepth, NULL, e->vars };
+    JL_GC_PUSH4(&u, &vb.lb, &vb.ub, &vb.innervars);
+    e->vars = &vb;
+    int ans = subtype_entry_instance(u->body, y, e, param);
+    e->vars = vb.prev;
+    JL_GC_POP();
+    return ans;
+}
+
+// x <: y through one entry: there are values of the entry's variables with x <: pattern and
+// instance <: y. The pattern's variables join the walk as existential variables; the match with x pins
+// them, and a pinned variable is substituted into the instance, so the right-hand side's variables bind
+// to its value. npat counts the pattern variables pushed so far.
+static int subtype_entry_body(jl_value_t *x, jl_value_t *pat, jl_value_t *inst, jl_value_t *y,
+                              jl_stenv_t *e, int param, int npat)
+{
+    if (!subtype(x, pat, e, param))
+        return 0;
+    JL_GC_PUSH1(&inst);
+    jl_varbinding_t *b = e->vars;
+    for (int k = 0; k < npat && inst != NULL; k++, b = b->prev) {
+        // a value outside the set's parameter bounds is no instance: no match
+        if (b->lb == b->ub || (jl_is_type(b->lb) && jl_is_type(b->ub) && obviously_egal(b->lb, b->ub)))
+            inst = jl_substitute_var_nothrow(inst, b->var, b->lb, 1);
+    }
+    int ans = inst != NULL && subtype_entry_instance(inst, y, e, param);
+    JL_GC_POP();
+    return ans;
+}
+
+static int subtype_entry(jl_value_t *x, jl_value_t *pat, jl_value_t *inst, jl_value_t *y,
+                         jl_stenv_t *e, int param, int npat)
+{
+    if (!jl_is_unionall(pat))
+        return subtype_entry_body(x, pat, inst, y, e, param, npat);
+    jl_unionall_t *u = (jl_unionall_t*)pat;
+    jl_value_t *body = u->body;
+    // the instance's UnionAll chain starts with the pattern's variables (jl_declare_membership checks it)
+    if (jl_is_unionall(inst) && ((jl_unionall_t*)inst)->var == u->var)
+        inst = ((jl_unionall_t*)inst)->body;
+    jl_varbinding_t vb = { u->var, u->var->lb, u->var->ub, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+                           e->invdepth, NULL, e->vars };
+    JL_GC_PUSH6(&inst, &body, &vb.var, &vb.lb, &vb.ub, &vb.innervars);
+    if (lookup(e, u->var) != NULL) {
+        // the same entry is already on this path: rename its variable
+        vb.var = jl_new_typevar(u->var->name, u->var->lb, u->var->ub);
+        body = jl_substitute_var(body, u->var, (jl_value_t*)vb.var);
+        inst = jl_substitute_var(inst, u->var, (jl_value_t*)vb.var);
+    }
+    e->vars = &vb;
+    int ans = subtype_entry(x, body, inst, y, e, param, npat + 1);
+    e->vars = vb.prev;
+    JL_GC_POP();
+    return ans;
+}
+
+// x <: y for a set y, after x's supertype chain missed it: x has one more supertype per live entry of
+// its TypeName and of each type on its chain. Which one leads to y is an existential choice, made as
+// the choice among a union's members on the right of `<:` is, so the rest of the walk can revisit it.
+static int subtype_membership(jl_datatype_t *x, jl_value_t *y, jl_stenv_t *e, int param)
+{
+    // inside an invariant parameter's equality a membership is no answer
+    if (e->noentry)
+        return 0;
+    size_t world = jl_membership_world();
+    jl_value_t *yu = jl_unwrap_unionall(y);
+    jl_typename_t *yname = jl_is_datatype(yu) ? ((jl_datatype_t*)yu)->name : NULL;
+    // a type value's entries are on its type's TypeName; a type's, on its own and on those of the types
+    // on its supertype chain
+    jl_typename_t *vhome = value_entries_home(x);
+    int value = vhome != NULL;
+    jl_datatype_t *first = value ? NULL : x;
+    int n = 0;
+    if (value) {
+        jl_svec_t *list = jl_typename_memberships(vhome);
+        for (size_t i = 0; i < jl_svec_len(list); i++)
+            n += entry_counts((jl_membership_t*)jl_svecref(list, i), 1, yname, world);
+    }
+    for (jl_datatype_t *xd = first; xd != NULL && xd != jl_any_type; xd = xd->super) {
+        jl_svec_t *list = jl_typename_memberships(xd->name);
+        for (size_t i = 0; i < jl_svec_len(list); i++)
+            n += entry_counts((jl_membership_t*)jl_svecref(list, i), 0, yname, world);
+    }
+    if (n == 0)
+        return 0;
+    int k = 0;
+    while (k < n - 1 && pick_union_decision(e, 1))
+        k++;
+    if (value) {
+        jl_svec_t *list = jl_typename_memberships(vhome);
+        for (size_t i = 0; i < jl_svec_len(list); i++) {
+            jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
+            if (!entry_counts(en, 1, yname, world) || k-- > 0)
+                continue;
+            // entries are never removed from a TypeName's list, so the TypeName (rooted through x)
+            // keeps en alive
+            JL_GC_PROMISE_ROOTED(en);
+            return subtype_entry((jl_value_t*)x, en->member, en->instance, y, e, param, 0);
+        }
+    }
+    for (jl_datatype_t *xd = first; xd != NULL && xd != jl_any_type; xd = xd->super) {
+        jl_svec_t *list = jl_typename_memberships(xd->name);
+        for (size_t i = 0; i < jl_svec_len(list); i++) {
+            jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
+            if (!entry_counts(en, 0, yname, world) || k-- > 0)
+                continue;
+            JL_GC_PROMISE_ROOTED(en);
+            return subtype_entry((jl_value_t*)xd, en->member, en->instance, y, e, param, 0);
+        }
+    }
+    return 0;
+}
+
+// Subtyping by declared supertypes and parameters alone, for normal forms (a union's simplification):
+// no membership entry is in force in world 1, since each is declared in a later one.
+JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b)
+{
+    if (!jl_has_open_set_in(a) && !jl_has_open_set_in(b))
+        return jl_subtype(a, b);
+    size_t last = jl_set_membership_query_world(1);
+    int r = jl_subtype(a, b);
+    jl_set_membership_query_world(last);
+    return r;
+}
+
 
 static int subtype_tuple_varargs(
     jl_vararg_t *vtx, jl_vararg_t *vty,
@@ -1280,7 +1497,7 @@ static int subtype_tuple_varargs(
         }
         else if ((e->Runions.depth == 0 ? !jl_has_free_typevars(xp0) : jl_is_concrete_type(xp0)) && !jl_has_free_typevars(yp0)) {
             // fast path for separable sub-formulas
-            if (!jl_subtype(xp0, yp0))
+            if (!subtype_fresh(xp0, yp0, e))
                 return 0;
         }
         else {
@@ -1445,7 +1662,7 @@ static int subtype_tuple_tail(jl_datatype_t *xd, jl_datatype_t *yd, int8_t R, jl
         }
         else if ((e->Runions.depth == 0 ? !jl_has_free_typevars(xi) : jl_is_concrete_type(xi)) && !jl_has_free_typevars(yi)) {
             // fast path for separable sub-formulas
-            if (!jl_subtype(xi, yi))
+            if (!subtype_fresh(xi, yi, e))
                 return 0;
         }
         else if (!subtype(xi, yi, e, param)) {
@@ -1654,7 +1871,8 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
         while (xd != NULL && xd != jl_any_type && xd->name != yd->name) {
             xd = xd->super;
         }
-        if (xd == jl_any_type)
+        // a membership is answered below, where the walk has unwrapped both sides
+        if (xd == jl_any_type && !yd->name->open_set)
             return 0;
     }
     // handle forall ("left") vars first
@@ -1677,8 +1895,12 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
                 // Int isa DataType, Int isa Type{Int}, Type{Int} more specific than DataType,
                 // !(Type{Int} <: DataType), !isleaftype(Type{Int}), because non-DataTypes can
                 // be type-equal to `Int`.
-                return jl_typeof(tp0) == (jl_value_t*)yd;
+                if (jl_typeof(tp0) == (jl_value_t*)yd)
+                    return 1;
             }
+            // a type value is a member of a set by an entry for Type{S}
+            if (yd->name->open_set)
+                return subtype_membership(xd, y, e, param);
             return 0;
         }
         if (jl_is_type_type(y) && !jl_is_type_type(x) && x != (jl_value_t*)jl_typeofbottom_type) {
@@ -1699,7 +1921,12 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
             }
             xd = xd->super;
         }
-        if (xd == jl_any_type) return 0;
+        if (xd == jl_any_type) {
+            // the chain missed: x's memberships are its other supertypes
+            if (yd->name->open_set)
+                return subtype_membership((jl_datatype_t*)x, y, e, param);
+            return 0;
+        }
         if (xd->name == jl_tuple_typename)
             return subtype_tuple(xd, yd, e, param);
         size_t i, np = jl_nparams(xd);
@@ -1781,7 +2008,7 @@ static int local_forall_exists_subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t 
     int kindx = !jl_has_free_typevars(x);
     int kindy = !jl_has_free_typevars(y);
     if (kindx && kindy)
-        return jl_subtype(x, y);
+        return subtype_fresh(x, y, e);
     int has_exists = (!kindx && has_existential_typevar(x, e)) ||
                      (!kindy && has_existential_typevar(y, e));
     if (!has_exists) {
@@ -1888,9 +2115,22 @@ static int equal_var(jl_tvar_t *v, jl_value_t *x, jl_stenv_t *e)
     return 1;
 }
 
+static int forall_exists_equal_(jl_value_t *x, jl_value_t *y, jl_stenv_t *e);
+
+// The equality of an invariant parameter: two types are equal where they are equal by their declared
+// structure, so no membership entry is consulted inside it. A variable's bound asked on the way is a
+// subtype question (subtype_ccheck).
 static int forall_exists_equal(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
 {
     if (obviously_egal(x, y)) return 1;
+    e->noentry++;
+    int ans = forall_exists_equal_(x, y, e);
+    e->noentry--;
+    return ans;
+}
+
+static int forall_exists_equal_(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
+{
 
     if ((is_indefinite_length_tuple_type(x) && is_definite_length_tuple_type(y)) ||
         (is_definite_length_tuple_type(x) && is_indefinite_length_tuple_type(y)))
@@ -1999,6 +2239,7 @@ static void init_stenv(jl_stenv_t *e, jl_value_t **env, int envsz)
     e->emptiness_only = 0;
     e->triangular = 0;
     e->Loffset = 0;
+    e->noentry = 0;
     e->Lunions.depth = 0;      e->Runions.depth = 0;
     e->Lunions.more = 0;       e->Runions.more = 0;
     e->Lunions.used = 0;       e->Runions.used = 0;
@@ -2219,6 +2460,10 @@ static int obvious_subtype(jl_value_t *x, jl_value_t *y, jl_value_t *y0, int *su
                     if (temp == NULL) // invalid state during type declaration
                         return 0;
                     if (temp == jl_any_type) {
+                        // a membership can still relate the pair: abstain, so that the full subtype
+                        // walks the entries
+                        if (((jl_datatype_t*)y)->name->open_set && !((jl_datatype_t*)x)->name->never_member)
+                            return 0;
                         *subtype = 0;
                         return 1;
                     }
@@ -2464,7 +2709,22 @@ static int subtype_in_env(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     e2.envout = e->envout;
     e2.envidx = e->envidx;
     e2.Loffset = e->Loffset;
+    e2.noentry = e->noentry;
     return forall_exists_subtype(x, y, &e2, 0);
+}
+
+// x <: y with no membership consulted: the half of an equality inside an invariant parameter, asked at
+// the top level
+static int subtype_noentry(jl_value_t *x, jl_value_t *y)
+{
+    if (x == y || y == (jl_value_t*)jl_any_type || x == jl_bottom_type)
+        return 1;
+    jl_stenv_t e;
+    init_stenv(&e, NULL, 0);
+    e.noentry = 1;
+    int sub = forall_exists_subtype(x, y, &e, 0);
+    free_stenv(&e);
+    return sub;
 }
 
 JL_DLLEXPORT int jl_subtype(jl_value_t *x, jl_value_t *y)
@@ -2608,9 +2868,13 @@ int jl_has_intersect_type_not_kind(jl_value_t *t)
                jl_has_intersect_type_not_kind(((jl_uniontype_t*)t)->b);
     if (jl_is_typevar(t))
         return jl_has_intersect_type_not_kind(((jl_tvar_t*)t)->ub);
-    if (jl_is_datatype(t))
+    if (jl_is_datatype(t)) {
         if (((jl_datatype_t*)t)->name == jl_type_typename)
             return 1;
+        // a type value is a member of a set by an entry for Type{S}
+        if (((jl_datatype_t*)t)->name->open_set)
+            return 1;
+    }
     return 0;
 }
 
@@ -2663,9 +2927,10 @@ JL_DLLEXPORT int jl_isa(jl_value_t *x, jl_value_t *t)
                         }
                     }
                 }
-                else {
+                else if (!((jl_datatype_t*)t2)->name->open_set) {
                     return 0;
                 }
+                // a set: a type value is a member by an entry for Type{S}, below
             }
             if (jl_subtype(jl_typeof(x), t))
                 return 1;
@@ -2721,7 +2986,11 @@ static jl_value_t *intersect_aside(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, 
     jl_saved_unionstate_t oldRunions; push_unionstate(&oldRunions, &e->Runions);
     int savedepth = e->invdepth;
     e->invdepth = depth;
+    // a bound's meet is a subtype question: memberships count
+    int noentry = e->noentry;
+    e->noentry = 0;
     jl_value_t *res = intersect_all(x, y, e);
+    e->noentry = noentry;
     e->invdepth = savedepth;
     pop_unionstate(&e->Runions, &oldRunions);
     if (bbprev) e->vars->prev = bbprev;
@@ -2932,7 +3201,20 @@ static int check_unsat_bound(jl_value_t *t, jl_tvar_t *v, jl_stenv_t *e) JL_NOTS
 
 static int intersect_var_ccheck_in_env(jl_value_t *xlb, jl_value_t *xub, jl_value_t *ylb, jl_value_t *yub, jl_stenv_t *e, int flip);
 
+static jl_value_t *intersect_var_(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int8_t R, int param);
+
+// a variable meets a type: its bounds are subtype questions, so memberships count there, also inside an
+// invariant parameter
 static jl_value_t *intersect_var(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int8_t R, int param)
+{
+    int noentry = e->noentry;
+    e->noentry = 0;
+    jl_value_t *res = intersect_var_(b, a, e, R, param);
+    e->noentry = noentry;
+    return res;
+}
+
+static jl_value_t *intersect_var_(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int8_t R, int param)
 {
     jl_varbinding_t *bb = lookup(e, b);
     if (bb == NULL)
@@ -3928,6 +4210,55 @@ static void flip_vars(jl_stenv_t *e)
     }
 }
 
+// x ∩ y for a set y (R: y is the left side) where the chains missed. As intersect_sub_datatype does
+// with a supertype, intersect the instance of each live entry of x and of the types on its chain with
+// y: x meets y when one of them does. With variables in x the match cannot be decided here, and x is
+// the answer when an entry of x's could lead to y (intersection may over-approximate).
+static jl_value_t *intersect_membership(jl_datatype_t *x, jl_value_t *y, jl_stenv_t *e, int R, int param)
+{
+    // inside an invariant parameter two types meet only where they are equal by their declared structure
+    if (e->noentry)
+        return jl_bottom_type;
+    size_t world = jl_membership_world();
+    jl_typename_t *yname = ((jl_datatype_t*)jl_unwrap_unionall(y))->name;
+    // a kind of type object meets a set that takes a type value by an entry; the kind itself is the answer
+    if (jl_is_datatype(jl_unwrap_unionall(y)) && kind_meets_set(x, (jl_datatype_t*)jl_unwrap_unionall(y)))
+        return (jl_value_t*)x;
+    int ground = !jl_has_free_typevars((jl_value_t*)x);
+    jl_value_t *res = jl_bottom_type;
+    jl_value_t *inst = NULL;
+    jl_svec_t *list = NULL;
+    JL_GC_PUSH2(&inst, &list);
+    jl_savedenv_t se;
+    save_env(e, &se, 1);
+    jl_typename_t *vhome = value_entries_home(x);
+    int value = vhome != NULL;
+    for (jl_datatype_t *xd = x; xd != NULL && xd != jl_any_type && res == jl_bottom_type; xd = value ? NULL : xd->super) {
+        list = jl_typename_memberships(value ? vhome : xd->name);
+        for (size_t i = 0; i < jl_svec_len(list); i++) {
+            jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
+            if (!entry_counts(en, value, yname, world))
+                continue;
+            if (!ground) {
+                res = (jl_value_t*)x;
+                break;
+            }
+            inst = membership_instance((jl_value_t*)xd, en);
+            if (inst == NULL)
+                continue;
+            jl_value_t *ii = R ? intersect(y, inst, e, param) : intersect(inst, y, e, param);
+            if (ii != jl_bottom_type) {
+                res = (jl_value_t*)x;
+                break;
+            }
+            restore_env(e, &se, 1);
+        }
+    }
+    free_env(&se);
+    JL_GC_POP();
+    return res;
+}
+
 // intersection where xd nominally inherits from yd
 static jl_value_t *intersect_sub_datatype(jl_datatype_t *xd, jl_datatype_t *yd, jl_stenv_t *e, int R, int param)
 {
@@ -3944,11 +4275,15 @@ static jl_value_t *intersect_sub_datatype(jl_datatype_t *xd, jl_datatype_t *yd, 
 
 static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
 {
+    // two types meet inside an invariant parameter where they are equal by their declared structure: no
+    // membership entry is consulted
     if (e->Loffset == 0 && !jl_has_free_typevars(x) && !jl_has_free_typevars(y)) {
-        return (jl_subtype(x,y) && jl_subtype(y,x)) ? y : NULL;
+        return (subtype_noentry(x,y) && subtype_noentry(y,x)) ? y : NULL;
     }
     e->invdepth++;
+    e->noentry++;
     jl_value_t *ii = intersect(x, y, e, 2);
+    e->noentry--;
     e->invdepth--;
     if (jl_is_typevar(x) && jl_is_typevar(y) && jl_is_typevar(ii))
         return ii; // skip the following check due to possible circular constraints.
@@ -3966,6 +4301,7 @@ static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t 
     jl_savedenv_t se;
     JL_GC_PUSH1(&ii);
     save_env(e, &se, 1);
+    e->noentry++;
     if (!subtype_in_env_existential(x, y, e))
         ii = NULL;
     else {
@@ -3975,6 +4311,7 @@ static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t 
             ii = NULL;
         flip_offset(e);
     }
+    e->noentry--;
     restore_env(e, &se, 1);
     free_env(&se);
     JL_GC_POP();
@@ -4301,8 +4638,8 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
         return intersect_var((jl_tvar_t*)y, x, e, 1, param);
     }
     if (e->Loffset == 0 && !jl_has_free_typevars(x) && !jl_has_free_typevars(y)) {
-        if (jl_subtype(x, y)) return x;
-        if (jl_subtype(y, x)) return y;
+        if (subtype_fresh(x, y, e)) return x;
+        if (subtype_fresh(y, x, e)) return y;
     }
     if (jl_is_uniontype(x)) {
         if (obviously_in_union(x, y))
@@ -4340,9 +4677,9 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
             }
             free_env(&se);
             if (!jl_has_free_typevars(a) && !jl_has_free_typevars(b)) {
-                if (jl_subtype(a, b))
+                if (subtype_fresh(a, b, e))
                     res = b;
-                else if (jl_subtype(b, a))
+                else if (subtype_fresh(b, a, e))
                     res = a;
             }
             if (!res) res = simple_join(a, b);
@@ -4356,12 +4693,15 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
     if (jl_is_datatype(x) && jl_is_datatype(y)) {
         jl_datatype_t *xd = (jl_datatype_t*)x, *yd = (jl_datatype_t*)y;
         if (param < 2) {
+            // a type value meets a set by an entry for Type{S}
             if (jl_is_type_type(x)) {
                 if (!jl_is_type_type(y))
-                    return intersect_type_type(x, y, e, 0);
+                    return yd->name->open_set ? intersect_membership(xd, y, e, 0, param)
+                                              : intersect_type_type(x, y, e, 0);
             }
             else if (jl_is_type_type(y)) {
-                return intersect_type_type(y, x, e, 1);
+                return xd->name->open_set ? intersect_membership(yd, x, e, 1, param)
+                                          : intersect_type_type(y, x, e, 1);
             }
         }
         if (xd->name == yd->name) {
@@ -4416,8 +4756,15 @@ static jl_value_t *intersect(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int pa
             xd = (jl_datatype_t*)x;
             while (yd != jl_any_type && yd->name != xd->name)
                 yd = yd->super;
-            if (yd == jl_any_type)
-                return jl_bottom_type;
+            if (yd == jl_any_type) {
+                // the chains missed: a membership is a supertype too
+                jl_value_t *r = jl_bottom_type;
+                if (((jl_datatype_t*)y)->name->open_set)
+                    r = intersect_membership((jl_datatype_t*)x, y, e, 0, param);
+                if (r == jl_bottom_type && ((jl_datatype_t*)x)->name->open_set)
+                    r = intersect_membership((jl_datatype_t*)y, x, e, 1, param);
+                return r;
+            }
             return intersect_sub_datatype((jl_datatype_t*)y, xd, e, 1, param);
         }
         return intersect_sub_datatype((jl_datatype_t*)x, yd, e, 0, param);
@@ -4708,6 +5055,10 @@ static int might_intersect_concrete(jl_value_t *a)
     if (jl_is_type_type(a))
         return 1;
     if (jl_is_datatype(a)) {
+        // a set's members are concrete types that need not be known yet: a query tuple naming one must
+        // not be dismissed as unable to meet a concrete type
+        if (((jl_datatype_t*)a)->name->open_set)
+            return 1;
         int tpl = jl_is_tuple_type(a);
         int i, n = jl_nparams(a);
         for (i = 0; i < n; i++) {
