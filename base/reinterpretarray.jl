@@ -757,13 +757,14 @@ isempty(cp::CyclePadding) = isempty(cp.padding)
 function iterate(cp::CyclePadding)
     y = iterate(cp.padding)
     y === nothing && return nothing
-    y[1]::Padding, (0, y[2])
+    getfield(y, 1)::Padding, (0, getfield(y, 2))
 end
 function iterate(cp::CyclePadding, state::Tuple)
     y = iterate(cp.padding, tail(state)...)
-    y === nothing && return iterate(cp, (state[1]+cp.total_size,))
-    p = y[1]::Padding
-    Padding(p.offset+state[1], p.size), (state[1], tail(y)...)
+    s1 = getfield(state, 1)::Int
+    y === nothing && return iterate(cp, (s1+cp.total_size,))
+    p = getfield(y, 1)::Padding
+    Padding(p.offset+s1, p.size), (s1, getfield(y, 2))
 end
 
 """
