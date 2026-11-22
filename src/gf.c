@@ -1313,6 +1313,21 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
                         min_valid, max_valid, ambig, NULL);
 }
 
+static int is_trait_arg_type(jl_value_t *decl_i) JL_NOTSAFEPOINT
+{
+    // a set or an intersection, also where its type names the method's variables (`X{T}`): declared
+    // `@nospecialize`, compiled once at its instance with those variables' values
+    if (jl_is_typevar(decl_i))
+        return 0;
+    jl_value_t *u = jl_unwrap_unionall(decl_i);
+    return jl_is_datatype(u) && (((jl_datatype_t*)u)->name->open_set || jl_is_all_type(u));
+}
+
+JL_DLLEXPORT int jl_is_trait_arg_type(jl_value_t *t) JL_NOTSAFEPOINT
+{
+    return is_trait_arg_type(t);
+}
+
 // get the compilation signature specialization for this method
 static void jl_compilation_sig(
     jl_tupletype_t *const tt, // the original tupletype of the call (or DataType from precompile)
@@ -1426,6 +1441,19 @@ static void jl_compilation_sig(
                 }
                 continue;
             }
+            // a trait argument whose type names the method's variables (`X{T}`): compiled once at that
+            // instance with the variables' values from the match
+            if (is_trait_arg_type(decl_i) && sparams != NULL && jl_svec_len(sparams) > 0 && jl_is_unionall(decl)) {
+                type_i = jl_instantiate_type_in_env(decl_i, (jl_unionall_t*)decl, jl_svec_data(sparams));
+                if (!jl_has_free_typevars(type_i)) {
+                    if (type_i != elt) {
+                        if (!*newparams) *newparams = jl_svec_copy(tt->parameters);
+                        jl_svecset(*newparams, i, type_i);
+                    }
+                    continue;
+                }
+                type_i = jl_rewrap_unionall(decl_i, decl);
+            }
         }
 
         if (jl_types_equal(elt, (jl_value_t*)jl_type_type)) { // elt == Type{T} where T
@@ -1492,8 +1520,10 @@ static void jl_compilation_sig(
             }
         }
 
+        // (not an argument declared at a set, `Callable{A, S}`: how it is compiled is the set's rule,
+        //, and `Function` is merely one of its members)
         int notcalled_func = (i_arg > 0 && i_arg <= 8 && !(definition->called & (1 << (i_arg - 1))) &&
-                              !jl_has_free_typevars(decl_i) &&
+                              !jl_has_free_typevars(decl_i) && !is_trait_arg_type(decl_i) &&
                               jl_subtype(elt, (jl_value_t*)jl_function_type));
         if (notcalled_func && (jl_subtype((jl_value_t*)jl_function_type, type_i))) {
             // and attempt to despecialize types marked as a supertype of Function (i.e.
@@ -1640,6 +1670,12 @@ JL_DLLEXPORT int jl_isa_compileable_sig(
                 JL_GC_POP();
                 return 0;
             }
+            // a trait argument whose type names the method's variables: its instance with their
+            // values, as `jl_compilation_sig` gives it
+            if (is_trait_arg_type(decl_i) && is_trait_arg_type(elt) && !jl_has_free_typevars(elt) &&
+                    ((jl_datatype_t*)jl_unwrap_unionall(elt))->name == ((jl_datatype_t*)jl_unwrap_unionall(decl_i))->name &&
+                    jl_subtype(elt, type_i))
+                continue;
         }
 
         if (jl_is_kind(elt)) {
@@ -1720,8 +1756,9 @@ JL_DLLEXPORT int jl_isa_compileable_sig(
             continue;
         }
 
+        // (not an argument declared at a set: as in `jl_compilation_sig`)
         int notcalled_func = (i_arg > 0 && i_arg <= 8 && !(definition->called & (1 << (i_arg - 1))) &&
-                              !jl_has_free_typevars(decl_i) &&
+                              !jl_has_free_typevars(decl_i) && !is_trait_arg_type(decl_i) &&
                               jl_subtype(elt, (jl_value_t*)jl_function_type));
         if (notcalled_func && jl_subtype((jl_value_t*)jl_function_type, type_i)) {
             // and attempt to despecialize types marked as a supertype of Function (i.e.
@@ -2377,6 +2414,34 @@ static void jl_index_open_set_methods(jl_method_t *m)
     open_set_walk_names((jl_value_t*)m->sig, m, 0);
 }
 
+// The methods whose signatures name the set (its TypeName, or a type of it): the set-to-methods
+// index, for compiling ahead. Each method once, in index order.
+JL_DLLEXPORT jl_value_t *jl_open_set_methods_of(jl_value_t *set)
+{
+    jl_value_t *uw = jl_unwrap_unionall(set);
+    jl_typename_t *tn = jl_is_typename(uw) ? (jl_typename_t*)uw :
+                        jl_is_datatype(uw) ? ((jl_datatype_t*)uw)->name : NULL;
+    jl_array_t *out = jl_alloc_vec_any(0);
+    if (tn == NULL)
+        return (jl_value_t*)out;
+    JL_GC_PUSH1(&out);
+    JL_LOCK(&open_set_methods_lock);
+    size_t n = open_set_methods ? jl_array_nrows(open_set_methods) : 0;
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        if (jl_array_ptr_ref(open_set_methods, i) != (jl_value_t*)tn)
+            continue;
+        jl_value_t *m = jl_array_ptr_ref(open_set_methods, i + 1);
+        int dup = 0;
+        for (size_t k = 0; k < jl_array_nrows(out); k++)
+            dup |= jl_array_ptr_ref(out, k) == m;
+        if (!dup)
+            jl_array_ptr_1d_push(out, m);
+    }
+    JL_UNLOCK(&open_set_methods_lock);
+    JL_GC_POP();
+    return (jl_value_t*)out;
+}
+
 // the methods indexed under `tn`
 static jl_array_t *jl_methods_at_set(jl_typename_t *tn)
 {
@@ -2392,6 +2457,73 @@ static jl_array_t *jl_methods_at_set(jl_typename_t *tn)
     JL_UNLOCK(&open_set_methods_lock);
     JL_GC_POP();
     return out;
+}
+
+// The table of a call's targets (Compiler/src/splittable.jl, `SplitTable`): one table
+// per call signature, from the value's type to a `:caller_world` pointer to the call's target
+// compiled for that type. The layouts mirror the Julia types. A table's state is replaced on each
+// addition, never mutated, so a reader loads it once; a state of another session (a table saved in
+// a package image) counts as empty.
+typedef struct {
+    jl_genericmemory_t *kv;   // Memory{UInt}: pairs (type address, pointer) by open addressing; 0 is empty
+    uint64_t session;         // the session that filled it
+    jl_genericmemory_t *keys; // Memory{Any}: the types, rooted
+} jl_split_state_t;
+typedef struct {
+    _Atomic(jl_split_state_t*) state;
+} jl_split_table_t;
+
+static _Atomic(uint64_t) jl_split_session_id = 0;
+jl_value_t *jl_split_table_miss_func JL_GLOBALLY_ROOTED = NULL; // kept by the system image (staticdata.c)
+
+// This session's stamp for split tables: made at its first use, never 0.
+JL_DLLEXPORT uint64_t jl_split_session(void)
+{
+    uint64_t s = jl_atomic_load_relaxed(&jl_split_session_id);
+    if (s == 0) {
+        uint64_t n = jl_hrtime() | 1;
+        if (jl_atomic_cmpswap(&jl_split_session_id, &s, n))
+            s = n;
+    }
+    return s;
+}
+
+// Base's `_split_table_miss!(tbl, T)`: makes the pointer for a type met the first time, and adds it.
+JL_DLLEXPORT void jl_set_split_table_miss(jl_value_t *f)
+{
+    jl_split_table_miss_func = f;
+}
+
+// The pointer for the type `T` in split table `tbl`: one probe, else made by the miss function. The
+// pointer dispatches in its caller's world at each call, so it is made in the latest world, where
+// Base's miss function and the target are defined whatever the caller's world.
+JL_DLLEXPORT void *jl_split_table_ptr(jl_value_t *tbl, jl_value_t *T)
+{
+    jl_split_state_t *st = jl_atomic_load_acquire(&((jl_split_table_t*)tbl)->state);
+    if (st->session == jl_atomic_load_relaxed(&jl_split_session_id)) {
+        jl_genericmemory_t *kv = st->kv;
+        uint64_t *d = (uint64_t*)kv->ptr;
+        size_t mask = kv->length / 2 - 1;
+        uint64_t a = (uint64_t)(uintptr_t)T;
+        size_t i = (size_t)(a >> 4) & mask;
+        while (1) {
+            uint64_t k = d[2 * i];
+            if (k == a)
+                return (void*)(uintptr_t)d[2 * i + 1];
+            if (k == 0)
+                break;
+            i = (i + 1) & mask;
+        }
+    }
+    if (jl_split_table_miss_func == NULL)
+        jl_error("a split's table was reached before Base was initialized");
+    jl_value_t *args[2] = {tbl, T};
+    jl_task_t *ct = jl_current_task;
+    size_t last_age = ct->world_age;
+    ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
+    jl_value_t *fp = jl_apply_generic(jl_split_table_miss_func, args, 2);
+    ct->world_age = last_age;
+    return jl_unbox_voidpointer(fp);
 }
 
 // the counters of a membership's walk: what one declaration cost, read by tests and by
@@ -2614,6 +2746,27 @@ static void invalidate_code_instance(jl_code_instance_t *replaced, size_t max_wo
 JL_DLLEXPORT void jl_invalidate_code_instance(jl_code_instance_t *replaced, size_t max_world)
 {
     invalidate_code_instance(replaced, max_world, 1);
+}
+
+// Invalidates the given CodeInstances, with their callers, in the latest world, and opens a new
+// world, as a method's deletion does: code of the latest world stays valid there, and what is
+// compiled from the new world on sees the change. Used once Base counts as loaded, for code
+// compiled at an intersection whose negative has become final.
+JL_DLLEXPORT void jl_invalidate_code_instances_new_world(jl_svec_t *cis)
+{
+    JL_LOCK(&world_counter_lock);
+    if (!jl_atomic_load_relaxed(&allow_new_worlds)) {
+        JL_UNLOCK(&world_counter_lock);
+        jl_error("Method changes have been disabled via a call to disable_new_worlds.");
+    }
+    size_t world = jl_atomic_load_relaxed(&jl_world_counter);
+    for (size_t i = 0; i < jl_svec_len(cis); i++) {
+        jl_value_t *ci = jl_svecref(cis, i);
+        if (jl_is_code_instance(ci))
+            invalidate_code_instance((jl_code_instance_t*)ci, world, 1);
+    }
+    jl_atomic_store_release(&jl_world_counter, world + 1);
+    JL_UNLOCK(&world_counter_lock);
 }
 
 JL_DLLEXPORT void jl_maybe_log_binding_invalidation(jl_value_t *replaced)

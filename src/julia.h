@@ -568,7 +568,8 @@ typedef struct {
     uint8_t mayinlinealloc:1;
     uint8_t open_set:1;       // this type is a set: it may gain members after its definition
     uint8_t never_member:1;   // Core's kinds and builtins: can never be a member of a set
-    uint8_t _unused:3;
+    uint8_t erases:1;         // a set of Core's build whose arguments are compiled once by default: `Callable`
+    uint8_t _unused:2;
     _Atomic(uint8_t) cache_entry_count; // (approximate counter of TypeMapEntry for heuristics)
     uint8_t max_methods; // override for inference's max_methods setting (0 = no additional limit or relaxation)
     uint8_t constprop_heustic; // override for inference's constprop heuristic
@@ -867,7 +868,7 @@ enum jl_binding_flags {
 
 // the bits of a module's options word
 enum jl_module_option {
-    // the scope options of a trait library, which the library reads (`jl_get_module_options`): the
+    // the scope options of a trait library, which the library reads (`jl_get_module_trait_options`): the
     // module's methods at a set are checked where they are defined (bounded), and the module defines
     // no method or membership of another module's function and types (no_pirates)
     JL_MODULE_OPTION_BOUNDED = 1,
@@ -926,7 +927,7 @@ typedef struct _jl_module_t {
     // compiled by facts: 0 plain, 1 facts, 2 never (the compiler's own modules)
     int8_t facts;
     // options for the module's own functions (`@compiler_options`), as bits: JL_MODULE_OPTION_*
-    uint8_t options;
+    uint8_t trait_options;
     // If cleared no binding partition in this module has PARTITION_FLAG_EXPORTED and min_world > jl_require_world.
     _Atomic(int8_t) export_set_changed_since_require_world;
     jl_mutex_t lock;
@@ -2123,7 +2124,7 @@ JL_DLLEXPORT int jl_get_module_infer(jl_module_t *m);
 JL_DLLEXPORT void jl_set_module_max_methods(jl_module_t *self, int value);
 JL_DLLEXPORT int jl_get_module_max_methods(jl_module_t *m);
 JL_DLLEXPORT void jl_set_module_facts(jl_module_t *self, int value);
-JL_DLLEXPORT void jl_set_module_option(jl_module_t *self, int bit, int value);
+JL_DLLEXPORT void jl_set_module_trait_option(jl_module_t *self, int bit, int value);
 JL_DLLEXPORT jl_value_t *jl_get_module_usings_backedges(jl_module_t *m);
 JL_DLLEXPORT jl_value_t *jl_get_module_scanned_methods(jl_module_t *m);
 JL_DLLEXPORT jl_value_t *jl_get_module_binding_or_nothing(jl_module_t *m, jl_sym_t *s);

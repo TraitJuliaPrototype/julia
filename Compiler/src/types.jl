@@ -392,18 +392,34 @@ struct NativeInterpreter <: AbstractInterpreter
     inf_params::InferenceParams
     opt_params::OptimizationParams
 
-    # whether calls are inferred only at facts (facts.jl)
+    # whether calls are inferred only at facts
     facts::Bool
     # how many inferences of the other policy this one is nested in
     crossings::Int
     # `return_type`'s run-time answers: every method inferred plainly, under an owner of its own
     plainrt::Bool
+    # the closed build's check in a session: the owner of its code, or `nothing`.
+    # It infers by a closed build's rules, every method plainly, into a cache of its own
+    closed::Any
+    # the check's method table: the session's with the build's replacements of Base's
+    # methods laid over it, or `nothing` (a check without replacements, and every other interpreter)
+    overlay_table::Union{Nothing,CachedMethodTable{OverlayMethodTable}}
 end
+
+"""
+The owner of the code of one closed build's check in a session. `overlay` holds
+the methods the build replaces in Base, as an overlay method table, or `nothing`.
+"""
+mutable struct ClosedCheck
+    overlay::Union{Nothing,MethodTable}
+end
+ClosedCheck() = ClosedCheck(nothing)
 
 function NativeInterpreter(world::UInt = get_world_counter();
                            inf_params::InferenceParams = InferenceParams(),
                            opt_params::OptimizationParams = OptimizationParams(),
-                           facts::Bool = false, crossings::Int = 0, plainrt::Bool = false)
+                           facts::Bool = false, crossings::Int = 0, plainrt::Bool = false,
+                           @nospecialize(closed = nothing))
     curr_max_world = get_world_counter()
     # Sometimes the caller is lazy and passes typemax(UInt).
     # we cap it to the current world age for correctness
@@ -416,7 +432,10 @@ function NativeInterpreter(world::UInt = get_world_counter();
     method_table = CachedMethodTable(InternalMethodTable(world))
     inf_cache = Vector{InferenceResult}() # Initially empty cache
     codegen = IdDict{CodeInstance,CodeInfo}()
-    return NativeInterpreter(world, method_table, inf_cache, codegen, inf_params, opt_params, facts && !plainrt, crossings, plainrt)
+    closed === nothing || (plainrt = true)
+    overlay_table = (closed isa ClosedCheck && closed.overlay !== nothing) ?
+        CachedMethodTable(OverlayMethodTable(world, closed.overlay::MethodTable)) : nothing
+    return NativeInterpreter(world, method_table, inf_cache, codegen, inf_params, opt_params, facts && !plainrt, crossings, plainrt, closed, overlay_table)
 end
 
 # Quickly and easily satisfy the AbstractInterpreter API contract
@@ -426,10 +445,10 @@ get_inference_world(interp::NativeInterpreter) = interp.world
 get_inference_cache(interp::NativeInterpreter) = interp.inf_cache
 # code of either policy is cached under Julia's own owner, with the policy in its flags;
 # `return_type`'s run-time answers under one of their own
-cache_owner(interp::NativeInterpreter) = interp.plainrt ? :plain_rt : nothing
+cache_owner(interp::NativeInterpreter) = interp.closed !== nothing ? interp.closed : interp.plainrt ? :plain_rt : nothing
 
-# the policy of the code an interpreter makes and looks up under Julia's own owner: 0 plain,
-# 1 facts, -1 the policy the runtime reaches a method with
+# the policy of the code an interpreter makes and looks up under Julia's own owner: 0
+# plain, 1 facts, -1 the policy the runtime reaches a method with
 code_policy(::AbstractInterpreter) = Cint(-1)
 code_policy(interp::NativeInterpreter) = interp.plainrt ? Cint(-1) : Cint(interp.facts)
 "A CodeInstance records the policy it is compiled in, before it is published."
@@ -525,6 +544,41 @@ function code_cache(interp::AbstractInterpreter)
   worlds = WorldRange(get_inference_world(interp))
   return WorldView(cache, worlds)
 end
+
+"""
+    DefinitionCheckInterpreter(world, hook, state)
+
+The definition-time check: Julia's inference of a method at its own signature, with an
+ephemeral cache, so that every function the method reaches is inferred again, and at each known call
+`hook(interp, f, argtypes, sv)`, the library's, which records a use outside a set's contract in `state`.
+The interpreter is the compiler's own: a library that runs the check defines no method of the
+compiler's functions, so loading it invalidates none of the compiler's code (compiler ).
+"""
+struct DefinitionCheckCache
+    dict::IdDict{MethodInstance,CodeInstance}
+end
+struct DefinitionCheckInterpreter <: AbstractInterpreter
+    world::UInt
+    inf_params::InferenceParams
+    opt_params::OptimizationParams
+    inf_cache::Vector{InferenceResult}
+    code_cache::DefinitionCheckCache
+    hook::Any       # hook(interp, f, argtypes::Vector{Any}, sv) -> nothing, called in the latest world
+    state::Any      # the library's record of this check
+end
+DefinitionCheckInterpreter(world::UInt, @nospecialize(hook), @nospecialize(state)) =
+    DefinitionCheckInterpreter(world, InferenceParams(), OptimizationParams(), InferenceResult[],
+                               DefinitionCheckCache(IdDict{MethodInstance,CodeInstance}()), hook, state)
+InferenceParams(interp::DefinitionCheckInterpreter) = interp.inf_params
+OptimizationParams(interp::DefinitionCheckInterpreter) = interp.opt_params
+get_inference_world(interp::DefinitionCheckInterpreter) = interp.world
+get_inference_cache(interp::DefinitionCheckInterpreter) = interp.inf_cache
+cache_owner(::DefinitionCheckInterpreter) = :DefinitionCheck
+code_cache(interp::DefinitionCheckInterpreter) = WorldView(interp.code_cache, WorldRange(interp.world))
+get(wvc::WorldView{DefinitionCheckCache}, mi::MethodInstance, default) = get(wvc.cache.dict, mi, default)
+getindex(wvc::WorldView{DefinitionCheckCache}, mi::MethodInstance) = getindex(wvc.cache.dict, mi)
+haskey(wvc::WorldView{DefinitionCheckCache}, mi::MethodInstance) = haskey(wvc.cache.dict, mi)
+setindex!(wvc::WorldView{DefinitionCheckCache}, ci::CodeInstance, mi::MethodInstance) = (setindex!(wvc.cache.dict, ci, mi); wvc)
 
 get_escape_cache(interp::AbstractInterpreter) = GetNativeEscapeCache(interp)
 

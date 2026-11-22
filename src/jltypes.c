@@ -4180,6 +4180,15 @@ static jl_value_t *core(const char *name)
 void post_boot_hooks(void)
 {
     jl_all_type = (jl_unionall_t*)core("All");
+    // `Callable{A, S}`: a set from Core's build, with both parameters as inputs, compiled once by default
+    jl_callable_type = (jl_unionall_t*)core("Callable");
+    {
+        jl_datatype_t *cb = (jl_datatype_t*)jl_unwrap_unionall((jl_value_t*)jl_callable_type);
+        cb->name->open_set = 1;
+        cb->name->erases = 1;
+        cb->has_open_set = 1;
+        cb->name->input_params = 0x03;
+    }
     // an intersection carries the open-set bit, so the bit gates the test for one (julia_internal.h); the
     // wrapper's body was built before `jl_all_type` was known
     ((jl_datatype_t*)jl_all_type->body)->has_open_set = 1;

@@ -333,14 +333,19 @@ macro _nospecializeinfer_meta() Expr(:meta, :nospecializeinfer) end
 macro _boundscheck() Expr(:boundscheck) end
 
 # n.b. the effects and model of these is refined in inference abstractinterpretation.jl; they are
-# inferred once, at `Any` (`Base.@nospecializeinfer`), and a call is matched at its own signature
+# inferred once, at `Any` (`Base.@nospecializeinfer`), and a call's dispatch backedge keeps its own signature
 TypeVar(@nospecialize(n)) = (@_nospecializeinfer_meta; _typevar(n::Symbol, Union{}, Any))
 TypeVar(@nospecialize(n), @nospecialize(ub)) = (@_nospecializeinfer_meta; _typevar(n::Symbol, Union{}, ub))
 TypeVar(@nospecialize(n), @nospecialize(lb), @nospecialize(ub)) = (@_nospecializeinfer_meta; _typevar(n::Symbol, lb, ub))
 
-# intersections: All{X, Y} is the type of the values that are members of each component; the runtime
-# builds it in its normal form as All{Tuple{X, Y}}
+# intersections: All{X, Y} is the type of the values that are members of each
+# component; the runtime builds it in its normal form as All{Tuple{X, Y}}
 abstract type All{T<:Tuple} end
+# `Callable{A, S}`: the functions called with arguments of `A`, returning an `S`. A set whose
+# members are declared: every `Function` by one entry (base/Base.jl), a callable type by its own; the signature
+# is checked at the box, the result on return. The runtime opens it when Core is built, both parameters inputs.
+abstract type Callable{A<:Tuple, S} end
+
 UnionAll(@nospecialize(v), @nospecialize(t)) = (@_nospecializeinfer_meta; ccall(:jl_type_unionall, Any, (Any, Any), v::TypeVar, t))
 
 const Memory{T} = GenericMemory{:not_atomic, T, CPU}
@@ -439,12 +444,51 @@ struct ArgumentError <: Exception
     msg::AbstractString
 end
 
-# A membership is a method of `implements`: `S <: X` by a membership holds where it has a method at
-# `(Type{X}, Type{S})`. The runtime defines the method when a membership is declared, in the
-# membership's world; its body is the template's. Code that relies on the membership holds an edge
-# to the method's instance, and ends when the method does.
+# A membership is a method of `implements`: `S <: X` by a membership holds where it has a method
+# at `(Type{X}, Type{S})`. The runtime defines the method when a membership is declared; its body is
+# the template's.
 function implements end
 _implements_body(@nospecialize(X), @nospecialize(S)) = nothing
+
+# The kept forms: ordinary structs with no rule of subtyping. The library
+# declares their memberships (each set's `Dynamic{Z} where Z<:X` and `Compiled{Z} where Z<:X`) and defines
+# their other methods; Core defines them so that a forwarder made where a method is defined names them.
+# The box: a member of the set `X`, held so that code for it is compiled once per set instance. Its
+# membership test is the field test of `new` with no conversion (`_new_dynamic`, below): `TypeError` for
+# a value that is not a member, decided by the compiler where it knows the member.
+struct Dynamic{X}
+    object::X
+    function Dynamic{X}(@nospecialize(x)) where {X}
+        X isa UnionAll && throw(ArgumentError("Dynamic{X} needs the trait's parameters"))
+        return _new_dynamic(Dynamic{X}, x)
+    end
+    # a box of `X` is itself; a box of a subset of `X` gives its object boxed at `X`, a member already
+    Dynamic{X}(d::Dynamic{X}) where {X} = d
+    function Dynamic{X}(d::Dynamic{Y}) where {X, Y<:X}
+        X isa UnionAll && throw(ArgumentError("Dynamic{X} needs the trait's parameters"))
+        return _new_dynamic(Dynamic{X}, getfield(d, :object))
+    end
+end
+# The wrapper: a value held at its own type, so that code for it is compiled for that type. A box gives
+# its object wrapped; a wrapper is itself. (The library's `compiled_for(x)` makes one.)
+struct Compiled{T}
+    object::T
+    Compiled{T}(x) where {T} = new{T}(x)
+end
+Compiled(x::T) where {T} = Compiled{T}(x)
+Compiled(w::Compiled) = w
+Compiled(d::Dynamic) = Compiled(getfield(d, :object))
+# a box of a wrapper holds the wrapper's object
+Dynamic{X}(w::Compiled) where {X} = Dynamic{X}(getfield(w, :object))
+# a call of a value known as `Callable{A, S}`: its arguments are of `A`, or the call
+# raises `MethodError`; the compiler inserts the check where it cannot prove them
+_callable_argcheck(@nospecialize(f), @nospecialize(A), @nospecialize(args...)) =
+    (isa(args, A) || throw_methoderror(f, args...); nothing)
+# and its result, or the result of a call that passed such a value on to code compiled for the function's
+# own type, is of the type inferred for it, or the call raises the box's `TypeError`: the
+# compiler invokes it after the call
+_callable_result(@nospecialize(r), @nospecialize(T)) =
+    isa(r, T) ? r : throw(TypeError(:Callable, T === Nothing ? "end the function with `nothing`" : "", T, r))
 struct UndefKeywordError <: Exception
     var::Symbol
 end
@@ -532,6 +576,8 @@ end
 VecElement(arg::T) where {T} = VecElement{T}(arg)
 
 eval(Core, quote
+    # the box made by `new` with no conversion: its field test is the membership test
+    _new_dynamic(::Type{D}, @nospecialize(x)) where {D} = $(Expr(:new, :D, :x))
     GotoNode(label::Int) = $(Expr(:new, :GotoNode, :label))
     NewvarNode(slot::SlotNumber) = $(Expr(:new, :NewvarNode, :slot))
     QuoteNode(@nospecialize value) = $(Expr(:new, :QuoteNode, :value))

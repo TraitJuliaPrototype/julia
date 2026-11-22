@@ -339,10 +339,20 @@ convert(::Type{IOContext{IO_t}}, io::IO) where {IO_t} = IOContext{IO_t}(io, iopr
 
 IOContext(io::IO) = convert(IOContext, io)
 IOContext{IO_t}(io::IO) where {IO_t} = convert(IOContext{IO_t}, io)
-
+# `IOContext{IO}(io, key => value, …)`, the erased stream: one type whatever the stream,
+# with the stream's properties and the pairs; its operations on the stream it holds branch over
+# `IO`'s candidates. An `IOContext` given is unwrapped, its properties kept.
 # A property is stored by the dictionary's own constructor, through `invoke`: the value is kept whatever
 # its type (often a type, `:typeinfo => T`), and a call at the value's type is one that a package's
 # method for its own type could intercept.
+function IOContext{IO_t}(io::IO, KV::Pair, KVs::Pair...) where {IO_t}
+    d = invoke(ImmutableDict{Symbol,Any}, Tuple{ImmutableDict, Any, Any}, ioproperties(io), KV[1], KV[2])
+    for kv in KVs
+        d = invoke(ImmutableDict{Symbol,Any}, Tuple{ImmutableDict, Any, Any}, d, kv[1], kv[2])
+    end
+    return IOContext{IO_t}(io, d)
+end
+
 function IOContext(io::IO, KV::Pair)
     d = ioproperties(io)
     return IOContext(io, invoke(ImmutableDict{Symbol,Any}, Tuple{ImmutableDict, Any, Any}, d, KV[1], KV[2]))

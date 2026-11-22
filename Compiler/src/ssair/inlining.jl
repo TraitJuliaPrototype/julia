@@ -58,8 +58,13 @@ struct UnionSplit
     atype::DataType
     cases::Vector{InliningCase}
     bbs::Vector{Int}
-    UnionSplit(handled_all_cases::Bool, fully_covered::Bool, atype::DataType, cases::Vector{InliningCase}) =
-        new(handled_all_cases, fully_covered, atype, cases, Int[])
+    fallback_rt::Any # an operation's split: its declared result, else nothing
+    table::Any       # and the table of its last branch, or nothing for the dynamic call
+    trusted::UInt32  # the call's `IR_FLAGS_TRUSTED`: the fallback's result is checked, and a case's at an
+                     # instance of wider types; a `Callable`'s split: its check's kind
+    UnionSplit(handled_all_cases::Bool, fully_covered::Bool, atype::DataType, cases::Vector{InliningCase},
+               @nospecialize(fallback_rt = nothing), @nospecialize(table = nothing), trusted::UInt32 = UInt32(0)) =
+        new(handled_all_cases, fully_covered, atype, cases, Int[], fallback_rt, table, trusted)
 end
 
 struct InliningEdgeTracker
@@ -246,7 +251,20 @@ function cfg_inline_unionsplit!(ir::IRCode, idx::Int, union_split::UnionSplit,
     # NOTE This edge is only required for `!handled_all_cases` and not `!fully_covered`,
     #      since in the latter case we inline `Core.throw_methoderror` into the fallback
     #      block, which is must-throw, making the subsequent code path unreachable.
-    !handled_all_cases && push!(from_bbs, length(state.new_cfg_blocks))
+    if !handled_all_cases && union_split.table !== nothing
+        # a split's last branch through its table: the fallback block takes the
+        # pointer, then the call through it, or the dynamic call where none was made
+        fb = length(state.new_cfg_blocks)
+        for _ in 1:2
+            push!(state.new_cfg_blocks, BasicBlock(StmtRange(idx, idx)))
+            push!(state.new_cfg_blocks[end].preds, fb)
+            push!(state.new_cfg_blocks[fb].succs, length(state.new_cfg_blocks))
+            push!(from_bbs, length(state.new_cfg_blocks))
+        end
+        push!(bbs, length(state.new_cfg_blocks))
+    elseif !handled_all_cases
+        push!(from_bbs, length(state.new_cfg_blocks))
+    end
     # This block will be the block everyone returns to
     push!(state.new_cfg_blocks, BasicBlock(StmtRange(idx, idx), from_bbs, orig_succs))
     join_bb = length(state.new_cfg_blocks)
@@ -466,6 +484,74 @@ function fix_va_argexprs!(insert_node!::Inserter, inline_target::Union{IRCode, I
 end
 
 """
+The table for the last branch of an operation's split at `sig` (the call `f(x, args...)`) with
+declared result `rt`: `nothing` where the call takes Julia's dynamic dispatch instead
+(a function of a type not concrete, more than `MAX_SPLIT_TABLE_ARGS` arguments, a closed build or its
+check).
+"""
+function split_fallback_table(sig::Signature, @nospecialize(rt), closed::Bool)
+    closed && return nothing
+    ats = sig.argtypes
+    length(ats) >= 2 || return nothing
+    n = length(ats) - 2
+    n <= MAX_SPLIT_TABLE_ARGS || return nothing
+    F = widenconst(ats[1])
+    (isconcretetype(F) && !iskindtype(F)) || return nothing
+    A = Any[split_table_type(widenconst(ats[i])) for i in 3:length(ats)]
+    for a in A
+        isvarargtype(a) && return nothing
+    end
+    R = rt === nothing ? Any : split_table_type(rt)
+    return split_table(F, Tuple{A...}, R)
+end
+
+"""
+The last branch of a split through its table (`SplitTable`): `typeof(x)` and the pointer for it
+(`jl_split_table_ptr`: one probe, or the pointer made at the first miss; `C_NULL` where none can be
+made), then the call through it, typed as `split_ccall_type` says. `argexprs` are the call's: `f`,
+`x`, the other arguments.
+"""
+function split_table_ptr!(compact::IncrementalCompact, argexprs::Vector{Any}, table::SplitTable, line)
+    T = insert_node_here!(compact, NewInstruction(Expr(:call, GlobalRef(Core, :typeof), argexprs[2]), DataType, line))
+    return insert_node_here!(compact, NewInstruction(Expr(:foreigncall, Expr(:tuple, QuoteNode(:jl_split_table_ptr)), Ptr{Cvoid},
+        svec(Any, Any), 0, QuoteNode(:ccall), table, T), Ptr{Cvoid}, line))
+end
+"""
+The `:caller_world` pointer of a split's branch not inlined: the
+target for the candidate at the split's value, `Base._SplitTarget{F, T, R, A}`, as the table's miss
+makes it for a type past the candidates. A call through it dispatches in the caller's world, so the
+caller holds no edge to the candidate's instance, and an invalidation below the candidate stops
+there. `nothing`, and the branch is a direct call, where the split has no table, where the case does
+not narrow the value (the call's second argument, as the table takes it) to a concrete type, and
+before Base defines the target (`SPLIT_TARGET`).
+"""
+function split_branch_pointer(@nospecialize(table), atype::DataType, mtype::DataType)
+    table isa SplitTable || return nothing
+    S = SPLIT_TARGET[]
+    S === nothing && return nothing
+    (fieldcount(atype) >= 2 && fieldcount(mtype) >= 2) || return nothing
+    T = fieldtype(mtype, 2)
+    (isconcretetype(T) && !(fieldtype(atype, 2) <: T)) || return nothing
+    A = table.args::DataType
+    D = Core.apply_type(S, table.f, T, table.rt, A)
+    (D isa DataType && isdefined(D, :instance)) || return nothing
+    target = D.instance
+    cats = Any[split_ccall_type(a) for a in A.parameters]
+    return Expr(:cfunction, Ptr{Cvoid}, QuoteNode(target), split_ccall_rt(table.rt),
+                svec(Any, Any, cats...), QuoteNode(:caller_world))
+end
+
+function split_table_call!(compact::IncrementalCompact, argexprs::Vector{Any}, table::SplitTable, fp, line)
+    ats = Any[Any, Any]
+    for A in (table.args::DataType).parameters
+        push!(ats, split_ccall_type(A))
+    end
+    rt = split_ccall_rt(table.rt)
+    return insert_node_here!(compact, NewInstruction(Expr(:foreigncall, fp, rt, svec(ats...), 0, QuoteNode(:ccall), argexprs...),
+        rt, line))
+end
+
+"""
     ir_inline_unionsplit!
 
 The primary purpose of this function is to emulate the dispatch behavior by generating flat
@@ -526,7 +612,7 @@ assuming their order stays the same post-discovery in `ml_matches`.
 function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::Vector{Any},
                                union_split::UnionSplit, boundscheck::Symbol,
                                todo_bbs::Vector{Tuple{Int,Int}}, interp::AbstractInterpreter)
-    (; handled_all_cases, fully_covered, atype, cases, bbs) = union_split
+    (; handled_all_cases, fully_covered, atype, cases, bbs, fallback_rt, table, trusted) = union_split
     stmt, typ, line = compact.result[idx][:stmt], compact.result[idx][:type], compact.result[idx][:line]
     join_bb = bbs[end]
     pn = PhiNode()
@@ -579,15 +665,36 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
         end
         if isa(case, InliningTodo)
             val = ir_inline_item!(compact, idx, argexprs′, case, boundscheck, todo_bbs)
+        elseif isa(case, InvokeCase) && (bfp = split_branch_pointer(table, atype, mtype)) !== nothing
+            # a split's branch not inlined: through the candidate's `:caller_world` pointer, with no edge
+            p = insert_node_here!(compact, NewInstruction(bfp, Ptr{Cvoid}, line))
+            val = split_table_call!(compact, argexprs′, table::SplitTable, p, line)
         elseif isa(case, InvokeCase)
             invoke_stmt = Expr(:invoke, case.invoke, argexprs′...)
             flag = flags_for_effects(case.effects)
-            val = insert_node_here!(compact, NewInstruction(invoke_stmt, typ, case.info, line, flag))
+            # in an operation's split, the invoke is typed by its own result, not the declared one
+            ityp = fallback_rt === nothing ? typ :
+                   case.invoke isa CodeInstance ? (case.invoke::CodeInstance).rettype : Any
+            val = insert_node_here!(compact, NewInstruction(invoke_stmt, ityp, case.info, line, flag))
+            # (a call whose type rests on a declared result its members' own code does not check, its case an
+            # instance at wider types than the case's: the result checked)
+            if fallback_rt === nothing && trusted != 0 && widenconst(typ) !== Any
+                mi = case.invoke isa CodeInstance ? get_ci_mi(case.invoke) : case.invoke
+                if !(mi.specTypes <: mtype)
+                    check = trusted_result_check(val, widenconst(typ), trusted, get_inference_world(interp))
+                    val = insert_node_here!(compact, NewInstruction(check, typ, line))
+                end
+            end
         else
             case = case::ConstantCase
             val = case.val
         end
         if !isempty(compact.cfg_transform.result_bbs[bb].preds)
+            if fallback_rt !== nothing && !⊑(optimizer_lattice(interp), argextype(val, compact), fallback_rt)
+                # a case whose result is not known to be the declared result asserts it
+                val = insert_node_here!(compact, NewInstruction(
+                    trusted_result_check(val, fallback_rt, trusted, get_inference_world(interp)), fallback_rt, line))
+            end
             push!(pn.edges, bb)
             push!(pn.values, val)
             insert_node_here!(compact,
@@ -601,7 +708,41 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
     bb += 1
     # We're now in the fall through block, decide what to do
     if !handled_all_cases
-        ssa = insert_node_here!(compact, NewInstruction(stmt, typ, line))
+        if table !== nothing
+            # the split's last branch: the pointer for the value's type from the table of the call's
+            # signature, and the call through it; where no pointer was made (a session without the
+            # compiler), the dynamic call
+            dyn_bb = bbs[end-1]
+            fp = split_table_ptr!(compact, argexprs, table::SplitTable, line)
+            isnull = insert_node_here!(compact, NewInstruction(Expr(:call, GlobalRef(Core, :(===)), fp, C_NULL), Bool, line))
+            made = insert_node_here!(compact, NewInstruction(Expr(:call, not_int, isnull), Bool, line))
+            insert_node_here!(compact, NewInstruction(GotoIfNot(made, dyn_bb), Any, line))
+            finish_current_bb!(compact, 0)
+            ssa = split_table_call!(compact, argexprs, table::SplitTable, fp, line)
+            if fallback_rt !== nothing
+                ssa = insert_node_here!(compact, NewInstruction(
+                    trusted_result_check(ssa, fallback_rt, trusted, get_inference_world(interp)), fallback_rt, line))
+            end
+            push!(pn.edges, dyn_bb - 1)
+            push!(pn.values, ssa)
+            insert_node_here!(compact, NewInstruction(GotoNode(join_bb), Any, line))
+            finish_current_bb!(compact, 0)
+            bb = dyn_bb
+            ssa = insert_node_here!(compact, NewInstruction(stmt, Any, line))
+        elseif fallback_rt === nothing && trusted != 0 && widenconst(typ) !== Any
+            # a call whose type rests on a declared result its members' own code does not check: the
+            # fallback is left to dispatch, its result checked
+            ssa = insert_node_here!(compact, NewInstruction(stmt, Any, line))
+            check = trusted_result_check(ssa, widenconst(typ), trusted, get_inference_world(interp))
+            ssa = insert_node_here!(compact, NewInstruction(check, typ, line))
+        else
+            ssa = insert_node_here!(compact, NewInstruction(stmt, fallback_rt === nothing ? typ : Any, line))
+        end
+        if fallback_rt !== nothing
+            # the split's last branch: the dynamic call, its result asserted to the declared result
+            ssa = insert_node_here!(compact, NewInstruction(
+                trusted_result_check(ssa, fallback_rt, trusted, get_inference_world(interp)), fallback_rt, line))
+        end
         push!(pn.edges, bb)
         push!(pn.values, ssa)
         insert_node_here!(compact, NewInstruction(GotoNode(join_bb), Any, line))
@@ -780,6 +921,28 @@ function only_vararg_widened(@nospecialize(atype), @nospecialize(new))
     return true
 end
 
+"""
+Whether a signature knows each argument's type but at arguments known only by their trait (a set
+instance with its parameters, or an intersection of such), with every static parameter bound: in a
+closed build the instance at it is the one that runs.
+"""
+function closed_set_signature(@nospecialize(atype), sparams::SimpleVector)
+    atype isa DataType || return false
+    for s in sparams
+        isa(s, TypeVar) && return false
+    end
+    ps = atype.parameters
+    trait = false
+    for i in 1:length(ps)
+        p = ps[i]
+        isvarargtype(p) && return false
+        isdispatchelem(p) && continue
+        (!has_free_typevars(p) && is_trait_arg_type(p)) || return false
+        trait = true
+    end
+    return trait
+end
+
 function compileable_specialization(code::Union{MethodInstance,CodeInstance}, effects::Effects,
     et::InliningEdgeTracker, @nospecialize(info::CallInfo), state::InliningState)
     mi = code isa CodeInstance ? get_ci_mi(code) : code
@@ -793,7 +956,11 @@ function compileable_specialization(code::Union{MethodInstance,CodeInstance}, ef
     # stay: they are what keeps the number of compiled specializations small.
     exact = isdispatchtuple(atype) ? get(code_cache(state), mi, nothing) : nothing
     if OptimizationParams(state.interp).compilesig_invokes
-        new_atype = get_compileable_sig(method, atype, sparams)
+        # a closed build: a call that does not know its argument's member runs the
+        # method's instance at the argument's type, the set; the instance's operations branch over the
+        # members. A session leaves such a call to dispatch when it runs.
+        new_atype = closed_build(state.interp) && closed_set_signature(atype, sparams) ? atype :
+                    get_compileable_sig(method, atype, sparams)
         new_atype === nothing && return nothing
         if atype !== new_atype && !(exact isa CodeInstance && only_vararg_widened(atype, new_atype))
             sp_ = ccall(:jl_type_intersection_with_env, Any, (Any, Any), new_atype, method.sig)::SimpleVector
@@ -1445,12 +1612,97 @@ end
 function handle_call!(todo::Vector{Pair{Int,Any}},
     ir::IRCode, idx::Int, stmt::Expr, @nospecialize(info::CallInfo), flag::UInt32, sig::Signature,
     state::InliningState)
-    cases = compute_inlining_cases(info, flag, sig, state)
-    cases === nothing && return nothing
+    # an operation's split: its cases' edges are collected apart, and a
+    # branch keeps its edge only where it is inlined or stays a direct call
+    split = info isa SplitCallInfo
+    estate = split ? InliningState(Any[], state.world, state.interp, state.opt_cache, state.cycle_results) : state
+    cases = compute_inlining_cases(info, flag, sig, estate)
+    if cases === nothing
+        # an operation's call that is not split: the dynamic call, asserted
+        split && handle_declared_result!(ir, idx, stmt, DeclaredResultInfo(info.rt))
+        return nothing
+    end
     cases, handled_all_cases, fully_covered, joint_effects = cases
     atype = argtypes_to_type(sig.argtypes)
     atype === Union{} && return nothing # accidentally actually unreachable
-    handle_cases!(todo, ir, idx, stmt, atype, cases, handled_all_cases, fully_covered, joint_effects)
+    # an operation's split: never fully covered, its branches asserted; a `Callable`'s (a closed
+    # build's) checked as the box's call checks
+    fallback_rt = split ? info.rt : nothing
+    kind = split && callable_set_type(widenconst(sig.ft)) ? IR_FLAG_TRUSTED_CALLABLE : UInt32(0)
+    # (a closed build's split with no branch, a set with no member: the `MethodError` below)
+    if fallback_rt !== nothing && isempty(cases) && !((info::SplitCallInfo).closed && handled_all_cases)
+        inst = ir[SSAValue(idx)]
+        call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], nothing))
+        inst[:stmt] = trusted_result_check(call, fallback_rt, kind, state.world)
+        inst[:info] = NoCallInfo()
+        inst[:flag] = IR_FLAG_NULL
+        return nothing
+    end
+    table = fallback_rt === nothing ? nothing : split_fallback_table(sig, fallback_rt, closed_build(state.interp))
+    if split
+        for i in 1:length(cases)
+            c = cases[i]
+            item = c.item
+            pointer = isa(atype, DataType) && isa(c.sig, DataType) && split_branch_pointer(table, atype, c.sig) !== nothing
+            # an inlined branch brings its body's edges: only a leaf is inlined, any other branch calls
+            # its candidate's target through the pointer
+            if pointer && item isa InliningTodo && !split_inline_leaf(item)
+                item = InvokeCase(item.mi, item.effects, NoCallInfo())
+                cases[i] = InliningCase(c.sig, item)
+            end
+            # a branch called through a `:caller_world` pointer dispatches in the caller's world: no edge
+            pointer && item isa InvokeCase && continue
+            split_case_edge!(state.edges, item, estate.edges)
+        end
+    end
+    # in a closed build the split is over every member: past its branches the call
+    # raises the `MethodError`, and no call is left to dispatch when the program runs
+    closed = split && (info::SplitCallInfo).closed && handled_all_cases
+    handle_cases!(todo, ir, idx, stmt, atype, cases, fallback_rt === nothing ? handled_all_cases : closed,
+                  fallback_rt === nothing ? fully_covered : false, joint_effects, fallback_rt, table, kind)
+end
+
+"""
+Whether a split's branch may be inlined: its body, with what it inlined itself, is a
+leaf, calling only builtins and intrinsics. Inlined into an instance compiled once, which every caller
+of the operation shares, a body that calls further would carry those callees' invalidation to all of
+them.
+"""
+function split_inline_leaf(item::InliningTodo)
+    ir = item.ir
+    for i in 1:length(ir.stmts)
+        st = ir.stmts[i][:stmt]
+        st isa Expr || continue
+        if st.head === :invoke || st.head === :invoke_modify
+            return false
+        elseif st.head === :call
+            f = singleton_type(argextype(st.args[1], ir))
+            f isa Builtin || return false
+        end
+    end
+    return true
+end
+
+# the edge of a split's branch that is inlined or stays a direct call. An inlined
+# branch names the CodeInstance whose code it inlined, where the case's own edges have it, as an
+# ordinary inlined call does: the caller rests on that code, not on every code its instance may get
+
+function split_case_edge!(edges::Vector{Any}, @nospecialize(item), caseedges::Vector{Any})
+    if item isa InliningTodo
+        ci = nothing
+        for e in caseedges
+            if e isa CodeInstance && get_ci_mi(e) === item.mi
+                ci = e
+                break
+            end
+        end
+        add_inlining_edge!(edges, ci === nothing ? item.mi : ci)
+    elseif item isa InvokeCase
+        add_inlining_edge!(edges, item.invoke)
+    elseif item isa ConstantCase
+        add_inlining_edge!(edges, item.edge)
+    end
+    return nothing
 end
 
 function handle_match!(cases::Vector{InliningCase},
@@ -1534,18 +1786,19 @@ end
 
 function handle_cases!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::Int, stmt::Expr,
     @nospecialize(atype), cases::Vector{InliningCase}, handled_all_cases::Bool, fully_covered::Bool,
-    joint_effects::Effects)
+    joint_effects::Effects, @nospecialize(fallback_rt = nothing), @nospecialize(table = nothing),
+    kind::UInt32 = UInt32(0))
     # If we only have one case and that case is fully covered, we may either
     # be able to do the inlining now (for constant cases), or push it directly
     # onto the todo list
-    if fully_covered && handled_all_cases && length(cases) == 1
+    if fully_covered && handled_all_cases && length(cases) == 1 && fallback_rt === nothing
         handle_single_case!(todo, ir, idx, stmt, cases[1].item)
     elseif length(cases) > 0 || handled_all_cases
         isa(atype, DataType) || return nothing
         for case in cases
             isa(case.sig, DataType) || return nothing
         end
-        push!(todo, idx=>UnionSplit(handled_all_cases, fully_covered, atype, cases))
+        push!(todo, idx=>UnionSplit(handled_all_cases, fully_covered, atype, cases, fallback_rt, table, kind))
     else
         add_flag!(ir[SSAValue(idx)], flags_for_effects(joint_effects))
     end
@@ -1661,10 +1914,19 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
         inst = ir.stmts[idx]
         flag = inst[:flag]
 
+        # (a call whose type rests on a declared result its members' own code does not check)
+        trusted = flag & IR_FLAGS_TRUSTED
+        ntodo = length(todo)
+
         simpleres = process_simple!(todo, ir, idx, flag, state)
-        simpleres === nothing && continue
+        if simpleres === nothing
+            trusted == 0 || check_trusted_result!(todo, ntodo, ir, idx, nothing, trusted, state)
+            continue
+        end
         stmt, sig = simpleres
         info = inst[:info]
+        # (an operation's split checks its own fallback)
+        info isa SplitCallInfo && (trusted = UInt32(0))
 
         # `NativeInterpreter` won't need this, but provide a support for `:invoke` exprs here
         # for external `AbstractInterpreter`s that may run the inlining pass multiple times
@@ -1686,6 +1948,10 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
             handle_declared_result!(ir, idx, stmt, info)
             continue
         end
+        if isa(info, CallableCallInfo)
+            handle_callable_call!(ir, idx, stmt, info, state)
+            continue
+        end
 
         # handle special cased builtins
         if isa(info, OpaqueClosureCallInfo)
@@ -1700,17 +1966,91 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
             # cascade to the generic (and extendable) handler
             handle_call!(todo, ir, idx, stmt, info, flag, sig, state)
         end
+        trusted == 0 || check_trusted_result!(todo, ntodo, ir, idx, sig, trusted, state)
     end
 
     return todo
 end
 
-# An operation's call at a receiver typed by its set: the dynamic call, its result asserted to the
-# declared result, which inference took as the call's type.
+# A call whose type rests on a declared result that the code compiled for a member's own type does not
+# check (the `trusted` flags), after the inliner has handled it. Where the code that runs
+# is the code inferred, the result holds: an inlined body, an invoke of the instance at the call's
+# types. Where it may be another instance, the result is checked against the type inferred for the
+# call: a call left to dispatch (with no case, a builtin's call such as a splat or `Core.invoke` that
+# stays one), a split's fallback, an invoke of an instance at wider types (a method that does not
+# specialize). Compiled code never takes a value that its call's type excludes.
+function check_trusted_result!(todo::Vector{Pair{Int,Any}}, ntodo::Int, ir::IRCode, idx::Int,
+                               sig::Union{Nothing,Signature}, trusted::UInt32, state::InliningState)
+    if length(todo) > ntodo && todo[end].first == idx
+        item = todo[end].second
+        if item isa UnionSplit && item.fallback_rt === nothing
+            todo[end] = idx => UnionSplit(item.handled_all_cases, item.fully_covered, item.atype, item.cases,
+                                          item.fallback_rt, item.table, trusted)
+        end
+        return nothing
+    end
+    inst = ir[SSAValue(idx)]
+    stmt = inst[:stmt]
+    stmt isa Expr || return nothing
+    if stmt.head === :invoke
+        sig === nothing && return nothing
+        edge = stmt.args[1]
+        mi = isa(edge, MethodInstance) ? edge : get_ci_mi(edge::CodeInstance)
+        mi.specTypes <: argtypes_to_type(sig.argtypes) && return nothing
+    elseif stmt.head !== :call
+        return nothing
+    end
+    T = widenconst(inst[:type])
+    T === Any && return nothing
+    call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], inst[:flag] & ~IR_FLAGS_TRUSTED))
+    inst[:stmt] = trusted_result_check(call, T, trusted, state.world)
+    inst[:info] = NoCallInfo()
+    inst[:flag] = IR_FLAG_NULL
+    return nothing
+end
+
+# The check of a result `val` against `T`: for a `Callable{A, S}`'s, the box's `TypeError`,
+# by an invoke of `Core._callable_result`; for an operation's, `typeassert`'s, as the operation's own
+# call asserts
+function trusted_result_check(@nospecialize(val), @nospecialize(T), trusted::UInt32, world::UInt)
+    if trusted & IR_FLAG_TRUSTED_CALLABLE != 0
+        mi = callable_result_instance(world)
+        mi === nothing || return Expr(:invoke, mi, GlobalRef(Core, :_callable_result), val, T)
+        return Expr(:call, GlobalRef(Core, :_callable_result), val, T)
+    end
+    return Expr(:call, GlobalRef(Core, :typeassert), val, T)
+end
+
+function callable_result_instance(world::UInt)
+    match, _ = _findsup(Tuple{typeof(Core._callable_result), Any, Any}, nothing, world)
+    match === nothing && return nothing
+    return specialize_method(match::MethodMatch)
+end
+
+# An operation's call at a receiver typed by its set, or a `Callable`'s: the
+# dynamic call, its result asserted to the declared result, which inference took as the
+# call's type.
 function handle_declared_result!(ir::IRCode, idx::Int, stmt::Expr, info::DeclaredResultInfo)
     inst = ir[SSAValue(idx)]
     call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], nothing))
     inst[:stmt] = Expr(:call, GlobalRef(Core, :typeassert), call, info.rt)
+    inst[:info] = NoCallInfo()
+    inst[:flag] = IR_FLAG_NULL
+    return nothing
+end
+
+
+# A call of a value known as `Callable{A, S}`: its arguments checked against `A`
+# (`MethodError`), then the dynamic call, its result asserted to `S`.
+function handle_callable_call!(ir::IRCode, idx::Int, stmt::Expr, info::CallableCallInfo, state::InliningState)
+    inst = ir[SSAValue(idx)]
+    if info.A !== nothing
+        check = Expr(:call, GlobalRef(Core, :_callable_argcheck), stmt.args[1], info.A, stmt.args[2:end]...)
+        insert_node!(ir, SSAValue(idx), NewInstruction(check, Nothing, NoCallInfo(), inst[:line], nothing))
+    end
+    # its result checked as a box's call checks it: one check, one message
+    call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], nothing))
+    inst[:stmt] = trusted_result_check(call, info.rt, IR_FLAG_TRUSTED_CALLABLE, state.world)
     inst[:info] = NoCallInfo()
     inst[:flag] = IR_FLAG_NULL
     return nothing
