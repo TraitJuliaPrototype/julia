@@ -3540,7 +3540,7 @@ end
     @eval module ScopedMod
         Base.Experimental.@compiler_options bounded=true no_pirates=true
     end
-    @test ccall(:jl_get_module_options, Cint, (Any,), ScopedMod) & 3 == 3
+    @test ccall(:jl_get_module_trait_options, Cint, (Any,), ScopedMod) & 3 == 3
 end
 
 # the member hook: a library checks the member of a set at its first use, before dispatch selects a

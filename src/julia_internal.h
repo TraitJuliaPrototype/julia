@@ -2170,7 +2170,7 @@ JL_DLLEXPORT int jl_isabspath(const char *in) JL_NOTSAFEPOINT;
     XX(macrocall_sym) \
     XX(max_methods_sym) \
     XX(facts_sym) \
-    XX(module_option_sym) \
+    XX(trait_option_sym) \
     XX(facts_boundary_sym) \
     XX(facts_always_sym) \
     XX(fully_typed_warn_sym) \

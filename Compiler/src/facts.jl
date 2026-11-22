@@ -45,7 +45,7 @@ function is_owner_only(@nospecialize(F))
     ccall(:jl_binding_owner_only_p, Cint, (Any, Any), m, name) != 0 && return true
     # a trait's operation is open to the set's members, exported or not
     ccall(:jl_binding_open_operation_p, Cint, (Any, Any), m, name) != 0 && return false
-    (ccall(:jl_get_module_options, Cint, (Any,), m) & Cint(64)) != 0 || return false
+    (ccall(:jl_get_module_trait_options, Cint, (Any,), m) & Cint(64)) != 0 || return false
     return ccall(:jl_module_public_p, Cint, (Any, Any), m, name) == 0
 end
 
