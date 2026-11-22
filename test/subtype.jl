@@ -2818,3 +2818,142 @@ end
 @test !(Tuple{Union{Int16,Int8},Ref{Int16},Ref{Int16}} <: Tuple{<:Union{S,T},Ref{S},Ref{T}} where {S,T})
 @test !(Tuple{Ref{Int16},Ref{Int16},Union{Int16,Int8}} <: Tuple{Ref{S},Ref{T},<:Union{S,T}} where {S,T})
 @test Tuple{NTuple{2,Int}, Int8} <: Tuple{<:Union{NTuple{2,T},Tuple{S,T}}, <:T} where {S,T>:Int}
+
+# Sets and memberships: an abstract type declared a set gains subtypes by memberships, each in force
+# from the world after its declaration. The sets and memberships are declared through the runtime's
+# entry points, as a library's declaration macros do.
+module SetsAndMemberships
+using Test
+
+# `@set X` or `@set X P...`: an abstract type `X{P...}` made a set before its binding is published
+macro set(name, params...)
+    tvs = [:($p = TypeVar($(QuoteNode(p)))) for p in params]
+    t = gensym(:set)
+    return esc(quote
+        Core.declare_global($__module__, $(QuoteNode(name)), false)
+        $(Expr(:latestworld))
+        let $(tvs...)
+            local $t = Core._abstracttype($__module__, $(QuoteNode(name)), Core.svec($(params...)))
+            ccall(:jl_set_open_set, Cvoid, (Any,), $t)
+            Core._setsuper!($t, Any)
+            Core._typebody!(false, $t)
+            Core.declare_const($__module__, $(QuoteNode(name)), $t)
+        end
+        $(Expr(:latestworld))
+        nothing
+    end)
+end
+# declare S a member of X in a new world; the next top-level statement runs in it
+member!(@nospecialize(X), @nospecialize(S)) =
+    ccall(:jl_declare_membership, Any, (Any, Any, Any, Any, Any), S, X, @__MODULE__, nothing, :self)
+setinputs!(@nospecialize(T), m::UInt8) = ccall(:jl_set_input_params, Cvoid, (Any, UInt8), T, m)
+world() = Base.get_world_counter()
+
+@set X1
+struct Late1 end
+struct NotMember1 end
+probe(y) = y isa X1                 # compiled before the membership
+tupq() = Tuple{Late1, Int} <: Tuple{X1, Int}
+castq(x) = x isa Late1 ? x::X1 : error("not Late1")
+@test ccall(:jl_is_open_set, Cint, (Any,), X1) == 1
+@test !probe(Late1()) && !tupq()
+@test_throws TypeError castq(Late1())
+@test Base.return_types(probe, (NotMember1,)) == Any[Bool]   # a negative about a set is not folded
+const w_before = world()
+const e1 = member!(X1, Late1)
+
+@testset "a membership is a supertype in the worlds it is in force" begin
+    @test e1 isa Core.MembershipEntry
+    @test e1.min_world > w_before && e1.max_world == typemax(UInt)
+    @test only(Late1.name.memberships) === e1
+    @test Late1 <: X1 && Late1() isa X1 && probe(Late1())
+    @test tupq() && castq(Late1()) === Late1()
+    @test !Base.invoke_in_world(w_before, probe, Late1())
+    @test !Base.invoke_in_world(w_before, tupq)
+    @test !(NotMember1 <: X1) && !probe(NotMember1())
+    @test typeintersect(Late1, X1) === Late1
+    @test typeintersect(NotMember1, X1) === Union{}
+    # an invariant parameter: a membership adds subtypes, never type equalities
+    @test !(Vector{Late1} <: Vector{X1})
+    @test Vector{Late1} <: Vector{<:X1}
+    @test typeintersect(Vector{Late1}, Vector{X1}) === Union{}
+    # a union's simplification reads declared supertypes alone
+    @test Union{Late1, X1} !== X1
+end
+
+@set PSet T
+struct PLate end
+struct PLate2 end
+member!(PSet, PLate)              # the bare set: a member of every instance
+member!(PSet{Float64}, PLate2)    # one instance
+
+@testset "a set's parameters" begin
+    @test PLate <: PSet{Int} && PLate <: PSet{String}
+    @test PLate2 <: PSet{Float64} && !(PLate2 <: PSet{Int})
+    @test PLate2 <: PSet
+    # one instance per member: a member of one instance is not declared a member of another
+    @test_throws ErrorException member!(PSet{Int}, PLate2)
+    @test !(PLate2 <: PSet{Int})
+end
+
+@set X4
+struct Late4 end
+struct Late4b end
+member!(X4, Type{Late4b})         # the type value is a member
+vprobe(y) = y isa X4
+
+@testset "a type value is a member by an entry for Type{S}" begin
+    @test Late4b isa X4 && vprobe(Late4b)
+    @test !(Late4b <: X4) && !(Late4b() isa X4)
+    @test typeintersect(Type{Late4b}, X4) == Type{Late4b}
+    @test typeintersect(Type{Late4}, X4) == Union{}
+    @test typeintersect(DataType, X4) !== Union{}   # a kind meets a set that takes a type value
+    @test !(Int isa X4)
+end
+
+@set XA
+@set XB
+struct Late5 end
+member!(XA, Late5)
+late5_xb() = Late5 <: XB
+const w_ab = world()
+member!(XB, XA)                    # the set XA joins XB
+
+@testset "memberships compose" begin
+    @test Late5 <: XB && XA <: XB
+    @test !Base.invoke_in_world(w_ab, late5_xb) && late5_xb()
+    # a cycle among sets is refused
+    @test_throws ErrorException member!(XA, XB)
+    @test !(XB <: XA)
+end
+
+@set HP N R
+setinputs!(HP, 0x01)
+struct S6 end
+member!(HP{:a, Int}, S6)
+member!(HP{:b, String}, S6)
+
+@testset "a set's inputs: one instance per value of the inputs" begin
+    @test S6 <: HP{:a, Int} && S6 <: HP{:b, String}
+    @test !(S6 <: HP{:a, String})
+    @test_throws ErrorException member!(HP{:a, Float64}, S6)
+    @test_throws ErrorException setinputs!(HP, 0x02)   # written once
+    @test_throws ErrorException setinputs!(Int, 0x01)  # only a set has inputs
+end
+
+struct Late7 end
+const e7 = member!(X1, Late7)
+const e7b = member!(X1, Late7)     # a redeclaration ends the old entry
+
+@testset "a declaration's checks" begin
+    @test e7.max_world == e7b.min_world - 1
+    @test e7b.max_world == typemax(UInt)
+    @test Late7 <: X1
+    @test_throws ErrorException member!(X1, DataType)          # Core's kinds are never members
+    @test_throws ErrorException member!(X1, typeof(Core.isa))  # nor a builtin's type
+    @test_throws ErrorException member!(Integer, Late7)        # Integer is no set
+    @test_throws ErrorException member!(X1, X1)
+    @test_throws ErrorException ccall(:jl_set_open_set, Cvoid, (Any,), Integer)  # published already
+    @test_throws ErrorException ccall(:jl_set_open_set, Cvoid, (Any,), Int)      # not abstract
+end
+end # module SetsAndMemberships

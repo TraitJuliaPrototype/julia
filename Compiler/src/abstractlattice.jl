@@ -109,6 +109,11 @@ function tmeet end
 
 function tmeet(::JLTypeLattice, @nospecialize(a::Type), @nospecialize(b::Type))
     ti = typeintersect(a, b)
+    if ti === Bottom && negative_fold_blocked(a, b)
+        # the empty meet is a negative: where a later world could have a value of both, the join instead
+        # (wide, but right in every world)
+        return tmerge(JLTypeLattice(), a, b)
+    end
     valid_as_lattice(ti, true) || return Bottom
     return ti
 end

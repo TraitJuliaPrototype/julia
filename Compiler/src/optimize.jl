@@ -380,6 +380,8 @@ function new_expr_effect_flags(𝕃ₒ::AbstractLattice, args::Vector{Any}, src:
             return (false, false, false)
         end
         ⊑(𝕃ₒ, eT, fT) || return (false, false, false)
+        # not where the test holds through a membership entry: it holds in some worlds only
+        positive_fold_blocked(widenconst(eT), fT) && return (false, false, false)
     end
     return (false, true, true)
 end

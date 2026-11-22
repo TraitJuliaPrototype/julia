@@ -545,6 +545,9 @@ jl_code_instance_t *jl_type_infer_policy(jl_method_instance_t *mi, size_t world,
     ct->ptls->in_pure_callback = 0;
     size_t last_age = ct->world_age;
     ct->world_age = jl_typeinf_world;
+    // the task's world is frozen at jl_typeinf_world, below every membership of the program: inference
+    // asks memberships in the world it infers for
+    size_t last_mq = jl_set_membership_query_world(world);
     // first bit is for reentrant timing,
     // so adding 1 to the bit above performs
     // inference reentrancy counter addition.
@@ -578,6 +581,7 @@ jl_code_instance_t *jl_type_infer_policy(jl_method_instance_t *mi, size_t world,
 #endif
     }
     JL_UNLOCK(&jl_typeinf_lock);
+    jl_set_membership_query_world(last_mq);
     ct->world_age = last_age;
     ct->reentrant_timing -= 0b10;
     ct->ptls->in_pure_callback = last_pure;
@@ -615,6 +619,7 @@ JL_DLLEXPORT jl_code_info_t *jl_gdbcodetyped1(jl_method_instance_t *mi, size_t w
     ct->ptls->in_pure_callback = 0;
     size_t last_age = ct->world_age;
     ct->world_age = jl_typeinf_world;
+    size_t last_mq = jl_set_membership_query_world(world); // see jl_type_infer
     jl_value_t **fargs;
     JL_GC_PUSHARGS(fargs, 4);
     jl_module_t *CC = (jl_module_t*)jl_get_global_value(jl_core_module, jl_symbol("Compiler"), ct->world_age);
@@ -628,6 +633,7 @@ JL_DLLEXPORT jl_code_info_t *jl_gdbcodetyped1(jl_method_instance_t *mi, size_t w
         fargs[3] = jl_true;
         ci = (jl_code_info_t*)jl_apply(fargs, 4);
     }
+    jl_set_membership_query_world(last_mq);
     ct->world_age = last_age;
     ct->ptls->in_pure_callback = last_pure;
 #ifdef _OS_WINDOWS_
@@ -646,11 +652,16 @@ JL_DLLEXPORT jl_value_t *jl_call_in_typeinf_world(jl_value_t **args, int nargs)
     jl_task_t *ct = jl_current_task;
     size_t last_age = ct->world_age;
     ct->world_age = jl_typeinf_world;
+    // the freeze point of inference driven from Julia (Base.code_typed, the compiler's entries):
+    // membership questions during the run are answered in the caller's world (last_age), not the frozen
+    // one; a query world already set by an enclosing region (jl_type_infer, a declaration) wins
+    size_t last_mq = jl_set_membership_query_world(jl_membership_query_world() ? jl_membership_query_world() : last_age);
     int last_pure = ct->ptls->in_pure_callback;
     ct->ptls->in_pure_callback = 0;
     jl_value_t *ret = jl_apply(args, nargs);
     ct->ptls->in_pure_callback = last_pure;
     ct->world_age = last_age;
+    jl_set_membership_query_world(last_mq);
     return ret;
 }
 

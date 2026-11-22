@@ -1587,6 +1587,101 @@ JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b)
     return r;
 }
 
+// whether a future declaration could make S (or something structurally inside it) a subtype of X: the
+// compiler's negative folds ask it. Conservatively true is always safe: its only job is refusing a
+// negative fold. Dispatch's match construction never reads it.
+JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X)
+{
+    jl_value_t *su = jl_unwrap_unionall(S);
+    jl_value_t *xu = jl_unwrap_unionall(X);
+    if (jl_is_uniontype(xu))
+        return jl_could_join(S, ((jl_uniontype_t*)xu)->a) || jl_could_join(S, ((jl_uniontype_t*)xu)->b);
+    if (jl_is_uniontype(su))
+        return jl_could_join(((jl_uniontype_t*)su)->a, X) || jl_could_join(((jl_uniontype_t*)su)->b, X);
+    if (!jl_is_datatype(su) || !jl_is_datatype(xu))
+        return 1; // unknown shapes are conservative
+    if (jl_is_type_type(su)) {
+        // Type{S} joins X exactly when S does (an entry for the type value)
+        jl_value_t *tp0 = jl_tparam0((jl_datatype_t*)su);
+        if (jl_is_datatype(tp0) && !jl_has_free_typevars(tp0))
+            return jl_could_join(tp0, X);
+    }
+    jl_datatype_t *sud = (jl_datatype_t*)su, *xud = (jl_datatype_t*)xu;
+    if (xud->name->open_set && sud->name != xud->name) {
+        if (sud->name == jl_datatype_type->name || sud->name == jl_type_typename ||
+            sud->name == jl_unionall_type->name || sud->name == jl_uniontype_type->name)
+            return 1; // type objects of every kind (`Dict` is a UnionAll): a later entry for Type{S} answers
+        // a differently headed S could join the set later unless it is a Core kind
+        return !sud->name->never_member;
+    }
+    // the same type name: inside a container a membership can flip the answer at a position (Tuple{S}
+    // against Tuple{X}); invariant parameters count too, since a union inside one can collapse
+    // (Vector{Union{S, X}}). Per position.
+    if (sud->name == xud->name && jl_nparams(su) == jl_nparams(xu)) {
+        size_t i, np = jl_nparams(su);
+        for (i = 0; i < np; i++) {
+            jl_value_t *pi = jl_tparam(su, i), *qi = jl_tparam(xu, i);
+            if (jl_is_vararg(pi))
+                pi = jl_unwrap_vararg(pi);
+            if (jl_is_vararg(qi))
+                qi = jl_unwrap_vararg(qi);
+            if (!jl_is_type(pi) || !jl_is_type(qi))
+                return 1;
+            if (jl_could_join(pi, qi))
+                return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+// The caller found S <: X true: could the answer have come from an entry rather than the declared
+// chain? Anything it cannot resolve is 1 (refuse the fold). Mirrors subtyping's walk.
+JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X)
+{
+    if (S == jl_bottom_type || X == (jl_value_t*)jl_any_type)
+        return 0;
+    jl_value_t *su = jl_unwrap_unionall(S);
+    jl_value_t *xu = jl_unwrap_unionall(X);
+    if (!jl_is_datatype(su) || !jl_is_datatype(xu) || jl_is_uniontype(xu))
+        return 1;
+    if (jl_is_type_type(su) && ((jl_datatype_t*)xu)->name->open_set)
+        return 1; // a type value is a member by an entry
+    if (((jl_datatype_t*)su)->name == ((jl_datatype_t*)xu)->name && jl_nparams(su) == jl_nparams(xu)) {
+        // the same container: the answer may come from a parameter (Tuple{Bar, Int} against
+        // Tuple{X, Int} with Bar a declared member): 1 where a position could be answered by an entry
+        // or cannot be resolved, 0 only where every parameter is answered by the chain
+        size_t i, np = jl_nparams(su);
+        for (i = 0; i < np; i++) {
+            jl_value_t *pi = jl_tparam(su, i), *qi = jl_tparam(xu, i);
+            if (jl_is_vararg(pi))
+                pi = jl_unwrap_vararg(pi);
+            if (jl_is_vararg(qi))
+                qi = jl_unwrap_vararg(qi);
+            if (!jl_is_type(pi) || !jl_is_type(qi))
+                return 1;
+            if (jl_subtype_via_membership(pi, qi))
+                return 1;
+        }
+        return 0;
+    }
+    jl_datatype_t *xd = (jl_datatype_t*)su;
+    while (xd != jl_any_type && xd->name != ((jl_datatype_t*)xu)->name) {
+        if (xd->super == NULL)
+            return 1;
+        xd = xd->super;
+    }
+    return xd == jl_any_type; // the chain missed: only an entry could answer true
+}
+
+// whether a membership could change an answer about the pair, in either direction (code generation)
+JL_DLLEXPORT int jl_membership_flip_possible(jl_value_t *a, jl_value_t *b)
+{
+    if (!jl_has_open_set_in(a) && !jl_has_open_set_in(b))
+        return 0;
+    return jl_could_join(a, b) || jl_could_join(b, a);
+}
+
 
 static int subtype_tuple_varargs(
     jl_vararg_t *vtx, jl_vararg_t *vty,
