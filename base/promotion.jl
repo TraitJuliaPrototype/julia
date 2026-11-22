@@ -107,7 +107,7 @@ function typejoin(@nospecialize(a), @nospecialize(b))
             while !(getfield(a, :name) === bname)
                 a = getfield(a, :super)::DataType
             end
-            if bname === Type.body.name
+            if bname === getfield(getfield(Type, :body), :name)
                 ap = getfield(a, :parameters)[1]
                 bp = getfield(b, :parameters)[1]
                 if ((isa(ap,TypeVar) && getfield(ap, :lb) === Bottom && getfield(ap, :ub) === Any) ||
@@ -199,18 +199,23 @@ function promote_typejoin_union(::Type{T}) where T
     elseif T isa UnionAll
         return Any # TODO: compute more precise bounds
     elseif T isa Union
-        return promote_typejoin(promote_typejoin_union(T.a), promote_typejoin_union(T.b))
+        return invoke(promote_typejoin, Tuple{Any, Any}, _promote_typejoin_union(getfield(T, :a)), _promote_typejoin_union(getfield(T, :b)))
     elseif T isa DataType
-        T <: Tuple && return typejoin_union_tuple(T)
+        T <: Tuple && return invoke(typejoin_union_tuple, Tuple{DataType}, T)
         return T
     else
         error("unreachable") # not a type??
     end
 end
 
+# a union's component or a tuple's parameter: a type is joined through `invoke` at the method's own
+# signature; a free type variable (in a type's body) has no method, as for a direct call
+_promote_typejoin_union(@nospecialize(U)) =
+    U isa Type ? invoke(promote_typejoin_union, Tuple{Type}, U) : promote_typejoin_union(U::TypeVar)
+
 function typejoin_union_tuple(T::DataType)
     @_foldable_meta
-    p = T.parameters::Core.SimpleVector
+    p = getfield(T, :parameters)::Core.SimpleVector
     lr = length(p)
     if lr == 0
         return Tuple{}
@@ -218,23 +223,23 @@ function typejoin_union_tuple(T::DataType)
     c = Vector{Any}(undef, lr)
     for i = 1:lr
         pi = p[i]
-        U = unwrapva(pi)
+        U = invoke(unwrapva, Tuple{Any}, pi)
         if U === Union{}
             ci = Union{}
         elseif U isa Union
-            ci = typejoin(U.a, U.b)
+            ci = invoke(typejoin, Tuple{Any, Any}, getfield(U, :a), getfield(U, :b))
         elseif U isa UnionAll
             return Any # TODO: compute more precise bounds
         else
-            ci = promote_typejoin_union(U)
+            ci = _promote_typejoin_union(U)
         end
-        if i == lr && isvarargtype(pi)
-            c[i] = isdefined(pi, :N) ? Vararg{ci, pi.N} : Vararg{ci}
+        if i == lr && pi isa Core.TypeofVararg
+            c[i] = isdefined(pi, :N) ? Vararg{ci, getfield(pi, :N)} : Vararg{ci}
         else
             c[i] = ci
         end
     end
-    return Base.rewrap_unionall(Tuple{c...}, T)
+    return invoke(rewrap_unionall, Tuple{Any, Any}, Tuple{c...}, T)
 end
 
 # Returns length, isfixed
