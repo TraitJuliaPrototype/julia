@@ -1039,8 +1039,9 @@ end
 function typeinf_edge(interp::AbstractInterpreter, method::Method, @nospecialize(atype), sparams::SimpleVector, caller::AbsIntState, edgecycle::Bool, edgelimited::Bool)
     mi = specialize_method(method, atype, sparams)
     # a callee of the other policy: an inference of its own; a callee that takes the policy of the
-    # code reaching it is inferred under the caller's
-    if interp isa NativeInterpreter && other_policy(method_policy(method), interp.facts)
+    # code reaching it is inferred under the caller's; `return_type`'s run-time interpreter infers
+    # every method plainly
+    if interp isa NativeInterpreter && !interp.plainrt && other_policy(method_policy(method), interp.facts)
         return typeinf_other_policy(interp, method, mi, caller, edgecycle, edgelimited)
     end
     cache_mode = CACHE_MODE_GLOBAL # cache edge targets globally by default
@@ -1780,7 +1781,7 @@ verify_typeinf_trim(codeinfos::Vector{Any}, onlywarn::Bool) = Core._call_in_worl
 
 function return_type(@nospecialize(f), t::DataType) # this method has a special tfunc
     world = tls_world_age()
-    args = Any[_return_type, NativeInterpreter(world), Tuple{Core.Typeof(f), t.parameters...}]
+    args = Any[_return_type, NativeInterpreter(world; plainrt = true), Tuple{Core.Typeof(f), t.parameters...}]
     return ccall(:jl_call_in_typeinf_world, Any, (Ptr{Any}, Cint), args, length(args))
 end
 
@@ -1794,7 +1795,7 @@ function return_type(t::DataType)
 end
 
 function return_type(t::DataType, world::UInt)
-    args = Any[_return_type, NativeInterpreter(world), t]
+    args = Any[_return_type, NativeInterpreter(world; plainrt = true), t]
     return ccall(:jl_call_in_typeinf_world, Any, (Ptr{Any}, Cint), args, length(args))
 end
 
