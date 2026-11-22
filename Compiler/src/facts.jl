@@ -126,3 +126,21 @@ function facts_find_method_matches(interp::AbstractInterpreter, argtypes::Vector
     is_fact_sig(atype, max_union_splitting) || return FACTS_ABSTRACT_SITE
     return find_simple_method_matches(interp, atype, max_methods)
 end
+
+# The policy per method: plain, facts, or the policy of the code that reaches it (a boundary).
+const POLICY_PLAIN = Cint(0)
+const POLICY_FACTS = Cint(1)
+const POLICY_CALLER = Cint(2)
+const REACH_PLAIN = Cint(0)
+const REACH_FACTS = Cint(1)
+const REACH_RUNTIME = Cint(2)
+method_policy(m::Method) = ccall(:jl_method_policy, Cint, (Any,), m)
+method_policy_facts(m::Method) = method_policy(m) === POLICY_FACTS
+"Whether the code of `mi` is compiled by facts where the runtime reaches it (a compile request)."
+mi_policy_facts(mi::MethodInstance) = ccall(:jl_mi_policy_at, Cint, (Any, Cint), mi, REACH_RUNTIME) != 0
+
+"Whether `mi`'s code is compiled by facts where code of policy `facts` reaches it."
+mi_policy_facts_at(mi::MethodInstance, facts::Bool) =
+    ccall(:jl_mi_policy_at, Cint, (Any, Cint), mi, facts ? REACH_FACTS : REACH_PLAIN) != 0
+"The policy a CodeInstance of Julia's own owner was compiled in (`JL_CI_FLAGS_FACTS`)."
+ci_policy_facts(ci::CodeInstance) = (getfield(ci, :flags, :monotonic)::UInt8 & 0x20) !== 0x00
