@@ -1266,10 +1266,35 @@ static jl_value_t *inst_varargp_in_env(jl_value_t *decl, jl_svec_t *sparams)
     return vm;
 }
 
+static jl_value_t *ml_matches_i(jl_methtable_t *mt, jl_methcache_t *mc,
+                              jl_tupletype_t *type, int lim, int include_ambiguous,
+                              int intersections, size_t world, int cache_result,
+                              size_t *min_valid, size_t *max_valid, int *ambig, jl_value_t **cells_out);
+
+// Method matching runs in the query's world: membership questions inside the match are asked there,
+// also where the task's world is frozen below the latest entries (inference driven from Julia).
+// `cells_out`, where given, receives the absence signatures of the matches dropped at a final pair.
+static jl_value_t *ml_matches_c(jl_methtable_t *mt, jl_methcache_t *mc,
+                              jl_tupletype_t *type, int lim, int include_ambiguous,
+                              int intersections, size_t world, int cache_result,
+                              size_t *min_valid, size_t *max_valid, int *ambig, jl_value_t **cells_out)
+{
+    if (world > jl_atomic_load_acquire(&jl_world_counter))
+        return jl_nothing; // the future is not enumerable
+    size_t last_mq = jl_set_membership_query_world(world);
+    jl_value_t *r = ml_matches_i(mt, mc, type, lim, include_ambiguous, intersections,
+                                 world, cache_result, min_valid, max_valid, ambig, cells_out);
+    jl_set_membership_query_world(last_mq);
+    return r;
+}
 static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
                               jl_tupletype_t *type, int lim, int include_ambiguous,
                               int intersections, size_t world, int cache_result,
-                              size_t *min_valid, size_t *max_valid, int *ambig);
+                              size_t *min_valid, size_t *max_valid, int *ambig)
+{
+    return ml_matches_c(mt, mc, type, lim, include_ambiguous, intersections, world, cache_result,
+                        min_valid, max_valid, ambig, NULL);
+}
 
 // get the compilation signature specialization for this method
 static void jl_compilation_sig(
@@ -4823,6 +4848,32 @@ JL_DLLEXPORT jl_value_t *jl_matching_methods(jl_tupletype_t *types, jl_value_t *
     return ml_matches((jl_methtable_t*)mt, mc, types, lim, include_ambiguous, 1, world, 1, min_valid, max_valid, ambig);
 }
 
+// `jl_matching_methods`, and the absence signatures of the matches the lookup dropped as unreachable at
+// a final pair: the matches alone where it dropped none, else `svec(matches, signatures)`. Inference
+// asks this one and records the signatures, so a membership that meets the intersection invalidates a
+// caller that relied on the drop.
+JL_DLLEXPORT jl_value_t *jl_matching_methods_cells(jl_tupletype_t *types, jl_value_t *mt, int lim, int include_ambiguous,
+                                                   size_t world, size_t *min_valid, size_t *max_valid, int *ambig)
+{
+    if (ambig != NULL)
+        *ambig = 0;
+    jl_value_t *unw = jl_unwrap_unionall((jl_value_t*)types);
+    if (!jl_is_tuple_type(unw))
+        return (jl_value_t*)jl_an_empty_vec_any;
+    if (unw == (jl_value_t*)jl_emptytuple_type || jl_tparam0(unw) == jl_bottom_type)
+        return (jl_value_t*)jl_an_empty_vec_any;
+    if (mt == jl_nothing)
+        mt = (jl_value_t*)jl_method_table;
+    jl_methcache_t *mc = ((jl_methtable_t*)mt)->cache;
+    jl_value_t *cells = jl_nothing, *r = NULL;
+    JL_GC_PUSH2(&cells, &r);
+    r = ml_matches_c((jl_methtable_t*)mt, mc, types, lim, include_ambiguous, 1, world, 1, min_valid, max_valid, ambig, &cells);
+    if (cells != jl_nothing && jl_is_array(r))
+        r = (jl_value_t*)jl_svec2(r, cells);
+    JL_GC_POP();
+    return r;
+}
+
 JL_DLLEXPORT jl_method_instance_t *jl_get_unspecialized(jl_method_t *def JL_PROPAGATES_ROOT)
 {
     // one unspecialized version of a function can be shared among all cached specializations
@@ -6512,6 +6563,59 @@ typedef struct {
     enum sort_state state;
 } sort_stack_frame_t;
 
+// A match met only as an intersection that no type of the query's world is in, at a final pair: no
+// value reaches it, and none will without a membership that adds the method of the pair's absence
+// signature. It is dropped whatever its specificity, before the matches are sorted and their ambiguity
+// computed, and the pairs' absence signatures go to `cells_out`, so a caller that relies on the drop
+// records them.
+static size_t drop_unmet_matches(jl_array_t *t, size_t len, jl_value_t **cells_out)
+{
+    size_t i, k = 0;
+    int any = 0;
+    jl_value_t *c = NULL, *acc = NULL;
+    JL_GC_PUSH2(&c, &acc);
+    for (i = 0; i < len; i++) {
+        jl_method_match_t *matc = (jl_method_match_t*)jl_array_ptr_ref(t, i);
+        c = jl_unmet_final_cells((jl_value_t*)matc->spec_types);
+        if (!jl_is_svec(c))
+            continue;
+        jl_array_ptr_set(t, i, NULL);
+        any = 1;
+        if (cells_out == NULL)
+            continue;
+        acc = *cells_out;
+        size_t na = jl_is_svec(acc) ? jl_svec_len(acc) : 0, nc = jl_svec_len(c), nn = na;
+        jl_svec_t *nw = jl_alloc_svec(na + nc);
+        for (size_t x = 0; x < na; x++)
+            jl_svecset(nw, x, jl_svecref(acc, x));
+        for (size_t y = 0; y < nc; y++) {
+            jl_value_t *cy = jl_svecref(c, y);
+            int seen = 0;
+            for (size_t x = 0; x < nn && !seen; x++)
+                seen = jl_svecref(nw, x) == cy;
+            if (!seen)
+                jl_svecset(nw, nn++, cy);
+        }
+        if (nn < na + nc) {
+            acc = (jl_value_t*)nw;
+            nw = jl_alloc_svec(nn);
+            for (size_t x = 0; x < nn; x++)
+                jl_svecset(nw, x, jl_svecref(acc, x));
+        }
+        *cells_out = (jl_value_t*)nw;
+    }
+    JL_GC_POP();
+    if (!any)
+        return len;
+    for (i = 0; i < len; i++) {
+        jl_value_t *matc = jl_array_ptr_ref(t, i);
+        if (matc != NULL)
+            jl_array_ptr_set(t, k++, matc);
+    }
+    jl_array_del_end(t, len - k);
+    return k;
+}
+
 // Returns:
 //  * -1: too many matches for lim, other outputs are undefined
 //  *  0: the child(ren) have been added to the output
@@ -6749,13 +6853,12 @@ static int sort_mlmatches(jl_array_t *t, size_t idx, arraylist_t *visited, array
 // fully-covers is a Bool indicating subtyping, though temporarily it may be
 // tri-values, with `nothing` indicating a match that is not a subtype, but
 // which is dominated by one which is (and thus should be excluded unless ambiguous)
-static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
+static jl_value_t *ml_matches_i(jl_methtable_t *mt, jl_methcache_t *mc,
                               jl_tupletype_t *type, int lim, int include_ambiguous,
                               int intersections, size_t world, int cache_result,
-                              size_t *min_valid, size_t *max_valid, int *ambig)
+                              size_t *min_valid, size_t *max_valid, int *ambig, jl_value_t **cells_out)
 {
-    if (world > jl_atomic_load_acquire(&jl_world_counter))
-        return jl_nothing; // the future is not enumerable
+    // (the wrappers refuse a world past the counter)
     JL_TIMING(METHOD_MATCH, METHOD_MATCH);
     int has_ambiguity = 0;
     jl_value_t *unw = jl_unwrap_unionall((jl_value_t*)type);
@@ -6892,6 +6995,8 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
     // all intersecting methods have been collected now. the remaining work is to sort
     // these and apply specificity to determine a list of dispatch-possible call targets
     size_t i, j, len = jl_array_nrows(env.t);
+    if (len > 0)
+        len = drop_unmet_matches((jl_array_t*)env.t, len, cells_out);
 
     // the 'minmax' method is a method that (1) fully-covers the queried type, and (2) is
     // more-specific than any other fully-covering method (but if !all_subtypes, there are
@@ -7349,7 +7454,7 @@ static void membership_ambiguities(jl_value_t *member, jl_value_t *set_instance,
                 if (!match_at_member(m, member, mask))
                     continue;
                 jl_value_t *ti = gc[6] = jl_type_intersection(q, (jl_value_t*)m->sig);
-                if (ti == jl_bottom_type)
+                if (ti == jl_bottom_type || jl_has_unmet_argument(ti, entry_min_world))
                     continue;
                 int dominated = 0;
                 for (size_t k = 0; k < l && !dominated; k++) {

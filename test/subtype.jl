@@ -3374,4 +3374,126 @@ folds_true(f, T) = only(code_typed(f, (T,))).first.code[end] == Core.ReturnNode(
     @test_throws MethodError Base.invokelatest(call_gm, MS())
     @test isempty(methods(Core.implements, Tuple{Type{MX}, Type{MS}}))
 end
+
+# an answer about a set that inference does not fold is not consistent, nor a call given a set as a
+# constant: no caller evaluates it at compile time and keeps the answer after a membership
+@set NcX
+struct NcS end
+const NcL1 = let T = TypeVar(:T, NcX, Any); UnionAll(T, Ref{T}) end
+const NcL2 = let T = TypeVar(:T, Union{NcX, NcS}, Any); UnionAll(T, Ref{T}) end
+ncq_sub() = Tuple{NcS} <: Tuple{NcX}
+ncr_sub() = ncq_sub()
+ncq_int() = typeintersect(NcS, NcX) === Union{}
+ncr_int() = ncq_int()
+ncq_eq() = NcL1 == NcL2
+ncr_eq() = ncq_eq()
+ncq_tas(x) = (x::NcX; true)
+ncr_tas(x) = ncq_tas(x)
+nccall(f, a...) = try f(a...) catch e; nameof(typeof(e)) end
+@test (ncr_sub(), ncr_int(), ncr_eq(), nccall(ncr_tas, NcS())) == (false, true, false, :TypeError)
+member!(NcX, NcS)
+
+@testset "an answer about a set that inference does not fold is not consistent" begin
+    @test (ncr_sub(), ncr_int(), ncr_eq()) == (true, false, true)
+    @test nccall(ncr_tas, NcS()) === true
+end
+
+# a kind of type object meets a set that takes a type value: a match at a kind, or its absence, holds
+# only in the worlds where the set's entries for type values are as they are in the world asked
+@set KvX
+struct KvS end
+struct KvT end
+kvg(::Any) = :Any
+kvg(::KvX) = :X
+kvq(x) = kvg(x)
+kvr(x) = kvq(x)
+const kvw = UInt[world()]
+member!(KvX, Type{KvS})
+push!(kvw, world())
+ccall(:jl_delete_membership, Cvoid, (Any, Any, Any), Type{KvS}, KvX, @__MODULE__)
+push!(kvw, world())
+kvlookup(tt, w) = Any[m.method.sig.parameters[2] for m in Base._methods_by_ftype(tt, -1, w)]
+member!(KvX, Type{KvT})
+const kvw1 = world()
+ccall(:jl_delete_membership, Cvoid, (Any, Any, Any), Type{KvT}, KvX, @__MODULE__)
+
+@testset "a match at a kind holds only while the set's entries for type values do" begin
+    @test kvr(KvS) === :Any
+    @test [Base.invoke_in_world(w, kvr, KvS) for w in kvw] == [:Any, :X, :Any]
+    tt = Tuple{typeof(kvg), Type{KvT}}
+    @test kvlookup(tt, kvw[1]) == Any[Any]
+    @test kvlookup(tt, kvw1) == Any[KvX]
+end
+
+# a membership adds no method: an answer that folds a choice left to the run among methods at a set, or
+# the coverage of a signature (`hasmethod`), is a question about a set
+@set ChX
+@set ChY
+abstract type ChAM end
+struct ChS end
+struct ChT end
+member!(ChY, ChT)
+chh(::ChX) = :h
+chh2(::Union{ChX, Int}) = :h2
+chm_abstract() = hasmethod(chh, Tuple{ChAM})
+chm_set() = hasmethod(chh, Tuple{ChY})
+chm_union() = hasmethod(chh2, Tuple{Union{ChS, Int}})
+chg(::Any) = :Any
+chg(::ChX) = :X
+Base.@nospecializeinfer chq(@nospecialize(x::ChY)) = chg(x)
+chr(x) = chq(x)
+Base.@nospecializeinfer chqa(@nospecialize(x::ChY)) = applicable(chh, x)
+chra(x) = chqa(x)
+@test (chm_abstract(), chm_set(), chm_union()) == (false, false, false)
+member!(ChX, ChAM)
+@test chm_abstract() === true                        # at an abstract member, compiled before
+member!(ChX, ChS)
+@test chm_union() === true
+ccall(:jl_delete_membership, Cvoid, (Any, Any, Any), ChS, ChX, @__MODULE__)
+@test chm_union() === false
+member!(ChX, ChS)
+@test chm_union() === true                           # compiled after the taking back, declared again
+@test chr(ChT()) === :Any && chra(ChT()) === false
+member!(ChX, ChY)
+
+@testset "a choice among methods at a set, and `hasmethod` at a set, are not folded" begin
+    @test chm_set() === true
+    @test chr(ChT()) === :X
+    @test chra(ChT()) === true
+end
+
+# a negative about a set is final where it holds: code relies on it with an edge at the pair's absence
+# signature, and a membership declared later ends that code, as a method ends the callers that found none
+@set FX
+struct FS end
+fnot(x) = x isa FX
+const ci_fnot = (fnot(FS()); native_ci(fnot, (FS,)))
+absence_edges(ci) = unique(Any[e for e in ci.edges if e isa Type && Base.unwrap_unionall(e) isa DataType &&
+                        Base.unwrap_unionall(e).parameters[1] === typeof(Core.implements)])
+@set UX
+abstract type UA end
+struct UC <: UA end
+v(::UX, ::Int) = :x
+v(::UA, ::Any) = :a
+callv(x::UA) = v(x, 1)
+const ci_callv = (callv(UC()); native_ci(callv, (UC,)))
+callva(xs::Vector{UA}) = v(xs[1], 1)
+const ci_callva = (callva(UA[UC()]); native_ci(callva, (Vector{UA},)))
+
+@testset "final negatives" begin
+    @test !fnot(FS()) && only(code_typed(fnot, (FS,))).first.code[end] == Core.ReturnNode(false)
+    @test length(absence_edges(ci_fnot)) == 1
+    # a match met only at an intersection no type is in is dropped, and so is its ambiguity
+    @test length(Base.methods_including_ambiguous(v, (UA, Int))) == 1
+    @test !Base.isambiguous(which(v, (UX, Int)), which(v, (UA, Any)))
+    @test callv(UC()) === :a
+    @test length(absence_edges(ci_callva)) == 1      # the dropped match's pair, `Type{<:UA}` at `UX`
+    member!(FX, FS)
+    @test ci_fnot.max_world < typemax(UInt) && Base.invokelatest(fnot, FS())
+    member!(UX, UC)
+    @test length(Base.methods_including_ambiguous(v, (UA, Int))) == 2
+    @test Base.isambiguous(which(v, (UX, Int)), which(v, (UA, Any)))
+    @test ci_callv.max_world < typemax(UInt) && ci_callva.max_world < typemax(UInt)
+    @test_throws MethodError Base.invokelatest(callv, UC())
+end
 end # module SetsAndMemberships
