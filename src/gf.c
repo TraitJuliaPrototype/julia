@@ -4189,6 +4189,15 @@ static int membership_param_meets(jl_value_t *Y, jl_value_t *uw, jl_value_t *msi
 {
     if (jl_has_free_typevars(Y))
         return 1; // a pattern's instance
+    if (jl_is_unionall(Y)) {
+        // an entry at instances of its own variables (`@implement Callable T`: every instance): it reaches the
+        // method's parameter where the two meet
+        jl_value_t *w = jl_rewrap_unionall(uw, msig);
+        JL_GC_PUSH1(&w);
+        int meets = jl_has_free_typevars(w) || !jl_has_empty_intersection(Y, w);
+        JL_GC_POP();
+        return meets;
+    }
     if (!jl_has_free_typevars(uw))
         return jl_egal(Y, uw) || jl_subtype(Y, uw);
     jl_value_t *w = jl_rewrap_unionall(uw, msig);
