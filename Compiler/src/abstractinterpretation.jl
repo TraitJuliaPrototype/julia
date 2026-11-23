@@ -4062,7 +4062,16 @@ function abstract_call_opaque_closure(interp::AbstractInterpreter,
     ocargsig′ = unwrap_unionall(ocargsig)
     ocargsig′ isa DataType || return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
     ocsig = rewrap_unionall(Tuple{Tuple, ocargsig′.parameters...}, ocargsig)
-    hasintersect(sig, ocsig) || return Future(CallMeta(Union{}, Union{MethodError,TypeError}, EFFECTS_THROWS, NoCallInfo()))
+    if !hasintersect(sig, ocsig)
+        # an empty intersection about a set that a membership could change proves no throw, and nothing records the
+        # pair (compiler §4.8): the call is left to the closure's own test of its arguments when it runs, its result
+        # the closure's declared one
+        if negative_fold_blocked(sig, ocsig)
+            ocrt = rewrap_unionall((unwrap_unionall(tt)::DataType).parameters[2], tt)
+            return Future(CallMeta(isa(ocrt, DataType) ? ocrt : Any, Any, Effects(), NoCallInfo()))
+        end
+        return Future(CallMeta(Union{}, Union{MethodError,TypeError}, EFFECTS_THROWS, NoCallInfo()))
+    end
     ocmethod = closure.source::Method
     if !isdefined(ocmethod, :source)
         # This opaque closure was created from optimized source. We cannot infer it further.
@@ -4101,9 +4110,17 @@ function abstract_call_opaque_closure(interp::AbstractInterpreter,
             ftt = closure.typ
             rty = (unwrap_unionall(ftt)::DataType).parameters[2]
             rty = rewrap_unionall(rty isa TypeVar ? rty.ub : rty, ftt)
-            if !(rt ⊑ rty && sig ⊑ ocsig_box.contents)
+            # the arguments' test holds through a membership entry only with the entry recorded, as `isa`'s
+            # positive does; not proved, a test about a set passes or throws by the world: not consistent, as an
+            # unfolded `isa` is not (compiler §4.8)
+            ocs = ocsig_box.contents
+            proved = sig ⊑ ocs && !positive_fold_blocked(sig, ocs, sv)
+            if !(rt ⊑ rty && proved)
                 effects = Effects(effects; nothrow=false)
                 exct = exct ⊔ TypeError
+                if !proved && (names_open_set(sig) || names_open_set(ocs))
+                    effects = Effects(effects; consistent=ALWAYS_FALSE)
+                end
             end
         end
         rt = from_interprocedural!(interp, rt, sv, arginfo, match.spec_types)
