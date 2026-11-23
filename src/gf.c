@@ -3604,6 +3604,9 @@ STATIC_INLINE int sig_has_open_set(jl_value_t *sig) JL_NOTSAFEPOINT
 // in the query's world instead (compiler §5.2): a later membership can make two methods meet that
 // were disjoint at insertion (a method at a set and one at a type that later joins it), or order
 // two sets, and the record knows neither.
+// whether m2 is in m1's interferences (not less specific than m1): the record made at the methods' insertions for two
+// closed signatures; asked in the query's world where either names an open set (compiler §5.2). The readers that walk a
+// method's list ask it of each listed method too: a membership orders or unorders such a pair after the list was made.
 static int method_in_interferences(jl_method_t *m2, jl_method_t *m1)
 {
     if (sig_has_open_set((jl_value_t*)m1->sig) || sig_has_open_set((jl_value_t*)m2->sig))
@@ -3637,8 +3640,8 @@ static int check_interferences_covers(jl_method_t *m, jl_value_t *ti, jl_array_t
         jl_genericmemory_t *interferences = jl_atomic_load_relaxed(&current_m->interferences);
         for (size_t i = 0; i < interferences->length; i++) {
             jl_method_t *m2 = (jl_method_t*)jl_genericmemory_ptr_ref(interferences, i);
-            if (m2 == NULL)
-                continue;
+            if (m2 == NULL || !method_in_interferences(m2, current_m))
+                continue; // (listed at an insertion: re-asked in the query's world where a set occurs, §5.2)
             // Check if we already visited this method
             int in_seen = 0;
             for (size_t i = 0; i < seen->len; i++) {
@@ -3676,7 +3679,7 @@ static int check_fully_ambiguous(jl_method_t *m, jl_value_t *ti, jl_array_t *t, 
     jl_genericmemory_t *interferences = jl_atomic_load_relaxed(&m->interferences);
     for (size_t i = 0; i < interferences->length; i++) {
         jl_method_t *m2 = (jl_method_t*)jl_genericmemory_ptr_ref(interferences, i);
-        if (m2 == NULL)
+        if (m2 == NULL || !method_in_interferences(m2, m))
             continue;
         int idx = find_method_in_matches(t, m2);
         if (idx < 0)
@@ -3713,7 +3716,7 @@ static int method_morespecific_via_interferences(jl_method_t *target_method, jl_
         jl_genericmemory_t *interferences = jl_atomic_load_relaxed(&current->interferences);
         for (size_t i = 0; i < interferences->length; i++) {
             jl_method_t *interference_method = (jl_method_t*)jl_genericmemory_ptr_ref(interferences, i);
-            if (interference_method == NULL)
+            if (interference_method == NULL || !method_in_interferences(interference_method, current))
                 continue;
             // Check if we're already visiting this interference method (cycle prevention)
             int already_seen = 0;
@@ -8127,7 +8130,7 @@ static int sort_mlmatches(jl_array_t *t, size_t idx, arraylist_t *visited, array
                     jl_method_t *m2 = (jl_method_t*)jl_genericmemory_ptr_ref(current->interferences, current->interference_index);
                     current->interference_index++;
 
-                    if (m2 == NULL)
+                    if (m2 == NULL || !method_in_interferences(m2, current->m))
                         continue;
 
                     int childidx = find_method_in_matches(t, m2);
