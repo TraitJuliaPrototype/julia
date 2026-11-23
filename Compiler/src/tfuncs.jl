@@ -2657,6 +2657,23 @@ const _EFFECTS_KNOWN_BUILTINS = Any[
 
 Compute the effects of a builtin function call. `argtypes` should not include `f` itself.
 """
+# Whether a store's type test names an open set: the value's type or the type of the place stored into (a field's for
+# `setfield!` and its kin, an element's for `memoryrefset!` and its kin; compiler §4.8)
+function store_test_names_open_set(𝕃::AbstractLattice, @nospecialize(f), argtypes::Vector{Any})
+    if (f === setfield! || f === swapfield! || f === replacefield! || f === modifyfield! || f === setfieldonce!) &&
+       length(argtypes) >= 2
+        i = f === replacefield! ? 4 : 3
+        names_open_set(_getfield_tfunc(𝕃, argtypes[1], argtypes[2], true)) && return true
+        return f !== modifyfield! && length(argtypes) >= i && names_open_set(argtypes[i])
+    elseif (f === memoryrefset! || f === Core.memoryrefswap! || f === Core.memoryrefreplace! ||
+            f === Core.memoryrefmodify! || f === Core.memoryrefsetonce!) && length(argtypes) >= 1
+        i = f === Core.memoryrefreplace! ? 3 : 2
+        names_open_set(memoryref_elemtype(argtypes[1])) && return true
+        return f !== Core.memoryrefmodify! && length(argtypes) >= i && names_open_set(argtypes[i])
+    end
+    return false
+end
+
 function builtin_effects(𝕃::AbstractLattice, @nospecialize(f::Builtin), argtypes::Vector{Any}, @nospecialize(rt))
     if isa(f, IntrinsicFunction)
         return intrinsic_effects(f, argtypes)
@@ -2725,6 +2742,10 @@ function builtin_effects(𝕃::AbstractLattice, @nospecialize(f::Builtin), argty
         # not consistent, so no concrete evaluation runs it at compile time (compiler §4.8)
         if consistent !== ALWAYS_FALSE && (f === isa || f === (<:) || f === typeassert) &&
            (f === typeassert ? !nothrow : !isa(rt, Const)) && names_open_set(argtypes, 1)
+            consistent = ALWAYS_FALSE
+        end
+        # so is a store's type test about a set that inference did not prove: whether it throws changes with the world
+        if consistent !== ALWAYS_FALSE && !nothrow && store_test_names_open_set(𝕃, f, argtypes)
             consistent = ALWAYS_FALSE
         end
         if contains_is(_INACCESSIBLEMEM_BUILTINS, f)
