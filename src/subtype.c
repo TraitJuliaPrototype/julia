@@ -1589,6 +1589,15 @@ static int subtype_membership(jl_datatype_t *x, jl_value_t *y, jl_stenv_t *e, in
     return 0;
 }
 
+// x <: y at an explicit world: the walk of a declaration asks at the declaration's world
+int jl_membership_holds_at(jl_value_t *x, jl_value_t *y, size_t world)
+{
+    size_t last = jl_set_membership_query_world(world);
+    int ans = jl_subtype(x, y);
+    jl_set_membership_query_world(last);
+    return ans;
+}
+
 // The world range over which the memberships that a question about t can read
 // are what they are in `world`: each entry on a TypeName reachable from t, through
 // parameters, supertypes and entries' instances, narrows [*lo, *hi] to the worlds
@@ -1700,6 +1709,65 @@ int jl_membership_range_is_fast(size_t world) JL_NOTSAFEPOINT
     return world != 0 && world >= jl_atomic_load_acquire(&membership_last_change);
 }
 
+// The lower bounds of the type variables bound at a covariant place of a signature (the top, a tuple's element, a
+// union's component, a `Vararg`'s element), but `Union{}`: the places where a membership changes which types are
+// under the signature through a type the signature names that is no set (`h(::Ph{T}) where T >: S` takes
+// `Ph{X}` once `S` joins `X`).
+void jl_sig_lower_bounds(jl_value_t *t, arraylist_t *out, int depth) JL_NOTSAFEPOINT
+{
+    if (t == NULL || depth > 8)
+        return;
+    while (jl_is_unionall(t)) {
+        jl_tvar_t *v = ((jl_unionall_t*)t)->var;
+        if (v->lb != jl_bottom_type)
+            arraylist_push(out, v->lb);
+        t = ((jl_unionall_t*)t)->body;
+    }
+    if (jl_is_uniontype(t)) {
+        jl_sig_lower_bounds(((jl_uniontype_t*)t)->a, out, depth + 1);
+        jl_sig_lower_bounds(((jl_uniontype_t*)t)->b, out, depth + 1);
+    }
+    else if (jl_is_vararg(t)) {
+        jl_sig_lower_bounds(((jl_vararg_t*)t)->T, out, depth + 1);
+    }
+    else if (jl_is_tuple_type(t)) {
+        for (size_t i = 0; i < jl_nparams(t); i++)
+            jl_sig_lower_bounds(jl_tparam(t, i), out, depth + 1);
+    }
+}
+
+// whether a lower bound of a signature (`jl_sig_lower_bounds`) holds membership entries; asked at each method a
+// lookup visits, so it walks the places with no list and stops at the first
+static int lower_bounds_have_memberships(jl_value_t *t, int depth) JL_NOTSAFEPOINT
+{
+    if (t == NULL || depth > 8)
+        return 0;
+    while (jl_is_unionall(t)) {
+        jl_tvar_t *v = ((jl_unionall_t*)t)->var;
+        if (v->lb != jl_bottom_type && jl_type_has_memberships(v->lb))
+            return 1;
+        t = ((jl_unionall_t*)t)->body;
+    }
+    if (jl_is_uniontype(t))
+        return lower_bounds_have_memberships(((jl_uniontype_t*)t)->a, depth + 1) ||
+               lower_bounds_have_memberships(((jl_uniontype_t*)t)->b, depth + 1);
+    if (jl_is_vararg(t))
+        return lower_bounds_have_memberships(((jl_vararg_t*)t)->T, depth + 1);
+    if (jl_is_tuple_type(t)) {
+        for (size_t i = 0; i < jl_nparams(t); i++) {
+            jl_value_t *p = jl_tparam(t, i);
+            if ((jl_is_unionall(p) || jl_is_uniontype(p) || jl_is_vararg(p) || jl_is_tuple_type(p)) &&
+                lower_bounds_have_memberships(p, depth + 1))
+                return 1;
+        }
+    }
+    return 0;
+}
+JL_DLLEXPORT int jl_sig_lower_bounds_have_memberships(jl_value_t *sig) JL_NOTSAFEPOINT
+{
+    return lower_bounds_have_memberships(sig, 0);
+}
+
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_t world, size_t *lo, size_t *hi)
 {
     if (world == 0)     // no range asked: whether `t` reaches an entry
@@ -1717,9 +1785,18 @@ JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_
         arraylist_t seen;
         arraylist_new(&seen, 0);
         found = membership_range_visit(t, world, lo, hi, &seen);
+        // The signature's lower bounds are the places where the answer rests on entries of a type the
+        // signature names (`Ph{X} <: Ph{T} where T >: S` on `S`'s): they narrow the worlds too.
+        if (sig != NULL) {
+            arraylist_t lbs;
+            arraylist_new(&lbs, 0);
+            jl_sig_lower_bounds(sig, &lbs, 0);
+            for (size_t i = 0; i < lbs.len; i++)
+                found |= membership_range_visit((jl_value_t*)lbs.items[i], world, lo, hi, &seen);
+            arraylist_free(&lbs);
+        }
         arraylist_free(&seen);
     }
-    (void)sig;
     return found;
 }
 

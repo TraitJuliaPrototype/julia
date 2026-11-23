@@ -991,6 +991,23 @@ int jl_membership_range_is_fast(size_t world) JL_NOTSAFEPOINT;
 // signature of the method matched.
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_t world, size_t *lo, size_t *hi);
 JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
+void jl_sig_lower_bounds(jl_value_t *t, arraylist_t *out, int depth) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_sig_lower_bounds_have_memberships(jl_value_t *sig) JL_NOTSAFEPOINT;
+// x <: y at an explicit world (subtype.c)
+int jl_membership_holds_at(jl_value_t *x, jl_value_t *y, size_t world);
+// what a membership changes of dispatch (gf.c): replays, for every method at the set or a set the
+// member joins, the insertion of the method with the member in place of the set, invalidating the
+// callers whose selection changes and lowering the dispatch caches. Called under world_counter_lock
+// with the entry published and the counter advanced to entry_min_world, the query world set to it.
+JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *set_instance,
+                                              size_t entry_min_world);
+// a membership taken back: the callers that relied on it end (gf.c)
+JL_DLLEXPORT void jl_membership_removal_walk(jl_value_t *member, jl_value_t *set_instance, size_t world);
+JL_DLLEXPORT size_t jl_membership_stat(int which);
+// what a membership ends of the deep class, kept as a definition's is (gf.c)
+JL_DLLEXPORT int jl_deep_ending_push(const char *kind, jl_value_t *cause);
+JL_DLLEXPORT void jl_deep_ending_pop(int pushed);
+JL_DLLEXPORT void jl_delete_membership(jl_value_t *member, jl_value_t *set_instance, jl_value_t *deleter);
 // the methods whose signatures name a set (gf.c), a collector root
 extern jl_array_t *open_set_methods JL_GLOBALLY_ROOTED;
 // the ambiguities a membership creates, reported as warnings (gf.c). Called under world_counter_lock,
