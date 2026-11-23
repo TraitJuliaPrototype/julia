@@ -3268,6 +3268,9 @@ function abstract_applicable(interp::AbstractInterpreter, argtypes::Vector{Any},
             end
             if rt !== Bool
                 info = VirtualMethodMatchInfo(matches.info)
+            elseif choice_rests_on_memberships(applicable, fully_covering(matches))
+                # answered when it runs by the world's memberships: not consistent (compiler §4.8)
+                return Future(CallMeta(rt, Union{}, Effects(EFFECTS_TOTAL; consistent = ALWAYS_FALSE), info))
             end
         end
     end
@@ -3300,8 +3303,19 @@ function _hasmethod_tfunc(interp::AbstractInterpreter, argtypes::Vector{Any}, sv
     match, valid_worlds = findsup(types, method_table(interp))
     update_valid_age!(sv, valid_worlds)
     if match === nothing
+        # "no method covers `types`" is a negative about a set where a method that meets `types` rests on
+        # memberships, or `types` names a set: a membership can make the method cover it, while the call's
+        # matches stay the same (compiler §5.5). It folds only with the absence edges of the pairs it rests on
+        # (§4.8): those of the matches the lookup dropped at a final pair. Elsewhere it is not folded.
+        lookup = findall(types, method_table(interp))
+        if lookup === nothing || names_open_set(types) ||
+           any(i -> sig_rests_on_memberships(lookup[i].method.sig), 1:length(lookup))
+            return CallMeta(Bool, Any, Effects(EFFECTS_TOTAL; consistent = ALWAYS_FALSE), NoCallInfo())
+        end
+        valid_worlds = intersect(valid_worlds, lookup.valid_worlds)
+        update_valid_age!(sv, valid_worlds)
         rt = Const(false)
-        vresults = MethodLookupResult(Any[], valid_worlds, true)
+        vresults = MethodLookupResult(Any[], valid_worlds, true, lookup.cells)
         mt = Core.methodtable
         vinfo = MethodMatchInfo(vresults, mt, types, false) # XXX: this should actually be an info with invoke-type edge
     else

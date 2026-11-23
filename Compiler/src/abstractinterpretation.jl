@@ -1365,6 +1365,12 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
                 state.all_effects = Effects(state.all_effects; nothrow=false)
                 state.exctype = state.exctype ⊔ₚ MethodError
             end
+            # a method chosen when the call runs, among matches at a set, answers by the world's memberships:
+            # not consistent, so no compile-time evaluation folds the choice (compiler §4.8)
+            if state.all_effects.consistent !== ALWAYS_FALSE &&
+               choice_rests_on_memberships(applicable, fully_covering(state.matches))
+                state.all_effects = Effects(state.all_effects; consistent = ALWAYS_FALSE)
+            end
             local fargs = arginfo.fargs
             if sv isa InferenceState && fargs !== nothing
                 state.slotrefinements = collect_slot_refinements(𝕃ᵢ, applicable, argtypes, fargs, sv)

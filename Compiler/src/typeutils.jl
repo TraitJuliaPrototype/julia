@@ -117,6 +117,39 @@ function names_open_set(@nospecialize(a))::Bool
     return ccall(:jl_has_open_set, Cint, (Any,), T) != 0
 end
 names_open_set(argtypes::Vector{Any}, start::Int) = any(i -> names_open_set(argtypes[i]), start:length(argtypes))
+# Whether a membership can change which types are under a method's signature: it names an open set, or it has a
+# variable with a lower bound (`h(::Ph{T}) where T >: S` takes `Ph{X}` once `S` joins `X`; compiler §5.5).
+function sig_rests_on_memberships(@nospecialize(sig))::Bool
+    ccall(:jl_has_open_set, Cint, (Any,), sig) != 0 && return true
+    return has_lower_bound(sig, 0)
+end
+# a variable with a lower bound at a covariant place: the top, a tuple's element, a union's component, a `Vararg`
+function has_lower_bound(@nospecialize(t), depth::Int)::Bool
+    depth > 8 && return false
+    while isa(t, UnionAll)
+        t.var.lb === Union{} || return true
+        t = t.body
+    end
+    isa(t, Union) && return has_lower_bound(t.a, depth + 1) || has_lower_bound(t.b, depth + 1)
+    isvarargtype(t) && return isdefined(t, :T) && has_lower_bound(unwrapva(t), depth + 1)
+    if isa(t, DataType) && t.name === Tuple.name
+        for p in t.parameters
+            has_lower_bound(p, depth + 1) && return true
+        end
+    end
+    return false
+end
+# Whether a call's method is chosen when it runs among matches one of which rests on memberships (compiler §4.8):
+# the choice is a question about a set that inference did not fold, answered by the world's memberships. A
+# membership adds no method, so the code that leaves the choice to the run keeps its validity (§5.5); an answer
+# computed at compile time from it at a narrower argument (concrete evaluation) would not.
+function choice_rests_on_memberships(applicable, fullcover::Bool)::Bool
+    (length(applicable) > 1 || !fullcover) || return false
+    for i = 1:length(applicable)
+        sig_rests_on_memberships(applicable[i].match.method.sig) && return true
+    end
+    return false
+end
 function positive_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
     (ccall(:jl_has_open_set, Cint, (Any,), a) != 0 || ccall(:jl_has_open_set, Cint, (Any,), b) != 0) || return false
     return ccall(:jl_subtype_via_membership, Cint, (Any, Any), a, b) != 0
