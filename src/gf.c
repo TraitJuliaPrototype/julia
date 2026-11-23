@@ -456,6 +456,12 @@ JL_DLLEXPORT void jl_ci_set_policy(jl_code_instance_t *ci, int facts) JL_NOTSAFE
         jl_atomic_fetch_and_relaxed(&ci->flags, (uint8_t)~JL_CI_FLAGS_FACTS);
 }
 
+// G2 as a predicate: set once a CodeInstance is finished and is deep G2 (Compiler's `set_g2!`).
+JL_DLLEXPORT void jl_ci_set_g2(jl_code_instance_t *ci) JL_NOTSAFEPOINT
+{
+    jl_atomic_fetch_or_relaxed(&ci->flags, JL_CI_FLAGS_G2);
+}
+
 // Opportunistic SOURCE_MODE_ABI cache lookup, only for bootstrapping.
 static jl_code_instance_t *jl_method_inferred_with_abi(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world, int facts)
 {
@@ -2421,7 +2427,7 @@ static int _invalidate_dispatch_backedges(jl_method_instance_t *mi, jl_value_t *
         int replaced_edge;
         if (invokeTypes && jl_is_svec(invokeTypes)) {
             // an ordinary call that reached this instance from a narrower signature (a `@nospecialize`
-            // argument inferred so): its dispatch changes only where the new method replaces this one over
+            // argument inferred so, `!==`): its dispatch changes only where the new method replaces this one over
             // the part of the call's signature it meets, whatever else of the instance's signature it meets
             jl_value_t *callsig = jl_svecref(invokeTypes, 0);
             jl_value_t *cisect = NULL, *cisect2 = NULL;
@@ -3773,7 +3779,7 @@ jl_code_instance_t *jl_compile_method_internal_policy(jl_method_instance_t *mi, 
                     jl_atomic_store_relaxed(&codeinst->invoke, invoke);
                     // unspec is probably not specsig, but might be using specptr
                     jl_atomic_store_relaxed(&codeinst->flags, (specsigflags & JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR) |
-                        (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FACTS)); // the policy stays
+                        (jl_atomic_load_relaxed(&codeinst->flags) & (JL_CI_FLAGS_FACTS | JL_CI_FLAGS_G2))); // the policy and G2 stay
                     jl_mi_cache_insert(mi, codeinst);
                     record_precompile_statement(mi, 0, 0);
                     return codeinst;
@@ -3891,7 +3897,7 @@ jl_code_instance_t *jl_compile_method_internal_policy(jl_method_instance_t *mi, 
         jl_atomic_store_relaxed(&codeinst->specptr.fptr, fptr);
         jl_atomic_store_relaxed(&codeinst->invoke, invoke);
         jl_atomic_store_relaxed(&codeinst->flags, (specsigflags & JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR) |
-                        (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FACTS)); // the policy stays
+                        (jl_atomic_load_relaxed(&codeinst->flags) & (JL_CI_FLAGS_FACTS | JL_CI_FLAGS_G2))); // the policy and G2 stay
         jl_mi_cache_insert(mi, codeinst);
     }
     jl_atomic_store_relaxed(&codeinst->precompile, 1);
