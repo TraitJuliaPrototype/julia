@@ -348,6 +348,8 @@ function compile_and_emit_native(worlds::Vector{UInt},
                                  module_init_order::Vector{Any}, # Vector{Module}
                                  ext_foreign_cis::Vector{Any}) # Vector{CodeInstance}
     latestworld = worlds[end]
+    # a closed build: its rules apply from here, to what the build compiles for its output
+    trim_mode == TRIM_NO || (CLOSED_OUTPUT[] = true)
 
     # Step 1: Precompile all __init__ methods that will be required
     for mod in module_init_order

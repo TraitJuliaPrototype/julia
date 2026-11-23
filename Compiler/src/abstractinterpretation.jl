@@ -288,12 +288,407 @@ function declared_field_in(@nospecialize(c), name::Symbol, depth::Int)
 end
 
 const MAX_OPERATION_SPLITS = 4
+# the members a closed build splits an operation's call over; past it the call stays dynamic, and the
+# build's verifier refuses it
+const MAX_CLOSED_SPLITS = 64
+"""
+A closed build: `--trim`, once the build compiles its output. The members of every set are
+those the build has. The rules apply to what the build compiles for its output, from the start of
+`compile_and_emit_native`: code the build runs while it loads its program (a package's precompile workload, an
+`__init__`, a constant's initializer) is compiled as in a session.
+"""
+closed_build() = CLOSED_OUTPUT[] && JLOptions().trim != 0
+const CLOSED_OUTPUT = RefValue(false)
+# inference by a closed build's rules
+closed_build(::AbstractInterpreter) = closed_build()
+# A build's process notes, from its start, the instances its output compile infers again by the closed rules
+# (`note_closed_operation!`): code inferred while the build loads its program is inferred as in a session.
+closed_process() = JLOptions().trim != 0
+closed_process(::AbstractInterpreter) = closed_process()
+
+# The types a closed build forgets, and where: the concrete type of each value its
+# compiled code passes to a place whose type does not keep it (a field, an array's element, a variable,
+# an argument of an instance compiled at such a type, a result, an assertion), with that place's type;
+# and the flows between such places: a value typed `S`, which does not keep its type, that the code
+# passes on to a place typed `P` or narrows to `P` by a test (`x::X`, `x isa X`). A place is a
+# component of a union, one object per type (`closed_place`). A set instance's members by use are the
+# types forgotten at a place typed by it, or at a place whose values flow there (`closed_candidates`).
+const CLOSED_USED_TYPES = Any[]                  # the types, in the order found
+const CLOSED_USED_AT = IdDict{Any,Vector{Any}}() # each with the places it was forgotten at
+const CLOSED_USED_PAIRS = RefValue{Int}(0)       # how many (type, place) pairs and flows were noted
+const CLOSED_FLOWS = IdDict{Any,IdSet{Any}}()    # a place, with the places whose values flow to it
+const CLOSED_SET_PLACES = Any[]                  # the places typed by a set: an instance, an intersection
+const CLOSED_PLACE_OF = IdDict{Any,Any}()        # a type, with the object that stands for it as a place
+const CLOSED_UNIONALL_PLACES = Any[]
+const CLOSED_CANDIDATES_MEMO = IdDict{Any,Any}()
+# a type that keeps its values' types: concrete, or a union of such
+closed_keeps_type(@nospecialize(T)) =
+    T isa Union ? (closed_keeps_type(T.a) && closed_keeps_type(T.b)) : (T isa DataType && isconcretetype(T))
+# a type that is a set: an instance (with parameters free or not), an intersection
+function closed_set_place(@nospecialize(P))
+    u = unwrap_unionall(P)
+    u isa DataType || return false
+    u.name === (unwrap_unionall(Core.All)::DataType).name && return true
+    return ccall(:jl_is_open_set, Cint, (Any,), u) != 0
+end
+# the object that stands for the type `P` as a place: two equal types with free variables are one place
+function closed_place(@nospecialize(P))
+    c = get(CLOSED_PLACE_OF, P, nothing)
+    c === nothing || return c
+    if P isa UnionAll
+        u = unwrap_unionall(P)
+        for Q in CLOSED_UNIONALL_PLACES
+            v = unwrap_unionall(Q)
+            (u isa DataType && v isa DataType && u.name !== v.name) && continue
+            if Q == P
+                CLOSED_PLACE_OF[P] = Q
+                return Q
+            end
+        end
+        push!(CLOSED_UNIONALL_PLACES, P)
+    end
+    CLOSED_PLACE_OF[P] = P
+    closed_set_place(P) && push!(CLOSED_SET_PLACES, P)
+    return P
+end
+function note_used_type!(@nospecialize(T), @nospecialize(P))
+    if T isa Union
+        note_used_type!(T.a, P)
+        note_used_type!(T.b, P)
+    elseif P isa Union
+        note_used_type!(T, P.a)
+        note_used_type!(T, P.b)
+    elseif T isa DataType && isconcretetype(T) && P isa Type && !closed_keeps_type(P) && T <: P
+        P = closed_place(P)
+        at = get(CLOSED_USED_AT, T, nothing)
+        if at === nothing
+            at = Any[]
+            CLOSED_USED_AT[T] = at
+            push!(CLOSED_USED_TYPES, T)
+        end
+        for Q in at
+            Q === P && return nothing
+        end
+        push!(at, P)
+        CLOSED_USED_PAIRS[] += 1
+    end
+    return nothing
+end
+# a value typed `S` that goes to a place typed `P`: passed on (`S <: P`) or narrowed by a test; neither
+# keeps the value's type
+function note_closed_flow!(@nospecialize(S), @nospecialize(P))
+    if S isa Union
+        note_closed_flow!(S.a, P)
+        note_closed_flow!(S.b, P)
+    elseif P isa Union
+        note_closed_flow!(S, P.a)
+        note_closed_flow!(S, P.b)
+    elseif S isa Type && P isa Type && S !== Union{} && !closed_keeps_type(S) && !closed_keeps_type(P)
+        S = closed_place(S)
+        P = closed_place(P)
+        S === P && return nothing
+        from = get(CLOSED_FLOWS, P, nothing)
+        if from === nothing
+            from = IdSet{Any}()
+            CLOSED_FLOWS[P] = from
+        end
+        S in from && return nothing
+        hasintersect(S, P) || return nothing
+        push!(from, S)
+        CLOSED_USED_PAIRS[] += 1
+    end
+    return nothing
+end
+# A split at a set type with no member is a "no method" fact in the build's last rounds,
+# once the members by use are complete: in the earlier rounds the call is left as it is, so that the code
+# below it is compiled and read for the types it forgets. Set when no round adds a member and a split
+# with no member was met (`CLOSED_NO_MEMBER_MET`).
+const CLOSED_NO_MEMBER = RefValue(false)
+const CLOSED_NO_MEMBER_MET = RefValue(false)
+function closed_used_reset!()
+    CLOSED_NO_MEMBER[] = false
+    CLOSED_NO_MEMBER_MET[] = false
+    empty!(CLOSED_USED_TYPES)
+    empty!(CLOSED_USED_AT)
+    empty!(CLOSED_FLOWS)
+    empty!(CLOSED_SET_PLACES)
+    empty!(CLOSED_PLACE_OF)
+    empty!(CLOSED_UNIONALL_PLACES)
+    CLOSED_USED_PAIRS[] = 0
+    empty!(CLOSED_CANDIDATES_MEMO)
+    return nothing
+end
+
+# The places whose values reach code typed by the set type `p`: the places typed by a set
+# under `p` (the instance, a subset, an intersection with one), and the places whose values the code
+# passes on or narrows to one of them, the rule repeating. A place typed by a type that merely is a member
+# (`Function`, a callable family) is one only where its values flow there.
+function closed_reaching_places(@nospecialize(p))
+    R = IdSet{Any}()
+    work = Any[]
+    for Q in CLOSED_SET_PLACES
+        if Q <: p
+            push!(R, Q)
+            push!(work, Q)
+        end
+    end
+    while !isempty(work)
+        Q = pop!(work)
+        from = get(CLOSED_FLOWS, Q, nothing)
+        from === nothing && continue
+        for S in from
+            S in R && continue
+            push!(R, S)
+            push!(work, S)
+        end
+    end
+    return R
+end
+# the set whose entries list the members of the set type `p`: an instance's set, an intersection's first
+# component's
+function closed_set_of(@nospecialize(p))
+    u = unwrap_unionall(p)
+    u isa DataType || return nothing
+    if u.name === (unwrap_unionall(Core.All)::DataType).name
+        u = unwrap_unionall((u.parameters[1]::DataType).parameters[1])
+        u isa DataType || return nothing
+    end
+    ccall(:jl_is_open_set, Cint, (Any,), u) != 0 || return nothing
+    return u.name.wrapper
+end
+
+# The members of the set type `p` in a closed build, from its set's membership entries in
+# force: each entry's concrete type; of an entry at a family `S{T} where T` or at an abstract type, the
+# types under it that reach a place typed by `p` (`closed_reaching_places`): its members by use; of a
+# subset, its members. With them the kept form `Dynamic{…}` where the build forgets a box at such a place.
+# The callers keep those of `p`'s type. `nothing` where the members cannot be listed.
+function closed_candidates(@nospecialize(p))
+    memo = get(CLOSED_CANDIDATES_MEMO, p, missing)
+    memo === missing || return memo::Union{Nothing,Vector{Any}}
+    X = closed_set_of(p)
+    out = nothing
+    if X === nothing && closed_record_family(p)
+        out = closed_record_candidates(p)
+    elseif X !== nothing
+        R = closed_reaching_places(p)
+        out = closed_candidates_in(X, R, Any[], 0)
+        if out !== nothing
+            box = (Core.Dynamic::UnionAll).body.name
+            for T in CLOSED_USED_TYPES
+                (T isa DataType && T.name === box) || continue
+                closed_reaches(T, R) && push!(out, T)
+            end
+        end
+    end
+    CLOSED_CANDIDATES_MEMO[p] = out
+    return out
+end
+# A record's family: `T` is a struct's family, not one of its types, and the
+# struct has a parameter bounded by a set (`Trip{C <: Callable{…}, …}`): its types record the form of each
+# value it keeps (a box, a wrapper, a plain member), and a join of records of different forms is the family.
+# Plain code bounds no parameter by a set.
+function closed_record_family(@nospecialize(T))
+    T isa UnionAll || return false
+    u = unwrap_unionall(T)
+    (u isa DataType && !isabstracttype(u) && !closed_kept_form(u)) || return false
+    w = u.name.wrapper
+    while w isa UnionAll
+        ccall(:jl_has_open_set, Cint, (Any,), w.var.ub) != 0 && return true
+        w = w.body
+    end
+    return false
+end
+# The types of a record's family `p` a closed build counted: those it forgets at a place
+# typed `p`, or at a place whose values flow there, as a set's members by use are counted
+function closed_record_candidates(@nospecialize(p))
+    P = closed_place(p)
+    R = IdSet{Any}()
+    push!(R, P)
+    work = Any[P]
+    while !isempty(work)
+        from = get(CLOSED_FLOWS, pop!(work), nothing)
+        from === nothing && continue
+        for S in from
+            S in R && continue
+            push!(R, S)
+            push!(work, S)
+        end
+    end
+    out = Any[]
+    for T in CLOSED_USED_TYPES
+        T <: p && closed_reaches(T, R) && push!(out, T)
+    end
+    return out
+end
+function closed_reaches(@nospecialize(T), R::IdSet{Any})
+    at = get(CLOSED_USED_AT, T, nothing)
+    at === nothing && return false
+    for P in at
+        P in R && return true
+    end
+    return false
+end
+# Whether the concrete type `m`'s entry in force in the set `X` leaves an input of the set free (the
+# instance has a variable at an input parameter: `@implement Callable T`, the instance `Callable{A, S}
+# where {A, S}`), so that `m` is a member of every instance at those inputs
+function closed_entry_free(@nospecialize(m), @nospecialize(X))
+    m isa DataType || return false
+    xn = (unwrap_unionall(X)::DataType).name
+    inputs = getfield(xn, :input_params)::UInt8
+    inputs == 0x00 && return false
+    for e in getfield(m.name, :memberships, :acquire)::SimpleVector
+        e = e::Core.MembershipEntry
+        (e.set === xn && e.member === m) || continue
+        getfield(e, :max_world, :monotonic) == typemax(UInt) || continue
+        u = unwrap_unionall(e.instance)
+        u isa DataType || continue
+        for i = 1:min(length(u.parameters), 8)
+            ((inputs >> (i - 1)) & 0x01) == 0x01 && u.parameters[i] isa TypeVar && return true
+        end
+    end
+    return false
+end
+function closed_candidates_in(@nospecialize(X), R::IdSet{Any}, out::Vector{Any}, depth::Int)
+    depth > 4 && return nothing
+    pats = ccall(:jl_set_member_patterns, Any, (Any,), X)::Vector{Any}
+    for m in pats
+        if isconcretetype(m)
+            any(c -> c === m, out) && continue
+            # an entry that leaves the set's inputs free makes the type a member of every instance
+            # (`@implement Callable T`): a member by use at each, as a family's member is
+            if closed_entry_free(m, X)
+                closed_reaches(m, R) && push!(out, m)
+            else
+                push!(out, m)
+            end
+            continue
+        end
+        u = unwrap_unionall(m)
+        u isa DataType || return nothing
+        if ccall(:jl_is_open_set, Cint, (Any,), u) != 0
+            closed_candidates_in(u.name.wrapper, R, out, depth + 1) === nothing && return nothing
+        else
+            for T in CLOSED_USED_TYPES
+                T <: m || continue
+                any(d -> d === T, out) && continue
+                closed_reaches(T, R) && push!(out, T)
+            end
+        end
+    end
+    return out
+end
+# the number of members each closed split was inferred with, by the set type it splits at: where a later
+# round adds one, the build infers the noted instances again (`closed_candidates_grew`)
+const CLOSED_CANDIDATE_COUNTS = IdDict{Any,Int}()
+function closed_candidates_grew()
+    grew = false
+    for (X, n) in CLOSED_CANDIDATE_COUNTS
+        c = closed_candidates(X)
+        c === nothing && continue
+        length(c) > n && (grew = true)
+    end
+    return grew
+end
+
+# Whether the argument `i` of a call is the object a box holds, `getfield(d::Dynamic, :object)`: never a
+# box, since the box's constructors unwrap one, so a closed build's split at it has no box branch.
+function closed_box_object(arginfo::ArgInfo, i::Int, sv::AbsIntState)
+    fargs = arginfo.fargs
+    (fargs !== nothing && sv isa InferenceState && i <= length(fargs)) || return false
+    x = fargs[i]
+    x isa SSAValue || return false
+    stmt = sv.src.code[x.id]
+    (isexpr(stmt, :call) && length(stmt.args) == 3) || return false
+    f, d, nm = stmt.args[1], stmt.args[2], stmt.args[3]
+    nm isa QuoteNode && (nm = nm.value)
+    nm === :object || return false
+    f isa GlobalRef || return false
+    ft = abstract_eval_globalref_type(f, sv.src)
+    (ft isa Const && ft.val === getfield) || return false
+    dt = d isa SSAValue ? sv.ssavaluetypes[d.id] :
+         d isa SlotNumber && d.id <= length(sv.slottypes) ? sv.slottypes[d.id] :
+         d isa Argument && d.n <= length(sv.slottypes) ? sv.slottypes[d.n] : Any
+    dt = widenconst(dt)
+    return dt !== Union{} && dt <: Core.Dynamic
+end
+# the union `U` without its boxes
+function closed_drop_boxes(@nospecialize(U))
+    V = Union{}
+    for C in uniontypes(U)
+        (C isa DataType && C.name === (Core.Dynamic::UnionAll).body.name) || (V = Union{V, C})
+    end
+    return V
+end
+
+# The result of an operation's call is typed by the declared result: in a closed build the branches'
+# results are values forgotten at a place of that type. Noted while inferring: the optimizer
+# may inline a lone branch, after which no statement of the code forgets its value (`linfactor(ls, W)`, its
+# result typed `Solvable{Float64}`, the one member's `LU` passed straight to `ldiv!`).
+function closed_note_result!(@nospecialize(rt), @nospecialize(P))
+    R = widenconst(rt)
+    (R isa Type && P isa Type && R !== Union{} && !has_free_typevars(P)) || return nothing
+    n = CLOSED_USED_PAIRS[]
+    note_used_type!(R, P)
+    note_closed_flow!(R, P)
+    CLOSED_USED_PAIRS[] > n && empty!(CLOSED_CANDIDATES_MEMO)
+    return nothing
+end
+
+# A closed build's call at a value known only by its trait, with no member of the value's type: a "no
+# method" fact. The call raises `MethodError`; the inliner puts the error in its place.
+closed_no_member(@nospecialize(rt)) =
+    CallMeta(Union{}, MethodError, Effects(), SplitCallInfo(UnionSplitInfo(MethodMatchInfo[]), rt, true))
+
+# whether every component of `q` is a kept form, `Dynamic{…}` or `Compiled{…}`
+function closed_kept_form(@nospecialize(q))
+    q isa Union && return closed_kept_form(unwrap_unionall(q.a)) && closed_kept_form(unwrap_unionall(q.b))
+    return q isa DataType && (q.name === (Core.Dynamic::UnionAll).body.name ||
+                              q.name === (Core.Compiled::UnionAll).body.name)
+end
+
+# Code inferred while a closed build loads its program saw the members declared until then: a method
+# at a set checked at its definition saw none. The instances whose inference met an operation's call
+# at a set are noted here, and inferred again when the build compiles, with every member
+# (`closed_build_reinfer!`).
+const CLOSED_OPERATION_INSTANCES = IdSet{MethodInstance}()
+function note_closed_operation!(sv::AbsIntState)
+    mi = frame_instance(sv)
+    mi isa MethodInstance && push!(CLOSED_OPERATION_INSTANCES, mi)
+    return nothing
+end
+# Ends a code instance of a closed build in the build's world, as `jl_invalidate_code_instance` does; also
+# one whose worlds end at a world later than the build's (a world opened while the build compiled, where
+# the instance's worlds were not left open)
+function closed_end_code!(ci::CodeInstance, world::UInt)
+    if ci.max_world == typemax(UInt)
+        ccall(:jl_invalidate_code_instance, Cvoid, (Any, UInt), ci, world - 1)
+    elseif ci.max_world >= world
+        setfield!(ci, :max_world, world - 1, :release)
+    end
+    return nothing
+end
+function closed_build_reinfer!(world::UInt, stale::Union{Nothing,IdSet{Any}} = nothing, @nospecialize(owner = nothing))
+    for mi in CLOSED_OPERATION_INSTANCES
+        isdefined(mi, :cache) || continue
+        ci = mi.cache
+        while true
+            # (also code that begins in the build's world: a round's own, inferred with fewer members)
+            ci.owner === owner && ci.min_world <= world && closed_end_code!(ci, world)
+            (stale === nothing || ci.owner !== owner) || push!(stale, ci)
+            isdefined(ci, :next) || break
+            ci = ci.next
+        end
+    end
+    empty!(CLOSED_OPERATION_INSTANCES)
+    return nothing
+end
+
 # The split of an operation's call: the first argument typed by a set instance, an
 # intersection or a closed abstract type with a contract, and the union of the first
 # `MAX_OPERATION_SPLITS` candidates of its set or type that are of that type (at an intersection, the
 # first component's candidates that are members of all). The candidates are read without an edge: a
 # member registered later reaches the fallback.
-function operation_split_type(@nospecialize(atype))
+function operation_split_type(@nospecialize(atype), closed_rules::Bool)
     tt = unwrap_unionall(atype)::DataType
     # asserted: at an argument typed `Type{Tuple{…}}` (a specialization of the image) the field infers `Any`
     ps = getfield(tt, :parameters)::SimpleVector
@@ -308,25 +703,45 @@ function operation_split_type(@nospecialize(atype))
             X = (u.parameters[1]::DataType).parameters[1]
         end
         (ccall(:jl_is_open_set, Cint, (Any,), X) != 0 || ccall(:jl_has_contract, Cint, (Any,), X) != 0) || continue
-        cands = ccall(:jl_candidates_of, Any, (Any,), X)::Vector{Any}
+        # a closed build (`--trim`) has every member: the split is over all of them,
+        # where the set's members can be listed
+        # (its members by use at `p`, and the box `Dynamic{X}`, which the set's own method
+        # opens, where the build forgets a box at a place typed by `p`)
+        cands = nothing
+        closed = false
+        if closed_rules && ccall(:jl_is_open_set, Cint, (Any,), X) != 0
+            cands = closed_candidates(p)
+            if cands !== nothing
+                closed = true
+                CLOSED_CANDIDATE_COUNTS[p] = length(cands)
+            end
+        end
+        cands === nothing && (cands = ccall(:jl_candidates_of, Any, (Any,), X)::Vector{Any})
         U = Union{}
         n = 0
         for C in cands
-            n < MAX_OPERATION_SPLITS || break
+            (closed || n < MAX_OPERATION_SPLITS) || break
             C <: p || continue
             U = Union{U, C}
             n += 1
         end
-        n == 0 && return nothing
-        return (i, U)
+        # (a closed build's set with no member of `p`'s type: `Union{}`, a "no method" fact, in the last
+        # rounds)
+        if n == 0
+            closed || return nothing
+            CLOSED_NO_MEMBER[] || (CLOSED_NO_MEMBER_MET[] = true; return nothing)
+        end
+        n <= MAX_CLOSED_SPLITS || return nothing
+        return (i, U, closed)
     end
     return nothing
 end
 
 # The effects of a call whose result is a declared result its members' own code is not checked against:
-# `TRUSTED_CALLABLE` or `TRUSTED_OPERATION`
+# `TRUSTED_CALLABLE` or `TRUSTED_OPERATION`. A closed build leaves no call to dispatch:
+# every call runs the instance inferred, and nothing is trusted there
 trusted_effects(interp::AbstractInterpreter, bits::UInt8, effects::Effects = Effects()) =
-    Effects(effects; trusted = bits)
+    closed_build(interp) ? effects : Effects(effects; trusted = bits)
 
 # a declared result at the call's types: the declared signature's variables instantiated where the
 # call fixes them, else bounded by their bounds
@@ -344,6 +759,7 @@ end
 function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(func),
                                   arginfo::ArgInfo, si::StmtInfo, @nospecialize(atype),
                                   sv::AbsIntState, max_methods::Int;
+                                  max_union_splitting::Int = InferenceParams(interp).max_union_splitting,
                                   operation::Bool = true)
     𝕃ₚ, 𝕃ᵢ = ipo_lattice(interp), typeinf_lattice(interp)
     ⊑ₚ, ⊔ₚ, ⊔ᵢ  = partialorder(𝕃ₚ), join(𝕃ₚ), join(𝕃ᵢ)
@@ -356,16 +772,27 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
     # (not at a split's own branches: they are the split already)
     drt = operation ? declared_operation_result(interp, argtypes, atype) : nothing
     if drt !== nothing
-        # (trusted: a member's own instance is not checked against the declared result in every world
-        # it runs in, a member of a pattern before its first use among them; nothing is trusted where
-        # the result is `Any`)
+        closed_process(interp) && note_closed_operation!(sv)
+        # (trusted: a member's own instance is not checked against the declared result
+        # in every world it runs in, a member of a pattern before its first use among them; nothing is
+        # trusted where the result is `Any`)
         opeffects = drt === Any ? Effects() : trusted_effects(interp, TRUSTED_OPERATION)
-        split = operation_split_type(atype)
+        split = operation_split_type(atype, closed_build(interp))
         split === nothing && return Future(CallMeta(drt, Any, opeffects, DeclaredResultInfo(drt)))
         # asserted, as the compiler's own results are: inferred while the compiler bootstraps itself,
         # an untyped index made `newargs[i]` a dynamic call whose edges any new integer constructor
         # invalidated, and the compiler with it
-        i, U = split::Tuple{Int,Type}
+        i, U, closed = split::Tuple{Int,Type,Bool}
+        if closed && U !== Union{} && closed_box_object(arginfo, i, sv)
+            U = closed_drop_boxes(U)
+            # (no member but a box, in the rounds before "no member" is a fact: the call as it is)
+            if U === Union{} && !CLOSED_NO_MEMBER[]
+                CLOSED_NO_MEMBER_MET[] = true
+                return Future(CallMeta(drt, Any, Effects(), DeclaredResultInfo(drt)))
+            end
+        end
+        # a closed build's operation on a set with no member: the call raises `MethodError`
+        U === Union{} && return Future(closed_no_member(drt))
         newargs = copy(argtypes)
         newargs[i] = U
         # each branch knows the value's type, a candidate: a branch served by a method at the set runs
@@ -373,19 +800,19 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         # candidate, never the set (which would cover the values past the candidates)
         call = abstract_call_gf_by_type(interp, func, ArgInfo(nothing, newargs), si,
                                         argtypes_to_type(newargs), sv, max_methods;
+                                        max_union_splitting = closed ? MAX_CLOSED_SPLITS :
+                                                              InferenceParams(interp).max_union_splitting,
                                         operation = false)::Future
         # (the declared result in a box: a closure over a type is a closure type of its own per type,
         # compiled in each session for each declared result)
         drtbox = RefValue{Any}(drt)
         return Future{CallMeta}(call, interp, sv) do call, _, _
-            CallMeta(drtbox[], Any, opeffects, SplitCallInfo(call.info, drtbox[]))
+            # (a closed build: the branches' results are forgotten at the declared result, a place)
+            closed && closed_note_result!(call.rt, drtbox[])
+            CallMeta(drtbox[], Any, opeffects, SplitCallInfo(call.info, drtbox[], closed))
         end
     end
-    matches = find_method_matches(interp, argtypes, atype; max_methods)
-    if isa(matches, FailedMethodMatch)
-        add_remark!(interp, sv, matches.reason)
-        return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
-    end
+    matches = find_method_matches(interp, argtypes, atype; max_methods, max_union_splitting)
 
     (; valid_worlds, applicable) = matches
     update_valid_age!(sv, valid_worlds) # need to record the negative world now, since even if we don't generate any useful information, inlining might want to add an invoke edge and it won't have this information anymore
