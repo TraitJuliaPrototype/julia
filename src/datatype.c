@@ -1427,14 +1427,15 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
         jl_method_table_activate(mentry);
         jl_set_membership_query_world(mqm);
     }
-    jl_atomic_store_release(&jl_world_counter, min_world);
-    // the stopgap (compiler C-18): replay dispatch for the methods the member can now
-    // reach, then report the ambiguities, both at the entry's world
+    // the walk (compiler §5.5): replay dispatch for the methods the member can now reach, then report the
+    // ambiguities, both at the entry's world, before the counter advances to it: as at a method's insertion, no
+    // task enters the new world while code the membership ends is still valid there (§4.3)
     size_t mq = jl_set_membership_query_world(min_world);
     jl_membership_dispatch_walk(member, set_instance, min_world);
     jl_deep_ending_pop(pushed);
     jl_membership_ambiguity_report(member, set_instance, min_world);
     jl_set_membership_query_world(mq);
+    jl_atomic_store_release(&jl_world_counter, min_world);
     JL_UNLOCK(&world_counter_lock);
     JL_GC_POP();
     return entry;

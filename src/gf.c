@@ -4148,10 +4148,11 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
 // signature names a set the member (transitively) joins is re-resolved as if
 // its sig, with the member substituted for the set, were inserted now — the
 // replay mode of the else-branch just extracted above. Calling convention
-// (single-bump protocol, review W3-F4): called under world_counter_lock with the
-// entry published and the counter ALREADY advanced to entry_min_world — the walk
-// runs at world == counter, so ml_matches' future guard passes and the
-// conservative path uses the counter-free jl_method_invalidate_core (W2-3);
+// (single-bump protocol): called under world_counter_lock with the entry published at
+// entry_min_world and, at a declaration, the counter not yet advanced to it, as at a
+// method's insertion: no task enters the new world while code the membership ends is
+// still valid there (compiler §4.3). The walk asks no lookup through ml_matches' future
+// guard, and the conservative path uses the counter-free jl_method_invalidate_core;
 // §0's query-world override is set by the declaring call site for this whole
 // region (D1), and the declaring task is synced to entry_min_world (n3), so the
 // just-published entry is visible to the replay's intersections. The region is
