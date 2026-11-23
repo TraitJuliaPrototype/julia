@@ -1013,6 +1013,7 @@ JL_DLLEXPORT void jl_invalidate_code_instances_new_world(jl_svec_t *cis);
 JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X);
 // x <: y at an explicit world
 int jl_membership_holds_at(jl_value_t *x, jl_value_t *y, size_t world);
+int jl_chain_has_set_bounded_pattern(jl_datatype_t *S); // datatype.c: a type in a pattern bounded by a set
 // whether the TypeName `from` reaches `to` along declared supertypes and the entries
 // live in `world` (0: every entry)
 int jl_typename_reaches(jl_typename_t *from, jl_typename_t *to, size_t world) JL_NOTSAFEPOINT;
@@ -2072,6 +2073,9 @@ struct typemap_intersection_env {
     jl_svec_t *env; // intersection env (initialize to null to perform intersection without an environment)
     int issubty;    // if `a <: b` is true in `intersect(a,b)`
     int skip_ranges; // the caller reads no match's worlds: the membership range is not taken (zero by default)
+    // called on an entry whose intersection with the type is empty, where it is set (NULL by default): the
+    // lookup's record of what a membership could make it meet (compiler §4.8)
+    jl_typemap_intersection_visitor_fptr dropped;
 };
 int jl_typemap_intersection_visitor(jl_typemap_t *a, int offs, struct typemap_intersection_env *closure);
 void typemap_slurp_search(jl_typemap_entry_t *ml, struct typemap_intersection_env *closure);

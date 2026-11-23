@@ -580,6 +580,10 @@ static int jl_typemap_intersection_node_visitor(jl_typemap_entry_t *ml, struct t
                 if (!fptr(ml, closure))
                     return 0;
         }
+        else if (closure->dropped != NULL) {
+            if (!closure->dropped(ml, closure))
+                return 0;
+        }
     }
     return 1;
 }

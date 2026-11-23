@@ -7636,6 +7636,7 @@ struct ml_matches_env {
     // results:
     jl_value_t *t; // array of method matches
     jl_method_match_t *matc; // current working method match
+    jl_array_t *drops; // [set, member, ...]: what a membership could make the dropped entries meet (or NULL)
 };
 
 enum SIGNATURE_FULLY_COVERS {
@@ -7653,6 +7654,229 @@ static jl_method_match_t *make_method_match(jl_tupletype_t *spec_types, jl_svec_
     match->method = method;
     match->fully_covers = fully_covers;
     return match;
+}
+
+// ---- the drops a membership could undo (compiler §4.8) ----
+// A lookup at a query that names a set drops a method whose type at a position is no member of the set
+// there (`g(::S)` at a call at `X`): that rests on the pair's absence as a folded negative does, and the
+// caller records it. `drops` collects [set, member, ...]; a member `jl_any_type` stands for every type,
+// where the pair cannot be named.
+
+// the sets named in `t` at any depth, each with the member `m`
+static void drop_all_sets(jl_value_t *t, jl_value_t *m, jl_array_t *drops, int depth)
+{
+    if (depth > 8 || t == NULL)
+        return;
+    while (jl_is_unionall(t)) {
+        drop_all_sets(((jl_unionall_t*)t)->var->ub, m, drops, depth + 1);
+        drop_all_sets(((jl_unionall_t*)t)->var->lb, m, drops, depth + 1);
+        t = ((jl_unionall_t*)t)->body;
+    }
+    if (jl_is_typevar(t)) {
+        drop_all_sets(((jl_tvar_t*)t)->ub, m, drops, depth + 1);
+        drop_all_sets(((jl_tvar_t*)t)->lb, m, drops, depth + 1);
+    }
+    else if (jl_is_uniontype(t)) {
+        drop_all_sets(((jl_uniontype_t*)t)->a, m, drops, depth + 1);
+        drop_all_sets(((jl_uniontype_t*)t)->b, m, drops, depth + 1);
+    }
+    else if (jl_is_vararg(t)) {
+        drop_all_sets(jl_unwrap_vararg(t), m, drops, depth + 1);
+    }
+    else if (jl_is_datatype(t) && ((jl_datatype_t*)t)->has_open_set) {
+        jl_datatype_t *dt = (jl_datatype_t*)t;
+        if (dt->name->open_set && !jl_is_all_type(t)) {
+            jl_array_ptr_1d_push(drops, (jl_value_t*)dt->name);
+            jl_array_ptr_1d_push(drops, m);
+            return;
+        }
+        for (size_t i = 0; i < jl_nparams(dt); i++)
+            drop_all_sets(jl_tparam(dt, i), m, drops, depth + 1);
+    }
+}
+
+// One position: the query's type `q` names a set and has no type in common with the method's `m`.
+static void drop_position(jl_value_t *q, jl_value_t *m, jl_array_t *drops, int depth)
+{
+    while (jl_is_typevar(q))
+        q = ((jl_tvar_t*)q)->ub;
+    while (jl_is_typevar(m))
+        m = ((jl_tvar_t*)m)->ub;
+    if (depth > 8) {
+        drop_all_sets(q, (jl_value_t*)jl_any_type, drops, 0);
+        return;
+    }
+    jl_value_t *qu = jl_unwrap_unionall(q), *mu = jl_unwrap_unionall(m);
+    while (jl_is_typevar(qu))
+        qu = jl_unwrap_unionall(((jl_tvar_t*)qu)->ub);
+    while (jl_is_typevar(mu))
+        mu = jl_unwrap_unionall(((jl_tvar_t*)mu)->ub);
+    if (jl_is_uniontype(qu)) {
+        // each arm that names a set; an arm that names none meets nothing here either
+        drop_position(((jl_uniontype_t*)qu)->a, m, drops, depth + 1);
+        drop_position(((jl_uniontype_t*)qu)->b, m, drops, depth + 1);
+        return;
+    }
+    if (!jl_has_open_set_in(qu))
+        return;
+    if (jl_is_datatype(qu) && (((jl_datatype_t*)qu)->name->open_set || jl_is_all_type(qu))) {
+        // the set itself, or an intersection's sets: the method's type is the member side, whole (a type
+        // that can never be a member needs no record)
+        jl_value_t *mm = !(jl_is_uniontype(mu) || jl_is_datatype(mu)) ? (jl_value_t*)jl_any_type :
+                         jl_is_typevar(jl_unwrap_unionall(m)) ? mu : m;
+        // a kind meets a set through its entries for type values (§4.10)
+        if (jl_is_datatype(mu) && ((jl_datatype_t*)mu)->name->never_member && !jl_is_type_type(mu) && !jl_is_kind(mu))
+            return;
+        if (jl_has_open_set_in(mm) || (jl_is_datatype(mu) && jl_is_concrete_type(mu) &&
+                                       jl_chain_has_set_bounded_pattern((jl_datatype_t*)mu)))
+            mm = (jl_value_t*)jl_any_type; // its membership rests on another pair's
+        drop_all_sets(qu, mm, drops, 0);
+        return;
+    }
+    if (jl_is_uniontype(mu)) {
+        // the method's union: each arm the query's type does not meet
+        jl_value_t *a = NULL;
+        JL_GC_PUSH1(&a);
+        for (int k = 0; k < 2; k++) {
+            a = jl_rewrap_unionall(k == 0 ? ((jl_uniontype_t*)mu)->a : ((jl_uniontype_t*)mu)->b, m);
+            if (jl_has_empty_intersection(q, a))
+                drop_position(q, a, drops, depth + 1);
+        }
+        JL_GC_POP();
+        return;
+    }
+    if (jl_is_datatype(qu) && jl_is_datatype(mu) && ((jl_datatype_t*)qu)->name == ((jl_datatype_t*)mu)->name &&
+            jl_nparams(qu) == jl_nparams(mu)) {
+        // a tuple's components pair covariantly; another type's parameters are invariant, where only a variable of
+        // the query's (`Type{<:X}` against `Type{S}`, `Ph{<:X}` against `Ph{S}`) takes the types under its bound: an
+        // invariant parameter's equality consults no membership (§4.5)
+        int tup = jl_is_tuple_type(qu);
+        jl_value_t *a = NULL, *b = NULL;
+        JL_GC_PUSH2(&a, &b);
+        for (size_t i = 0; i < jl_nparams(qu); i++) {
+            jl_value_t *qi = jl_tparam(qu, i), *mi = jl_tparam(mu, i);
+            if (jl_is_vararg(qi) || jl_is_vararg(mi)) {
+                drop_all_sets(qi, (jl_value_t*)jl_any_type, drops, 0);
+                continue;
+            }
+            if (!jl_has_open_set_in(qi) || (!tup && !jl_is_typevar(qi)))
+                continue;
+            a = jl_rewrap_unionall(qi, q);
+            b = jl_rewrap_unionall(mi, m);
+            if (jl_has_empty_intersection(a, b))
+                drop_position(a, b, drops, depth + 1);
+            a = b = NULL;
+        }
+        JL_GC_POP();
+        return;
+    }
+    if (jl_is_datatype(qu) && jl_is_datatype(mu)) {
+        // another head: the method's type reaches the query's only through its declared supertypes, which carry its
+        // parameters (`P2{S}` against `AP{<:X}`); none reaches it: no membership makes them meet
+        for (jl_datatype_t *d = ((jl_datatype_t*)mu)->super; d != NULL && d != jl_any_type; d = d->super) {
+            if (d->name == ((jl_datatype_t*)qu)->name) {
+                jl_value_t *a = jl_rewrap_unionall((jl_value_t*)d, m);
+                JL_GC_PUSH1(&a);
+                drop_position(q, a, drops, depth + 1);
+                JL_GC_POP();
+                return;
+            }
+        }
+        return;
+    }
+    // any other shape: no one pair says what a membership would change; every membership of the sets
+    drop_all_sets(qu, (jl_value_t*)jl_any_type, drops, 0);
+}
+
+// the drops of the entry `ml` at the query
+static int ml_matches_dropped(jl_typemap_entry_t *ml, struct typemap_intersection_env *closure0)
+{
+    struct ml_matches_env *closure = container_of(closure0, struct ml_matches_env, match);
+    if (closure->world < jl_atomic_load_relaxed(&ml->min_world) || closure->world > jl_atomic_load_relaxed(&ml->max_world))
+        return 1;
+    jl_value_t *q = closure0->type, *msig = (jl_value_t*)ml->sig;
+    jl_value_t *qu = jl_unwrap_unionall(q), *mu = jl_unwrap_unionall(msig);
+    if (!jl_is_tuple_type(qu) || !jl_is_tuple_type(mu))
+        return 1;
+    size_t nq = jl_nparams(qu), nm = jl_nparams(mu);
+    int qva = nq > 0 && jl_is_vararg(jl_tparam(qu, nq - 1)), mva = nm > 0 && jl_is_vararg(jl_tparam(mu, nm - 1));
+    size_t n = nq > nm ? nq : nm;
+    if ((nq < nm && !qva) || (nm < nq && !mva))
+        return 1; // the arities differ: no membership makes them meet
+    jl_value_t *qi = NULL, *mi = NULL;
+    JL_GC_PUSH2(&qi, &mi);
+    // first the positions that name no set: where they do not meet, the drop rests on no membership
+    for (size_t i = 0; i < n; i++) {
+        qi = i < nq - qva ? jl_tparam(qu, i) : jl_unwrap_vararg(jl_tparam(qu, nq - 1));
+        mi = i < nm - mva ? jl_tparam(mu, i) : jl_unwrap_vararg(jl_tparam(mu, nm - 1));
+        if (qi == NULL || mi == NULL || jl_has_open_set_in(qi) || jl_has_open_set_in(mi))
+            continue;
+        qi = jl_rewrap_unionall(qi, q);
+        mi = jl_rewrap_unionall(mi, msig);
+        if (jl_has_empty_intersection(qi, mi)) {
+            JL_GC_POP();
+            return 1;
+        }
+    }
+    for (size_t i = 0; i < n; i++) {
+        qi = i < nq - qva ? jl_tparam(qu, i) : jl_unwrap_vararg(jl_tparam(qu, nq - 1));
+        mi = i < nm - mva ? jl_tparam(mu, i) : jl_unwrap_vararg(jl_tparam(mu, nm - 1));
+        if (qi == NULL || !jl_has_open_set_in(qi))
+            continue;
+        if (mi == NULL) {
+            drop_all_sets(qi, (jl_value_t*)jl_any_type, closure->drops, 0);
+            continue;
+        }
+        qi = jl_rewrap_unionall(qi, q);
+        mi = jl_rewrap_unionall(mi, msig);
+        if (!jl_has_empty_intersection(qi, mi))
+            continue;
+        drop_position(qi, mi, closure->drops, 0);
+    }
+    JL_GC_POP();
+    return 1;
+}
+
+// The cells of the drops: per set, one absence at the union of its member sides (compiler §4.8).
+static jl_value_t *drop_cells(jl_array_t *drops)
+{
+    size_t n = jl_array_nrows(drops);
+    if (n == 0)
+        return jl_nothing;
+    jl_value_t *out = NULL, *u = NULL, *c = NULL;
+    jl_array_t *mem = NULL, *done = NULL;
+    JL_GC_PUSH5(&out, &u, &c, &mem, &done);
+    out = (jl_value_t*)jl_alloc_vec_any(0);
+    done = jl_alloc_vec_any(0);
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        jl_value_t *tn = jl_array_ptr_ref(drops, i);
+        if (in_list(done, tn))
+            continue;
+        jl_array_ptr_1d_push(done, tn);
+        mem = jl_alloc_vec_any(0);
+        int every = 0;
+        for (size_t k = i; k + 1 < n; k += 2) {
+            if (jl_array_ptr_ref(drops, k) != tn)
+                continue;
+            jl_value_t *m = jl_array_ptr_ref(drops, k + 1);
+            if (m == (jl_value_t*)jl_any_type)
+                every = 1;
+            else if (!in_list(mem, m))
+                jl_array_ptr_1d_push(mem, m);
+        }
+        if (every || jl_array_nrows(mem) == 0)
+            u = (jl_value_t*)jl_any_type;
+        else
+            u = jl_type_union(jl_array_ptr_data(mem), jl_array_nrows(mem));
+        c = jl_membership_final_cell(u, tn);
+        jl_array_ptr_1d_push((jl_array_t*)out, c);
+    }
+    size_t nc = jl_array_nrows((jl_array_t*)out);
+    jl_svec_t *sv = jl_alloc_svec(nc);
+    for (size_t i = 0; i < nc; i++)
+        jl_svecset(sv, i, jl_array_ptr_ref((jl_array_t*)out, i));
+    JL_GC_POP();
+    return (jl_value_t*)sv;
 }
 
 // callback for typemap_visitor
@@ -7711,7 +7935,9 @@ static int ml_matches_visitor(jl_typemap_entry_t *ml, struct typemap_intersectio
         closure->match.env, meth,
         closure->match.issubty ? FULLY_COVERS : NOT_FULLY_COVERS);
     size_t len = jl_array_nrows(closure->t);
-    if (closure->match.issubty && only) {
+    // with the drops recorded every entry is visited: a method that meets no other at its insertion may
+    // meet one through a membership declared later (compiler §4.8)
+    if (closure->match.issubty && only && closure->drops == NULL) {
         if (len == 0)
             closure->t = (jl_value_t*)jl_alloc_vec_any(1);
         else if (len > 1)
@@ -8114,7 +8340,13 @@ static jl_value_t *ml_matches_i(jl_methtable_t *mt, jl_methcache_t *mc,
     };
     struct jl_typemap_assoc search = {(jl_value_t*)type, world, jl_emptysvec};
     jl_value_t *isect2 = NULL;
-    JL_GC_PUSH6(&env.t, &env.matc, &env.match.env, &search.env, &env.match.ti, &isect2);
+    env.drops = NULL;
+    JL_GC_PUSH7(&env.t, &env.matc, &env.match.env, &search.env, &env.match.ti, &isect2, &env.drops);
+    // a caller that records what the lookup relied on (inference) gets the drops a membership could undo
+    if (cells_out != NULL && ((jl_datatype_t*)unw)->has_open_set) {
+        env.drops = jl_alloc_vec_any(0);
+        env.match.dropped = ml_matches_dropped;
+    }
 
     if (mc) {
         // first check the leaf cache if the type might have been put in there
@@ -8207,6 +8439,39 @@ static jl_value_t *ml_matches_i(jl_methtable_t *mt, jl_methcache_t *mc,
     size_t i, j, len = jl_array_nrows(env.t);
     if (len > 0)
         len = drop_unmet_matches((jl_array_t*)env.t, len, cells_out);
+    if (env.drops != NULL && jl_array_nrows(env.drops) > 0) {
+        // the drops' cells beside the unmet matches' (compiler §4.8)
+        jl_value_t *dc = NULL, *nw = NULL;
+        JL_GC_PUSH2(&dc, &nw);
+        dc = drop_cells(env.drops);
+        env.drops = NULL;
+        if (jl_is_svec(dc) && !jl_is_svec(*cells_out)) {
+            *cells_out = dc;
+        }
+        else if (jl_is_svec(dc)) {
+            jl_value_t *acc = *cells_out;
+            size_t na = jl_svec_len(acc), nd = jl_svec_len(dc), nn = na;
+            nw = (jl_value_t*)jl_alloc_svec(na + nd);
+            for (size_t x = 0; x < na; x++)
+                jl_svecset(nw, x, jl_svecref(acc, x));
+            for (size_t y = 0; y < nd; y++) {
+                jl_value_t *cy = jl_svecref(dc, y);
+                int seen = 0;
+                for (size_t x = 0; x < na && !seen; x++)
+                    seen = jl_svecref(acc, x) == cy;
+                if (!seen)
+                    jl_svecset(nw, nn++, cy);
+            }
+            if (nn < na + nd) {
+                jl_svec_t *sh = jl_alloc_svec(nn);
+                for (size_t x = 0; x < nn; x++)
+                    jl_svecset(sh, x, jl_svecref(nw, x));
+                nw = (jl_value_t*)sh;
+            }
+            *cells_out = nw;
+        }
+        JL_GC_POP();
+    }
 
     // the 'minmax' method is a method that (1) fully-covers the queried type, and (2) is
     // more-specific than any other fully-covering method (but if !all_subtypes, there are

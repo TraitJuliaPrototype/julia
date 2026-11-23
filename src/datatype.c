@@ -512,8 +512,9 @@ static void absence_list_add(jl_typename_t *setname, jl_value_t *cell)
 }
 
 // The signature at which a negative of the pair (`member`, the set `set`) is relied on (W-141; compiler
-// §4.8): `Tuple{typeof(implements), Type{<:X}, Type{S}}`, with `Type{<:S}` for an abstract type, whose
-// negative says that no type under it is in the set. A membership's method that meets it ends the code
+// §4.8): `Tuple{typeof(implements), Type{<:X}, Type{S}}`, with `Type{<:S}` for a type that is not
+// concrete (an abstract type, a family, a union of the types a lookup dropped), whose negative says
+// that no type under it is in the set. A membership's method that meets it ends the code
 // that recorded it, as a method ends a call that found none. One object per pair in a session, so that
 // a frame's edges compare by identity.
 static jl_value_t *absence_sig(jl_value_t *member, jl_typename_t *setname)
@@ -525,7 +526,7 @@ static jl_value_t *absence_sig(jl_value_t *member, jl_typename_t *setname)
     JL_GC_PUSH5(&tvx, &tvm, &px, &pm, &sig);
     tvx = (jl_value_t*)jl_new_typevar(jl_symbol("X"), jl_bottom_type, setname->wrapper);
     px = jl_apply_type1((jl_value_t*)jl_type_type, tvx);
-    if (abstract_member(member))
+    if (abstract_member(member) || !jl_is_concrete_type(member))
         tvm = (jl_value_t*)jl_new_typevar(jl_symbol("S"), jl_bottom_type, member);
     pm = jl_apply_type1((jl_value_t*)jl_type_type, tvm ? tvm : member);
     jl_value_t *params[3] = {ft, px, pm};
@@ -626,7 +627,7 @@ static int type_declarers_loaded(jl_value_t *t, int depth)
 // Whether a type on `S`'s chain holds a pattern's entry whose variable is bounded by a type in which an open set
 // occurs (`Compiled{Z} where Z <: X`, the library's entries for the kept forms): `S` is in that pattern's set where
 // its parameter is under the bound, which a membership of the parameter changes (compiler §4.8, §6.9).
-static int chain_has_set_bounded_pattern(jl_datatype_t *S)
+int jl_chain_has_set_bounded_pattern(jl_datatype_t *S)
 {
     for (jl_datatype_t *d = S; d != NULL && d != jl_any_type; d = d->super) {
         jl_svec_t *list = jl_typename_memberships(d->name);
@@ -665,7 +666,7 @@ JL_DLLEXPORT int jl_membership_final(jl_value_t *S, jl_value_t *X)
         return 0;
     // a pattern of S's bounded by a set: whether S is in it rests on its parameter's memberships, whose pair is
     // not this one (`Compiled{S} <: X` once `S` joins `X`): not final
-    if (chain_has_set_bounded_pattern((jl_datatype_t*)S))
+    if (jl_chain_has_set_bounded_pattern((jl_datatype_t*)S))
         return 0;
     // a non-membership is relied on wherever it holds, while a declarer loads and for a type or set of
     // Main too (W-140, stage 2): the code records the pair's cell, and a membership declared later
