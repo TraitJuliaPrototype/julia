@@ -4734,18 +4734,98 @@ JL_DLLEXPORT jl_value_t *jl_membership_replay_sigs(jl_value_t *member, jl_value_
     return (jl_value_t*)out;
 }
 
+// The memberships through a pattern bounded by a set (compiler §5.5): an entry whose pattern's variable has a
+// bound that names one of `sets` (`Compiled{Z} where Z <: X`, the library's kept forms) puts under its own set
+// the pattern's types whose parameter is under the bound, which the membership being walked changes. Appends
+// [member, instance, ...] for each such entry live in `world` but the membership itself, and adds the sets each
+// entry's instance joins to `sets`, until no entry is added.
+static void membership_bounded_patterns(jl_array_t *sets, size_t world, jl_value_t *member0,
+                                        jl_value_t *inst0, jl_array_t *out)
+{
+    jl_array_t *more = NULL;
+    JL_GC_PUSH1(&more);
+    int added = 1;
+    while (added && jl_array_nrows(out) < 64) {
+        added = 0;
+        jl_genericmemory_t *tab = jl_set_entries;
+        if (tab == NULL)
+            break;
+        for (size_t t = 1; t < tab->length; t += 2) {
+            jl_value_t *list = jl_genericmemory_ptr_ref(tab, t);
+            if (list == NULL || !jl_is_array(list))
+                continue;
+            for (size_t i = 0; i < jl_array_nrows((jl_array_t*)list); i++) {
+                jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref((jl_array_t*)list, i);
+                if (en->min_world > world || jl_atomic_load_relaxed(&en->max_world) < world)
+                    continue;
+                if (!jl_is_unionall(en->member) || (en->member == member0 && en->instance == inst0))
+                    continue;
+                int seen = 0;
+                for (size_t k = 0; k + 1 < jl_array_nrows(out) && !seen; k += 2)
+                    seen = jl_array_ptr_ref(out, k) == en->member && jl_array_ptr_ref(out, k + 1) == en->instance;
+                if (seen)
+                    continue;
+                int bounded = 0;
+                for (jl_value_t *p = en->member; jl_is_unionall(p) && !bounded; p = ((jl_unionall_t*)p)->body) {
+                    jl_tvar_t *v = ((jl_unionall_t*)p)->var;
+                    for (size_t s = 0; s < jl_array_nrows(sets) && !bounded; s++) {
+                        jl_value_t *Yuw = jl_unwrap_unionall(jl_array_ptr_ref(sets, s));
+                        bounded = jl_is_datatype(Yuw) && set_name_nested(v->ub, ((jl_datatype_t*)Yuw)->name, 1, 1);
+                    }
+                }
+                if (!bounded)
+                    continue;
+                jl_array_ptr_1d_push(out, en->member);
+                jl_array_ptr_1d_push(out, en->instance);
+                more = jl_alloc_vec_any(0);
+                membership_superset_sets(en->instance, world, more);
+                for (size_t k = 0; k < jl_array_nrows(more); k++)
+                    if (!in_list(sets, jl_array_ptr_ref(more, k)))
+                        jl_array_ptr_1d_push(sets, jl_array_ptr_ref(more, k));
+                added = 1;
+                tab = jl_set_entries;
+                if (tab == NULL || t >= tab->length)
+                    break;
+                list = jl_genericmemory_ptr_ref(tab, t);
+                if (list == NULL || !jl_is_array(list))
+                    break;
+            }
+        }
+    }
+    JL_GC_POP();
+}
+
+static void membership_dispatch_walk_one(jl_value_t *member, jl_value_t *set_instance, size_t entry_min_world);
+
+// A membership's walk (compiler §5.5): the member, then the types it puts under a set through a pattern
+// bounded by a set (the kept forms at the member, `Compiled{S}`), each such pattern replayed as a member.
 JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *set_instance,
                                               size_t entry_min_world)
 {
     if (!jl_atomic_load_relaxed(&allow_new_worlds))
         return; // entries land at package *execution*, not serialization (M6 replays them)
+    membership_stats.declares++;
+    membership_dispatch_walk_one(member, set_instance, entry_min_world);
+    jl_array_t *sets = NULL, *derived = NULL;
+    JL_GC_PUSH2(&sets, &derived);
+    sets = jl_alloc_vec_any(0);
+    membership_superset_sets(set_instance, entry_min_world, sets);
+    derived = jl_alloc_vec_any(0);
+    membership_bounded_patterns(sets, entry_min_world, member, set_instance, derived);
+    for (size_t k = 0; k + 1 < jl_array_nrows(derived); k += 2)
+        membership_dispatch_walk_one(jl_array_ptr_ref(derived, k), jl_array_ptr_ref(derived, k + 1), entry_min_world);
+    jl_membership_log(member, set_instance, entry_min_world - 1);
+    JL_GC_POP();
+}
+
+static void membership_dispatch_walk_one(jl_value_t *member, jl_value_t *set_instance, size_t entry_min_world)
+{
     size_t max_world = entry_min_world - 1; // I5: align to entry visibility (n3 semantics), not the counter
     // gc slots: 0 sets, 1 targets, 2 ms, 3 oldmi, 4 oldvalue, 5 dummy_sig, 6 dummy,
     // 7 loctag, 8 isect, 9 isect2. JL_GC_PUSHARGS slots hold the values themselves,
     // so the address-taking consumers below point at &gc[k] directly.
     jl_value_t **gc;
     JL_GC_PUSHARGS(gc, 11);
-    membership_stats.declares++;
 
     jl_array_t *sets = (jl_array_t*)(gc[0] = (jl_value_t*)jl_alloc_vec_any(0));
     membership_superset_sets(set_instance, entry_min_world, sets);
@@ -4916,7 +4996,6 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
         gc[5] = NULL;
         gc[6] = NULL;
     }
-    jl_membership_log(member, set_instance, max_world);
     JL_GC_POP();
 }
 
@@ -4988,10 +5067,29 @@ static int membership_removal_backedges(jl_method_instance_t *mi, jl_value_t *su
 // or ambiguous ones ends. A call at the member that selected another method (the member's own) keeps its
 // code. Called under the world counter's lock, with the entry live in `world` and not after it, and
 // the membership's query world at `world`.
+static void membership_removal_walk_one(jl_value_t *member, jl_value_t *set_instance, size_t world, int derived);
+
 JL_DLLEXPORT void jl_membership_removal_walk(jl_value_t *member, jl_value_t *set_instance, size_t world)
 {
     if (!jl_atomic_load_relaxed(&allow_new_worlds))
         return;
+    membership_removal_walk_one(member, set_instance, world, 0);
+    // the types the membership put under a set through a pattern bounded by a set (the kept forms at the member)
+    jl_array_t *sets = NULL, *derived = NULL;
+    JL_GC_PUSH2(&sets, &derived);
+    sets = jl_alloc_vec_any(0);
+    membership_superset_sets(set_instance, world, sets);
+    derived = jl_alloc_vec_any(0);
+    membership_bounded_patterns(sets, world, member, set_instance, derived);
+    for (size_t k = 0; k + 1 < jl_array_nrows(derived); k += 2)
+        membership_removal_walk_one(jl_array_ptr_ref(derived, k), jl_array_ptr_ref(derived, k + 1), world, 1);
+    JL_GC_POP();
+}
+
+// `derived`: the member is a pattern bounded by a set, which holds other members' types too: an instance at a
+// type the method still takes after the membership ends keeps its code
+static void membership_removal_walk_one(jl_value_t *member, jl_value_t *set_instance, size_t world, int derived)
+{
     // gc slots: 0 sets, 1 targets, 2 ms / search, 3 shadowed, 4 the member's signature, 5 dummy, 6 isect, 7 isect2
     jl_value_t **gc;
     JL_GC_PUSHARGS(gc, 9);
@@ -5053,6 +5151,8 @@ JL_DLLEXPORT void jl_membership_removal_walk(jl_value_t *member, jl_value_t *set
                 if ((jl_value_t*)mi == jl_nothing || mi == NULL)
                     continue;
                 if (jl_has_empty_intersection((jl_value_t*)mi->specTypes, substsig))
+                    continue;
+                if (derived && jl_membership_holds_at((jl_value_t*)mi->specTypes, (jl_value_t*)m->sig, world + 1))
                     continue;
                 jl_array_ptr_1d_push(shadowed, (jl_value_t*)mi);
                 if (jl_subtype((jl_value_t*)mi->specTypes, substsig)) {
