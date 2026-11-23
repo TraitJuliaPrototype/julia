@@ -4732,19 +4732,16 @@ static void membership_visit_function(jl_typemap_t *map, jl_value_t *search, siz
     JL_GC_POP();
 }
 
-// What a membership's walk would replay, for the library's check before a pirate's membership under
-// strict mode (compiler §10.2): [method, signature, ...], each method at the set or at a set it joins,
-// with its signature at the member in the set's place; `nothing` where the walk has no such signature
-// and passes over the whole method. It reads the current world and changes nothing.
-JL_DLLEXPORT jl_value_t *jl_membership_replay_sigs(jl_value_t *member, jl_value_t *set_instance)
+// One member's replays (the member itself, or a pattern bounded by a set, as the walk replays each), appended to
+// `out` as [method, signature, ...]; a method already listed for this member from `from` on is not listed again.
+static void membership_replay_sigs_one(jl_value_t *member, jl_value_t *set_instance, size_t world,
+                                       jl_array_t *out, size_t from)
 {
-    jl_array_t *sets = NULL, *out = NULL;
+    jl_array_t *sets = NULL;
     jl_value_t *ms = NULL, *sub = NULL;
-    JL_GC_PUSH4(&sets, &out, &ms, &sub);
+    JL_GC_PUSH3(&sets, &ms, &sub);
     sets = jl_alloc_vec_any(0);
-    out = jl_alloc_vec_any(0);
-    JL_LOCK(&world_counter_lock);
-    membership_superset_sets(set_instance, jl_atomic_load_relaxed(&jl_world_counter), sets);
+    membership_superset_sets(set_instance, world, sets);
     for (size_t s = 0; s < jl_array_nrows(sets); s++) {
         jl_value_t *Yuw = jl_unwrap_unionall(jl_array_ptr_ref(sets, s));
         if (!jl_is_datatype(Yuw))
@@ -4753,7 +4750,7 @@ JL_DLLEXPORT jl_value_t *jl_membership_replay_sigs(jl_value_t *member, jl_value_
         for (size_t i = 0; i < jl_array_nrows((jl_array_t*)ms); i++) {
             jl_value_t *m = jl_array_ptr_ref((jl_array_t*)ms, i);
             size_t k;
-            for (k = 0; k < jl_array_nrows(out); k += 2)
+            for (k = from; k < jl_array_nrows(out); k += 2)
                 if (jl_array_ptr_ref(out, k) == m)
                     break;
             if (k < jl_array_nrows(out))
@@ -4769,11 +4766,11 @@ JL_DLLEXPORT jl_value_t *jl_membership_replay_sigs(jl_value_t *member, jl_value_
     // the methods whose lower bound the member meets (C-162), each at its own signature
     ms = (jl_value_t*)jl_alloc_vec_any(0);
     sub = (jl_value_t*)jl_alloc_vec_any(0);
-    lower_bound_targets(member, jl_atomic_load_relaxed(&jl_world_counter), (jl_array_t*)sub, (jl_array_t*)ms);
+    lower_bound_targets(member, world, (jl_array_t*)sub, (jl_array_t*)ms);
     for (size_t i = 0; i < jl_array_nrows((jl_array_t*)ms); i++) {
         jl_value_t *m = jl_array_ptr_ref((jl_array_t*)ms, i);
         size_t k;
-        for (k = 0; k < jl_array_nrows(out); k += 2)
+        for (k = from; k < jl_array_nrows(out); k += 2)
             if (jl_array_ptr_ref(out, k) == m)
                 break;
         if (k < jl_array_nrows(out)) {
@@ -4782,6 +4779,75 @@ JL_DLLEXPORT jl_value_t *jl_membership_replay_sigs(jl_value_t *member, jl_value_
         }
         jl_array_ptr_1d_push(out, m);
         jl_array_ptr_1d_push(out, jl_nothing);
+    }
+    JL_GC_POP();
+}
+
+static void membership_bounded_patterns(jl_array_t *sets, size_t world, jl_value_t *member0,
+                                        jl_value_t *inst0, jl_array_t *out);
+
+// A pattern whose outermost variable is bounded by one of `sets` (`Compiled{Z} where Z <: X`), with the member as that
+// variable's bound (`Compiled{Z} where Z <: S`): the types the membership puts under the set through the pattern. NULL
+// for any other shape.
+static jl_value_t *bounded_pattern_at_member(jl_value_t *p, jl_array_t *sets, jl_value_t *member)
+{
+    if (!jl_is_unionall(p))
+        return NULL;
+    jl_tvar_t *v = ((jl_unionall_t*)p)->var;
+    jl_value_t *ub = jl_unwrap_unionall(v->ub);
+    if (!jl_is_datatype(ub))
+        return NULL;
+    int named = 0;
+    for (size_t s = 0; s < jl_array_nrows(sets) && !named; s++) {
+        jl_value_t *Yuw = jl_unwrap_unionall(jl_array_ptr_ref(sets, s));
+        named = jl_is_datatype(Yuw) && ((jl_datatype_t*)Yuw)->name == ((jl_datatype_t*)ub)->name;
+    }
+    if (!named)
+        return NULL;
+    jl_tvar_t *nv = NULL;
+    jl_value_t *body = NULL;
+    JL_GC_PUSH2(&nv, &body);
+    nv = jl_new_typevar(v->name, v->lb, member);
+    body = jl_instantiate_unionall((jl_unionall_t*)p, (jl_value_t*)nv);
+    body = jl_type_unionall(nv, body);
+    JL_GC_POP();
+    return body;
+}
+
+// What a membership's walk would replay, for the library's check before a pirate's membership under
+// strict mode (compiler §10.2): [method, signature, ...], each method at the set or at a set it joins,
+// with its signature at the member in the set's place; `nothing` where the walk has no such signature
+// and passes over the whole method. Then the same for each pattern bounded by a set that the walk replays
+// as a member (§5.5: the kept forms at the member, `Compiled{S}`), at the pattern in the set's place. It
+// reads the current world and changes nothing.
+JL_DLLEXPORT jl_value_t *jl_membership_replay_sigs(jl_value_t *member, jl_value_t *set_instance)
+{
+    jl_array_t *sets = NULL, *out = NULL, *derived = NULL;
+    JL_GC_PUSH3(&sets, &out, &derived);
+    out = jl_alloc_vec_any(0);
+    JL_LOCK(&world_counter_lock);
+    size_t world = jl_atomic_load_relaxed(&jl_world_counter);
+    membership_replay_sigs_one(member, set_instance, world, out, 0);
+    sets = jl_alloc_vec_any(0);
+    membership_superset_sets(set_instance, world, sets);
+    derived = jl_alloc_vec_any(0);
+    membership_bounded_patterns(sets, world, member, set_instance, derived);
+    for (size_t k = 0; k + 1 < jl_array_nrows(derived); k += 2) {
+        // asked before the declaration, the pattern covers no type at the member yet: the types the membership adds
+        // under it are the pattern with the member as its variable's bound (`Compiled{Z} where Z <: S`)
+        jl_value_t *p = jl_array_ptr_ref(derived, k);
+        size_t from = jl_array_nrows(out);
+        jl_value_t *at = bounded_pattern_at_member(p, sets, member);
+        if (at == NULL) {
+            membership_replay_sigs_one(p, jl_array_ptr_ref(derived, k + 1), world, out, from);
+            for (size_t i = from + 1; i < jl_array_nrows(out); i += 2)
+                jl_array_ptr_set(out, i, jl_nothing); // no one signature says it: the method's own, as the walk's
+        }
+        else {
+            JL_GC_PUSH1(&at);
+            membership_replay_sigs_one(at, jl_array_ptr_ref(derived, k + 1), world, out, from);
+            JL_GC_POP();
+        }
     }
     JL_UNLOCK(&world_counter_lock);
     JL_GC_POP();
