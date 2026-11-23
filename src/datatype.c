@@ -720,6 +720,146 @@ static int same_inputs(jl_typename_t *tn, jl_value_t *a, jl_value_t *b)
     return 1;
 }
 
+// Memberships in package images ------------------------------------------------------
+// A package image keeps the memberships its own modules declared, also on another module's type, and
+// activates them at load in the world its methods are activated in, before its code is validated.
+
+// The memberships declared in this session, as [home TypeName, entry, ...]: an image built here keeps
+// those its own modules declared.
+jl_array_t *jl_declared_memberships JL_GLOBALLY_ROOTED = NULL;
+
+// The entries images activated in this session, in order: a library rebuilds the records it keeps of
+// a membership from them. An svec replaced copy-on-write under the world counter's lock, read without
+// a lock; never written into an image.
+_Atomic(jl_svec_t*) jl_activated_entries JL_GLOBALLY_ROOTED = NULL;
+
+static void note_activated(jl_membership_t *en)
+{
+    jl_svec_t *old = jl_atomic_load_relaxed(&jl_activated_entries);
+    size_t n = old ? jl_svec_len(old) : 0;
+    jl_svec_t *nw = jl_alloc_svec_uninit(n + 1);
+    for (size_t i = 0; i < n; i++)
+        jl_svecset(nw, i, jl_svecref(old, i));
+    jl_svecset(nw, n, (jl_value_t*)en);
+    jl_atomic_store_release(&jl_activated_entries, nw);
+}
+
+JL_DLLEXPORT size_t jl_activated_memberships_count(void)
+{
+    jl_svec_t *l = jl_atomic_load_acquire(&jl_activated_entries);
+    return l ? jl_svec_len(l) : 0;
+}
+
+// the list as it is (immutable): the caller reads from its own cursor
+JL_DLLEXPORT jl_value_t *jl_activated_memberships(void)
+{
+    jl_svec_t *l = jl_atomic_load_acquire(&jl_activated_entries);
+    return l ? (jl_value_t*)l : (jl_value_t*)jl_emptysvec;
+}
+
+// Would this image's entry give a member a second instance of its set, against the entries in force
+// at `world`? As a declaration's check.
+static int activation_conflicts(jl_membership_t *en, size_t world)
+{
+    if (!jl_is_concrete_type(en->member)) {
+        size_t mq = jl_set_membership_query_world(world);
+        int c = pattern_second_instance(en->member, en->instance, en->set, world);
+        jl_set_membership_query_world(mq);
+        return c;
+    }
+    jl_value_t *setuw = jl_unwrap_unionall(en->instance);
+    if (!jl_is_datatype(setuw))
+        return 0;
+    jl_value_t *at = NULL;
+    JL_GC_PUSH1(&at);
+    size_t mq = jl_set_membership_query_world(world);
+    at = set_at_inputs(((jl_datatype_t*)setuw)->name, (jl_datatype_t*)setuw);
+    int in_set = jl_subtype(en->member, at);
+    int in_instance = in_set && jl_subtype(en->member, en->instance);
+    jl_set_membership_query_world(mq);
+    JL_GC_POP();
+    return in_set && !in_instance;
+}
+
+// Activate an image's memberships, [home TypeName, entry, ...], under the world counter's lock and
+// before the image's code is validated: each entry the image wrote live is in force from `world`, the
+// world of the image's methods, its membership's method among them; one on another module's TypeName
+// joins that TypeName's list. An entry that would give its member a second instance of its set is
+// refused, with a warning, and its method retired.
+void jl_activate_memberships(jl_array_t *list, size_t world)
+{
+    size_t n = jl_array_nrows(list);
+    if (n > 0)
+        jl_membership_changed(world);   // the entries begin, or are refused, at `world`
+    jl_value_t *nd = NULL;
+    JL_GC_PUSH1(&nd);
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        jl_typename_t *home = (jl_typename_t*)jl_array_ptr_ref(list, i);
+        jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i + 1);
+        if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
+            continue;   // superseded while the image was built: never in force
+        en->min_world = world;
+        if (activation_conflicts(en, world)) {
+            // refused as at a declaration: never in force, and said
+            jl_atomic_store_release(&en->max_world, world - 1);
+            if (jl_is_method(en->method))
+                jl_membership_method_retire((jl_method_t*)en->method, world);
+            jl_printf(JL_STDERR, "WARNING: a package image's membership of ");
+            jl_static_show(JL_STDERR, en->member);
+            jl_printf(JL_STDERR, " in ");
+            jl_static_show(JL_STDERR, en->instance);
+            jl_printf(JL_STDERR, " is refused: the member is in the set at another instance already\n");
+            continue;
+        }
+        // every entry in force is in its set's index and in the session's list of activated entries,
+        // also one an image keeps on its own TypeName, which is on that TypeName's list already
+        index_entry(en);
+        note_activated(en);
+        jl_svec_t *old = jl_typename_memberships(home);
+        int present = 0;
+        for (size_t k = 0; k < jl_svec_len(old); k++) {
+            jl_membership_t *o = (jl_membership_t*)jl_svecref(old, k);
+            if (o == en) {
+                present = 1;
+                continue;
+            }
+            // as at a declaration: an older entry in force for the same member, set and inputs ends
+            // where this one begins
+            if (o->set == en->set && jl_atomic_load_relaxed(&o->max_world) == ~(uint64_t)0 &&
+                jl_types_equal(o->member, en->member) && same_inputs(en->set, o->instance, en->instance))
+                jl_atomic_store_release(&o->max_world, world - 1);
+        }
+        if (present)
+            continue;
+        nd = (jl_value_t*)jl_alloc_svec_uninit(jl_svec_len(old) + 1);
+        for (size_t k = 0; k < jl_svec_len(old); k++)
+            jl_svecset(nd, k, jl_svecref(old, k));
+        jl_svecset(nd, jl_svec_len(old), (jl_value_t*)en);
+        jl_atomic_store_release(&home->memberships, (jl_svec_t*)nd);
+        jl_gc_wb(home, nd);
+    }
+    JL_GC_POP();
+}
+
+// Once `world` is published: the walk and the ambiguity report for each activated entry, as at a
+// declaration, still under the world counter's lock.
+void jl_memberships_activated(jl_array_t *list, size_t world)
+{
+    size_t n = jl_array_nrows(list);
+    size_t mq = jl_set_membership_query_world(world);
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        jl_membership_t *en = (jl_membership_t*)jl_array_ptr_ref(list, i + 1);
+        if (jl_atomic_load_relaxed(&en->max_world) != ~(uint64_t)0)
+            continue;
+        // what it ends of the deep class is the membership's, named by its method
+        int pushed = jl_deep_ending_push("membership", en->method != jl_nothing ? en->method : (jl_value_t*)en);
+        jl_membership_dispatch_walk(en->member, en->instance, world);
+        jl_deep_ending_pop(pushed);
+        jl_membership_ambiguity_report(en->member, en->instance, world);
+    }
+    jl_set_membership_query_world(mq);
+}
+
 // The signature of a membership's method: `Tuple{typeof(implements), Type{X}, Type{S}}` under the member
 // pattern's variables; `Type{<:S}` for an abstract member, every type under which is a member. NULL
 // before Core defines `implements`.
@@ -856,6 +996,11 @@ JL_DLLEXPORT jl_value_t *jl_declare_membership(jl_value_t *member, jl_value_t *s
     entry = publish_entry(home, setname, member, set_instance, declarer, by, receiver, min_world,
                           mmeth != NULL ? (jl_value_t*)mmeth : jl_nothing);
     index_entry((jl_membership_t*)entry);
+    // the session's list, from which an image built here takes its own modules' memberships
+    if (jl_declared_memberships == NULL)
+        jl_declared_memberships = jl_alloc_vec_any(0);
+    jl_array_ptr_1d_push(jl_declared_memberships, (jl_value_t*)home);
+    jl_array_ptr_1d_push(jl_declared_memberships, entry);
     // what the membership ends of the deep class is the membership's, named by its method
     int pushed = jl_deep_ending_push("membership", mmeth != NULL ? (jl_value_t*)mmeth : entry);
     if (mmeth != NULL) {
