@@ -561,7 +561,7 @@ static int jl_typemap_intersection_node_visitor(jl_typemap_entry_t *ml, struct t
         // query at the set through them (compiler §5.5), though it names no set.
         int lbm = 0;
         if (!closure->skip_ranges && (jl_has_open_set_in((jl_value_t*)ml->sig) ||
-             (lbm = jl_sig_lower_bounds_have_memberships((jl_value_t*)ml->sig))) &&
+             (lbm = jl_method_sig_lower_bounds(ml->func.value, (jl_value_t*)ml->sig))) &&
             (closure->ti != (jl_value_t*)jl_bottom_type || jl_membership_range_is_fast(closure->world) || lbm ||
              jl_type_has_memberships(closure->type) || jl_type_has_kind(closure->type))) {
             size_t lo = closure->min_valid, hi = closure->max_valid;

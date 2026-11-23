@@ -2539,6 +2539,16 @@ static void index_lower_bound_method(jl_method_t *m)
 
 static void jl_index_open_set_methods(jl_method_t *m)
 {
+    // the mark a lookup reads before it asks whether a lower bound holds entries (`jl_method_sig_lower_bounds`):
+    // a method with no variable's lower bound at a covariant place, nearly every method, asks nothing
+    {
+        arraylist_t lbs;
+        arraylist_new(&lbs, 0);
+        jl_sig_lower_bounds((jl_value_t*)m->sig, &lbs, 0);
+        if (lbs.len > 0)
+            m->declared_covers |= JL_METHOD_SIG_LOWER_BOUND;
+        arraylist_free(&lbs);
+    }
     if (!jl_is_implements_sig(m->sig))
         index_lower_bound_method(m);
     if (!jl_has_open_set_in((jl_value_t*)m->sig)) // one bit; false for every Base method (I3)
@@ -8042,7 +8052,7 @@ static int ml_matches_visitor(jl_typemap_entry_t *ml, struct typemap_intersectio
     // a match that holds only through membership entries is valid only while
     // those entries live (I2: this is the dispatch-side world bound — inference
     // intersects it into sv.world.valid_worlds the way it does method worlds)
-    if (sig_has_open_set((jl_value_t*)ml->sig) || jl_sig_lower_bounds_have_memberships((jl_value_t*)ml->sig)) {
+    if (sig_has_open_set((jl_value_t*)ml->sig) || jl_method_sig_lower_bounds(ml->func.value, (jl_value_t*)ml->sig)) {
         size_t lo = 1, hi = ~(size_t)0;
         if (jl_membership_world_range(closure->match.ti, (jl_value_t*)ml->sig, closure->world, &lo, &hi)) {
             if (closure->match.min_valid < lo)

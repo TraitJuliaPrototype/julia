@@ -1038,6 +1038,16 @@ JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_type_has_kind(jl_value_t *t) JL_NOTSAFEPOINT;
 void jl_sig_lower_bounds(jl_value_t *t, arraylist_t *out, int depth) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_sig_lower_bounds_have_memberships(jl_value_t *sig) JL_NOTSAFEPOINT;
+// `Method.declared_covers` bit 2: the signature has a variable's lower bound at a covariant place (`jl_sig_lower_bounds`),
+// set where the method enters its table. Whether a lookup's entry `func` at `sig` has such a bound that holds membership
+// entries (compiler §5.3, §5.5): a method without the mark has none, and nothing is walked.
+#define JL_METHOD_SIG_LOWER_BOUND 4
+STATIC_INLINE int jl_method_sig_lower_bounds(jl_value_t *func, jl_value_t *sig) JL_NOTSAFEPOINT
+{
+    if (func != NULL && jl_is_method(func) && !(((jl_method_t*)func)->declared_covers & JL_METHOD_SIG_LOWER_BOUND))
+        return 0;
+    return jl_sig_lower_bounds_have_memberships(sig);
+}
 // whether call types hold an argument met only as an intersection no type of the world is in (datatype.c)
 JL_DLLEXPORT int jl_has_unmet_argument(jl_value_t *ti, size_t world);
 JL_DLLEXPORT jl_value_t *jl_unmet_final_cells(jl_value_t *spec);

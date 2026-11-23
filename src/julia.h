@@ -388,7 +388,8 @@ typedef struct _jl_method_t {
     _jl_purity_overrides_t purity;
     // a declared result (compiler §6.8): an upper bound of what the method returns, or NULL; and
     // bit 0: whether it covers every member of the sets the method is at (a trait's method for an
-    // operation); bit 1: the method serves no member, so it can only raise there (compiler §5.6)
+    // operation); bit 1: unused; bit 2: the signature has a variable's lower bound at a covariant place, which a
+    // membership can change the types under (compiler §5.5; `jl_method_sig_lower_bounds`)
     jl_value_t *declared_result;
     uint8_t declared_covers;
     // the policy flag (compiler §2.2), bits 0-1: 0 as its module says, 1 a boundary, 2 always facts;

@@ -3852,7 +3852,7 @@ void jl_init_types(void) JL_GC_DISABLED
                             jl_uint8_type,
                             jl_uint16_type,
                             jl_any_type,   // declared_result
-                            jl_uint8_type, // declared_covers: bit 0 covers every member
+                            jl_uint8_type, // declared_covers: bit 0 covers every member; bit 2 a lower bound at a covariant place
                             jl_uint8_type),
                         jl_emptysvec,
                         0, 1, 10);
