@@ -1035,6 +1035,8 @@ int jl_membership_range_is_fast(size_t world) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_t world, size_t *lo, size_t *hi);
 JL_DLLEXPORT int jl_type_has_memberships(jl_value_t *t) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_type_has_kind(jl_value_t *t) JL_NOTSAFEPOINT;
+void jl_sig_lower_bounds(jl_value_t *t, arraylist_t *out, int depth) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_sig_lower_bounds_have_memberships(jl_value_t *sig) JL_NOTSAFEPOINT;
 // whether call types hold an argument met only as an intersection no type of the world is in (datatype.c)
 JL_DLLEXPORT int jl_has_unmet_argument(jl_value_t *ti, size_t world);
 JL_DLLEXPORT jl_value_t *jl_unmet_final_cells(jl_value_t *spec);

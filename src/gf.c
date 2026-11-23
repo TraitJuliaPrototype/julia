@@ -2466,8 +2466,31 @@ JL_DLLEXPORT jl_value_t *jl_func_methods_at_sets(jl_value_t *ft)
     return ms ? ms : (jl_value_t*)jl_emptysvec;
 }
 
+// A method whose signature has a variable with a lower bound at a covariant place (`h(::Ph{T}) where T >: S`) is
+// listed under the key `nothing`: a membership of a type under the bound in a set changes which types are under the
+// signature (`Ph{X}`, once `S` joins `X`), though the signature names no set (compiler §5.5). Rare: twenty of
+// Base's methods (`T >: Missing`, `T >: Nothing`).
+static void index_lower_bound_method(jl_method_t *m)
+{
+    arraylist_t lbs;
+    arraylist_new(&lbs, 0);
+    jl_sig_lower_bounds((jl_value_t*)m->sig, &lbs, 0);
+    size_t n = lbs.len;
+    arraylist_free(&lbs);
+    if (n == 0)
+        return;
+    JL_LOCK(&open_set_methods_lock);
+    if (!open_set_methods)
+        open_set_methods = jl_alloc_vec_any(0);
+    jl_array_ptr_1d_push(open_set_methods, jl_nothing);
+    jl_array_ptr_1d_push(open_set_methods, (jl_value_t*)m);
+    JL_UNLOCK(&open_set_methods_lock);
+}
+
 static void jl_index_open_set_methods(jl_method_t *m)
 {
+    if (!jl_is_implements_sig(m->sig))
+        index_lower_bound_method(m);
     if (!jl_has_open_set_in((jl_value_t*)m->sig)) // one bit; false for every Base method (I3)
         return;
     if (jl_is_implements_sig(m->sig)) // a membership's method is no method at a set (W-141)
@@ -2519,6 +2542,53 @@ static jl_array_t *jl_methods_at_set(jl_typename_t *tn)
     JL_UNLOCK(&open_set_methods_lock);
     JL_GC_POP();
     return out;
+}
+
+// The methods with a lower bound (`index_lower_bound_method`) of which a bound meets the member `member` in `world`:
+// a membership of `member` changes which types are under them. Appended to `targets` where not there, and to `lb`.
+static void lower_bound_targets(jl_value_t *member, size_t world, jl_array_t *targets, jl_array_t *lb)
+{
+    jl_array_t *ms = NULL;
+    JL_GC_PUSH1(&ms);
+    ms = jl_methods_at_set((jl_typename_t*)jl_nothing);
+    size_t mq = jl_set_membership_query_world(world);
+    for (size_t i = 0; i < jl_array_nrows(ms); i++) {
+        jl_method_t *m = (jl_method_t*)jl_array_ptr_ref(ms, i);
+        arraylist_t lbs;
+        arraylist_new(&lbs, 0);
+        jl_sig_lower_bounds((jl_value_t*)m->sig, &lbs, 0);
+        int meets = 0;
+        for (size_t k = 0; k < lbs.len && !meets; k++) {
+            jl_value_t *b = (jl_value_t*)lbs.items[k];
+            // a bound that names a variable meets whatever its variable may be: conservatively, every member
+            meets = jl_has_free_typevars(b) || !jl_has_empty_intersection(b, member);
+        }
+        arraylist_free(&lbs);
+        if (!meets)
+            continue;
+        size_t k;
+        for (k = 0; k < jl_array_nrows(lb); k++)
+            if (jl_array_ptr_ref(lb, k) == (jl_value_t*)m)
+                break;
+        if (k < jl_array_nrows(lb))
+            continue;
+        jl_array_ptr_1d_push(lb, (jl_value_t*)m);
+        for (k = 0; k < jl_array_nrows(targets); k++)
+            if (jl_array_ptr_ref(targets, k) == (jl_value_t*)m)
+                break;
+        if (k == jl_array_nrows(targets))
+            jl_array_ptr_1d_push(targets, (jl_value_t*)m);
+    }
+    jl_set_membership_query_world(mq);
+    JL_GC_POP();
+}
+
+static int in_list(jl_array_t *a, jl_value_t *x) JL_NOTSAFEPOINT
+{
+    for (size_t k = 0; k < jl_array_nrows(a); k++)
+        if (jl_array_ptr_ref(a, k) == x)
+            return 1;
+    return 0;
 }
 
 // The table of a call's targets (compiler §7.3; Compiler/src/splittable.jl, `SplitTable`): one table
@@ -4633,6 +4703,23 @@ JL_DLLEXPORT jl_value_t *jl_membership_replay_sigs(jl_value_t *member, jl_value_
             jl_array_ptr_1d_push(out, clean == 1 && sub != NULL ? sub : jl_nothing); // 3: the method's own
         }
     }
+    // the methods whose lower bound the member meets (C-162), each at its own signature
+    ms = (jl_value_t*)jl_alloc_vec_any(0);
+    sub = (jl_value_t*)jl_alloc_vec_any(0);
+    lower_bound_targets(member, jl_atomic_load_relaxed(&jl_world_counter), (jl_array_t*)sub, (jl_array_t*)ms);
+    for (size_t i = 0; i < jl_array_nrows((jl_array_t*)ms); i++) {
+        jl_value_t *m = jl_array_ptr_ref((jl_array_t*)ms, i);
+        size_t k;
+        for (k = 0; k < jl_array_nrows(out); k += 2)
+            if (jl_array_ptr_ref(out, k) == m)
+                break;
+        if (k < jl_array_nrows(out)) {
+            jl_array_ptr_set(out, k + 1, jl_nothing);
+            continue;
+        }
+        jl_array_ptr_1d_push(out, m);
+        jl_array_ptr_1d_push(out, jl_nothing);
+    }
     JL_UNLOCK(&world_counter_lock);
     JL_GC_POP();
     return (jl_value_t*)out;
@@ -4648,7 +4735,7 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
     // 7 loctag, 8 isect, 9 isect2. JL_GC_PUSHARGS slots hold the values themselves,
     // so the address-taking consumers below point at &gc[k] directly.
     jl_value_t **gc;
-    JL_GC_PUSHARGS(gc, 10);
+    JL_GC_PUSHARGS(gc, 11);
     membership_stats.declares++;
 
     jl_array_t *sets = (jl_array_t*)(gc[0] = (jl_value_t*)jl_alloc_vec_any(0));
@@ -4668,6 +4755,9 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
         }
     }
     gc[2] = NULL;
+    // the methods whose lower bound the member meets (C-162): the membership adds the set's types under them
+    jl_array_t *lbt = (jl_array_t*)(gc[10] = (jl_value_t*)jl_alloc_vec_any(0));
+    lower_bound_targets(member, entry_min_world, targets, lbt);
 
     for (size_t i = 0; i < jl_array_nrows(targets); i++) {
         jl_method_t *m = (jl_method_t*)jl_array_ptr_ref(targets, i);
@@ -4678,6 +4768,12 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
         // rooted at once: the member's signature can be a fresh UnionAll, and the search type below
         // allocates (open issue 189: unrooted, a collection there left the typemap entry a freed object)
         jl_value_t *substsing = gc[5] = membership_subst_sig(m, sets, member, &clean);
+        if (clean != 0 && in_list(lbt, (jl_value_t*)m)) {
+            // a lower bound: no one signature with the member says what the membership adds there; the replay
+            // is at the method's own signature, where a call that matched it before keeps its code
+            clean = 3;
+            substsing = gc[5] = (jl_value_t*)m->sig;
+        }
         if (clean == 2)
             continue; // m names the set only at other instances: the membership does not reach it
         membership_stats.replays++;
@@ -4889,7 +4985,7 @@ JL_DLLEXPORT void jl_membership_removal_walk(jl_value_t *member, jl_value_t *set
         return;
     // gc slots: 0 sets, 1 targets, 2 ms / search, 3 shadowed, 4 the member's signature, 5 dummy, 6 isect, 7 isect2
     jl_value_t **gc;
-    JL_GC_PUSHARGS(gc, 8);
+    JL_GC_PUSHARGS(gc, 9);
     jl_array_t *sets = (jl_array_t*)(gc[0] = (jl_value_t*)jl_alloc_vec_any(0));
     membership_superset_sets(set_instance, world, sets);
     jl_array_t *targets = (jl_array_t*)(gc[1] = (jl_value_t*)jl_alloc_vec_any(0));
@@ -4907,6 +5003,8 @@ JL_DLLEXPORT void jl_membership_removal_walk(jl_value_t *member, jl_value_t *set
         }
     }
     gc[2] = NULL;
+    jl_array_t *lbt = (jl_array_t*)(gc[8] = (jl_value_t*)jl_alloc_vec_any(0));
+    lower_bound_targets(member, world, targets, lbt);
     for (size_t i = 0; i < jl_array_nrows(targets); i++) {
         jl_method_t *m = (jl_method_t*)jl_array_ptr_ref(targets, i);
         jl_methtable_t *mt = jl_method_get_table(m);
@@ -4914,6 +5012,10 @@ JL_DLLEXPORT void jl_membership_removal_walk(jl_value_t *member, jl_value_t *set
             continue;
         int clean = 1;
         jl_value_t *substsig = gc[4] = membership_subst_sig(m, sets, member, &clean);
+        if (clean != 0 && in_list(lbt, (jl_value_t*)m)) {
+            clean = 3; // a lower bound (C-162): the method's own signature
+            substsig = gc[4] = (jl_value_t*)m->sig;
+        }
         if (clean == 2)
             continue; // m names the set only at other instances
         jl_value_t *search = gc[2] = method_function_search_type(m);
@@ -7487,7 +7589,7 @@ static int ml_matches_visitor(jl_typemap_entry_t *ml, struct typemap_intersectio
     // a match that holds only through membership entries is valid only while
     // those entries live (I2: this is the dispatch-side world bound — inference
     // intersects it into sv.world.valid_worlds the way it does method worlds)
-    if (sig_has_open_set((jl_value_t*)ml->sig)) {
+    if (sig_has_open_set((jl_value_t*)ml->sig) || jl_sig_lower_bounds_have_memberships((jl_value_t*)ml->sig)) {
         size_t lo = 1, hi = ~(size_t)0;
         if (jl_membership_world_range(closure->match.ti, (jl_value_t*)ml->sig, closure->world, &lo, &hi)) {
             if (closure->match.min_valid < lo)

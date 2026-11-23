@@ -557,8 +557,12 @@ static int jl_typemap_intersection_node_visitor(jl_typemap_entry_t *ml, struct t
         // common case: a non-member of the set), and then nothing narrows the range.
         // A query at a kind meets the set where the set takes a type value: that rests on the set's
         // entries for type values, held on no type of the query (compiler §4.10).
-        if (!closure->skip_ranges && jl_has_open_set_in((jl_value_t*)ml->sig) &&
-            (closure->ti != (jl_value_t*)jl_bottom_type || jl_membership_range_is_fast(closure->world) ||
+        // A signature whose variable's lower bound holds membership entries (`h(::Ph{T}) where T >: S`) meets a
+        // query at the set through them (compiler §5.5), though it names no set.
+        int lbm = 0;
+        if (!closure->skip_ranges && (jl_has_open_set_in((jl_value_t*)ml->sig) ||
+             (lbm = jl_sig_lower_bounds_have_memberships((jl_value_t*)ml->sig))) &&
+            (closure->ti != (jl_value_t*)jl_bottom_type || jl_membership_range_is_fast(closure->world) || lbm ||
              jl_type_has_memberships(closure->type) || jl_type_has_kind(closure->type))) {
             size_t lo = closure->min_valid, hi = closure->max_valid;
             if (jl_membership_world_range(closure->type, (jl_value_t*)ml->sig, closure->world, &lo, &hi)) {
