@@ -921,6 +921,28 @@ function only_vararg_widened(@nospecialize(atype), @nospecialize(new))
     return true
 end
 
+"""
+Whether a signature knows each argument's type but at arguments known only by their trait (a set
+instance with its parameters, or an intersection of such), with every static parameter bound: in a
+closed build the instance at it is the one that runs.
+"""
+function closed_set_signature(@nospecialize(atype), sparams::SimpleVector)
+    atype isa DataType || return false
+    for s in sparams
+        isa(s, TypeVar) && return false
+    end
+    ps = atype.parameters
+    trait = false
+    for i in 1:length(ps)
+        p = ps[i]
+        isvarargtype(p) && return false
+        isdispatchelem(p) && continue
+        (!has_free_typevars(p) && is_trait_arg_type(p)) || return false
+        trait = true
+    end
+    return trait
+end
+
 function compileable_specialization(code::Union{MethodInstance,CodeInstance}, effects::Effects,
     et::InliningEdgeTracker, @nospecialize(info::CallInfo), state::InliningState)
     mi = code isa CodeInstance ? get_ci_mi(code) : code
@@ -934,7 +956,11 @@ function compileable_specialization(code::Union{MethodInstance,CodeInstance}, ef
     # stay: they are what keeps the number of compiled specializations small.
     exact = isdispatchtuple(atype) ? get(code_cache(state), mi, nothing) : nothing
     if OptimizationParams(state.interp).compilesig_invokes
-        new_atype = get_compileable_sig(method, atype, sparams)
+        # a closed build: a call that does not know its argument's member runs the
+        # method's instance at the argument's type, the set; the instance's operations branch over the
+        # members. A session leaves such a call to dispatch when it runs.
+        new_atype = closed_build(state.interp) && closed_set_signature(atype, sparams) ? atype :
+                    get_compileable_sig(method, atype, sparams)
         new_atype === nothing && return nothing
         if atype !== new_atype && !(exact isa CodeInstance && only_vararg_widened(atype, new_atype))
             sp_ = ccall(:jl_type_intersection_with_env, Any, (Any, Any), new_atype, method.sig)::SimpleVector
@@ -1599,9 +1625,10 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
     cases, handled_all_cases, fully_covered, joint_effects = cases
     atype = argtypes_to_type(sig.argtypes)
     atype === Union{} && return nothing # accidentally actually unreachable
-    # an operation's split: never fully covered, its branches asserted
+    # an operation's split: never fully covered, its branches asserted; a `Callable`'s (a closed
+    # build's) checked as the box's call checks
     fallback_rt = split ? info.rt : nothing
-    kind = UInt32(0)
+    kind = split && callable_set_type(widenconst(sig.ft)) ? IR_FLAG_TRUSTED_CALLABLE : UInt32(0)
     # (a closed build's split with no branch, a set with no member: the `MethodError` below)
     if fallback_rt !== nothing && isempty(cases) && !((info::SplitCallInfo).closed && handled_all_cases)
         inst = ir[SSAValue(idx)]
