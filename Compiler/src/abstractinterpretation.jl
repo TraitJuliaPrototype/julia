@@ -287,6 +287,42 @@ function declared_field_in(@nospecialize(c), name::Symbol, depth::Int)
     return nothing
 end
 
+const MAX_OPERATION_SPLITS = 4
+# The split of an operation's call: the first argument typed by a set instance, an
+# intersection or a closed abstract type with a contract, and the union of the first
+# `MAX_OPERATION_SPLITS` candidates of its set or type that are of that type (at an intersection, the
+# first component's candidates that are members of all). The candidates are read without an edge: a
+# member registered later reaches the fallback.
+function operation_split_type(@nospecialize(atype))
+    tt = unwrap_unionall(atype)::DataType
+    # asserted: at an argument typed `Type{Tuple{…}}` (a specialization of the image) the field infers `Any`
+    ps = getfield(tt, :parameters)::SimpleVector
+    for i = 2:length(ps)
+        p = ps[i]
+        isvarargtype(p) && break
+        (isconcretetype(p) || has_free_typevars(p)) && continue
+        u = unwrap_unionall(p)
+        u isa DataType || continue
+        X = u
+        if u.name === (unwrap_unionall(Core.All)::DataType).name
+            X = (u.parameters[1]::DataType).parameters[1]
+        end
+        (ccall(:jl_is_open_set, Cint, (Any,), X) != 0 || ccall(:jl_has_contract, Cint, (Any,), X) != 0) || continue
+        cands = ccall(:jl_candidates_of, Any, (Any,), X)::Vector{Any}
+        U = Union{}
+        n = 0
+        for C in cands
+            n < MAX_OPERATION_SPLITS || break
+            C <: p || continue
+            U = Union{U, C}
+            n += 1
+        end
+        n == 0 && return nothing
+        return (i, U)
+    end
+    return nothing
+end
+
 # The effects of a call whose result is a declared result its members' own code is not checked against:
 # `TRUSTED_CALLABLE` or `TRUSTED_OPERATION`
 trusted_effects(interp::AbstractInterpreter, bits::UInt8, effects::Effects = Effects()) =
@@ -307,7 +343,8 @@ end
 
 function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(func),
                                   arginfo::ArgInfo, si::StmtInfo, @nospecialize(atype),
-                                  sv::AbsIntState, max_methods::Int)
+                                  sv::AbsIntState, max_methods::Int;
+                                  operation::Bool = true)
     𝕃ₚ, 𝕃ᵢ = ipo_lattice(interp), typeinf_lattice(interp)
     ⊑ₚ, ⊔ₚ, ⊔ᵢ  = partialorder(𝕃ₚ), join(𝕃ₚ), join(𝕃ᵢ)
     argtypes = arginfo.argtypes
@@ -315,15 +352,34 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         add_remark!(interp, sv, "Cannot infer call, because we previously saw :latestworld")
         return Future(CallMeta(Any, Any, unedged_effects(interp), NoCallInfo()))
     end
-    # an operation of a set at a receiver typed by the set: the operation's declared result, the call
-    # left to dispatch and its result asserted
-    drt = declared_operation_result(interp, argtypes, atype)
+    # an operation of a set at a receiver typed by the set
+    # (not at a split's own branches: they are the split already)
+    drt = operation ? declared_operation_result(interp, argtypes, atype) : nothing
     if drt !== nothing
         # (trusted: a member's own instance is not checked against the declared result in every world
         # it runs in, a member of a pattern before its first use among them; nothing is trusted where
         # the result is `Any`)
         opeffects = drt === Any ? Effects() : trusted_effects(interp, TRUSTED_OPERATION)
-        return Future(CallMeta(drt, Any, opeffects, DeclaredResultInfo(drt)))
+        split = operation_split_type(atype)
+        split === nothing && return Future(CallMeta(drt, Any, opeffects, DeclaredResultInfo(drt)))
+        # asserted, as the compiler's own results are: inferred while the compiler bootstraps itself,
+        # an untyped index made `newargs[i]` a dynamic call whose edges any new integer constructor
+        # invalidated, and the compiler with it
+        i, U = split::Tuple{Int,Type}
+        newargs = copy(argtypes)
+        newargs[i] = U
+        # each branch knows the value's type, a candidate: a branch served by a method at the set runs
+        # that method's instance for the candidate, as Julia compiles it, and the branch's case is the
+        # candidate, never the set (which would cover the values past the candidates)
+        call = abstract_call_gf_by_type(interp, func, ArgInfo(nothing, newargs), si,
+                                        argtypes_to_type(newargs), sv, max_methods;
+                                        operation = false)::Future
+        # (the declared result in a box: a closure over a type is a closure type of its own per type,
+        # compiled in each session for each declared result)
+        drtbox = RefValue{Any}(drt)
+        return Future{CallMeta}(call, interp, sv) do call, _, _
+            CallMeta(drtbox[], Any, opeffects, SplitCallInfo(call.info, drtbox[]))
+        end
     end
     matches = find_method_matches(interp, argtypes, atype; max_methods)
     if isa(matches, FailedMethodMatch)
