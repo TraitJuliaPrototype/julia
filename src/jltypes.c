@@ -575,7 +575,8 @@ static int simple_subtype(jl_value_t *a, jl_value_t *b, int hasfree, int isUnion
         if (!mergeable) // issue #24521: don't merge Type{T} where typeof(T) varies
             mergeable = !(jl_is_type_type(a) && jl_is_type_type(b) &&
              jl_typeof(jl_tparam0(a)) != jl_typeof(jl_tparam0(b)));
-        return mergeable && jl_subtype(a, b);
+        // a membership never absorbs: a type expression gives the same type in every world
+        return mergeable && jl_subtype_declared(a, b);
     }
     if (jl_is_typevar(a)) {
         jl_value_t *na = ((jl_tvar_t*)a)->ub;
@@ -721,8 +722,9 @@ static int simple_subtype2(jl_value_t *a, jl_value_t *b, int hasfree, int isUnio
         subab = subba = 1;
     }
     else {
-        subab = jl_subtype(a, b);
-        subba = jl_subtype(b, a);
+        // a membership never absorbs
+        subab = jl_subtype_declared(a, b);
+        subba = jl_subtype_declared(b, a);
     }
     return subab | (subba<<1);
 }
