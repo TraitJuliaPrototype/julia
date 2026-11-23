@@ -299,12 +299,14 @@ those the build has. The rules apply to what the build compiles for its output, 
 """
 closed_build() = CLOSED_OUTPUT[] && JLOptions().trim != 0
 const CLOSED_OUTPUT = RefValue(false)
-# inference by a closed build's rules
+# inference by a closed build's rules: in a build, and in the build's check run in a session
 closed_build(::AbstractInterpreter) = closed_build()
+closed_build(interp::NativeInterpreter) = interp.closed !== nothing || closed_build()
 # A build's process notes, from its start, the instances its output compile infers again by the closed rules
 # (`note_closed_operation!`): code inferred while the build loads its program is inferred as in a session.
 closed_process() = JLOptions().trim != 0
 closed_process(::AbstractInterpreter) = closed_process()
+closed_process(interp::NativeInterpreter) = interp.closed !== nothing || closed_process()
 
 # The types a closed build forgets, and where: the concrete type of each value its
 # compiled code passes to a place whose type does not keep it (a field, an array's element, a variable,

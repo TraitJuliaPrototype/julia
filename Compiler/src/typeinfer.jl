@@ -1413,7 +1413,8 @@ function ci_has_source(interp::AbstractInterpreter, code::CodeInstance)
     if isa(inf, String)
         inf = _uncompressed_ir(code, inf)
     end
-    if code.owner === nothing
+    if code.owner === nothing || (interp isa NativeInterpreter && code.owner === cache_owner(interp))
+        # (also the code of a closed build's check: the native interpreter's, under an owner of its own)
         if isa(inf, CodeInfo)
             codegen[code] = inf
             return true
@@ -1553,15 +1554,20 @@ struct CompilationQueue
     tocompile::Vector{QueueItems}
     inspected::IdSet{QueueItems}
     interp::Union{AbstractInterpreter,Nothing}
+    # per method, the instances queued because an invoke names them and not their code (`collectinvokes!`)
+    named::IdDict{Any,Int}
 
     CompilationQueue(;
         interp::Union{AbstractInterpreter,Nothing}
-    ) = new(QueueItems[], IdSet{QueueItems}(), interp)
+    ) = new(QueueItems[], IdSet{QueueItems}(), interp, IdDict{Any,Int}())
 
     CompilationQueue(queue::CompilationQueue;
         interp::Union{AbstractInterpreter,Nothing}
-    ) = new(empty!(queue.tocompile), empty!(queue.inspected), interp)
+    ) = new(empty!(queue.tocompile), empty!(queue.inspected), interp, empty!(queue.named))
 end
+# An invoke that names its instance is followed for at most this many instances of one method: a call
+# that inference limited (a recursion over growing types) names a new instance at each step
+const MAX_NAMED_INSTANCES = 4
 
 Base.push!(queue::CompilationQueue, item) = push!(queue.tocompile, item)
 Base.append!(queue::CompilationQueue, items) = append!(queue.tocompile, items)
@@ -1597,7 +1603,8 @@ is_threads_call_def(@nospecialize def) = def isa Method && is_base_threads_metho
 # collect a list of all code that is needed along with CodeInstance to codegen it fully
 function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vector{VarState};
                          invokelatest_queue::Union{CompilationQueue,Nothing} = nothing,
-                         external_linkage::Bool = false)
+                         external_linkage::Bool = false,
+                         instances::Bool = false)
     src = ci.code
     for i = 1:length(src)
         stmt = src[i]
@@ -1611,6 +1618,20 @@ function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vec
                     (isexpr(stmt, :invoke_modify) ||
                      !(external_linkage && ci_from_image(edge) && ci_has_invoke(edge)))
                 push!(workqueue, edge)
+            elseif instances && edge isa MethodInstance
+                # (a build's queue only: the JIT's queue holds code instances) an invoke that names
+                # its instance and not its code: a body inlined from an image's cache, where code
+                # instances are stored as their method instances. The instance is compiled as any
+                # other target. A call that inference limited names its instance too, a new one at
+                # each step of a recursion over growing types: a method's instances are followed
+                # up to a bound, and past it the invoke stays unresolved
+                if !isinspected(workqueue, edge)
+                    n = get(workqueue.named, edge.def, 0)
+                    if n < MAX_NAMED_INSTANCES
+                        workqueue.named[edge.def] = n + 1
+                        push!(workqueue, edge)
+                    end
+                end
             end
         end
         if invokelatest_queue !== nothing && isexpr(stmt, :invoke)
@@ -1801,7 +1822,7 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             markinspected!(workqueue, callee)
             if src isa CodeInfo
                 sptypes = sptypes_from_meth_instance(mi)
-                collectinvokes!(workqueue, src, sptypes; invokelatest_queue, external_linkage)
+                collectinvokes!(workqueue, src, sptypes; invokelatest_queue, external_linkage, instances = true)
                 # an image holds the code a facts run-time site reaches whatever the values
                 if invokelatest_queue !== nothing && callee.owner === nothing && ci_policy_facts(callee)
                     for target in rtsite_targets(interp, src, sptypes)
@@ -2144,6 +2165,68 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
         verify_typeinf_trim(codeinfos, trim_mode == TRIM_UNSAFE_WARN)
     end
     return codeinfos
+end
+
+"""
+    closed_check(mis::Vector{Any}, world::UInt, overlay = nothing) -> (errors, parents, members, rounds)
+
+The closed build's check, run in a session: the method instances `mis` and what
+they reach are inferred by a closed build's rules, every method plainly, in the build's rounds, into
+a cache of their own, and verified by the build's verifier. `errors` lists the calls a build from
+`mis` would refuse (`TrimVerifier.CallMissing`, each with `false` for an error, `true` for a call
+that only raises); `parents` gives each instance's caller; `members` each set type a split was made
+at, with its members of that type; `rounds` the number of rounds. The session's code is not touched: the
+check's code has an owner of its own, a fresh object. `overlay` holds the methods the build replaces
+in Base: the check infers and verifies with them laid over the session's.
+"""
+function closed_check(mis::Vector{Any}, world::UInt, overlay::Union{Nothing,MethodTable} = nothing)
+    owner = ClosedCheck(overlay)
+    inf_params = InferenceParams(; force_enable_inference = true)
+    mq = ccall(:jl_set_membership_query_world, UInt, (UInt,), world)
+    codeinfos = []
+    try
+        empty!(CLOSED_OPERATION_INSTANCES)
+        closed_used_reset!()
+        rounds = 0
+        while true
+            empty!(CLOSED_CANDIDATE_COUNTS)
+            codeinfos = []
+            interp = NativeInterpreter(world; inf_params, closed = owner)
+            latest_queue = CompilationQueue(; interp)
+            workqueue = CompilationQueue(; interp)
+            append!(workqueue, mis)
+            compile!(codeinfos, workqueue; invokelatest_queue = latest_queue, external_linkage = false)
+            compile!(codeinfos, latest_queue; invokelatest_queue = latest_queue, external_linkage = false)
+            closed_note_used!(codeinfos)
+            (rounds < 16 && closed_candidates_grew()) || closed_no_member_round(rounds) || break
+            rounds += 1
+            stale = IdSet{Any}()
+            closed_build_reinfer!(world, stale, owner)
+            closed_invalidate_callers!(codeinfos, stale, world, owner)
+        end
+        # each set type a split was made at, with its members of that type
+        members = Pair{Any,Vector{Any}}[]
+        for (X, _) in CLOSED_CANDIDATE_COUNTS
+            c = closed_candidates(X)
+            c === nothing && continue
+            mx = Any[]
+            for C in c
+                C <: X && push!(mx, C)
+            end
+            push!(members, Pair{Any,Vector{Any}}(X, mx))
+        end
+        errors, parents = Core._call_in_world(_verify_trim_world_age[], TrimVerifier.get_verify_typeinf_trim, codeinfos, owner, world)
+        return errors, parents, members, rounds + 1
+    finally
+        # the check's code ends with the check
+        for item in codeinfos
+            item isa CodeInstance && item.owner === owner && closed_end_code!(item, world)
+        end
+        empty!(CLOSED_OPERATION_INSTANCES)
+        closed_used_reset!()
+        empty!(CLOSED_CANDIDATE_COUNTS)
+        ccall(:jl_set_membership_query_world, UInt, (UInt,), mq)
+    end
 end
 
 const _verify_trim_world_age = RefValue{UInt}(typemax(UInt))
