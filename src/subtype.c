@@ -1800,6 +1800,121 @@ JL_DLLEXPORT int jl_membership_world_range(jl_value_t *t, jl_value_t *sig, size_
     return found;
 }
 
+// the TypeNames of the open sets that occur in t: through parameters, unions, UnionAlls (a
+// variable's lower and upper bound), varargs and an intersection's components
+static void open_sets_in(jl_value_t *t, arraylist_t *out) JL_NOTSAFEPOINT
+{
+    if (t == NULL)
+        return;
+    if (jl_is_unionall(t)) {
+        open_sets_in(((jl_unionall_t*)t)->var->lb, out);
+        open_sets_in(((jl_unionall_t*)t)->var->ub, out);
+        open_sets_in(((jl_unionall_t*)t)->body, out);
+        return;
+    }
+    if (jl_is_uniontype(t)) {
+        open_sets_in(((jl_uniontype_t*)t)->a, out);
+        open_sets_in(((jl_uniontype_t*)t)->b, out);
+        return;
+    }
+    if (jl_is_vararg(t)) {
+        open_sets_in(jl_unwrap_vararg(t), out);
+        return;
+    }
+    if (!jl_is_datatype(t) || !((jl_datatype_t*)t)->has_open_set)
+        return;
+    jl_typename_t *tn = ((jl_datatype_t*)t)->name;
+    if (tn->open_set) {
+        size_t i;
+        for (i = 0; i < out->len; i++)
+            if (out->items[i] == tn)
+                break;
+        if (i == out->len)
+            arraylist_push(out, tn);
+    }
+    for (size_t i = 0; i < jl_nparams(t); i++)
+        open_sets_in(jl_tparam(t, i), out);
+}
+
+// the entries live in `world` on a TypeName reachable from t (through parameters, a variable's
+// bounds, supertypes and entries' instances) whose set reaches one of `targets`
+static void membership_entries_visit(jl_value_t *t, size_t world, arraylist_t *targets,
+                                     arraylist_t *out, arraylist_t *seen)
+{
+    if (t == NULL)
+        return;
+    if (jl_is_unionall(t)) {
+        membership_entries_visit(((jl_unionall_t*)t)->var->lb, world, targets, out, seen);
+        membership_entries_visit(((jl_unionall_t*)t)->var->ub, world, targets, out, seen);
+        membership_entries_visit(((jl_unionall_t*)t)->body, world, targets, out, seen);
+        return;
+    }
+    if (jl_is_uniontype(t)) {
+        membership_entries_visit(((jl_uniontype_t*)t)->a, world, targets, out, seen);
+        membership_entries_visit(((jl_uniontype_t*)t)->b, world, targets, out, seen);
+        return;
+    }
+    if (jl_is_vararg(t)) {
+        membership_entries_visit(jl_unwrap_vararg(t), world, targets, out, seen);
+        return;
+    }
+    if (!jl_is_datatype(t))
+        return;
+    jl_datatype_t *dt = (jl_datatype_t*)t;
+    for (size_t i = 0; i < jl_nparams(dt); i++)
+        membership_entries_visit(jl_tparam(dt, i), world, targets, out, seen);
+    for (jl_datatype_t *d = dt; d != NULL && d != jl_any_type; d = d->super) {
+        size_t i;
+        for (i = 0; i < seen->len; i++)
+            if (seen->items[i] == d->name)
+                break;
+        if (i < seen->len)
+            continue;
+        arraylist_push(seen, d->name);
+        jl_svec_t *list = jl_typename_memberships(d->name);
+        for (i = 0; i < jl_svec_len(list); i++) {
+            jl_membership_t *en = (jl_membership_t*)jl_svecref(list, i);
+            if (!entry_live(en, world))
+                continue;
+            int relevant = 0;
+            for (size_t k = 0; k < targets->len && !relevant; k++) {
+                jl_typename_t *to = (jl_typename_t*)targets->items[k];
+                relevant = en->set == to || jl_typename_reaches(en->set, to, world);
+            }
+            if (!relevant)
+                continue;
+            arraylist_push(out, en);
+            membership_entries_visit(en->instance, world, targets, out, seen);
+        }
+    }
+}
+
+// The entries a positive answer `S <: X` may rest on in `world`: each
+// entry live there, on a TypeName reachable from S or X, whose set reaches an open set that S or
+// X names. A lower bound turns the question around: in `Ref{Y} <: Ref{T} where T >: Z` the walk
+// asks `Z <: Y`, the member in X and the set in S; so both sides are read, both bounds of each
+// variable. Inference records them in the code's record when it folds the answer, and bounds the
+// code's worlds by theirs. Empty where neither side reaches one.
+JL_DLLEXPORT jl_value_t *jl_membership_entries_for(jl_value_t *S, jl_value_t *X, size_t world)
+{
+    arraylist_t targets, out, seen;
+    arraylist_new(&targets, 0);
+    arraylist_new(&out, 0);
+    arraylist_new(&seen, 0);
+    open_sets_in(X, &targets);
+    open_sets_in(S, &targets);
+    if (targets.len > 0) {
+        membership_entries_visit(S, world, &targets, &out, &seen);
+        membership_entries_visit(X, world, &targets, &out, &seen);
+    }
+    jl_svec_t *r = jl_alloc_svec_uninit(out.len);
+    for (size_t i = 0; i < out.len; i++)
+        jl_svecset(r, i, (jl_value_t*)out.items[i]);
+    arraylist_free(&targets);
+    arraylist_free(&out);
+    arraylist_free(&seen);
+    return (jl_value_t*)r;
+}
 // Subtyping by declared supertypes and parameters alone, for normal forms (a union's simplification):
 // no membership entry is in force in world 1, since each is declared in a later one.
 JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b)

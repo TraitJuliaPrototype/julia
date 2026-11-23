@@ -49,16 +49,62 @@ has_extended_info(@nospecialize x) = (!isa(x, Type) && !isvarargtype(x)) || isTy
 isnotbrokensubtype(@nospecialize(a), @nospecialize(b)) = (!iskindtype(b) || !isType(a) || hasuniquerep(a.parameters[1]) || b <: a)
 
 # The gates of a fold about a pair that names a set: a negative that a later membership could make
-# true never folds; a positive answered through a membership entry does not fold either, since the
-# entry is in force in some worlds only. Both are cheap flag reads where no set is involved.
+# true never folds. A positive answered through a membership entry folds only where the fold can be
+# recorded: the frame being inferred takes the entries into its record (an edge to each membership's
+# method) and its worlds start no earlier than theirs; elsewhere it does not fold. Both are cheap flag
+# reads where no set is involved.
 function negative_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
     (ccall(:jl_has_open_set, Cint, (Any,), a) != 0 || ccall(:jl_has_open_set, Cint, (Any,), b) != 0) || return false
     return ccall(:jl_could_join, Cint, (Any, Any), a, b) != 0 ||
            ccall(:jl_could_join, Cint, (Any, Any), b, a) != 0
 end
+negative_fold_blocked(@nospecialize(a), @nospecialize(b), ::Union{Nothing,AbsIntState}) =
+    negative_fold_blocked(a, b)
 function positive_fold_blocked(@nospecialize(a), @nospecialize(b))::Bool
     (ccall(:jl_has_open_set, Cint, (Any,), a) != 0 || ccall(:jl_has_open_set, Cint, (Any,), b) != 0) || return false
     return ccall(:jl_subtype_via_membership, Cint, (Any, Any), a, b) != 0
+end
+function positive_fold_blocked(@nospecialize(a), @nospecialize(b), sv::Union{Nothing,AbsIntState})::Bool
+    positive_fold_blocked(a, b) || return false
+    sv isa InferenceState || return true
+    return !record_memberships!(sv, a, b)
+end
+
+"""
+    record_memberships!(sv::InferenceState, a, b) -> Bool
+
+Record the membership entries a positive answer `a <: b` rests on in the frame's record, and start
+the frame's worlds no earlier than theirs. False where no entry with a method is found to rest it
+on: the answer is then not folded.
+"""
+function record_memberships!(sv::InferenceState, @nospecialize(a), @nospecialize(b))
+    entries = ccall(:jl_membership_entries_for, Any, (Any, Any, UInt), a, b, frame_world(sv))::SimpleVector
+    isempty(entries) && return false
+    for e in entries
+        e = e::Core.MembershipEntry
+        getfield(e, :method) isa Method || return false
+    end
+    for e in entries
+        e = e::Core.MembershipEntry
+        # the fields by the builtin, which infers their declared type
+        update_valid_age!(sv, WorldRange(getfield(e, :min_world), getfield(e, :max_world, :monotonic)))
+        # the edge is the membership's method, held as an `invoke` edge at the method's own
+        # signature: validated as any method is, with a backedge on the method's instance
+        m = getfield(e, :method)::Method
+        msig = m.sig
+        sparams = (ccall(:jl_type_intersection_with_env, Any, (Any, Any), msig, msig)::SimpleVector)[2]::SimpleVector
+        mi = specialize_method(m, msig, sparams)
+        edges = sv.edges
+        found = false
+        for i in 2:length(edges)
+            if edges[i] === mi && edges[i-1] === msig
+                found = true
+                break
+            end
+        end
+        found || push!(edges, msig, mi)
+    end
+    return true
 end
 
 function argtypes_to_type(argtypes::Array{Any,1})
@@ -138,6 +184,9 @@ end
 # such that `return <: a` && `Union{return, b} == Union{a, b}`
 function typesubtract(@nospecialize(a), @nospecialize(b), max_union_splitting::Int)
     if a <: b && isnotbrokensubtype(a, b)
+        # subtracting to Bottom keeps the else-branch dead only while the positive answer holds: an
+        # answer through a membership entry does not bound older worlds
+        positive_fold_blocked(a, b) && return a
         return Bottom
     end
     ua = unwrap_unionall(a)
@@ -154,6 +203,7 @@ function typesubtract(@nospecialize(a), @nospecialize(b), max_union_splitting::I
                     ta = switchtupleunion(a)
                     return typesubtract(Union{ta...}, b, 0)
                 elseif b isa DataType
+                    negative_fold_blocked(a, b) && return a
                     if !compatible_vatuple(a, b)
                         return a
                     end

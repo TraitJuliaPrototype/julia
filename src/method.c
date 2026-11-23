@@ -1414,6 +1414,9 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
     m->line = line;
     jl_method_set_source(m, f);
 
+    // `Core.implements` holds the runtime's methods only, one per membership
+    if (!external_mt && jl_is_implements_sig(m->sig))
+        jl_error("Core.implements is the runtime's: a membership is declared by its declaration, not by a method");
     jl_method_table_insert(mt, m, NULL);
     if (jl_newmeth_tracer)
         jl_call_tracer(jl_newmeth_tracer, (jl_value_t*)m);
@@ -1698,6 +1701,42 @@ int nroots_with_key(jl_method_t *m, uint64_t key)
             nwithkey += (j+3 < nblocks2 ? rletable[j+3] : nroots) - rletable[j+1];
     }
     return nwithkey;
+}
+
+// A membership's method: `implements(::Type{X}, ::Type{S})` with the signature `sig`, in the declarer's
+// module, not yet in the table. Its body is the template's (`Core._implements_body`). NULL before Core
+// defines the template.
+jl_method_t *jl_new_membership_method(jl_module_t *module, jl_value_t *sig)
+{
+    jl_value_t *tf = jl_get_global(jl_core_module, jl_symbol("_implements_body"));
+    if (tf == NULL)
+        return NULL;
+    jl_value_t *tt = NULL, *tmv = NULL;
+    jl_method_t *m = NULL;
+    jl_code_info_t *src = NULL;
+    JL_GC_PUSH4(&tt, &tmv, &m, &src);
+    jl_value_t *params[3] = {jl_typeof(tf), (jl_value_t*)jl_any_type, (jl_value_t*)jl_any_type};
+    tt = jl_apply_tuple_type_v(params, 3);
+    tmv = jl_gf_invoke_lookup(tt, jl_nothing, jl_atomic_load_acquire(&jl_world_counter));
+    if (tmv == jl_nothing) {
+        JL_GC_POP();
+        return NULL;
+    }
+    jl_method_t *tm = (jl_method_t*)tmv;
+    src = jl_is_code_info(tm->source) ? jl_copy_code_info((jl_code_info_t*)tm->source)
+                                      : jl_uncompress_ir(tm, NULL, (jl_value_t*)tm->source);
+    m = jl_new_method_uninit(module);
+    m->external_mt = NULL;
+    m->sig = sig;
+    jl_gc_wb(m, sig);
+    m->name = jl_symbol("implements");
+    m->isva = 0;
+    m->nargs = 3;
+    m->file = tm->file;
+    m->line = tm->line;
+    jl_method_set_source(m, src);
+    JL_GC_POP();
+    return m;
 }
 
 #ifdef __cplusplus

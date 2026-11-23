@@ -1986,6 +1986,8 @@ public:
     jl_code_instance_t *codeinst = NULL;
     jl_value_t *rettype = NULL;
     jl_code_info_t *source = NULL;
+    // the statement being emitted carries IR_FLAG_TYPES_PROVEN
+    bool types_proven = false;
     jl_array_t *code = NULL;
     size_t min_world = 0;
     size_t max_world = -1;
@@ -9875,7 +9877,13 @@ static jl_llvm_functions_t
             }
         }
         else {
+            // the statement's type tests that inference proved, those through a membership entry
+            // with the entry recorded: decided here
+            ctx.types_proven = jl_is_array(ctx.source->ssaflags) &&
+                (size_t)cursor < jl_array_dim0(ctx.source->ssaflags) &&
+                (jl_array_data(ctx.source->ssaflags, uint32_t)[cursor] & IR_FLAG_TYPES_PROVEN) != 0;
             emit_stmtpos(ctx, stmt, cursor);
+            ctx.types_proven = false;
             mallocVisitStmt(nullptr, have_dbg_update);
         }
         find_next_stmt(cursor + 1);

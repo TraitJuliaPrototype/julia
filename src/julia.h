@@ -592,6 +592,7 @@ typedef struct {
     _Atomic(uint64_t) max_world;       // lowered once, when the membership is redeclared
     jl_value_t *JL_NONNULL declarer; // the Module that declared it
     jl_value_t *JL_NONNULL by;       // the forwarding field name, or nothing
+    jl_value_t *JL_NONNULL method;   // the membership's method of Core.implements, or nothing
 } jl_membership_t;
 
 typedef struct {

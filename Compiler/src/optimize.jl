@@ -50,6 +50,10 @@ const IR_FLAG_UNUSED      = one(UInt32) << 17
 const IR_FLAG_EFIIMO      = one(UInt32) << 18
 # This statement is :inaccessiblememonly == INACCESSIBLEMEM_OR_ARGMEMONLY
 const IR_FLAG_INACCESSIBLEMEM_OR_ARGMEM = one(UInt32) << 19
+# Inference proved this statement's type tests (`new`'s field tests, a store's value test, a
+# `typeassert`), recording the membership entries those that hold through one rest on: code
+# generation emits no run-time test for them
+const IR_FLAG_TYPES_PROVEN = one(UInt32) << 20
 
 const NUM_IR_FLAGS = 3 # sync with julia.h
 
@@ -380,7 +384,8 @@ function new_expr_effect_flags(𝕃ₒ::AbstractLattice, args::Vector{Any}, src:
             return (false, false, false)
         end
         ⊑(𝕃ₒ, eT, fT) || return (false, false, false)
-        # not where the test holds through a membership entry: it holds in some worlds only
+        # through a membership entry only where inference recorded the entry: this pass has no
+        # frame to record it in, so the statement keeps the flags inference gave it
         positive_fold_blocked(widenconst(eT), fT) && return (false, false, false)
     end
     return (false, true, true)

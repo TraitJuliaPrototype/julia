@@ -1003,6 +1003,8 @@ JL_DLLEXPORT void jl_membership_dispatch_walk(jl_value_t *member, jl_value_t *se
                                               size_t entry_min_world);
 // a membership taken back: the callers that relied on it end (gf.c)
 JL_DLLEXPORT void jl_membership_removal_walk(jl_value_t *member, jl_value_t *set_instance, size_t world);
+// a membership's method ends with its membership (gf.c)
+JL_DLLEXPORT void jl_membership_method_end(jl_method_t *m, size_t world);
 JL_DLLEXPORT size_t jl_membership_stat(int which);
 // what a membership ends of the deep class, kept as a definition's is (gf.c)
 JL_DLLEXPORT int jl_deep_ending_push(const char *kind, jl_value_t *cause);
@@ -1468,6 +1470,11 @@ JL_DLLEXPORT jl_genericmemory_t *jl_idtable_rehash(jl_genericmemory_t *a, size_t
 _Atomic(jl_value_t*) *jl_table_peek_bp(jl_genericmemory_t *a, jl_value_t *key) JL_NOTSAFEPOINT;
 
 JL_DLLEXPORT jl_method_t *jl_new_method_uninit(jl_module_t*);
+// a membership's method of Core.implements (method.c), not yet in the table
+jl_method_t *jl_new_membership_method(jl_module_t *module, jl_value_t *sig);
+JL_DLLEXPORT jl_value_t *jl_implements_functype(void); // typeof(Core.implements), or NULL (gf.c)
+int jl_is_implements_sig(jl_value_t *sig);
+JL_DLLEXPORT jl_value_t *jl_gf_invoke_lookup(jl_value_t *types, jl_value_t *mt, size_t world);
 
 jl_module_t *jl_new_module_(jl_sym_t *name, jl_module_t *parent, uint8_t default_using_core, uint8_t self_name);
 jl_module_t *jl_add_standard_imports(jl_module_t *m);
@@ -2237,6 +2244,7 @@ JL_DLLEXPORT uint32_t jl_crc32c(uint32_t crc, const char *buf, size_t len);
 // -- exports from codegen -- //
 
 #define IR_FLAG_INBOUNDS 0x01
+#define IR_FLAG_TYPES_PROVEN 0x100000 // Compiler/src/optimize.jl: inference proved the statement's type tests
 
 JL_DLLIMPORT void jl_generate_fptr_for_unspecialized(jl_code_instance_t *unspec);
 JL_DLLIMPORT int jl_compile_codeinst(jl_code_instance_t *unspec);
