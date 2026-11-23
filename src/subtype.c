@@ -120,6 +120,9 @@ typedef struct jl_stenv_t {
     // never type equalities, so no entry is consulted there; a variable's bound is a subtype question
     // and is asked with entries (subtype_ccheck, intersect_var)
     int noentry;
+    // the invariant depth at which the outermost such equality began: a variable bound inside it (its depth0 at
+    // least this) is part of the equality, and its bounds are compared with no entry either
+    int noentry_depth;
     // meeting an entry's instance with the set asked about (intersect_membership): the member is in the
     // set only where the entry's instance meets it parameter by parameter, so two instances of one set
     // that differ in an input do not meet there as two sets do (compiler §4.9)
@@ -794,7 +797,7 @@ static int env_unchanged(jl_stenv_t *e, jl_savedenv_t *se) JL_NOTSAFEPOINT
 }
 
 // subtype for variable bounds consistency check. needs its own forall/exists environment.
-static int subtype_ccheck(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
+static int subtype_ccheck(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, jl_varbinding_t *vb)
 {
     if (jl_is_long(x) && jl_is_long(y))
         return jl_unbox_long(x) == jl_unbox_long(y) + e->Loffset;
@@ -811,9 +814,11 @@ static int subtype_ccheck(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     if (obviously_in_union(y, x))
         return 1;
     jl_saved_unionstate_t oldLunions; push_unionstate(&oldLunions, &e->Lunions);
-    // a variable's bound is a subtype question: memberships count (compiler §4.5)
+    // a variable's bound is a subtype question: memberships count (compiler §4.5), but for a variable bound
+    // inside an invariant parameter's equality, which is part of that equality's declared structure
     int noentry = e->noentry;
-    e->noentry = 0;
+    if (!(noentry && vb != NULL && vb->depth0 >= e->noentry_depth))
+        e->noentry = 0;
     int sub = local_forall_exists_subtype(x, y, e, 0, 1);
     e->noentry = noentry;
     pop_unionstate(&e->Lunions, &oldLunions);
@@ -888,7 +893,7 @@ static int var_lt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int param)
         return subtype_left_var(bb->ub, a, e, param);
     if (bb->ub == a)
         return 1;
-    if (!((bb->lb == jl_bottom_type && !jl_is_type(a) && !jl_is_typevar(a)) || subtype_ccheck(bb->lb, a, e)))
+    if (!((bb->lb == jl_bottom_type && !jl_is_type(a) && !jl_is_typevar(a)) || subtype_ccheck(bb->lb, a, e, bb)))
         return 0;
     // for this to work we need to compute issub(left,right) before issub(right,left),
     // since otherwise the issub(a, bb.ub) check in var_gt becomes vacuous.
@@ -929,7 +934,7 @@ static int var_gt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int param)
         return subtype_left_var(a, bb->lb, e, param);
     if (bb->lb == a)
         return 1;
-    if (!((bb->ub == (jl_value_t*)jl_any_type && !jl_is_type(a) && !jl_is_typevar(a)) || subtype_ccheck(a, bb->ub, e)))
+    if (!((bb->ub == (jl_value_t*)jl_any_type && !jl_is_type(a) && !jl_is_typevar(a)) || subtype_ccheck(a, bb->ub, e, bb)))
         return 0;
     jl_value_t *lb = simple_join(bb->lb, a);
     JL_GC_PUSH1(&lb);
@@ -2837,7 +2842,7 @@ static int equal_var(jl_tvar_t *v, jl_value_t *x, jl_stenv_t *e)
                local_forall_exists_subtype(vb->ub, x, e, 0, 0);
     if (vb->lb == x)
         return var_lt(v, x, e, 0);
-    if (!subtype_ccheck(x, vb->ub, e))
+    if (!subtype_ccheck(x, vb->ub, e, vb))
         return 0;
     jl_value_t *lb = simple_join(vb->lb, x);
     JL_GC_PUSH1(&lb);
@@ -2846,7 +2851,7 @@ static int equal_var(jl_tvar_t *v, jl_value_t *x, jl_stenv_t *e)
     JL_GC_POP();
     if (vb->ub == x)
         return 1;
-    if (!subtype_ccheck(vb->lb, x, e))
+    if (!subtype_ccheck(vb->lb, x, e, vb))
         return 0;
     // skip `simple_meet` here as we have proven `x <: vb->ub`
     if (!e->intersection || !reachable_var(x, v, e))
@@ -2862,9 +2867,12 @@ static int forall_exists_equal_(jl_value_t *x, jl_value_t *y, jl_stenv_t *e);
 static int forall_exists_equal(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
 {
     if (obviously_egal(x, y)) return 1;
-    e->noentry++;
+    int depth = e->noentry_depth;
+    if (e->noentry++ == 0)
+        e->noentry_depth = e->invdepth;
     int ans = forall_exists_equal_(x, y, e);
     e->noentry--;
+    e->noentry_depth = depth;
     return ans;
 }
 
@@ -2979,6 +2987,7 @@ static void init_stenv(jl_stenv_t *e, jl_value_t **env, int envsz)
     e->triangular = 0;
     e->Loffset = 0;
     e->noentry = 0;
+    e->noentry_depth = 0;
     e->entryinst = 0;
     e->Lunions.depth = 0;      e->Runions.depth = 0;
     e->Lunions.more = 0;       e->Runions.more = 0;
@@ -3457,6 +3466,7 @@ static int subtype_in_env(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     e2.envidx = e->envidx;
     e2.Loffset = e->Loffset;
     e2.noentry = e->noentry;
+    e2.noentry_depth = e->noentry_depth;
     e2.entryinst = e->entryinst;
     return forall_exists_subtype(x, y, &e2, 0);
 }
@@ -3734,9 +3744,11 @@ static jl_value_t *intersect_aside(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, 
     jl_saved_unionstate_t oldRunions; push_unionstate(&oldRunions, &e->Runions);
     int savedepth = e->invdepth;
     e->invdepth = depth;
-    // a bound's meet is a subtype question: memberships count (compiler §4.5)
+    // a bound's meet is a subtype question: memberships count (compiler §4.5), but for a variable bound inside
+    // an invariant parameter's equality
     int noentry = e->noentry;
-    e->noentry = 0;
+    if (!(noentry && depth >= e->noentry_depth))
+        e->noentry = 0;
     jl_value_t *res = intersect_all(x, y, e);
     e->noentry = noentry;
     e->invdepth = savedepth;
@@ -3956,7 +3968,9 @@ static jl_value_t *intersect_var_(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, in
 static jl_value_t *intersect_var(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int8_t R, int param)
 {
     int noentry = e->noentry;
-    e->noentry = 0;
+    jl_varbinding_t *bb = noentry ? lookup(e, b) : NULL;
+    if (!(noentry && bb != NULL && bb->depth0 >= e->noentry_depth))
+        e->noentry = 0;
     jl_value_t *res = intersect_var_(b, a, e, R, param);
     e->noentry = noentry;
     return res;
@@ -5096,9 +5110,12 @@ static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t 
         return (subtype_noentry(x,y) && subtype_noentry(y,x)) ? y : NULL;
     }
     e->invdepth++;
-    e->noentry++;
+    int depth = e->noentry_depth;
+    if (e->noentry++ == 0)
+        e->noentry_depth = e->invdepth;
     jl_value_t *ii = intersect(x, y, e, 2);
     e->noentry--;
+    e->noentry_depth = depth;
     e->invdepth--;
     if (jl_is_typevar(x) && jl_is_typevar(y) && jl_is_typevar(ii))
         return ii; // skip the following check due to possible circular constraints.
@@ -5116,7 +5133,9 @@ static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t 
     jl_savedenv_t se;
     JL_GC_PUSH1(&ii);
     save_env(e, &se, 1);
-    e->noentry++;
+    int depth2 = e->noentry_depth;
+    if (e->noentry++ == 0)
+        e->noentry_depth = e->invdepth + 1; // the parameter's own depth, as above
     if (!subtype_in_env_existential(x, y, e))
         ii = NULL;
     else {
@@ -5127,6 +5146,7 @@ static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t 
         flip_offset(e);
     }
     e->noentry--;
+    e->noentry_depth = depth2;
     restore_env(e, &se, 1);
     free_env(&se);
     JL_GC_POP();
