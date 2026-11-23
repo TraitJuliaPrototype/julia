@@ -1597,11 +1597,9 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
     cases, handled_all_cases, fully_covered, joint_effects = cases
     atype = argtypes_to_type(sig.argtypes)
     atype === Union{} && return nothing # accidentally actually unreachable
-    # an operation's split: never fully covered, its branches asserted; a `Callable`'s (a closed
-    # build's) checked as the box's call checks
+    # an operation's split: never fully covered, its branches asserted
     fallback_rt = split ? info.rt : nothing
-    kind = split && callable_set_type(widenconst(sig.ft)) ? IR_FLAG_TRUSTED_CALLABLE : UInt32(0)
-    # (a closed build's split with no branch, a set with no member: the `MethodError` below)
+    kind = UInt32(0)
     if fallback_rt !== nothing && isempty(cases)
         inst = ir[SSAValue(idx)]
         call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], nothing))
