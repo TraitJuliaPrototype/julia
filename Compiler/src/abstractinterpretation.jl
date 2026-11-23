@@ -3476,7 +3476,7 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
             specsig = get_ci_abi(method_or_ci)
             defdef = get_ci_mi(method_or_ci).def
             exct = method_or_ci.exctype
-            if !hasintersect(argtype, specsig)
+            if !may_intersect(argtype, specsig)
                 return Future(CallMeta(Bottom, TypeError, EFFECTS_THROWS, NoCallInfo()))
             elseif !(argtype <: specsig) || ((!isa(method_or_ci.def, ABIOverride) && isa(defdef, Method)) && !(argtype <: defdef.sig))
                 exct = Union{exct, TypeError}
@@ -4142,7 +4142,7 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
         A = callable_args(wft)
         if A !== nothing
             args = argtypes_to_type(arginfo.argtypes[2:end])
-            if !hasintersect(args, A)
+            if !may_intersect(args, A)
                 # proved outside `A`: the check still runs, and raises, before the call would
                 # (the function's own code may take them: trusted)
                 return Future(CallMeta(Union{}, MethodError, trusted_effects(interp, TRUSTED_CALLABLE, EFFECTS_THROWS),
@@ -5153,7 +5153,7 @@ function global_assignment_binding_rt_exct(interp::AbstractInterpreter, partitio
     end
     ty = kind == PARTITION_KIND_DECLARED ? Any : partition_restriction(partition)
     wnewty = widenconst(newty)
-    if !hasintersect(wnewty, ty)
+    if !may_intersect(wnewty, ty)
         return Pair{Any,Any}(Bottom, TypeError)
     elseif !(wnewty <: ty)
         retty = tmeet(typeinf_lattice(interp), newty, ty)

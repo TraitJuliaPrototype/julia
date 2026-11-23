@@ -378,7 +378,7 @@ end
     return egal_tfunc(widenlattice(𝕃), x, y)
 end
 @nospecs function egal_tfunc(::JLTypeLattice, x, y)
-    hasintersect(widenconst(x), widenconst(y)) || return Const(false)
+    may_intersect(widenconst(x), widenconst(y)) || return Const(false)
     return Bool
 end
 add_tfunc(===, 2, 2, egal_tfunc, 1)
@@ -1325,7 +1325,7 @@ end
     mutability_errorcheck(o) || return Bottom
     ft = _getfield_tfunc(𝕃, o, f, true)
     ft === Bottom && return Bottom
-    hasintersect(widenconst(v), widenconst(ft)) || return Bottom
+    may_intersect(widenconst(v), widenconst(ft)) || return Bottom
     return v
 end
 mutability_errorcheck(@nospecialize obj) = _mutability_errorcheck(widenconst(obj))
@@ -2052,7 +2052,7 @@ add_tfunc(Core.memorynew, 2, 2, memorynew_tfunc, 10)
     return memoryref_elemtype(mem)
 end
 @nospecs function memoryrefset!_tfunc(𝕃::AbstractLattice, mem, item, order, boundscheck)
-    hasintersect(widenconst(item), memoryrefget_tfunc(𝕃, mem, order, boundscheck)) || return Bottom
+    may_intersect(widenconst(item), memoryrefget_tfunc(𝕃, mem, order, boundscheck)) || return Bottom
     return item
 end
 @nospecs function memoryrefswap!_tfunc(𝕃::AbstractLattice, mem, v, order, boundscheck)

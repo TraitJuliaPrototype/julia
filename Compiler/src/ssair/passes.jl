@@ -305,7 +305,7 @@ function walk_to_defs(compact::IncrementalCompact, @nospecialize(defssa), @nospe
                     val = OldSSAValue(val.id)
                 end
                 edge_typ = widenconst(argextype(val, compact))
-                hasintersect(edge_typ, typeconstraint) || continue
+                may_intersect(edge_typ, typeconstraint) || continue
                 push!(possible_predecessors, n)
             end
             for n in possible_predecessors
@@ -2203,7 +2203,7 @@ function adce_pass!(ir::IRCode, inlining::Union{Nothing,InliningState}=nothing)
             if !isassigned(stmt.values, i)
                 # Should be impossible to have something used only by PiNodes that's undef
                 push!(to_drop, i)
-            elseif !hasintersect(widenconst(argextype(stmt.values[i], compact)),
+            elseif !may_intersect(widenconst(argextype(stmt.values[i], compact)),
                                  widenconst(t))
                 push!(to_drop, i)
             end

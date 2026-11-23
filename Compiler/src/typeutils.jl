@@ -80,6 +80,10 @@ function negative_fold_blocked(@nospecialize(a), @nospecialize(b), sv::Union{Not
     end
     return false
 end
+# Whether a value of type `a` may be of type `b`, where a builtin's check, the type of a global's store or the
+# optimizer's pruning would decide by an empty intersection: about a set that a membership could change it proves
+# nothing, and with no frame to record the pair's edge it is not relied on (compiler §4.8).
+may_intersect(@nospecialize(a), @nospecialize(b)) = hasintersect(a, b) || negative_fold_blocked(a, b)
 # The worlds around `world` in which no method meets the absence signature `sig`: no membership of the
 # pair is in force (compiler §4.8).
 function absence_worlds(@nospecialize(sig), world::UInt)
