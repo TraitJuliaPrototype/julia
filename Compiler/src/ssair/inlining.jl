@@ -1597,9 +1597,11 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
     cases, handled_all_cases, fully_covered, joint_effects = cases
     atype = argtypes_to_type(sig.argtypes)
     atype === Union{} && return nothing # accidentally actually unreachable
-    # an operation's split: never fully covered, its branches asserted
+    # an operation's split: never fully covered, its branches asserted; a `Callable`'s (a closed
+    # build's) checked as the box's call checks
     fallback_rt = split ? info.rt : nothing
-    kind = UInt32(0)
+    kind = split && callable_set_type(widenconst(sig.ft)) ? IR_FLAG_TRUSTED_CALLABLE : UInt32(0)
+    # (a closed build's split with no branch, a set with no member: the `MethodError` below)
     if fallback_rt !== nothing && isempty(cases)
         inst = ir[SSAValue(idx)]
         call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], nothing))
@@ -1915,6 +1917,10 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
             handle_declared_result!(ir, idx, stmt, info)
             continue
         end
+        if isa(info, CallableCallInfo)
+            handle_callable_call!(ir, idx, stmt, info, state)
+            continue
+        end
 
         # handle special cased builtins
         if isa(info, OpaqueClosureCallInfo)
@@ -1972,11 +1978,25 @@ function check_trusted_result!(todo::Vector{Pair{Int,Any}}, ntodo::Int, ir::IRCo
     return nothing
 end
 
-# The check of a result `val` against `T`: `typeassert`'s, as the operation's own call asserts
-trusted_result_check(@nospecialize(val), @nospecialize(T), trusted::UInt32, world::UInt) =
-    Expr(:call, GlobalRef(Core, :typeassert), val, T)
+# The check of a result `val` against `T`: for a `Callable{A, S}`'s, the box's `TypeError`,
+# by an invoke of `Core._callable_result`; for an operation's, `typeassert`'s, as the operation's own
+# call asserts
+function trusted_result_check(@nospecialize(val), @nospecialize(T), trusted::UInt32, world::UInt)
+    if trusted & IR_FLAG_TRUSTED_CALLABLE != 0
+        mi = callable_result_instance(world)
+        mi === nothing || return Expr(:invoke, mi, GlobalRef(Core, :_callable_result), val, T)
+        return Expr(:call, GlobalRef(Core, :_callable_result), val, T)
+    end
+    return Expr(:call, GlobalRef(Core, :typeassert), val, T)
+end
 
-# An operation's call at a receiver typed by its set: the
+function callable_result_instance(world::UInt)
+    match, _ = _findsup(Tuple{typeof(Core._callable_result), Any, Any}, nothing, world)
+    match === nothing && return nothing
+    return specialize_method(match::MethodMatch)
+end
+
+# An operation's call at a receiver typed by its set, or a `Callable`'s: the
 # dynamic call, its result asserted to the declared result, which inference took as the
 # call's type.
 function handle_declared_result!(ir::IRCode, idx::Int, stmt::Expr, info::DeclaredResultInfo)
@@ -1988,6 +2008,22 @@ function handle_declared_result!(ir::IRCode, idx::Int, stmt::Expr, info::Declare
     return nothing
 end
 
+
+# A call of a value known as `Callable{A, S}`: its arguments checked against `A`
+# (`MethodError`), then the dynamic call, its result asserted to `S`.
+function handle_callable_call!(ir::IRCode, idx::Int, stmt::Expr, info::CallableCallInfo, state::InliningState)
+    inst = ir[SSAValue(idx)]
+    if info.A !== nothing
+        check = Expr(:call, GlobalRef(Core, :_callable_argcheck), stmt.args[1], info.A, stmt.args[2:end]...)
+        insert_node!(ir, SSAValue(idx), NewInstruction(check, Nothing, NoCallInfo(), inst[:line], nothing))
+    end
+    # its result checked as a box's call checks it: one check, one message
+    call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], nothing))
+    inst[:stmt] = trusted_result_check(call, info.rt, IR_FLAG_TRUSTED_CALLABLE, state.world)
+    inst[:info] = NoCallInfo()
+    inst[:flag] = IR_FLAG_NULL
+    return nothing
+end
 
 function linear_inline_eligible(ir::IRCode)
     length(ir.cfg.blocks) == 1 || return false
