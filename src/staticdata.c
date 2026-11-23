@@ -4538,7 +4538,12 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
             size_t world = jl_atomic_load_relaxed(&jl_world_counter);
             if (new_methods || new_memberships)
                 world += 1;
+            // the methods' insertion asks its questions about memberships in their world: the loading code runs
+            // in an older one (`_require_world_age`), where the entries of the session and of the images loaded
+            // since are not in force (compiler §4.11, §9)
+            size_t mq = jl_set_membership_query_world(world);
             jl_activate_methods(extext_methods, internal_methods, world, pkgname);
+            jl_set_membership_query_world(mq);
             // the memberships are in force from the same world, before the image's code is validated
             if (new_memberships)
                 jl_activate_memberships(ext_memberships, world);
