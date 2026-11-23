@@ -623,6 +623,25 @@ static int type_declarers_loaded(jl_value_t *t, int depth)
     return 1; // a value parameter
 }
 
+// Whether a type on `S`'s chain holds a pattern's entry whose variable is bounded by a type in which an open set
+// occurs (`Compiled{Z} where Z <: X`, the library's entries for the kept forms): `S` is in that pattern's set where
+// its parameter is under the bound, which a membership of the parameter changes (compiler §4.8, §6.9).
+static int chain_has_set_bounded_pattern(jl_datatype_t *S)
+{
+    for (jl_datatype_t *d = S; d != NULL && d != jl_any_type; d = d->super) {
+        jl_svec_t *list = jl_typename_memberships(d->name);
+        for (size_t i = 0; i < jl_svec_len(list); i++) {
+            jl_value_t *p = ((jl_membership_t*)jl_svecref(list, i))->member;
+            for (; jl_is_unionall(p); p = ((jl_unionall_t*)p)->body) {
+                jl_tvar_t *v = ((jl_unionall_t*)p)->var;
+                if (jl_has_open_set_in(v->ub) || jl_has_open_set_in(v->lb))
+                    return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 // Is "S is not a member of X" final (compiler §4.8)? X is a set closed after load, S a concrete type
 // that is not a member of X in the query world, and the declarers have finished loading: X's module and
 // the module of every TypeName in S. Code that relies on it records the pair's final cell.
@@ -643,6 +662,10 @@ JL_DLLEXPORT int jl_membership_final(jl_value_t *S, jl_value_t *X)
         return !intersection_met(S, xn, world);
     }
     if (!jl_is_concrete_type(S) || jl_is_type_type(S) || ((jl_datatype_t*)S)->name->never_member)
+        return 0;
+    // a pattern of S's bounded by a set: whether S is in it rests on its parameter's memberships, whose pair is
+    // not this one (`Compiled{S} <: X` once `S` joins `X`): not final
+    if (chain_has_set_bounded_pattern((jl_datatype_t*)S))
         return 0;
     // a non-membership is relied on wherever it holds, while a declarer loads and for a type or set of
     // Main too (W-140, stage 2): the code records the pair's cell, and a membership declared later
