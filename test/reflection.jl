@@ -411,6 +411,15 @@ tlayout = TLayout(5,7,11)
 @test_throws ArgumentError fieldname(TLayout, 4)
 @test_throws BoundsError fieldoffset(TLayout, 4)
 
+# `fieldname`'s error path and `_promote_typesubtract` are inferred once, at the instance that runs
+@test_throws "only has 3 fields" fieldname(TLayout, 4)
+let f(x) = Base._promote_typesubtract(x)
+    @test f(Union{Nothing, Int}) === Int
+    @test Base.infer_return_type(f, (Type{Union{Missing, Float64}},)) !== Union{}
+    @test all(mi -> mi.specTypes === Tuple{typeof(Base._promote_typesubtract), Any},
+              Base.specializations(only(methods(Base._promote_typesubtract))))
+end
+
 @test fieldtype(Tuple{Vararg{Int8}}, 1) === Int8
 @test fieldtype(Tuple{Vararg{Int8}}, 10) === Int8
 @test_throws BoundsError fieldtype(Tuple{Vararg{Int8}}, 0)
