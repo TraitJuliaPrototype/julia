@@ -4547,13 +4547,15 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
             // the memberships are in force from the same world, before the image's code is validated
             if (new_memberships)
                 jl_activate_memberships(ext_memberships, world);
+            // the walk and the ambiguity report, as at a declaration (compiler §5.5, §5.4), in the entries' world
+            // before the counter advances to it: no task enters the new world while code the activation ends is
+            // still valid there (§4.3)
+            if (new_memberships)
+                jl_memberships_activated(ext_memberships, world);
             // TODO: inject internal_methods into caches here, so the system can see them immediately as potential candidates (before validation)
             // allow users to start running in this updated world
             if (new_methods || new_memberships)
                 jl_atomic_store_release(&jl_world_counter, world);
-            // the stopgap's walk and the ambiguity report, as at a declaration (compiler C-18, §5.4)
-            if (new_memberships)
-                jl_memberships_activated(ext_memberships, world);
             // now permit more methods to be added again
             JL_UNLOCK(&world_counter_lock);
 

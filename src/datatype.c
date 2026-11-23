@@ -814,8 +814,8 @@ JL_DLLEXPORT jl_value_t *jl_take_activation_ambiguities(void)
     return a;
 }
 
-// Once `world` is published: the stopgap's walk and the ambiguity report for each activated
-// entry, as at a declaration (compiler C-18, §5.4), still under the world counter's lock.
+// The walk and the ambiguity report for each activated entry, as at a declaration (compiler §5.5, §5.4),
+// under the world counter's lock, in the entries' `world` before the counter advances to it (§4.3).
 void jl_memberships_activated(jl_array_t *list, size_t world)
 {
     size_t n = jl_array_nrows(list);
