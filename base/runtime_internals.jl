@@ -338,7 +338,8 @@ julia> fieldname(Tuple{String,Int}, 2)
 """
 function fieldname(t::DataType, i::Integer)
     throw_not_def_field() = throw(ArgumentError("type does not have definite field names"))
-    function throw_field_access(t, i, n_fields)
+    function throw_field_access(@nospecialize(t), i, n_fields)
+        @_nospecializeinfer_meta
         field_label = n_fields == 1 ? "field" : "fields"
         throw(ArgumentError("Cannot access field $i since type $t only has $n_fields $field_label."))
     end
