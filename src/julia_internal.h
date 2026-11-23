@@ -969,6 +969,10 @@ JL_DLLEXPORT size_t jl_membership_query_world(void) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_entry_intersection(jl_value_t *x, jl_value_t *y);
 // subtyping by declared supertypes and parameters alone, for normal forms (a union's simplification)
 JL_DLLEXPORT int jl_subtype_declared(jl_value_t *a, jl_value_t *b);
+// the compiler's questions before it folds an answer about a pair that names a set (subtype.c)
+JL_DLLEXPORT int jl_could_join(jl_value_t *S, jl_value_t *X);
+JL_DLLEXPORT int jl_subtype_via_membership(jl_value_t *S, jl_value_t *X);
+JL_DLLEXPORT int jl_membership_flip_possible(jl_value_t *a, jl_value_t *b);
 jl_datatype_t *jl_new_uninitialized_datatype(void);
 void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable);
 JL_DLLEXPORT jl_datatype_t *jl_wrap_Type(jl_value_t *t);  // x -> Type{x}

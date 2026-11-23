@@ -2002,6 +2002,8 @@ end
     if isexact_tty && !isa(tty_ub, TypeVar)
         tty_lb = tty_ub # TODO: this would be wrong if !isexact_tty, but instanceof_tfunc doesn't preserve this info
         if !has_free_typevars(tty_lb) && !has_free_typevars(tty_ub)
+            # no branch is narrowed where a membership could change the test's answer
+            negative_fold_blocked(tty, tty_ub) && return nothing
             thentype = typeintersect(tty, tty_ub)
             if iskindtype(tty_ub) && thentype !== Bottom
                 # `typeintersect` may be unable narrow down `Type`-type
@@ -3200,6 +3202,9 @@ function abstract_eval_new(interp::AbstractInterpreter, e::Expr, sstate::Stateme
                 at = widenslotwrapper(abstract_eval_value(interp, e.args[i+1], sstate, sv))
                 ft = fieldtype(rt, i)
                 nothrow && (nothrow = ⊑(𝕃ᵢ, at, ft))
+                # a field's test that holds through a membership entry is not proved: it holds in some
+                # worlds only
+                nothrow && (nothrow = !positive_fold_blocked(widenconst(at), ft))
                 at = tmeet(𝕃ᵢ, at, ft)
                 at === Bottom && return RTEffects(Bottom, TypeError, EFFECTS_THROWS)
                 if ismutable && !isconst(rt, i)
