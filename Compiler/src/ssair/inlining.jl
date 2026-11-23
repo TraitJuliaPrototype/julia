@@ -486,9 +486,11 @@ end
 """
 The table for the last branch of an operation's split at `sig` (the call `f(x, args...)`) with
 declared result `rt`: `nothing` where the call takes Julia's dynamic dispatch instead
-(a function of a type not concrete, more than `MAX_SPLIT_TABLE_ARGS` arguments).
+(a function of a type not concrete, more than `MAX_SPLIT_TABLE_ARGS` arguments, a closed build or its
+check).
 """
-function split_fallback_table(sig::Signature, @nospecialize(rt))
+function split_fallback_table(sig::Signature, @nospecialize(rt), closed::Bool)
+    closed && return nothing
     ats = sig.argtypes
     length(ats) >= 2 || return nothing
     n = length(ats) - 2
@@ -1600,7 +1602,8 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
     # an operation's split: never fully covered, its branches asserted
     fallback_rt = split ? info.rt : nothing
     kind = UInt32(0)
-    if fallback_rt !== nothing && isempty(cases)
+    # (a closed build's split with no branch, a set with no member: the `MethodError` below)
+    if fallback_rt !== nothing && isempty(cases) && !((info::SplitCallInfo).closed && handled_all_cases)
         inst = ir[SSAValue(idx)]
         call = insert_node!(ir, SSAValue(idx), NewInstruction(stmt, Any, NoCallInfo(), inst[:line], nothing))
         inst[:stmt] = trusted_result_check(call, fallback_rt, kind, state.world)
@@ -1608,7 +1611,7 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
         inst[:flag] = IR_FLAG_NULL
         return nothing
     end
-    table = fallback_rt === nothing ? nothing : split_fallback_table(sig, fallback_rt)
+    table = fallback_rt === nothing ? nothing : split_fallback_table(sig, fallback_rt, closed_build(state.interp))
     if split
         for i in 1:length(cases)
             c = cases[i]
@@ -1625,7 +1628,10 @@ function handle_call!(todo::Vector{Pair{Int,Any}},
             split_case_edge!(state.edges, item, estate.edges)
         end
     end
-    handle_cases!(todo, ir, idx, stmt, atype, cases, fallback_rt === nothing ? handled_all_cases : false,
+    # in a closed build the split is over every member: past its branches the call
+    # raises the `MethodError`, and no call is left to dispatch when the program runs
+    closed = split && (info::SplitCallInfo).closed && handled_all_cases
+    handle_cases!(todo, ir, idx, stmt, atype, cases, fallback_rt === nothing ? handled_all_cases : closed,
                   fallback_rt === nothing ? fully_covered : false, joint_effects, fallback_rt, table, kind)
 end
 
