@@ -2365,8 +2365,19 @@ static void open_set_walk_names(jl_value_t *v, jl_method_t *m, int depth)
     // it, and stale dispatch persisted in the NEW world. Recurse into the
     // element exactly like set_name_nested does.
     v = jl_unwrap_unionall(v);
-    if (depth > 8)
+    if (depth > 8) {
+        // past the walk's depth: listed under `nothing`, which every membership's walk replays at the method's own
+        // signature (`lower_bound_targets`)
+        if (jl_has_open_set_in(v)) {
+            JL_LOCK(&open_set_methods_lock);
+            if (!open_set_methods)
+                open_set_methods = jl_alloc_vec_any(0);
+            jl_array_ptr_1d_push(open_set_methods, jl_nothing);
+            jl_array_ptr_1d_push(open_set_methods, (jl_value_t*)m);
+            JL_UNLOCK(&open_set_methods_lock);
+        }
         return;
+    }
     if (jl_is_typevar(v)) {
         // `f(c::C) where C <: X{T}`: the variable's bound names the set. Without this arm the method
         // was indexed under no set, the membership's walk never replayed it, and a call cached before
@@ -2466,6 +2477,45 @@ JL_DLLEXPORT jl_value_t *jl_func_methods_at_sets(jl_value_t *ft)
     return ms ? ms : (jl_value_t*)jl_emptysvec;
 }
 
+// Whether a signature has a covariant place (a tuple's element, a union's component, a `Vararg`'s element, under a
+// `UnionAll`) deeper than the walks follow (8) where the type goes on (a variable with a lower bound, a tuple, a union):
+// a membership's walk cannot say what it adds there (compiler §5.5).
+static int sig_places_past_depth(jl_value_t *t, int depth) JL_NOTSAFEPOINT
+{
+    if (t == NULL)
+        return 0;
+    if (depth > 8)
+        return jl_is_unionall(t) || jl_is_uniontype(t) || jl_is_vararg(t) || jl_is_tuple_type(t);
+    while (jl_is_unionall(t))
+        t = ((jl_unionall_t*)t)->body;
+    if (jl_is_uniontype(t))
+        return sig_places_past_depth(((jl_uniontype_t*)t)->a, depth + 1) ||
+               sig_places_past_depth(((jl_uniontype_t*)t)->b, depth + 1);
+    if (jl_is_vararg(t))
+        return sig_places_past_depth(((jl_vararg_t*)t)->T, depth + 1);
+    if (jl_is_tuple_type(t)) {
+        for (size_t i = 0; i < jl_nparams(t); i++)
+            if (sig_places_past_depth(jl_tparam(t, i), depth + 1))
+                return 1;
+    }
+    return 0;
+}
+
+// Whether a lower bound `b` may meet the member: it does by their intersection, a bound that names a variable meets
+// whatever the variable may be, and a bound with parameters (`Tuple{S}`, `Ph{S}`) holds the member below its top,
+// where a membership changes which types are under it: conservatively, every member.
+static int lower_bound_meets(jl_value_t *b, jl_value_t *member)
+{
+    if (jl_has_free_typevars(b))
+        return 1;
+    jl_value_t *bu = jl_unwrap_unionall(b);
+    if (jl_is_uniontype(bu))
+        return lower_bound_meets(((jl_uniontype_t*)bu)->a, member) || lower_bound_meets(((jl_uniontype_t*)bu)->b, member);
+    if (jl_is_datatype(bu) && jl_nparams(bu) > 0)
+        return 1;
+    return !jl_has_empty_intersection(b, member);
+}
+
 // A method whose signature has a variable with a lower bound at a covariant place (`h(::Ph{T}) where T >: S`) is
 // listed under the key `nothing`: a membership of a type under the bound in a set changes which types are under the
 // signature (`Ph{X}`, once `S` joins `X`), though the signature names no set (compiler §5.5). Rare: twenty of
@@ -2477,7 +2527,7 @@ static void index_lower_bound_method(jl_method_t *m)
     jl_sig_lower_bounds((jl_value_t*)m->sig, &lbs, 0);
     size_t n = lbs.len;
     arraylist_free(&lbs);
-    if (n == 0)
+    if (n == 0 && !sig_places_past_depth((jl_value_t*)m->sig, 0))
         return;
     JL_LOCK(&open_set_methods_lock);
     if (!open_set_methods)
@@ -2557,12 +2607,10 @@ static void lower_bound_targets(jl_value_t *member, size_t world, jl_array_t *ta
         arraylist_t lbs;
         arraylist_new(&lbs, 0);
         jl_sig_lower_bounds((jl_value_t*)m->sig, &lbs, 0);
-        int meets = 0;
-        for (size_t k = 0; k < lbs.len && !meets; k++) {
-            jl_value_t *b = (jl_value_t*)lbs.items[k];
-            // a bound that names a variable meets whatever its variable may be: conservatively, every member
-            meets = jl_has_free_typevars(b) || !jl_has_empty_intersection(b, member);
-        }
+        // a signature past the walks' depth is replayed for every member
+        int meets = sig_places_past_depth((jl_value_t*)m->sig, 0);
+        for (size_t k = 0; k < lbs.len && !meets; k++)
+            meets = lower_bound_meets((jl_value_t*)lbs.items[k], member);
         arraylist_free(&lbs);
         if (!meets)
             continue;
@@ -4152,8 +4200,10 @@ static void membership_superset_sets(jl_value_t *set_instance, size_t entry_min_
 static int set_name_nested(jl_value_t *v, jl_typename_t *tn, int cov, int depth)
 {
     v = jl_unwrap_unionall(v);
-    if (v == NULL || depth > 8)
+    if (v == NULL)
         return 0;
+    if (depth > 8)
+        return jl_has_open_set_in(v); // past the walk's depth: any set there may be this one
     if (jl_is_uniontype(v))
         return set_name_nested(((jl_uniontype_t*)v)->a, tn, cov, depth + 1) ||
                set_name_nested(((jl_uniontype_t*)v)->b, tn, cov, depth + 1);
