@@ -2395,8 +2395,8 @@ static void open_set_walk_names(jl_value_t *v, jl_method_t *m, int depth)
         // indexed nothing (Union is not a datatype), §7 never saw the method,
         // and a caller compiled pre-declare kept its stale answer. Same class
         // as the Vararg gap above; same fix shape as set_name_nested.
-        open_set_walk_names(((jl_uniontype_t*)v)->a, m, depth + 1);
-        open_set_walk_names(((jl_uniontype_t*)v)->b, m, depth + 1);
+        open_set_walk_names(((jl_uniontype_t*)v)->a, m, depth); // a union's nesting is no depth
+        open_set_walk_names(((jl_uniontype_t*)v)->b, m, depth);
         return;
     }
     if (!jl_is_datatype(v))
@@ -2488,9 +2488,9 @@ static int sig_places_past_depth(jl_value_t *t, int depth) JL_NOTSAFEPOINT
         return jl_is_unionall(t) || jl_is_uniontype(t) || jl_is_vararg(t) || jl_is_tuple_type(t);
     while (jl_is_unionall(t))
         t = ((jl_unionall_t*)t)->body;
-    if (jl_is_uniontype(t))
-        return sig_places_past_depth(((jl_uniontype_t*)t)->a, depth + 1) ||
-               sig_places_past_depth(((jl_uniontype_t*)t)->b, depth + 1);
+    if (jl_is_uniontype(t)) // a union's components are one place's: its nesting is no depth
+        return sig_places_past_depth(((jl_uniontype_t*)t)->a, depth) ||
+               sig_places_past_depth(((jl_uniontype_t*)t)->b, depth);
     if (jl_is_vararg(t))
         return sig_places_past_depth(((jl_vararg_t*)t)->T, depth + 1);
     if (jl_is_tuple_type(t)) {

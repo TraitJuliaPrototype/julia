@@ -1787,9 +1787,9 @@ void jl_sig_lower_bounds(jl_value_t *t, arraylist_t *out, int depth) JL_NOTSAFEP
             arraylist_push(out, v->lb);
         t = ((jl_unionall_t*)t)->body;
     }
-    if (jl_is_uniontype(t)) {
-        jl_sig_lower_bounds(((jl_uniontype_t*)t)->a, out, depth + 1);
-        jl_sig_lower_bounds(((jl_uniontype_t*)t)->b, out, depth + 1);
+    if (jl_is_uniontype(t)) { // a union's nesting is no depth
+        jl_sig_lower_bounds(((jl_uniontype_t*)t)->a, out, depth);
+        jl_sig_lower_bounds(((jl_uniontype_t*)t)->b, out, depth);
     }
     else if (jl_is_vararg(t)) {
         jl_sig_lower_bounds(((jl_vararg_t*)t)->T, out, depth + 1);
@@ -1812,9 +1812,9 @@ static int lower_bounds_have_memberships(jl_value_t *t, int depth) JL_NOTSAFEPOI
             return 1;
         t = ((jl_unionall_t*)t)->body;
     }
-    if (jl_is_uniontype(t))
-        return lower_bounds_have_memberships(((jl_uniontype_t*)t)->a, depth + 1) ||
-               lower_bounds_have_memberships(((jl_uniontype_t*)t)->b, depth + 1);
+    if (jl_is_uniontype(t)) // a union's nesting is no depth
+        return lower_bounds_have_memberships(((jl_uniontype_t*)t)->a, depth) ||
+               lower_bounds_have_memberships(((jl_uniontype_t*)t)->b, depth);
     if (jl_is_vararg(t))
         return lower_bounds_have_memberships(((jl_vararg_t*)t)->T, depth + 1);
     if (jl_is_tuple_type(t)) {
