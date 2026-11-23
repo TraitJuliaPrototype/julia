@@ -2914,6 +2914,7 @@ static void gc_mark_roots(jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT
     gc_try_claim_and_push(mq, jl_absence_sigs, NULL); // each set's absence signatures (datatype.c)
     gc_try_claim_and_push(mq, jl_declared_memberships, NULL); // this session's memberships (datatype.c)
     gc_try_claim_and_push(mq, jl_atomic_load_relaxed(&jl_activated_entries), NULL); // the entries images activated
+    gc_try_claim_and_push(mq, jl_activation_ambiguities, NULL); // strict mode's findings at an image's activation (datatype.c)
     gc_try_claim_and_push(mq, jl_member_hook, NULL); // the member hook (gf.c)
     gc_try_claim_and_push(mq, jl_member_states, NULL); // the member checks' states (gf.c)
     gc_try_claim_and_push(mq, jl_member_pending, NULL);
