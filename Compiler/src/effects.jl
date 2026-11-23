@@ -103,7 +103,13 @@ following meanings:
   `Core.Compiler.return_type`.
 - `nortsite::Bool`: under the facts mode, this method has no call compiled without an edge
   (a run-time site), and neither have the methods it calls. Only the facts mode clears it;
-  no assertion sets it.
+  no assertion sets it. No asserted effect applies where it is clear (facts.jl).
+- `trusted::UInt8`: the declared results this method's result rests on that the code compiled for a
+  member's own type does not check: `TRUSTED_CALLABLE`, a call of a function known only
+  as `Callable{A, S}`, its result `S`; `TRUSTED_OPERATION`, an operation's result at an argument its
+  members' check does not infer at. The result holds for the instance inferred; where dispatch may run
+  another instance (a call at argument types that are not concrete), the call keeps the bits, and the
+  optimizer checks its result where it is left to dispatch. No assertion sets or clears them.
 
 Note that the representations above are just internal implementation details and thus likely
 to change in the future. See [`Base.@assume_effects`](@ref) for more detailed explanation
@@ -130,6 +136,7 @@ struct Effects
     nonoverlayed::UInt8
     nortcall::Bool
     nortsite::Bool
+    trusted::UInt8
     function Effects(
         consistent::UInt8,
         effect_free::UInt8,
@@ -140,7 +147,8 @@ struct Effects
         noub::UInt8,
         nonoverlayed::UInt8,
         nortcall::Bool,
-        nortsite::Bool = true)
+        nortsite::Bool = true,
+        trusted::UInt8 = 0x00)
         return new(
             consistent,
             effect_free,
@@ -151,7 +159,8 @@ struct Effects
             noub,
             nonoverlayed,
             nortcall,
-            nortsite)
+            nortsite,
+            trusted)
     end
 end
 
@@ -181,6 +190,10 @@ const NOUB_IF_NOINBOUNDS = 0x01 << 1
 # :nonoverlayed bits
 const CONSISTENT_OVERLAY = 0x01 << 1
 
+# :trusted bits
+const TRUSTED_CALLABLE  = 0x01
+const TRUSTED_OPERATION = 0x02
+
 const EFFECTS_TOTAL   = Effects(ALWAYS_TRUE,  ALWAYS_TRUE,  true,  true,  true,  ALWAYS_TRUE,  ALWAYS_TRUE,  ALWAYS_TRUE, true)
 const EFFECTS_THROWS  = Effects(ALWAYS_TRUE,  ALWAYS_TRUE,  false, true,  true,  ALWAYS_TRUE,  ALWAYS_TRUE,  ALWAYS_TRUE, true)
 const EFFECTS_UNKNOWN = Effects(ALWAYS_FALSE, ALWAYS_FALSE, false, false, false, ALWAYS_FALSE, ALWAYS_FALSE, ALWAYS_TRUE, false) # unknown mostly, but it's not overlayed at least (e.g. it's not a call)
@@ -196,7 +209,8 @@ function Effects(effects::Effects=Effects(
     noub::UInt8 = effects.noub,
     nonoverlayed::UInt8 = effects.nonoverlayed,
     nortcall::Bool = effects.nortcall,
-    nortsite::Bool = effects.nortsite)
+    nortsite::Bool = effects.nortsite,
+    trusted::UInt8 = effects.trusted)
     return Effects(
         consistent,
         effect_free,
@@ -207,10 +221,11 @@ function Effects(effects::Effects=Effects(
         noub,
         nonoverlayed,
         nortcall,
-        nortsite)
+        nortsite,
+        trusted)
 end
 
-# a call compiled without an edge under the facts mode: unknown, and a run-time site
+# a call compiled without an edge under the facts mode: unknown, and a run-time site (facts.jl)
 const EFFECTS_RTSITE = Effects(Effects(); nortsite=false)
 
 function is_better_effects(new::Effects, old::Effects)
@@ -285,6 +300,11 @@ function is_better_effects(new::Effects, old::Effects)
     elseif new.nortsite != old.nortsite
         return false
     end
+    if new.trusted == 0x00
+        any_improved |= old.trusted != 0x00
+    elseif new.trusted != old.trusted
+        return false
+    end
     return any_improved
 end
 
@@ -299,7 +319,8 @@ function merge_effects(old::Effects, new::Effects)
         merge_effectbits(old.noub, new.noub),
         merge_effectbits(old.nonoverlayed, new.nonoverlayed),
         merge_effectbits(old.nortcall, new.nortcall),
-        merge_effectbits(old.nortsite, new.nortsite))
+        merge_effectbits(old.nortsite, new.nortsite),
+        old.trusted | new.trusted)
 end
 
 function merge_effectbits(old::UInt8, new::UInt8)
@@ -321,6 +342,7 @@ is_noub_if_noinbounds(effects::Effects)  = effects.noub === NOUB_IF_NOINBOUNDS
 is_nonoverlayed(effects::Effects)        = effects.nonoverlayed === ALWAYS_TRUE
 is_nortcall(effects::Effects)            = effects.nortcall
 is_nortsite(effects::Effects)            = effects.nortsite
+is_trusted(effects::Effects)             = effects.trusted !== 0x00
 
 # implies `is_notaskstate` & `is_inaccessiblememonly`, but not explicitly checked here
 is_foldable(effects::Effects, check_rtcall::Bool=false) =
@@ -364,7 +386,8 @@ function encode_effects(e::Effects)
            ((e.noub                % UInt32) << 10) |
            ((e.nonoverlayed        % UInt32) << 12) |
            ((e.nortcall            % UInt32) << 14) |
-           (((!e.nortsite) % UInt32) << 15)    # stored inverted: zeroed bits read as no run-time site
+           (((!e.nortsite) % UInt32) << 15) |  # stored inverted: zeroed bits read as no run-time site
+           ((e.trusted             % UInt32) << 16)
 end
 
 function decode_effects(e::UInt32)
@@ -378,7 +401,8 @@ function decode_effects(e::UInt32)
         UInt8((e >> 10) & 0x03),
         UInt8((e >> 12) & 0x03),
         Bool((e >> 14) & 0x01),
-        iszero((e >> 15) & 0x01))
+        iszero((e >> 15) & 0x01),
+        UInt8((e >> 16) & 0x03))
 end
 
 decode_statement_effects_override(ssaflag::UInt32) =
